@@ -269,11 +269,16 @@ A Rust binary (target: `cluster-mesh-agent`) shipped as an OCI image and include
 7. **Wait for peer endpoints.** Each Indexer push of a `MessageSent` event on the member's channel is decrypted (sealed-box, x25519). Payloads that parse as `PeerEndpoint{ memberId, ip, port, wgPublicKey, expiresAt }` from existing members are consumed: the sidecar configures the wireguard interface with the peer.
 8. **Send own endpoint.** For every other member the sidecar learns about (via `AttestFacet.listMembers()` plus inbound endpoint messages), encrypt a `PeerEndpoint` of self to the peer's x25519 pubkey via sealed-box and send it via MessageFacet.
 9. **Heartbeat.** For every wireguard peer, run a lightweight heartbeat — a periodic UDP packet over wireguard carrying (a) sender memberId, (b) timestamp, (c) the sender's view of which peers it currently considers connected. Heartbeats are signed with the Ed25519 key so they are not spoofable on the wire.
-10. **Liveness consensus gate.** The sidecar maintains a local view:
+10. **First-convergence gate.** The sidecar maintains a local view:
     - A node is **live** iff at least one other node's heartbeat reports it as connected.
     - The mesh is **converged** iff every live node reports the same connected-set, and that set equals the live set.
-    - Until the mesh is converged, the sidecar's healthcheck returns 503 and the application container does not start.
-11. **Become healthy.** Once converged, healthy is reported. Heartbeat continues for the life of the process; on transient drops the sidecar re-tries connection and the application's own logic decides whether to degrade. The Indexer subscription stays open for the life of the process; if it drops, the sidecar reconnects and resumes from its last-delivered cursor.
+    - Until first convergence is observed, the sidecar's healthcheck returns 503 and the application container does not start.
+    - **The gate fires once.** Once a sidecar observes first convergence, it never re-gates on convergence again — subsequent member joins/departures may temporarily break the cluster-wide property, but a node that has already crossed the gate stays healthy.
+11. **Become healthy; steady-state mesh maintenance.** Once converged, healthy is reported. From here on the sidecar:
+    - Continues heartbeating its current peers.
+    - On Indexer push of `MemberRegistered` for a new member, sends a `PeerEndpoint` to them and adds them as a wireguard peer once their own `PeerEndpoint` arrives — but does *not* re-evaluate convergence or change its healthcheck while the new node integrates.
+    - On peer connection loss, retries connection and continues heartbeating; the application's own logic decides whether to degrade based on the heartbeat liveness report.
+    - The Indexer subscription stays open for the life of the process; if it drops, the sidecar reconnects and resumes from its last-delivered cursor.
 
 ### 7.2 Failure modes
 
@@ -281,7 +286,7 @@ A Rust binary (target: `cluster-mesh-agent`) shipped as an OCI image and include
 - **Indexer down.** If the Indexer is unreachable at boot, the sidecar stays in step 6 and reports unhealthy. The application container does not start. There is no v1 fallback to direct chain polling — operationally, the Indexer's HA shape is what guarantees liveness.
 - **Indexer signature/attestation mismatch.** Treated as adversarial: the sidecar tears down the subscription, re-reads IndexerRegistry, and retries. If the pubkey on chain has been rotated (legitimate operator action), the new subscription succeeds. If not, the sidecar fails closed and stays unhealthy.
 - **Message channel poisoned.** A malicious member could spam another member's channel with garbage. Decryption failures are silently dropped; the sidecar logs at debug only. Rate-limiting is not enforced on chain in v1.
-- **Liveness deadlock.** If the network is partitioned at startup such that no convergence is possible, the sidecar stays unhealthy indefinitely. This is intentional — degraded boot of an unmeshed mesh is worse than visible failure.
+- **First-convergence deadlock.** If the network is partitioned at startup such that no convergence is possible, a *joining* sidecar stays unhealthy indefinitely. This is intentional — degraded boot of an unmeshed mesh is worse than visible failure. Already-healthy sidecars elsewhere in the cluster are unaffected; the gate fires once per process.
 
 ---
 
@@ -372,6 +377,7 @@ No remaining open questions block v1. (Component-level specs may surface new one
 8. **Atomic constructor bootstrapping.** ClusterDiamond's constructor takes `(facetCuts, initContract, initCalldata)` and delegatecalls the init contract into its own storage on construction, seeding the dstack KMS root allowlist, the initial compose-hash / device-id allowlists, the cluster owner Safe, and any other per-platform-facet config in one transaction. The diamond is never reachable in a "deployed but unconfigured" state. Same pattern dstackgres's `DiamondInit` uses; the constructor-arg encoding burden is real but worth it for atomicity.
 9. **Indexer push transport: gRPC bidirectional streaming over HTTP/2 (via `tonic`).** One `.proto` for the subscription envelope generates code on both ends; eliminates schema drift between sidecar and Indexer. HTTP/2 plays well with load balancers when the Indexer goes HA in milestone B. OpenTelemetry instrumentation is first-class.
 10. **Heartbeat defaults (v1).** 2-second interval, 3-miss threshold (a peer is considered down after 6 seconds of silence). Convergence calc tolerates a single missed heartbeat without breaking the converged signal — only a full miss-threshold flips a peer to down. These are tunable in milestone B; v1 picks defaults and we adjust during the demo build-out.
+11. **First-convergence gate fires once per sidecar process, not continuously.** Bringing a CVM up gates its application container behind the first cluster-wide convergence it observes. Subsequent member joins or peer drops may temporarily break cluster-wide convergence; already-healthy sidecars do not re-gate or report unhealthy. Joining nodes still integrate (new peer is added to wireguard, heartbeats start), they just don't push existing nodes back through the healthcheck.
 
 ---
 
