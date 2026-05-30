@@ -317,27 +317,48 @@ dstackgres is the codebase TeeMesh is being extracted from. The differences:
 
 ---
 
-## 10. Out of scope (v1)
+## 10. v1 scope
 
-- On-chain eviction of misbehaving members
-- Cluster-to-cluster federation
-- Non-EVM target chains
-- The CVM sidecar's docker-compose authoring helpers (we will hand-roll those for the first integrations and standardize later)
-- A reference application running on top of TeeMesh (dstackgres will become the first such application, post-extraction)
-- Platform facets other than DstackFacet
+v1 is a **working three-node demo on Base Sepolia** (milestone "A"). The goal is to prove out the protocol end-to-end with the smallest possible surface — production hardening, second platform facets, and security review are deferred to milestone "B".
+
+**In v1:**
+
+- DstackFacet only (no second platform).
+- A single ClusterDiamond deployed on Base Sepolia.
+- Three dstack CVMs registering, publishing wg pubkeys, exchanging endpoints via MessageFacet, and converging the wireguard mesh.
+- A single-instance Indexer (one CVM, no HA) watching that one cluster and pushing events to the three members.
+- IndexerRegistry contract deployed on Sepolia with the v1 Indexer's endpoint and pubkey.
+- One end-to-end test sealed-box message exchanged between two members.
+- Liveness gate working: the application container does not start until the mesh is converged.
+
+**Deferred to milestone B (production-shaped single-platform release):**
+
+- Deployment to Base mainnet behind a Safe.
+- HA Indexer (multiple replicas, load balancer, monitoring).
+- Production sidecar packaging (signed OCI images, dstack runtime integration).
+- Formal threat model review.
+- Member-side sampling cadence policy (always trust Indexer in v1; sampling tunable in B).
+- Indexer-side attestation cache TTL (v1 re-verifies on every reconnect; B introduces a cache).
+- Member factory shape settles (v1 uses per-cluster factory; B revisits if per-platform impls force a different shape).
+- Reorg handling policy (v1 treats Sepolia confirmations as final; B picks a finality depth).
+
+**Deferred indefinitely (not on the B path):**
+
+- On-chain eviction of misbehaving members.
+- Cluster-to-cluster federation.
+- Non-EVM target chains.
+- Platform facets other than DstackFacet (milestone C territory).
+- A reference application on top of TeeMesh.
 
 ---
 
 ## 11. Open questions
 
-These are tracked as open questions to resolve before the spec moves out of draft:
+Open questions that still block v1:
 
-1. **Member factory ownership.** Should the ClusterMemberFactory be diamond-owned (each cluster has its own factory) or shared across all clusters in the org? Per-platform member impls add a wrinkle here.
-2. **Reorg handling for registration.** Do we wait for finality before treating a member as registered, or accept and let upstream prune? The Indexer's per-member cursor needs an answer here too.
-3. **DstackFacet bootstrapping.** On a fresh cluster, the cluster owner needs to seed dstack's allowedKmsRoots before any CVM can register. Does this happen via the diamond constructor (init contract), or as a post-deploy admin call?
-4. **Indexer push transport.** gRPC streaming? HTTP/2 server-sent events? A custom protocol over libp2p? Each has different ops/observability/firewall trade-offs.
-5. **Indexer-side member-attestation cache.** On subscribe, the Indexer re-verifies the member's attestation. Do we cache the result with a TTL, or re-verify on every reconnect? Affects p99 reconnect latency vs freshness against on-chain eviction (if eviction lands later).
-6. **Member-side sampling cadence for Indexer pushes.** What fraction of pushes does a member spot-check via the RPC repro stub? Always (defeats the purpose), never (max trust in Indexer), or 1-in-N with N adjustable?
+1. **DstackFacet bootstrapping.** On a fresh cluster, the cluster owner needs to seed dstack's `allowedKmsRoots` (plus an initial compose-hash / device-id allowlist) before any CVM can register. Does this happen via the diamond constructor (a `DiamondInit` contract delegatecalled during construction, dstackgres-style), or as a separate post-deploy admin call?
+2. **Indexer push transport.** gRPC streaming over HTTP/2, HTTP/2 server-sent events, or something else? Affects the sidecar's Rust dependency tree and the Indexer's tech stack.
+3. **Heartbeat parameters.** Interval (seconds), miss-threshold (consecutive missed heartbeats before a peer is marked down), and how the convergence calculation handles transient drops.
 
 ---
 
@@ -348,7 +369,7 @@ These are tracked as open questions to resolve before the spec moves out of draf
 1. **Heartbeat transport: UDP-over-wireguard, gossip-computed convergence** (not on chain via MessageFacet). Cheap, fast, no per-heartbeat gas. Off-chain observers wanting "is the mesh healthy" must consume from a member.
 2. **Curve25519-only on the per-CVM key path** (sealed-box on x25519 for messaging, Ed25519 for heartbeat signatures). Per-CVM keys are bound via attestation quote user-data commitments, not on-chain ECDSA. Per-CVM secp256k1 is gone.
 3. **Platform support = installed facet.** Each TEE platform is a facet on the diamond. Clusters install whichever platform facets they want to admit; the core facets (Attest / Message / Network) are platform-agnostic and never need to change as new platforms ship.
-4. **Target chain: Base mainnet.** Same chain as dstackgres. Chain-agnosticism is a v2+ concern; v1 deployment scripts, the IndexerRegistry instance, and the org Safe-owned addresses are all Base-specific.
+4. **Target chain: Base** (Sepolia for v1, mainnet for milestone B and beyond). Same EVM family as dstackgres. Chain-agnosticism is a milestone-C+ concern; v1 deployment scripts, the IndexerRegistry instance, and the org Safe-owned addresses are all Base-specific.
 5. **Event delivery via a shared TEE-attested Indexer**, not direct chain polling from each CVM. Members trust the Indexer for liveness and completeness only; each push carries an RPC repro stub so correctness is independently verifiable per event. Follows the dstackgres monitoring-hub pattern.
 6. **Monorepo.** Contracts, CVM sidecar, and Indexer service all live in `TeeSQL/TeeMesh`. The protocol and its reference implementations evolve together; the spec in this repo is authoritative for the deployed Indexer it ships alongside.
 7. **No dstackgres compatibility, Postgres deferred.** TeeMesh is the generic mesh primitive. The existing TeeSQL Postgres-as-a-Service product is on hold and the existing dstackgres deployments on Base mainnet are not migration targets. dstackgres is referenced in §9 strictly as the *extraction source* — useful for understanding which moving parts were ripped out and why — not as a system we owe ABI compatibility to. A future Postgres application on top of TeeMesh is plausible but explicitly out of scope for v1.
