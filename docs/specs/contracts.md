@@ -485,9 +485,7 @@ contract DiamondInit {
 }
 ```
 
-All cluster-wide config — `clusterOwner`, `pendingClusterOwner`, `meshCidrIp`, `meshCidrPrefix` — lives in `MemberStorage` (§4.1 has the canonical layout). AttestFacet's `meshCidr()` and `meshIpOf(bytes32)` view selectors (declared on `IAttest`, §5.1) are the read paths; `meshIpOf` performs the master-spec §7.3 derivation on chain for clients that don't want to re-implement it.
-
-(`MemberStorage.Layout` gets an additional `address clusterOwner` field for this; corrects §4.1 above.)
+All cluster-wide config — `clusterOwner`, `pendingClusterOwner`, `meshCidrIp`, `meshCidrPrefix` — lives in `MemberStorage` per the canonical layout in §4.1. AttestFacet's `meshCidr()` and `meshIpOf(bytes32)` view selectors (declared on `IAttest`, §5.1) are the read paths; `meshIpOf` performs the master-spec §7.3 derivation on chain for clients that don't want to re-implement it.
 
 For milestone B / multi-platform clusters, `InitArgs` extends with per-platform-facet init blobs. v1 is dstack-only.
 

@@ -47,10 +47,12 @@ What this spec deliberately does **not** include:
 │   │                          * = future                         │  │
 │   └─────────────────────────────────────────────────────────────┘  │
 │                              ▲                                      │
-│                              │ passthrough                          │
+│                              │ execute()  (EIP-4337 entry path)     │
+│                              │  + dstack IAppAuth                   │
 │                              │                                      │
 │   ┌──────────────────────────┴──────────────────────────┐          │
-│   │   ClusterMember proxies (one per CVM)               │          │
+│   │  ClusterMember (one per CVM):                       │          │
+│   │    dstack app proxy + EIP-4337 smart wallet         │          │
 │   └─────────────────────────────────────────────────────┘          │
 │                              ▲                                      │
 │                              │ event subscription (eth_getLogs)     │
@@ -87,7 +89,7 @@ The diamond's surface area is split into two layers:
 - **Core facets** know about cluster membership, encrypted messaging, and wireguard signalling. They are platform-agnostic, always installed, and define the contract's stable API.
 - **Platform facets** know about one specific TEE platform. They verify that platform's attestation quote shape, hold that platform's allowlists, and on successful registration write into the shared member storage that the core facets read from. Each cluster's deployer chooses which platform facets to install based on the TEE platforms they want to admit.
 
-Every CVM that participates in the cluster is represented on chain by a **ClusterMember** passthrough contract. The CVM's TEE attestation chain commits to the member contract's address (analogous to dstack's `app_id`). The member contract forwards a small set of calls into the diamond's facets, so the diamond can run cluster-wide logic while individual CVMs only ever interact with their own member address.
+Every CVM that participates in the cluster is represented on chain by a **ClusterMember** contract that combines two responsibilities on a single address: a dstack-style app proxy (so dstack's KMS recognizes the CVM at boot via `IAppAuth`) AND an EIP-4337 v0.7 smart wallet (so the sidecar can submit gasless UserOps via Alchemy's bundler with paymaster-sponsored gas — §13 item 18). The CVM's dstack attestation commits to this address; the diamond sees this address as `msg.sender` on every member-originated call. Details in §5.
 
 ---
 
@@ -262,7 +264,7 @@ Member sidecar → Indexer over a long-lived bidirectional connection (gRPC bidi
 1. Member opens a connection and presents `(memberId, clusterAddress, attestationProof)`.
 2. Indexer verifies that `memberId` exists in `clusterAddress`'s AttestFacet `MemberStorage` and that the attestation matches the recorded TEE pubkeys. (The Indexer is essentially re-running the same verification the platform facet did at registration time — but it can do so as an off-chain read since the cluster diamond is authoritative.)
 3. On success, Indexer adds the member to the cluster's subscriber set, records the highest delivered `blockNumber` for that member, and begins streaming events.
-4. Each event is delivered as a signed envelope: `{event, clusterAddress, blockNumber, txHash, logIndex, rpcReproStub, indexerAttestation, indexerSignature}`.
+4. Each event is delivered as a signed envelope: `{event_data, cluster_addr, block_number, tx_hash, log_index, rpc_repro, indexer_signature, indexer_attestation}` (proto field names — see indexer spec §8.1 and sidecar spec §9.1 for the full message definition).
 5. Member verifies the signature against the Indexer's pubkey from IndexerRegistry. On signature mismatch (or attestation mismatch on the Indexer's first push of the session), the member tears down the subscription and re-discovers.
 
 Subscriptions are stateful: the Indexer remembers per-member delivery cursors so a reconnecting member catches up cleanly rather than losing events.
@@ -322,7 +324,7 @@ A Rust binary (target: `cluster-mesh-agent`) shipped as an OCI image and include
 
 ### 7.3 Mesh IP allocation
 
-Each cluster has a CIDR (configured in `DiamondInit.InitArgs.meshCidr`; default `10.13.0.0/16` for v1). Every member's mesh IPv4 is derived deterministically from its `memberId` and the cluster CIDR:
+Each cluster has a CIDR (configured by the `(meshCidrIp, meshCidrPrefix)` pair in `DiamondInit.InitArgs`; default `10.13.0.0/16` for v1). Every member's mesh IPv4 is derived deterministically from its `memberId` and the cluster CIDR:
 
 ```
 ip = cidr.network_address() | ((uint32(keccak256(memberId)) mod (cidr.host_count() - 2)) + 1)
@@ -416,7 +418,7 @@ A compromised cluster owner can install a malicious platform facet or relax an e
 
 A compromised TEE platform vendor (e.g. a malicious dstack KMS root, a leaked Intel PCS signer key) is out of scope: each platform's security model is taken as a given by that platform's facet. Mitigations exist platform-side (root rotation, multi-root patterns) and can be reflected here by updating the facet's allowlists or pinned signer set.
 
-**Registration binding signature plus EIP-4337 UserOp authentication share one CVM-derived secp256k1 key.** On dstack, the binding signature is a single secp256k1 signature from a key derived via the dstack KMS at registration time. The *same* derived key's address is then installed as the ClusterMember smart wallet's `owner` (atomically, via a diamond callback inside `dstack_register` — see §13 item 18). Every subsequent EIP-4337 UserOp from that CVM is signed by the same key and validated against the stored owner. The CVM's other operational keys are all Curve25519 (x25519 for sealed-box, Ed25519 for heartbeat signatures, plus its wireguard keypair). On future platforms that expose raw attestation quotes, the binding mechanism is even thinner: the pubkeys live in the quote's user-data slot, no per-CVM ECDSA at all. Either way, the only ECDSA key the CVM holds is the one bound by attestation at registration; there is no operator-provisioned key.
+**Registration binding signature plus EIP-4337 UserOp authentication share one CVM-derived secp256k1 key.** On dstack, the binding signature is a single secp256k1 signature from a key derived via the dstack KMS at registration time. The *same* derived key's address is then installed as the ClusterMember smart wallet's `owner` (atomically, via a diamond callback inside `dstack_register` — see §13 item 18). Every subsequent EIP-4337 UserOp from that CVM is signed by the same key and validated on chain by `ClusterMember.validateUserOp` against the stored owner. The CVM's other operational keys are all Curve25519 (x25519 for sealed-box, Ed25519 for heartbeat signatures, plus its wireguard keypair). On future platforms that expose raw attestation quotes, the *attestation* binding mechanism is thinner — the pubkeys live in the quote's user-data slot, no per-CVM ECDSA needed for the registration proof — but those platforms still need a per-CVM signing key for EIP-4337 UserOps (or, equivalently, an alternative paymaster integration that doesn't require k256 sigs). The only ECDSA key the CVM holds is the one bound by attestation at registration; there is no operator-provisioned key.
 
 ---
 
@@ -430,7 +432,7 @@ dstackgres is the codebase TeeMesh is being extracted from. The differences:
 - **Verifier as facet, not external contract.** dstackgres has a separate `DstackVerifier` UUPS contract registered with `TEEBridge` via an adapter registry. TeeMesh folds that role directly into the platform facet: there is no separate verifier contract, no adapter registry, no `IVerifier` interface needed cross-platform. Each platform's verification logic is library code linked into its facet.
 - **MessageFacet is new.** dstackgres has nothing equivalent — endpoint exchange there happens via `signalEndpoint(bytes ciphertext, ...)` on `WgMeshFacet`. TeeMesh splits this cleanly: messaging is one facet, networking is another.
 - **Wireguard signalling is decoupled from endpoint registry.** dstackgres stores endpoint blobs on chain; TeeMesh stores only wg public keys on chain and pushes endpoint info through MessageFacet so deployment topology is not leaked.
-- **Curve25519 only on the member key path.** dstackgres derives a per-CVM secp256k1 key and binds it via `ecrecover` on a signed registration message. TeeMesh derives x25519 + Ed25519 from a Curve25519 seed and binds them via the attestation quote's user-data commitment — no per-CVM ECDSA touches the chain.
+- **Curve25519 for the CVM's operational keys.** dstackgres derives a per-CVM secp256k1 key and uses it for cluster-side operations via the dstackgres control plane. TeeMesh derives x25519 + Ed25519 + wireguard from Curve25519 for the operational surface; the per-CVM secp256k1 key from the dstack KMS is reused only for (a) the one-shot registration binding signature and (b) signing EIP-4337 UserOpHashes for sponsored paymaster submission. No long-lived per-CVM ECDSA key exists beyond what attestation produces.
 
 ---
 
@@ -480,7 +482,7 @@ No remaining open questions block v1. (Component-level specs may surface new one
 (Decisions called during the spec's drafting that may otherwise look load-bearing without context.)
 
 1. **Heartbeat transport: UDP-over-wireguard, gossip-computed convergence** (not on chain via MessageFacet). Cheap, fast, no per-heartbeat gas. Off-chain observers wanting "is the mesh healthy" must consume from a member.
-2. **Curve25519 for the CVM's ongoing key path** (sealed-box on x25519 for messaging, Ed25519 for heartbeat signatures). The only ECDSA on the CVM side is a one-shot binding signature at registration time, using a key the platform's KMS derives for that purpose (on dstack: a k256 derived key); after registration that key is never used again. Future platforms that expose raw attestation quotes can eliminate even that one signature by committing pubkeys into the quote's user-data slot.
+2. **Curve25519 for the CVM's operational key path** (sealed-box on x25519 for messaging, Ed25519 for heartbeat signatures). The per-CVM secp256k1 key the dstack KMS derives is used both for the registration binding signature AND, after the diamond callback installs it as the ClusterMember's owner, for signing every subsequent EIP-4337 UserOpHash (item 18). One key, two recoverable signing surfaces. Future platforms that expose raw attestation quotes can use the user-data slot for the *attestation* binding, but still need a signing key for paymaster-sponsored UserOps (unless an alternative gas-sponsorship integration removes that requirement).
 3. **Platform support = installed facet.** Each TEE platform is a facet on the diamond. Clusters install whichever platform facets they want to admit; the core facets (Attest / Message / Network) are platform-agnostic and never need to change as new platforms ship.
 4. **Target chain: Base** (Sepolia for v1, mainnet for milestone B and beyond). Same EVM family as dstackgres. Chain-agnosticism is a milestone-C+ concern; v1 deployment scripts, the IndexerRegistry instance, and the org Safe-owned addresses are all Base-specific.
 5. **Event delivery via a shared TEE-attested Indexer**, not direct chain polling from each CVM. Members trust the Indexer for liveness and completeness only; each push carries an RPC repro stub so correctness is independently verifiable per event. Follows the dstackgres monitoring-hub pattern.
