@@ -226,7 +226,8 @@ loop {
 "Relevant for this member" filters per master spec §6.2:
 
 - `MessageSent` where `recipient_member_id == subscriber.member_id`: yes (this is the recipient).
-- `MemberRegistered`, `WgKeyPublished`, `MemberRemoved`: yes (all cluster members care about who's in the cluster).
+- `MemberRegistered`, `WgKeyPublished`: yes (all cluster members care about who's in the cluster).
+- `MemberRemoved`: **milestone B only.** On-chain eviction is not in v1 (master spec §11 — deferred indefinitely). The v1 indexer never emits this push because the underlying event is never emitted.
 - Allowlist mutations / owner transfers: yes (for observability; sidecars may ignore but operators may consume via a separate subscription pattern in milestone B).
 - `MessageSent` where `recipient_member_id != subscriber.member_id`: **no**. The Indexer enforces this so it never leaks the existence of a message to a non-recipient member. (The plaintext is sealed anyway, but suppressing the event metadata adds defense-in-depth.)
 

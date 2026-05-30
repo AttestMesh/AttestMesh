@@ -23,9 +23,12 @@ Expert smart-contract engineer specializing in ERC-2535 diamond proxies, OpenZep
 
 ### Core Components
 
-| Component | Description | Location |
-|-----------|-------------|----------|
-| *To be filled as project develops* | | |
+| Component | Description | Location | Spec |
+|-----------|-------------|----------|------|
+| Contracts | Foundry workspace: ClusterDiamond, core/platform facets, ClusterMember (dstack + EIP-4337), factories, IndexerRegistry | `contracts/` | [`docs/specs/contracts.md`](docs/specs/contracts.md) |
+| Sidecar | Rust binary `cluster-mesh-agent` running inside every CVM: key derivation, registration, Indexer subscription, wireguard mesh, heartbeats, app-facing gRPC | `sidecar/` | [`docs/specs/sidecar.md`](docs/specs/sidecar.md) |
+| Indexer | Rust service `teemesh-indexer` (TEE-attested): watches every cluster on the chain, pushes signed events with RPC-repro stubs to subscribed members | `indexer/` | [`docs/specs/indexer.md`](docs/specs/indexer.md) |
+| Gas webhook | Cloudflare Worker (TypeScript) gating Alchemy's EIP-4337 paymaster sponsorship for TeeMesh UserOps | `services/gas-sponsorship-webhook/` | [`docs/specs/gas-webhook.md`](docs/specs/gas-webhook.md) |
 
 ---
 

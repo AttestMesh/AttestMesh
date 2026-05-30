@@ -129,7 +129,7 @@ No secrets in env vars. All key material is derived from the dstack TEE seed at 
 
 ## 6. Key derivation
 
-All key material is derived via `dstack.derive_key(purpose, algo)` and never persisted in plaintext outside the sidecar's process memory + the dstack sealed store.
+All key material is derived via `dstack.derive_key(purpose, algo)` and never persisted in plaintext outside the sidecar's process memory + the dstack sealed store. (The master spec uses the same name; `derive_key` is the canonical dstack runtime API.)
 
 | Purpose string | Algo | Used for |
 |---|---|---|
@@ -257,6 +257,8 @@ Every other chain read goes via the Indexer.
 
 ### 9.1 `.proto`
 
+The canonical proto is in `sidecar/proto/indexer.proto`, shared with `indexer/`'s build. The full message set (including `RpcReproStub` and `IndexerAttestation`) is documented in **indexer.md §8.1**; the excerpt here covers only what's load-bearing for the sidecar's client view:
+
 ```proto
 service Indexer {
   rpc Subscribe(stream SubscribeMessage) returns (stream PushEnvelope);
@@ -272,7 +274,7 @@ message SubscribeMessage {
 message Hello {
   bytes32 cluster_addr = 1;
   bytes32 member_id = 2;
-  bytes attestation = 3;    // proof against AttestFacet.memberOf
+  bytes attestation = 3;    // reserved for milestone B re-verification; v1 indexer ignores (indexer.md §8.3)
   uint64 from_block = 4;    // resume cursor; 0 means "from this member's MemberRegistered"
 }
 
@@ -282,18 +284,18 @@ message Ack {
 }
 
 message PushEnvelope {
-  EventBlob event = 1;            // ABI-encoded event topics + data
+  bytes event_data = 1;             // RLP-encoded event topics + data (verifiable against the chain)
   bytes32 cluster_addr = 2;
   uint64 block_number = 3;
   bytes32 tx_hash = 4;
   uint64 log_index = 5;
-  RpcReproStub rpc_repro = 6;     // contract addr + block range + topic filter for independent verify
-  bytes indexer_signature = 7;    // Ed25519 over keccak256(envelope-without-signature)
-  IndexerAttestation indexer_attestation = 8;  // TEE quote proving the Indexer's identity
+  RpcReproStub rpc_repro = 6;       // see indexer.md §8.1 for full definition
+  bytes indexer_signature = 7;      // Ed25519 over canonical-bytes(envelope minus this field minus indexer_attestation)
+  IndexerAttestation indexer_attestation = 8;  // present on first push of a session only; see indexer.md §8.1
 }
 ```
 
-(Lives in `proto/indexer.proto`; this is the v1 shape — extend in milestone B.)
+The proto file itself is canonical for codegen; both this spec and indexer.md must keep their illustrative excerpts in sync with it.
 
 ### 9.2 Client behavior
 

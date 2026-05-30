@@ -38,7 +38,7 @@ indexer/          Rust workspace: the TEE-attested event indexer
 services/
   gas-sponsorship-webhook/   Cloudflare Worker: validates EIP-4337 paymaster sponsorship for TeeMesh UserOps
 docs/specs/       Specifications (start with teemesh-coordination-layer.md)
-docs/             Other design docs
+docs/audits/      Project audit reports (latest only; git history holds previous)
 .claude/commands/ Holodeck slash commands (/warmup, /spec, /generate, ...)
 ```
 

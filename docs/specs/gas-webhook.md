@@ -68,7 +68,10 @@ services/gas-sponsorship-webhook/
 | `CACHE_TTL_SECONDS` | no | env (plaintext, default `86400`) | KV cache TTL for `isDeployedCluster` answers |
 | `LOG_LEVEL` | no | env (plaintext, default `info`) | `info` \| `warn` \| `error` |
 
-KV namespace: `FACTORY_PROVENANCE_CACHE` — keyed by `${chainId}:${target}`.
+KV namespaces (declared in `wrangler.toml`):
+
+- `FACTORY_PROVENANCE_CACHE` — cached answers from `ClusterDiamondFactory.isDeployedCluster`. Keyed `${chainId}:${target}`.
+- `MEMBER_PROVENANCE_CACHE` — cached answers from `ClusterMemberFactory.isOurMember`. Keyed `${chainId}:${sender}`.
 
 ---
 
@@ -156,13 +159,18 @@ The inner-selector allowlist is the *exact set* of cluster operations the operat
 
 ```typescript
 export const ALLOWED_SELECTORS = [
+  // Member-driven operations:
   selectorOf("dstack_register(DstackProof,address,bytes32,bytes32)"),
   selectorOf("publishWgKey(bytes32)"),
   selectorOf("send(bytes32,bytes32,bytes)"),
+
+  // Cluster ownership transitions (used during deploy + Safe rotation):
   selectorOf("transferClusterOwnership(address)"),
   selectorOf("acceptClusterOwnership()"),
   selectorOf("transferBothOwners(address)"),
   selectorOf("acceptBothOwners()"),
+  selectorOf("acceptOwnership()"),                  // solidstate SafeOwnable accept side; cluster Safe calls this after deploy
+
   // dstack allowlist mutations (cluster owner does these from the Safe, not from a CVM,
   // but include them so an ops Safe operated via 4337 can manage allowlists too):
   selectorOf("addComposeHash(bytes32)"),

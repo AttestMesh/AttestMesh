@@ -23,7 +23,7 @@ Code generation works from this spec. The parent spec defines *what* the system 
   - `OpenZeppelin/openzeppelin-contracts-upgradeable` — for `Initializable`, `UUPSUpgradeable` on `ClusterMember`.
   - `solidstate-network/solidstate-solidity` — diamond base (`SolidStateDiamond`, `DiamondWritable`, `DiamondReadable`, `ERC165Base`, `SafeOwnable`).
   - `eth-infinitism/account-abstraction` — EIP-4337 v0.7 interfaces (`IAccount`, `PackedUserOperation`, `IEntryPoint`).
-- **EntryPoint v0.7** (canonical, identical address on every supported chain): `0x0000000071727De22E5E9d8BAf0edAc6f37da032`. Hardcoded into `ClusterMember` as an immutable; not deployed by us.
+- **EntryPoint v0.7** (canonical, identical address on every supported chain): `0x0000000071727De22E5E9d8BAf0edAc6f37da032`. Hardcoded into `ClusterMember` as a `constant`; not deployed by us.
 - **Targets**:
   - v1: Base Sepolia (chain id 84532).
   - Milestone B: Base mainnet (chain id 8453).
@@ -73,9 +73,9 @@ contracts/
 │   └── errors/
 │       └── Errors.sol                    # canonical error declarations
 ├── script/
-│   ├── DeployIndexerRegistry.s.sol
-│   ├── DeployClusterMemberFactory.s.sol
-│   └── DeployCluster.s.sol               # atomic ClusterDiamond + DiamondInit
+│   ├── DeployInfra.s.sol                 # one-shot per-chain: facets, factories, IndexerRegistry
+│   ├── DeployCluster.s.sol               # per-cluster: atomic ClusterDiamond + DiamondInit via the factory
+│   └── DeployMember.s.sol                # per-CVM: deploy ClusterMember via the factory
 └── test/
     ├── unit/
     ├── integration/
@@ -109,20 +109,29 @@ bytes32 internal constant SLOT =
 
 ### 4.1 MemberStorage.Layout
 
+This is the canonical layout. AttestFacet owns this namespace; platform facets write into it via the internal `_addMember` selector (§5.1).
+
 ```solidity
 struct MemberRecord {
     bytes32 platformId;      // keccak256("teemesh.platform.dstack") etc.
-    address memberContract;  // ClusterMember proxy address
+    address memberContract;  // ClusterMember address (also the EIP-4337 sender per §9)
     bytes32 xPubKey;         // x25519 public key for sealed-box
-    bytes32 wgPubKey;        // wireguard public key (mirror)
+    bytes32 wgPubKey;        // wireguard public key (mirror; canonical source is NetworkStorage)
     uint64 registeredAt;     // block.timestamp
-    bytes32 metadata;        // application-defined; opaque to TeeMesh
 }
 
 struct Layout {
     mapping(bytes32 memberId => MemberRecord) members;
     mapping(address memberAddr => bytes32 memberId) memberIdOf;
     bytes32[] memberIds;     // enumeration
+
+    // Cluster-wide config (written once by DiamondInit, updated by AttestFacet's owner-transfer selectors):
+    address clusterOwner;
+    address pendingClusterOwner;
+
+    // Per-cluster wireguard mesh CIDR (DiamondInit-seeded; immutable thereafter in v1):
+    uint32 meshCidrIp;       // packed network address, big-endian (e.g. 0x0a0d0000 for 10.13.0.0)
+    uint8 meshCidrPrefix;    // e.g. 16 for /16
 }
 ```
 
@@ -175,7 +184,7 @@ Mirrors dstackgres's `KmsDstackStorage` + the `IAppAuthBasicManagement` set.
 
 ```solidity
 interface IAttest is IERC165 {
-    // ── View surface ────────────────────────────────────────────
+    // ── Member registry view surface ──────────────────────────────
     function isClusterMember(address account) external view returns (bool);
     function memberOf(address account) external view returns (MemberStorage.MemberRecord memory);
     function memberById(bytes32 memberId) external view returns (MemberStorage.MemberRecord memory);
@@ -184,7 +193,13 @@ interface IAttest is IERC165 {
     function listMembers() external view returns (bytes32[] memory);
     function memberCount() external view returns (uint256);
 
-    // ── Events ──────────────────────────────────────────────────
+    // ── Cluster-wide config readers ───────────────────────────────
+    function clusterOwner() external view returns (address);
+    function pendingClusterOwner() external view returns (address);
+    function meshCidr() external view returns (uint32 ip, uint8 prefix);
+    function meshIpOf(bytes32 memberId) external view returns (uint32);
+
+    // ── Events ────────────────────────────────────────────────────
     event MemberRegistered(
         bytes32 indexed memberId,
         address indexed memberContract,
@@ -207,10 +222,10 @@ function _setWgPubKey(bytes32 memberId, bytes32 wgPubKey) external;
 **Cluster-ownership management.** Two distinct ownership concepts live on the diamond — the solidstate owner (DiamondCut authority, exposed by `SolidStateDiamond`'s SafeOwnable) and the cluster owner (allowlist + admin authority, stored in `MemberStorage.clusterOwner`). In production both are typically the same Safe; the runbook for rotating that Safe needs to update both. AttestFacet exposes both an independent transfer for the cluster-owner side and a fused helper for the common case where both should move together.
 
 ```solidity
-// Independent cluster-owner transfer (two-step, mirrors SafeOwnable's shape)
+// Independent cluster-owner transfer (two-step, mirrors SafeOwnable's shape).
+// pendingClusterOwner() / clusterOwner() are declared on IAttest above.
 function transferClusterOwnership(address newOwner) external;   // onlyClusterOwner
 function acceptClusterOwnership() external;                     // only the pending owner
-function pendingClusterOwner() external view returns (address);
 
 // Fused two-step transfer of BOTH owners in lockstep — what the runbook uses
 // when rotating the cluster Safe in the typical case where one Safe holds both
@@ -232,16 +247,7 @@ Implementation notes:
 - `acceptBothOwners` calls `SafeOwnable.acceptOwnership()` and writes `MemberStorage.layout().clusterOwner` in the same tx. Either both updates land or both revert (atomic).
 - Anyone who wants the owners to diverge (e.g. a council Safe for DiamondCut, an ops Safe for allowlists) can use the independent paths — the fused helper does not foreclose that flexibility.
 
-`MemberStorage.Layout` from §4.1 gains:
-
-```solidity
-struct Layout {
-    // ... existing fields ...
-    address clusterOwner;
-    address pendingClusterOwner;
-    // ... mesh-CIDR fields (§8) ...
-}
-```
+The `clusterOwner` / `pendingClusterOwner` storage slots live in `MemberStorage.Layout` (§4.1) and are read by every facet's `onlyClusterOwner` modifier.
 
 ### 5.2 MessageFacet
 
@@ -479,7 +485,7 @@ contract DiamondInit {
 }
 ```
 
-Mesh-CIDR fields live in `MemberStorage` alongside `clusterOwner` so AttestFacet can expose them as cluster-wide config via a single namespace. AttestFacet adds two view selectors: `meshCidr() returns (uint32 ip, uint8 prefix)` and a convenience `meshIpOf(bytes32 memberId) returns (uint32)` that performs the master-spec §7.3 derivation on chain for clients who don't want to re-implement it.
+All cluster-wide config — `clusterOwner`, `pendingClusterOwner`, `meshCidrIp`, `meshCidrPrefix` — lives in `MemberStorage` (§4.1 has the canonical layout). AttestFacet's `meshCidr()` and `meshIpOf(bytes32)` view selectors (declared on `IAttest`, §5.1) are the read paths; `meshIpOf` performs the master-spec §7.3 derivation on chain for clients that don't want to re-implement it.
 
 (`MemberStorage.Layout` gets an additional `address clusterOwner` field for this; corrects §4.1 above.)
 
