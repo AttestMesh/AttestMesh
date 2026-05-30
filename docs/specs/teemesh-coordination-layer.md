@@ -350,6 +350,7 @@ These are tracked as open questions to resolve before the spec moves out of draf
 3. **Platform support = installed facet.** Each TEE platform is a facet on the diamond. Clusters install whichever platform facets they want to admit; the core facets (Attest / Message / Network) are platform-agnostic and never need to change as new platforms ship.
 4. **Target chain: Base mainnet.** Same chain as dstackgres. Chain-agnosticism is a v2+ concern; v1 deployment scripts, the IndexerRegistry instance, and the org Safe-owned addresses are all Base-specific.
 5. **Event delivery via a shared TEE-attested Indexer**, not direct chain polling from each CVM. Members trust the Indexer for liveness and completeness only; each push carries an RPC repro stub so correctness is independently verifiable per event. Follows the dstackgres monitoring-hub pattern.
+6. **Monorepo.** Contracts, CVM sidecar, and Indexer service all live in `TeeSQL/TeeMesh`. The protocol and its reference implementations evolve together; the spec in this repo is authoritative for the deployed Indexer it ships alongside.
 
 ---
 

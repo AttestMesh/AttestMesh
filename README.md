@@ -28,15 +28,18 @@ Pre-alpha. The contracts are being extracted from dstackgres; the sidecar is bei
 
 ## Repo layout
 
+TeeMesh is a monorepo. The protocol, on-chain primitives, CVM sidecar, and Indexer service all live in one tree so they evolve atomically.
+
 ```
-contracts/        Foundry workspace for the diamond, facets, and member contracts
-sidecar/          Rust workspace for the CVM-side compose package
+contracts/        Foundry workspace: diamond, core facets, platform facets, member contracts, IndexerRegistry
+sidecar/          Rust workspace: cluster-mesh-agent (the per-CVM sidecar)
+indexer/          Rust workspace: the TEE-attested event indexer
 docs/specs/       Specifications (start with teemesh-coordination-layer.md)
 docs/             Other design docs
 .claude/commands/ Holodeck slash commands (/warmup, /spec, /generate, ...)
 ```
 
-(`contracts/` and `sidecar/` will land as the first specs get generated.)
+(`contracts/`, `sidecar/`, and `indexer/` will land as the matching specs get generated.)
 
 ## Build
 
