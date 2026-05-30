@@ -235,7 +235,7 @@ A cluster may override the default indexer by storing its own indexer reference 
 
 ### 6.4 Subscription protocol
 
-Member sidecar → Indexer over a long-lived bidirectional connection (transport TBD — see §11):
+Member sidecar → Indexer over a long-lived bidirectional connection (gRPC bidi streaming, see §13 item 9):
 
 1. Member opens a connection and presents `(memberId, clusterAddress, attestationProof)`.
 2. Indexer verifies that `memberId` exists in `clusterAddress`'s AttestFacet `MemberStorage` and that the attestation matches the recorded TEE pubkeys. (The Indexer is essentially re-running the same verification the platform facet did at registration time — but it can do so as an off-chain read since the cluster diamond is authoritative.)
@@ -247,7 +247,7 @@ Subscriptions are stateful: the Indexer remembers per-member delivery cursors so
 
 ### 6.5 Indexer infrastructure (v1)
 
-For v1 the Indexer ships as a single CVM image, run by TeeMesh-org, with whatever HA shape is operationally appropriate (load balancer + N replicas; each replica is independently attested). A future spec will treat the Indexer itself as a TeeMesh cluster — eating our own dog food, with members of the Indexer cluster mutually attesting each other through the same primitives this spec defines. v1 punts that recursion.
+For v1 the Indexer ships as a single CVM image, run by TeeMesh-org. Whether milestone B's HA Indexer eats its own dog food (Indexer replicas as members of a TeeMesh cluster, coordinating cursor leadership via MessageFacet) or runs as a standalone primitive is deferred — both are open; dog-fooding is the preferred direction but neither shape is committed. v1's single-instance Indexer is built to be portable into either model.
 
 ---
 
@@ -264,9 +264,10 @@ A Rust binary (target: `cluster-mesh-agent`) shipped as an OCI image and include
    Same underlying curve, two operations; on dstack this comes out of `derive_key` with a deterministic purpose string. A separate derivation produces the wireguard keypair (`teemesh.wireguard.v1`).
 3. **Construct the registration proof.** Platform-specific. On dstack: ask the dstack runtime for a `derive_key("teemesh.bind.v1", k256)` derived secp256k1 key, then sign a binding message that commits to `(clusterAddr, memberAddr, xPubKey, wgPubKey)` with that derived key. Bundle the dstack KMS sig chain (KMS root → app key → derived key) plus the binding signature into a `DstackProof`. On future platforms that expose raw attestation quotes, instead request a quote whose user-data slot commits to `keccak256(xPubKey || wgPubKey)` and bundle that with the platform's verifier chain. The TEE will only sign / emit either shape if it actually controls those pubkeys, so the binding is forgery-resistant either way.
 4. **Register (or recognize that we already have).** First, read `AttestFacet.memberOf(memberContractAddress)`:
-   - If a record exists and its `xPubKey` and `wgPubKey` match the derived ones: this is a CVM restart with persisted TEE state, *not* a first-time join. Skip directly to step 5. No transaction needed.
+   - If a record exists and its `xPubKey` and `wgPubKey` match the derived ones: this is a CVM restart with persisted TEE state, *not* a first-time join. The CSK is in the sealed store (§8.5); unseal it. Skip directly to step 5. No transaction needed.
    - If a record exists but the keys do *not* match: the TEE state has been lost and the sidecar derived different keys. Fail closed — log loudly and exit with a non-zero code. Ops needs to either restore the TEE state or replace the ClusterMember (different address, different member entry). v1 does not attempt automated recovery.
    - If no record exists: call the appropriate platform-facet selector — `dstack_register(proof, xPubKey, wgPubKey)` on a dstack CVM, `tdx_register(...)` on a future Intel TDX direct CVM, etc. The CVM only knows its own platform; it does not need to enumerate the diamond's installed facets. On failure (verifier reverts, allowlist mismatch), retry with backoff — but never silently proceed past this gate. Until registration succeeds, the sidecar never reports healthy.
+4a. **Determine CSK role.** Immediately after registration confirms, read `AttestFacet.memberCount()`. If `1`, this member is the CSK **originator** — derive and seal the CSK per §8.1. If `>1`, this member is an **onboardee** and will receive the CSK via an Indexer-pushed envelope during step 6/7; mark "awaiting CSK" as one of the gates blocking step 11.
 5. **Publish wireguard key.** Call `NetworkFacet.publishWgKey(wgPubKey)` through the member proxy. (In v1 we can fold this into `register` since registration already binds the wg pubkey; we keep the separate selector for rotation and resilience.)
 6. **Subscribe to the Indexer.** Read the IndexerRegistry contract for this chain to discover the Indexer endpoint and pubkey. Open a subscription (§6.4), presenting `(memberId, clusterAddress, attestationProof)`. From this point on, every `MessageSent`, `MemberRegistered`, `WgKeyPublished`, or other cluster event the sidecar cares about arrives as a signed Indexer push — the sidecar does not poll the chain directly for events.
 7. **Wait for peer endpoints.** Each Indexer push of a `MessageSent` event on the member's channel is decrypted (sealed-box, x25519). Payloads that parse as `PeerEndpoint{ memberId, ip, port, wgPublicKey, expiresAt }` from existing members are consumed: the sidecar configures the wireguard interface with the peer.
@@ -277,9 +278,9 @@ A Rust binary (target: `cluster-mesh-agent`) shipped as an OCI image and include
     - The mesh is **converged** iff every live node reports the same connected-set, and that set equals the live set.
     - Until first convergence is observed, the sidecar's healthcheck returns 503 and the application container does not start.
     - **The gate fires once.** Once a sidecar observes first convergence, it never re-gates on convergence again — subsequent member joins/departures may temporarily break the cluster-wide property, but a node that has already crossed the gate stays healthy.
-11. **Become healthy; steady-state mesh maintenance.** Once converged, healthy is reported. From here on the sidecar:
+11. **Become healthy; steady-state mesh maintenance.** Once *both* first-convergence is observed *and* the CSK is acquired (originator: derived in step 4a; onboardee: received and sealed in steps 6/7 per §8.3), healthy is reported. From here on the sidecar:
     - Continues heartbeating its current peers.
-    - On Indexer push of `MemberRegistered` for a new member, sends a `PeerEndpoint` to them and adds them as a wireguard peer once their own `PeerEndpoint` arrives — but does *not* re-evaluate convergence or change its healthcheck while the new node integrates.
+    - On Indexer push of `MemberRegistered` for a new member, sends a `PeerEndpoint` to them and adds them as a wireguard peer once their own `PeerEndpoint` arrives — but does *not* re-evaluate convergence or change its healthcheck while the new node integrates. *Additionally*, after a uniform `[0, 500]` ms backoff and a dedup check, the existing member may onboard the new node with the CSK per §8.2.
     - On peer connection loss, retries connection and continues heartbeating; the application's own logic decides whether to degrade based on the heartbeat liveness report.
     - The Indexer subscription stays open for the life of the process; if it drops, the sidecar reconnects and resumes from its last-delivered cursor.
 
@@ -290,10 +291,77 @@ A Rust binary (target: `cluster-mesh-agent`) shipped as an OCI image and include
 - **Indexer signature/attestation mismatch.** Treated as adversarial: the sidecar tears down the subscription, re-reads IndexerRegistry, and retries. If the pubkey on chain has been rotated (legitimate operator action), the new subscription succeeds. If not, the sidecar fails closed and stays unhealthy.
 - **Message channel poisoned.** A malicious member could spam another member's channel with garbage. Decryption failures are silently dropped; the sidecar logs at debug only. Rate-limiting is not enforced on chain in v1.
 - **First-convergence deadlock.** If the network is partitioned at startup such that no convergence is possible, a *joining* sidecar stays unhealthy indefinitely. This is intentional — degraded boot of an unmeshed mesh is worse than visible failure. Already-healthy sidecars elsewhere in the cluster are unaffected; the gate fires once per process.
+- **CSK acquisition deadlock.** An onboardee that never receives a `csk-onboarding-v1` envelope stays unhealthy indefinitely. Same surface as first-convergence deadlock — the application container does not start. Recovery is operational (verify the Indexer is delivering events to that member; verify at least one existing member sees the new `MemberRegistered` and is actually sending). The originator-lost case (§8.6) is permanent.
 
 ---
 
-## 8. Trust model
+## 8. Cluster Shared Key
+
+The **Cluster Shared Key (CSK)** is a 32-byte AES-256 key that every member of a TeeMesh cluster holds. The cluster contract never sees it; the Indexer never sees it. TeeMesh treats its plaintext as opaque — the application layer decides what to use it for (typically: encrypting cluster-wide shared state, deriving sub-keys for specific app concerns, sealing artifacts at rest).
+
+This is the one TeeMesh primitive that lets the application bootstrap symmetric-key crypto across the cluster without rolling its own key-exchange protocol.
+
+### 8.1 Origination
+
+The first member to register derives the CSK locally via dstack's key derivation:
+
+```
+csk = dstack.get_key("teemesh.cluster-shared.v1", "csk-v1")
+```
+
+Deterministic for *that specific* member's TEE state — across the originator's own restarts, the same call gives the same key. It is **not** deterministic across different CVMs: dstack keys by app_id, and every ClusterMember has a different address. Only the originator can derive the CSK; everyone else gets it via onboarding (§8.2).
+
+The originator detects its role by reading `AttestFacet.memberCount()` immediately after its `dstack_register` tx confirms. If `memberCount == 1`, it is the originator. The check is racey across simultaneous registrations, but the chain serializes — exactly one tx confirms first; any CVM whose tx confirms second sees `memberCount >= 2` and recognizes itself as an onboardee.
+
+The originator seals the CSK to dstack's local sealed store after deriving it. The originator could skip sealing and rely on re-derivation across its own restarts, but matching the onboardee storage path keeps the sidecar state machine uniform.
+
+### 8.2 Distribution
+
+When any existing cluster member sees `MemberRegistered` for a new member (via Indexer push), it may onboard them:
+
+1. **Randomized backoff**, uniform on `[0, 500]` ms. Spreads the moment-of-decision across existing members so they do not all race to onboard simultaneously and burn redundant gas. Backoff is hard-capped at 500 ms so onboardees do not wait noticeably.
+2. **Check for prior onboarding** by looking at the recipient's MessageFacet channel for any prior envelope with `envelopeId == keccak256("teemesh.csk.onboarding.v1")` — a canonical, well-known envelope id used only for CSK onboarding. If one already exists, no-op. Someone else got there first.
+3. **Send**, otherwise. Construct `payload = { kind: "csk-onboarding-v1", csk: <32 bytes>, originatorMemberId: <originator's memberId> }`, sealed-box-encrypt with the new member's `xPubKey` from AttestFacet, call `MessageFacet.send(newMemberId, envelopeId=keccak256("teemesh.csk.onboarding.v1"), ciphertext)`.
+
+The well-known `envelopeId` is what enables the step-2 dedup via MessageFacet's built-in duplicate-envelope check — a racing second sender simply reverts with `DuplicateEnvelope`, costing them one tx but doing no protocol damage.
+
+### 8.3 Onboardee receipt
+
+A new member that recognizes itself as an onboardee (post-register `memberCount > 1`) does the following in parallel with mesh bring-up:
+
+1. Subscribe to the Indexer (already required for peer-endpoint exchange — §7.1 step 6).
+2. Listen for a `MessageSent` event on its own channel with `envelopeId == keccak256("teemesh.csk.onboarding.v1")`.
+3. Decrypt with its x25519 private key (sealed-box open). Validate `payload.kind == "csk-onboarding-v1"`.
+4. Verify the sender is a cluster member (implicit in MessageFacet's send gate, but the sidecar may double-check the sender's `memberId` from the Indexer-signed envelope).
+5. Seal the CSK to its own dstack store.
+6. Mark "CSK acquired" — one of the gates before reporting healthy (§7.1 step 11).
+
+### 8.4 Sidecar app exposure
+
+The sidecar's app-facing gRPC (§13 item 13) adds one method:
+
+```
+rpc GetClusterSharedKey(Empty) returns (Bytes32);
+```
+
+Available only after CSK acquisition; before then, the call returns `Unavailable`.
+
+### 8.5 Storage in the CVM
+
+- **In memory** in the sidecar process, zeroed on process exit.
+- **At rest** sealed via `dstack.seal("teemesh.csk.v1", csk_bytes)`. Unsealed at boot.
+- **Never** on disk in plaintext, never in a shared tmpfs volume, never exposed to the application except through the sidecar gRPC.
+
+### 8.6 Failure modes
+
+- **Originator dies before onboarding any other member.** The CSK is lost forever (only the originator's TEE could re-derive it). The cluster cannot bootstrap. This is accepted: a cluster that never starts up is never used. v1 and milestone B both ship this behavior. Out-of-scope mitigations (key escrow, quorum recovery) are not on the roadmap.
+- **All members die simultaneously.** Same outcome — CSK is lost, accepted.
+- **Onboarding race burns gas.** Two existing members both pass the dedup check inside the same racy window and both send. The first send confirms; the second reverts with `DuplicateEnvelope`. Cost: one wasted tx. No protocol damage.
+- **Onboardee is partitioned from the Indexer.** Onboardee blocks at the "CSK acquired" gate. Same failure surface as first-convergence deadlock; healthcheck stays at 503.
+
+---
+
+## 9. Trust model
 
 The diamond's cluster owner (a Safe in production) controls:
 - Which platform facets are installed (via diamondCut).
@@ -311,7 +379,7 @@ A compromised TEE platform vendor (e.g. a malicious dstack KMS root, a leaked In
 
 ---
 
-## 9. Differences from dstackgres
+## 10. Differences from dstackgres
 
 dstackgres is the codebase TeeMesh is being extracted from. The differences:
 
@@ -325,7 +393,7 @@ dstackgres is the codebase TeeMesh is being extracted from. The differences:
 
 ---
 
-## 10. v1 scope
+## 11. v1 scope
 
 v1 is a **working three-node demo on Base Sepolia** (milestone "A"). The goal is to prove out the protocol end-to-end with the smallest possible surface — production hardening, second platform facets, and security review are deferred to milestone "B".
 
@@ -360,13 +428,13 @@ v1 is a **working three-node demo on Base Sepolia** (milestone "A"). The goal is
 
 ---
 
-## 11. Open questions
+## 12. Open questions
 
 No remaining open questions block v1. (Component-level specs may surface new ones as they get written; those will be tracked in their respective specs, not here.)
 
 ---
 
-## 12. Resolved design decisions
+## 13. Resolved design decisions
 
 (Decisions called during the spec's drafting that may otherwise look load-bearing without context.)
 
@@ -382,11 +450,12 @@ No remaining open questions block v1. (Component-level specs may surface new one
 10. **Heartbeat defaults (v1).** 2-second interval, 3-miss threshold (a peer is considered down after 6 seconds of silence). Convergence calc tolerates a single missed heartbeat without breaking the converged signal — only a full miss-threshold flips a peer to down. These are tunable in milestone B; v1 picks defaults and we adjust during the demo build-out.
 11. **First-convergence gate fires once per sidecar process, not continuously.** Bringing a CVM up gates its application container behind the first cluster-wide convergence it observes. Subsequent member joins or peer drops may temporarily break cluster-wide convergence; already-healthy sidecars do not re-gate or report unhealthy. Joining nodes still integrate (new peer is added to wireguard, heartbeats start), they just don't push existing nodes back through the healthcheck.
 12. **CVM restart is sidecar-detected, not a contract concern.** Before calling `dstack_register` (or any other platform-facet register selector), the sidecar checks `AttestFacet.memberOf(memberAddr)` and skips the registration tx if a matching record already exists. Pubkey mismatch on the existing record means lost TEE state — sidecar fails closed in v1; future eviction / rotation specs cover automated recovery. Contracts treat re-registration as an error (`AlreadyRegistered`) — the sidecar is responsible for not getting there.
-13. **Full sidecar-as-app-facade.** The sidecar exposes a gRPC API to the application container running alongside it (over a unix domain socket in the same CVM). Surface includes mesh status, peer listing, message send, decrypted message subscription, and peer-event subscription. The app never holds TeeMesh keys, never sees ciphertexts, and never talks to the chain or the Indexer directly. **Decryption-filtered:** the sidecar receives every `MessageSent` event from the Indexer but only forwards to the application those whose payloads decrypt successfully against the member's x25519 private key. Failed decryptions (not addressed to us, malformed, key mismatch) are silently dropped — the app's message stream contains only verified, decrypted, addressed-to-it traffic. Sidecar-internal coordination messages (e.g. `PeerEndpoint`) are also consumed before the app sees them.
+13. **Full sidecar-as-app-facade.** The sidecar exposes a gRPC API to the application container running alongside it (over a unix domain socket in the same CVM). Surface includes mesh status, peer listing, message send, decrypted message subscription, peer-event subscription, and `GetClusterSharedKey`. The app never holds TeeMesh keys, never sees ciphertexts, and never talks to the chain or the Indexer directly. **Decryption-filtered:** the sidecar receives every `MessageSent` event from the Indexer but only forwards to the application those whose payloads decrypt successfully against the member's x25519 private key. Failed decryptions (not addressed to us, malformed, key mismatch) are silently dropped — the app's message stream contains only verified, decrypted, addressed-to-it traffic. Sidecar-internal coordination messages (`PeerEndpoint`, `csk-onboarding-v1`) are consumed before the app sees them.
+14. **Cluster Shared Key (CSK) primitive.** A single 32-byte symmetric key, derived deterministically by the first member to register via `dstack.get_key("teemesh.cluster-shared.v1", "csk-v1")`, distributed to subsequent members via sealed-box-encrypted `MessageFacet.send` with a canonical well-known `envelopeId == keccak256("teemesh.csk.onboarding.v1")`. Senders apply a uniform `[0, 500]` ms randomized backoff and dedup against the canonical envelopeId so only one onboarding tx wins; racers revert with `DuplicateEnvelope`. The CSK is sealed to dstack's per-CVM sealed store at rest, held in sidecar memory at runtime, exposed to the application via `GetClusterSharedKey` gRPC. Never on chain in plaintext; never visible to the diamond, Indexer, or application container outside the sidecar gRPC. Originator-permanent-loss before first onboarding bricks the cluster — accepted as a non-issue ("a cluster that never starts up is never used"). See §8 for the full mechanism.
 
 ---
 
-## 13. References
+## 14. References
 
 - [dstack — IAppAuth / IAppAuthBasicManagement](https://github.com/Dstack-TEE/dstack/blob/master/kms/auth-eth/contracts/)
 - [dstackgres contracts/teesql-group-auth](https://github.com/TeeSQL/dstackgres/tree/main/contracts/teesql-group-auth) — extraction source

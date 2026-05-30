@@ -229,6 +229,15 @@ interface IMessage is IERC165 {
 
 On success, marks the nonce and emits `MessageSent`. Ciphertext bytes are emitted as event data only — never stored.
 
+**Reserved envelope ids** (TeeMesh-internal protocol messages — the contract treats them as opaque but the sidecar handles them specially):
+
+| `envelopeId` source string | Purpose | Sender | Recipient |
+|---|---|---|---|
+| `"teemesh.csk.onboarding.v1"` | Cluster Shared Key onboarding (master spec §8) | Any existing member | A newly-registered onboardee |
+| `"teemesh.peer-endpoint.v1"` | Wireguard peer-endpoint exchange (master spec §7.1 step 7) | Any cluster member | Any cluster member |
+
+The `DuplicateEnvelope` revert is what implements the CSK-onboarding-dedup race semantics: multiple existing members racing to onboard a new member will all pass the local "any prior onboarding tx?" check inside the racy window, both send, the first lands and the second reverts at zero protocol cost. v1 takes the dedup at face value — no rate-limiting beyond it.
+
 ### 5.3 NetworkFacet
 
 **Storage**: `NetworkStorage` + writes to `MemberStorage` (via AttestFacet's internal `_setWgPubKey`).
