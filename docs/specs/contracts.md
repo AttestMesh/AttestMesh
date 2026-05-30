@@ -200,6 +200,45 @@ function _setWgPubKey(bytes32 memberId, bytes32 wgPubKey) external;
 
 `_addMember` reverts if `memberIdOf[rec.memberContract] != 0` (no double-registration).
 
+**Cluster-ownership management.** Two distinct ownership concepts live on the diamond — the solidstate owner (DiamondCut authority, exposed by `SolidStateDiamond`'s SafeOwnable) and the cluster owner (allowlist + admin authority, stored in `MemberStorage.clusterOwner`). In production both are typically the same Safe; the runbook for rotating that Safe needs to update both. AttestFacet exposes both an independent transfer for the cluster-owner side and a fused helper for the common case where both should move together.
+
+```solidity
+// Independent cluster-owner transfer (two-step, mirrors SafeOwnable's shape)
+function transferClusterOwnership(address newOwner) external;   // onlyClusterOwner
+function acceptClusterOwnership() external;                     // only the pending owner
+function pendingClusterOwner() external view returns (address);
+
+// Fused two-step transfer of BOTH owners in lockstep — what the runbook uses
+// when rotating the cluster Safe in the typical case where one Safe holds both
+// roles. Requires the caller to currently hold *both* roles. The accept side
+// (called by the new Safe) atomically writes both slots inside one tx, so the
+// inconsistency window collapses to zero.
+function transferBothOwners(address newOwner) external;         // requires caller == both current owners
+function acceptBothOwners() external;                           // requires caller == both pending owners
+
+event ClusterOwnershipTransferProposed(address indexed pending);
+event ClusterOwnershipTransferAccepted(address indexed newOwner);
+event BothOwnersTransferProposed(address indexed pending);
+event BothOwnersTransferAccepted(address indexed newOwner);
+```
+
+Implementation notes:
+
+- `transferBothOwners` internally calls `SafeOwnable.transferOwnership` (queues the solidstate-side pending owner) and writes `MemberStorage.layout().pendingClusterOwner`. Both proposals are revocable until accepted — `transferBothOwners(address(0))` clears them.
+- `acceptBothOwners` calls `SafeOwnable.acceptOwnership()` and writes `MemberStorage.layout().clusterOwner` in the same tx. Either both updates land or both revert (atomic).
+- Anyone who wants the owners to diverge (e.g. a council Safe for DiamondCut, an ops Safe for allowlists) can use the independent paths — the fused helper does not foreclose that flexibility.
+
+`MemberStorage.Layout` from §4.1 gains:
+
+```solidity
+struct Layout {
+    // ... existing fields ...
+    address clusterOwner;
+    address pendingClusterOwner;
+    // ... mesh-CIDR fields (§8) ...
+}
+```
+
 ### 5.2 MessageFacet
 
 **Storage**: `MessageStorage`.
@@ -610,6 +649,6 @@ No fuzz / invariant tests for v1. Add in milestone B.
 
 ## 15. Open questions (component-level)
 
-1. **MemberStorage `clusterOwner` field vs solidstate owner.** The spec puts a `clusterOwner` field in MemberStorage so every facet's `onlyClusterOwner` modifier can read it from one place. Alternative: each facet reads from solidstate's `OwnableStorage`. The latter unifies ownership but conflates `diamondCut` authority with allowlist authority — they may want to diverge (e.g. a council Safe for diamondCut, an ops Safe for allowlist mutations). v1 keeps them separate.
+1. *(Resolved)* `MemberStorage.clusterOwner` and solidstate's owner are intentionally separate slots so DiamondCut authority and allowlist authority can diverge in principle. v1 ships the fused `transferBothOwners` / `acceptBothOwners` pair on AttestFacet for the common case where they should rotate together (a single cluster Safe), plus independent `transferClusterOwnership` / `acceptClusterOwnership` for the diverging case. See AttestFacet ownership-management section.
 2. **MessageFacet duplicate-envelope storage cost.** Tracking `envelopeNonces` is one cold SSTORE per send (~20k gas). For a noisy cluster this dominates per-send cost. Alternatives: drop the duplicate check entirely (let readers dedupe), use a bitmap, or bound the lookback window. v1 ships the strict check; revisit if gas becomes a demo blocker.
 3. **TCB status comparison.** Currently a `keccak256(bytes(tcbStatus)) == keccak256(bytes("UpToDate"))` check. dstack may emit other accepted strings (e.g. `"SWHardeningNeeded"` with whitelisted advisory ids). v1 is strict; revisit when we have a real TDX deployment to feel out the policy.
