@@ -411,6 +411,8 @@ contract DiamondInit {
         bytes32[] initialDeviceIds;       // seeded into DstackStorage
         bool allowAnyDevice;
         bool requireTcbUpToDate;
+        uint32 meshCidrIp;                // network address of the cluster's wireguard CIDR (e.g. 10.13.0.0 → 0x0a0d0000)
+        uint8 meshCidrPrefix;             // prefix length (e.g. 16 for /16). Sidecars compute peer IPs deterministically.
     }
 
     function init(InitArgs calldata args) external {
@@ -425,11 +427,15 @@ contract DiamondInit {
         d.allowAnyDevice = args.allowAnyDevice;
         d.requireTcbUpToDate = args.requireTcbUpToDate;
 
-        // Cluster owner is recorded in MemberStorage so every facet can read it
-        MemberStorage.layout().clusterOwner = args.clusterOwner;
+        MemberStorage.Layout storage m = MemberStorage.layout();
+        m.clusterOwner = args.clusterOwner;
+        m.meshCidrIp = args.meshCidrIp;
+        m.meshCidrPrefix = args.meshCidrPrefix;
     }
 }
 ```
+
+Mesh-CIDR fields live in `MemberStorage` alongside `clusterOwner` so AttestFacet can expose them as cluster-wide config via a single namespace. AttestFacet adds two view selectors: `meshCidr() returns (uint32 ip, uint8 prefix)` and a convenience `meshIpOf(bytes32 memberId) returns (uint32)` that performs the master-spec §7.3 derivation on chain for clients who don't want to re-implement it.
 
 (`MemberStorage.Layout` gets an additional `address clusterOwner` field for this; corrects §4.1 above.)
 
