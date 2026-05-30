@@ -1,0 +1,27 @@
+# Build artifacts
+out/
+cache/
+broadcast/
+target/
+
+# Foundry
+**/foundry.lock
+
+# Rust
+**/Cargo.lock
+**/*.rs.bk
+
+# Editor / OS
+.DS_Store
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Local env
+.env
+.env.local
+*.local
+
+# Logs
+*.log
