@@ -26,7 +26,8 @@ The sidecar is the per-CVM process that turns "a CVM running in dstack" into "a 
 |---|---|
 | `tokio` (full) | async runtime |
 | `tonic` + `prost` | gRPC client (Indexer) + server (app facade) |
-| `alloy` (`alloy-primitives`, `alloy-provider`, `alloy-signer`, `alloy-sol-types`) | EVM RPC, signing, ABI |
+| `alloy` (`alloy-primitives`, `alloy-provider`, `alloy-signer`, `alloy-sol-types`) | EVM RPC reads, signing, ABI binding |
+| `alloy-rpc-types-bundler` (or hand-rolled wrappers if upstream isn't ready) | EIP-4337 v0.7 bundler RPC (`eth_sendUserOperation`, `eth_estimateUserOperationGas`, `eth_getUserOperationReceipt`, `eth_getUserOperationNonce`) |
 | `dalek-cryptography` family (`x25519-dalek`, `ed25519-dalek`) | Curve25519 ops |
 | `crypto_box` | NaCl sealed-box (x25519 + XSalsa20-Poly1305) |
 | `zeroize` | zero-on-drop key material |
@@ -74,12 +75,14 @@ sidecar/
 │   ├── dstack.rs                    # dstack runtime client wrappers (derive, seal, get_quote)
 │   ├── keys.rs                      # all key derivation + zeroize wrappers
 │   ├── chain/
-│   │   ├── mod.rs                   # provider + signer setup
-│   │   ├── registry.rs              # IndexerRegistry read
-│   │   ├── attest.rs                # AttestFacet view + register selectors
-│   │   ├── dstack_facet.rs          # dstack_register builder + tx submit
-│   │   ├── network_facet.rs         # publishWgKey
-│   │   └── message_facet.rs         # send envelope builder
+│   │   ├── mod.rs                   # RPC provider + bundler client + signer setup
+│   │   ├── userop.rs                # PackedUserOperation construction + signing
+│   │   ├── bundler.rs               # EIP-4337 bundler RPC client (eth_sendUserOperation etc.)
+│   │   ├── registry.rs              # IndexerRegistry read (direct RPC)
+│   │   ├── attest.rs                # AttestFacet view reads (direct RPC at startup only)
+│   │   ├── dstack_facet.rs          # dstack_register UserOp builder
+│   │   ├── network_facet.rs         # publishWgKey UserOp builder
+│   │   └── message_facet.rs         # send UserOp builder
 │   ├── indexer_client.rs            # gRPC client + reconnect logic
 │   ├── wg/
 │   │   ├── mod.rs                   # netlink + interface lifecycle
@@ -111,7 +114,8 @@ All configuration is via environment variables (no config files). The sidecar fa
 |---|---|---|---|
 | `MEMBER_CONTRACT` | yes | — | hex address of this CVM's ClusterMember proxy |
 | `CHAIN_ID` | yes | — | EVM chain id (`84532` for Base Sepolia v1, `8453` for Base mainnet) |
-| `RPC_URL` | yes | — | EVM RPC endpoint URL |
+| `RPC_URL` | yes | — | EVM RPC endpoint URL (read-only direct chain reads — §8.4) |
+| `BUNDLER_URL` | yes | — | EIP-4337 bundler RPC endpoint (Alchemy in v1). All state-mutating calls go through here. |
 | `INDEXER_REGISTRY_ADDR` | yes | — | hex address of the per-chain IndexerRegistry. (Hardcoded per chain id in v1 sidecar binary; env var allows overriding for tests.) |
 | `DSTACK_SOCKET` | no | `/var/run/dstack.sock` | path to dstack guest-agent socket |
 | `AGENT_GRPC_SOCKET` | no | `/var/run/teemesh/agent.sock` | path the app facade listens on |
@@ -131,7 +135,7 @@ All key material is derived via `dstack.derive_key(purpose, algo)` and never per
 |---|---|---|
 | `teemesh.identity.v1` | curve25519 | Curve25519 root seed. x25519 (encryption) and Ed25519 (signing) are derived from this via standard ed25519 → curve25519 conversion (`x25519-dalek::PublicKey::from(&ed25519_sk)`) so they share one stored secret. |
 | `teemesh.wireguard.v1` | curve25519 | wireguard private key (Curve25519 scalar) |
-| `teemesh.binding.v1` | k256 | secp256k1 derived key used for the *one-shot* `dstack_register` binding signature (master spec §4.2). Used once, never again. |
+| `teemesh.binding.v1` | k256 | secp256k1 derived key whose address becomes the ClusterMember's `owner` after first registration. Signs (a) the one-shot dstack_register binding signature (master spec §4.2), and (b) every subsequent UserOpHash. One key, two recoverable signing surfaces. |
 | `teemesh.cluster-shared.v1` (purpose) / `csk-v1` (version) | aes-256 raw bytes | Cluster Shared Key. **Only derived by the originator.** Onboardees never call this. |
 
 All keys are wrapped in `zeroize::Zeroizing` containers and zeroed on drop. Cargo-deny is configured to reject any dependency that prints derived key material.
@@ -195,22 +199,57 @@ Every state change emits a `tracing::info!` event with a `phase` field (`booting
 
 ## 8. Chain interaction
 
-### 8.1 Provider + signer
+The sidecar never submits raw transactions to the chain. Every state-mutating call goes through EIP-4337 as a UserOperation submitted to an Alchemy bundler endpoint, sponsored by the Alchemy paymaster after the TeeMesh gas-sponsorship webhook approves (master spec §13 item 18, gas-webhook spec). The sidecar holds zero ETH.
 
-- Provider: `alloy-provider` with HTTP transport against `RPC_URL`. WebSocket fallback in milestone B.
-- Signer: an `alloy-signer-local::PrivateKeySigner` constructed from the `teemesh.binding.v1` k256 derived key — but **only** for the one `dstack_register` tx. After registration, the sidecar's *runtime* txes (publishWgKey, send) are sent by a separate alloy signer built from a *short-lived* k256 key the sidecar derives at boot from `teemesh.tx-sender.v1` and uses for its lifetime. This key has no chain-level authority; it just pays gas. The contracts gate on `AttestFacet.isClusterMember(msg.sender)` where `msg.sender` is the member's ClusterMember proxy address, not the sender of the meta-tx; for v1 we send directly from the member's binding key and rely on the gas-payer-equals-binding-key shape. (Account abstraction for runtime txes is milestone B.)
+### 8.1 Provider, bundler, signer
 
-Wait — let me restate that cleanly: **v1 sends every tx from the same `teemesh.binding.v1`-derived secp256k1 key.** That is the only k256 the sidecar holds. It is used both for the one-shot registration binding sig (recovered on chain) and for paying gas on subsequent txes. The contracts' `isClusterMember` check resolves `msg.sender` against `MemberStorage.memberIdOf[msg.sender]`; the binding-derived address is one of the dstack-attested addresses for this CVM, so the check passes. Funding that address with a small amount of testnet ETH is an operator step (logged as an open question in §17 — *funding model for the binding-derived sender key*).
+- **EVM RPC provider** (read-only): `alloy-provider` HTTP transport against `RPC_URL`. Used only for the small set of direct startup reads listed in §8.4.
+- **Bundler RPC**: a separate HTTP client against `BUNDLER_URL` (Alchemy's `https://...api.g.alchemy.com/v2/<key>` endpoint with the `eth_sendUserOperation` namespace). The sidecar sends a single `eth_sendUserOperation` per outbound call and polls `eth_getUserOperationReceipt` until inclusion.
+- **Signer**: a single `alloy-signer-local::PrivateKeySigner` constructed from the `teemesh.binding.v1` k256 derived key. This is the key whose address gets set as the ClusterMember's `owner` during `dstack_register`. It signs:
+  - The dstack-registration binding hash (recovered inside `DstackFacet.dstack_register`).
+  - Every subsequent UserOpHash (recovered inside `ClusterMember.validateUserOp`).
 
-### 8.2 Tx submission
+  One key, two signing surfaces, both recoverable on chain.
 
-- Gas estimation: `eth_estimateGas` + 20% headroom for v1.
-- Nonce: in-memory tracking against `eth_getTransactionCount(pending)` at boot; resync on revert.
-- Retry policy: on `nonce too low` or `replacement transaction underpriced`, bump priority fee 1.25× and retry once. On other reverts, surface to the state machine — registration revert is fatal (state goes to `Exit(non-zero)`); a later `publishWgKey` revert is logged at warn and retried once.
+### 8.2 UserOp construction
 
-### 8.3 Reads
+For every outbound call (`dstack_register`, `publishWgKey`, `send`, etc.):
 
-- All chain reads go through the Indexer once subscribed. The only direct RPC reads from the sidecar are at startup: `member.cluster()`, `IndexerRegistry.current()`, `AttestFacet.memberOf(memberAddr)`, `AttestFacet.memberCount()`.
+1. **Wrap as execute calldata.** The actual selector + args (e.g. `dstack_register(...)`) is encoded as `data`, then wrapped as `ClusterMember.execute(target=clusterDiamond, value=0, data=...)` to match the gas-webhook policy (gas-webhook spec §6 step 4).
+2. **Construct PackedUserOperation v0.7.** Sender = our ClusterMember address. Nonce = next from `eth_getUserOperationNonce(memberAddr, key=0)` (we use a single nonce key for v1; 2D nonces remain available for future use).
+3. **Gas estimation.** `eth_estimateUserOperationGas` via the bundler. Add 20% headroom.
+4. **Paymaster fields.** Empty (`paymaster = null`). Alchemy's bundler fills these in after the webhook approves and the paymaster service signs.
+5. **Sign userOpHash.** Compute per EIP-4337 v0.7 (keccak over the packed bytes + EntryPoint + chainId). Sign with the binding key.
+6. **Submit.** `eth_sendUserOperation`. Returns a userOpHash.
+7. **Poll for inclusion.** `eth_getUserOperationReceipt(userOpHash)` every 2 seconds, up to 60 seconds. On success, return the underlying `txHash`. On timeout, surface to the state machine as a transient failure.
+
+### 8.3 Bootstrap-UserOp special case
+
+The very first UserOp from a fresh ClusterMember invokes `dstack_register`. At that moment the ClusterMember's `owner` field is still `address(0)` and validateUserOp uses the bootstrap path (contracts spec §9.1.2):
+
+- The signature on `userOpHash` is from the binding key.
+- The bindingSig inside the inner `dstack_register` calldata is also from the binding key (signed over the bind-hash described in contracts spec §6.3 step 8).
+- ClusterMember's validateUserOp recovers both and requires them to match.
+
+The sidecar does not need to do anything different on its end — it constructs the UserOp the same way it constructs any other one. The chicken-and-egg is resolved entirely contract-side.
+
+### 8.4 Direct RPC reads (the only direct ones)
+
+Used at startup, before the Indexer subscription is established:
+
+- `member.cluster()` — finds the ClusterDiamond from the predicted ClusterMember address.
+- `IndexerRegistry.current()` — finds the v1 Indexer endpoint + pubkey.
+- `AttestFacet.memberOf(memberAddr)` — restart detection (§7.1 step 4).
+- `AttestFacet.memberCount()` — CSK-role determination (§7.1 step 4a).
+
+Every other chain read goes via the Indexer.
+
+### 8.5 Tx-receipt failure handling
+
+- **Registration UserOp reverts**: fatal. Exit non-zero. Common causes: not-allowlisted compose hash, bad KMS root, replay (member already exists — should have been caught by the §7.1 step 4 pre-flight read, but a race could land us here).
+- **publishWgKey or send UserOp reverts**: log at warn, retry once with fresh gas estimation. If the second attempt also reverts, surface to the application as a `SendMessage` error (for `send`) or set a degraded-mode flag (for `publishWgKey`).
+- **Bundler unavailable**: exponential-backoff retry against the same endpoint. Milestone B adds multi-provider failover (Pimlico, Stackup, etc.); v1 is single-provider.
+- **Webhook denies sponsorship**: bundler returns `paymaster declined`. Treated as transient: log, wait 5 seconds, retry. (Persistent denial would mean the webhook config is wrong, which is operator-fixable; the sidecar's own behavior never changes.)
 
 ---
 
@@ -499,7 +538,7 @@ No fuzz tests for v1. No mainnet-fork tests. No actual dstack hardware tests; th
 
 ## 17. Open questions
 
-1. **Funding model for the binding-derived sender key.** The sidecar's k256 derived key needs testnet ETH for gas on every tx (`dstack_register`, `publishWgKey`, every `MessageFacet.send`). For v1 demo: an operator manually funds before starting the CVM, using a CLI helper that reads `member.cluster()` → predicts the address → drops funds. For milestone B: paymaster / account abstraction, or sidecar registers with an off-chain relay. v1 punts to the manual flow.
-2. **`SubscribeMessages` catchup boundary.** Currently the sidecar's queue is "since process start." App restarts lose history. Should the sidecar persist incoming messages to a sealed disk store keyed by `(envelopeId, block_number)` so app restarts can replay? Adds storage; v1 leaves out. Application must dedup if it relies on idempotency.
-3. **Heartbeat packet encoding stability.** v1 uses `serde_cbor`. CBOR has multiple valid encodings of the same logical value — the signature would not survive a re-encode. Mitigation: canonical CBOR or switch to protobuf. v1 picks canonical CBOR via `ciborium` and pins the encoder.
-4. **Multiple cluster membership.** What if one CVM is a member of two TeeMesh clusters (e.g. a hypothetical Indexer dog-fooding scenario where the Indexer cluster's members are also subscribers to the customer clusters)? v1 sidecar is single-cluster only; this is a milestone B+ shape.
+1. **`SubscribeMessages` catchup boundary.** Currently the sidecar's queue is "since process start." App restarts lose history. Should the sidecar persist incoming messages to a sealed disk store keyed by `(envelopeId, block_number)` so app restarts can replay? Adds storage; v1 leaves out. Application must dedup if it relies on idempotency.
+2. **Heartbeat packet encoding stability.** v1 uses `serde_cbor` via `ciborium` with a pinned canonical encoder. CBOR has multiple valid encodings of the same logical value, and the heartbeat's Ed25519 signature is over the encoded bytes — the canonicalization is what guarantees verification works across encoder versions.
+3. **Multiple cluster membership.** What if one CVM is a member of two TeeMesh clusters (e.g. a hypothetical Indexer dog-fooding scenario where the Indexer cluster's members are also subscribers to the customer clusters)? v1 sidecar is single-cluster only; this is a milestone B+ shape.
+4. **Bundler provider failover.** v1 ships single-provider (Alchemy). If Alchemy's bundler is down, the CVM cannot submit any UserOps and stays unable to send messages until it recovers. Milestone B adds Pimlico / Stackup as fallback endpoints, with health-checked round-robin.

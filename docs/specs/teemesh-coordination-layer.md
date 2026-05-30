@@ -59,14 +59,26 @@ What this spec deliberately does **not** include:
 │   │   Indexer (TEE service, watches many clusters)      │           │
 │   └────┬───────────────────────────────────────────────┘            │
 └────────┼─────────────────────┼──────────────────────────────────────┘
+         │                     ▲
+         │ signed event push   │ EntryPoint.handleOps(userOps) — sent by Alchemy bundler
+         │ (+ RPC-repro stub)  │
+         │                     │     ┌──────────────────────────────────┐
+         │                     │     │ Alchemy bundler + paymaster      │
+         │                     ├─────┤ (asks gas-webhook to approve)    │
+         │                     │     └────────────▲─────────────────────┘
+         │                     │                  │ approve/deny
+         │                     │     ┌────────────┴─────────────────────┐
+         │                     │     │ TeeMesh-org Cloudflare Worker    │
+         │                     │     │ (gas-sponsorship-webhook)        │
+         │                     │     └──────────────────────────────────┘
          │                     │
-         │ signed event push   │ register() / publishWgKey() / send()
-         │ (+ RPC-repro stub)  │ via ClusterMember passthrough
-         ▼                     ▼
+         │                     │ eth_sendUserOperation
+         ▼                     │
         ┌─────────────────────────┐
         │   CVM sidecar           │
         │   (Rust, runs in each   │
         │   confidential VM)      │
+        │   — holds zero ETH      │
         └─────────────────────────┘
 ```
 
@@ -469,6 +481,7 @@ No remaining open questions block v1. (Component-level specs may surface new one
 15. **Ed25519 pubkeys are exchanged off-chain in `PeerEndpoint` envelopes, not stored in MemberStorage.** Heartbeats are signed with the sender's Ed25519 key; receivers learn each peer's Ed25519 pubkey at the same moment they learn the peer's wireguard endpoint (both ride together in the sealed-box `PeerEndpoint` payload). The trust chain on the Ed25519 pubkey holds via the Indexer-signed `senderMemberId` on the carrying `MessageSent` event plus the payload's self-claim of identity. Keeps MemberStorage at two pubkeys (x25519 + wg) and the on-chain registration binding at 64 bytes; the cost is that non-members cannot verify heartbeats they happen to capture, which doesn't matter in practice since heartbeats are UDP-over-wireguard.
 16. **Mesh IP allocation: deterministic from `memberId` against a per-cluster CIDR.** Each cluster's `DiamondInit.InitArgs` sets a `meshCidr` (default `10.13.0.0/16`). Every member's wireguard IP is `cidr.network() | (keccak256(memberId) mod (cidr.host_count() - 2)) + 1` — any sidecar can compute any peer's IP from the on-chain memberId. No off-chain coordination, no on-chain IP storage. Collision probability is ~1.5e-5 per pair for a /16; mitigation if it ever bites is to redeploy the affected member behind a different ClusterMember address. See §7.3.
 17. **Fused two-owner rotation helper.** The diamond has two owners by design — solidstate's owner (DiamondCut authority) and `MemberStorage.clusterOwner` (allowlist authority) — which can diverge if an operator wants distinct council vs ops Safes. For the common case where one Safe holds both roles and needs to rotate to a new Safe, AttestFacet ships `transferBothOwners(newOwner)` / `acceptBothOwners()` that propose + atomically apply both transitions in two transactions. Independent `transferClusterOwnership` / `acceptClusterOwnership` remain for the diverging case. Inconsistency window for the typical case collapses to zero.
+18. **Gas: EIP-4337 + Alchemy paymaster, gated by a TeeMesh-org Cloudflare Worker.** CVMs hold zero ETH. The sidecar submits every state-mutating call as an EIP-4337 v0.7 UserOperation against an Alchemy bundler endpoint. Alchemy's paymaster service POSTs each UserOp to a TeeMesh-org Cloudflare Worker for policy validation (chain id, outer selector is `ClusterMember.execute`, inner selector is in an allowlist of cluster operations, value is 0, sender is a known ClusterMember per `ClusterMemberFactory.isOurMember`, target is a known cluster per `ClusterDiamondFactory.isDeployedCluster`); on approve, the paymaster signs the sponsorship fields and Alchemy bills the TeeMesh org account for the gas. To make this work, ClusterMember is an EIP-4337 smart wallet (implements `IAccount` + `IAppAuth` + `IAppAuthBasicManagement` on the same address) and the dstack-derived `teemesh.binding.v1` k256 key is set as its owner during `dstack_register` via a diamond callback. Ported and narrowed from dstackgres's existing `gas-sponsorship-webhook` Cloudflare Worker — see `docs/specs/gas-webhook.md` and contracts spec §9.1 (ClusterMember as smart wallet) + §10 (ClusterDiamondFactory provenance for the webhook check).
 
 ---
 

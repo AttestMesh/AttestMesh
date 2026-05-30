@@ -22,6 +22,8 @@ Code generation works from this spec. The parent spec defines *what* the system 
   - `OpenZeppelin/openzeppelin-contracts` — for `IERC165`, `IERC1271`, ECDSA recovery utilities.
   - `OpenZeppelin/openzeppelin-contracts-upgradeable` — for `Initializable`, `UUPSUpgradeable` on `ClusterMember`.
   - `solidstate-network/solidstate-solidity` — diamond base (`SolidStateDiamond`, `DiamondWritable`, `DiamondReadable`, `ERC165Base`, `SafeOwnable`).
+  - `eth-infinitism/account-abstraction` — EIP-4337 v0.7 interfaces (`IAccount`, `PackedUserOperation`, `IEntryPoint`).
+- **EntryPoint v0.7** (canonical, identical address on every supported chain): `0x0000000071727De22E5E9d8BAf0edAc6f37da032`. Hardcoded into `ClusterMember` as an immutable; not deployed by us.
 - **Targets**:
   - v1: Base Sepolia (chain id 84532).
   - Milestone B: Base mainnet (chain id 8453).
@@ -46,8 +48,10 @@ contracts/
 │   │   └── platform/
 │   │       └── DstackFacet.sol           # dstack platform facet + IAppAuthBasicManagement
 │   ├── members/
-│   │   ├── ClusterMember.sol             # UUPS per-CVM passthrough proxy impl
+│   │   ├── ClusterMember.sol             # UUPS per-CVM contract: dstack passthrough + EIP-4337 smart wallet
 │   │   └── ClusterMemberFactory.sol      # deterministic CREATE2 deployer
+│   ├── factory/
+│   │   └── ClusterDiamondFactory.sol     # CREATE2 atomic ClusterDiamond + DiamondInit deployer
 │   ├── registry/
 │   │   └── IndexerRegistry.sol           # per-chain Indexer lookup
 │   ├── storage/
@@ -398,6 +402,7 @@ Internal verification order (each step reverts with a named error on failure):
 7. **TCB freshness** — if `requireTcbUpToDate`, then `keccak256(bytes(proof.tcbStatus)) == keccak256(bytes("UpToDate"))`. Reverts `TcbStale()`.
 8. **Binding** — compute `bindHash = keccak256(abi.encode(BIND_DOMAIN, address(this), memberContract, xPubKey, wgPubKey))` where `BIND_DOMAIN = "teemesh.bind.v1"`. Recover signer from `proof.bindingSig` over the EIP-191 prefixed bindHash. Recovered address must equal `deriveAddress(proof.derivedPubKey)`. Reverts `BindingSigInvalid()`.
 9. **Write member** — construct `MemberRecord`, call `IAttest(address(this))._addMember(rec)`, capture returned `memberId`, call `INetwork(address(this))._setWgPubKey(memberId, wgPubKey)` (folded for atomicity — see boot-flow note in master spec §7.1 step 5).
+9.5. **Set the ClusterMember's owner** — call `ClusterMember(memberContract).__setOwnerFromCluster(deriveAddress(proof.derivedPubKey))`. This closes the EIP-4337 bootstrap window for this member: every subsequent UserOp will be validated against `owner == bindingKeyAddress` in standard LightAccount mode. Reverts if `__setOwnerFromCluster` is rejected (which would only happen if the owner is somehow already set — unreachable in normal flow).
 10. **Emit** — `MemberRegistered` is emitted by `_addMember`. DstackFacet additionally emits `DstackMemberRegistered(memberId, proof.appComposeHash, proof.derivedDeviceId)` for indexer convenience.
 
 `DstackSigChain.sol` library provides the secp256k1 verification primitives (`recover`, `compressedToAddress`).
@@ -484,32 +489,110 @@ For milestone B / multi-platform clusters, `InitArgs` extends with per-platform-
 
 ## 9. ClusterMember + ClusterMemberFactory
 
+ClusterMember is the per-CVM contract that does double duty: dstack-style app proxy (so dstack's KMS recognizes the CVM via `IAppAuth` at boot) **and** EIP-4337 smart wallet (so the sidecar can submit gasless UserOps via Alchemy's bundler with the Cloudflare-Worker-validated paymaster — master spec §13 item 18). One contract per CVM; one address that dstack sees as `app_id` and that the cluster diamond sees as `msg.sender` on every member operation.
+
 ### 9.1 ClusterMember
 
 ```solidity
-contract ClusterMember is Initializable, UUPSUpgradeable, IAppAuth, IAppAuthBasicManagement {
-    function initialize(address cluster_) external initializer;
-    function cluster() external view returns (address);
+contract ClusterMember is
+    Initializable,
+    UUPSUpgradeable,
+    IAccount,                 // EIP-4337 v0.7
+    IAppAuth,                 // dstack KMS boot gate
+    IAppAuthBasicManagement   // phala-cli compat (forwarded to DstackFacet)
+{
+    /// Canonical v0.7 EntryPoint, identical on every supported chain.
+    address public constant ENTRY_POINT = 0x0000000071727De22E5E9d8BAf0edAc6f37da032;
 
-    // IAppAuth — forwards to DstackFacet
+    /// One-shot init by the factory. Owner is *not* set here; it lands during
+    /// dstack_register via a diamond-mediated callback (see §6.3 + §9.1.3).
+    function initialize(address cluster_) external initializer;
+
+    function cluster() external view returns (address);
+    function owner() external view returns (address);   // address(0) until registered
+
+    // ── IAccount (EIP-4337) ─────────────────────────────────────────────────
+    function validateUserOp(
+        PackedUserOperation calldata userOp,
+        bytes32 userOpHash,
+        uint256 missingAccountFunds
+    ) external returns (uint256 validationData);
+
+    function execute(address target, uint256 value, bytes calldata data) external;
+    // executeBatch is intentionally omitted from v1 — one call per UserOp.
+
+    // ── IAppAuth ────────────────────────────────────────────────────────────
     function isAppAllowed(AppBootInfo calldata bootInfo)
         external view returns (bool, string memory);
 
-    // IAppAuthBasicManagement — all forwards
+    // ── IAppAuthBasicManagement — all forwarded to DstackFacet ──────────────
     function addComposeHash(bytes32) external;
-    // ... (full set forwarded to DstackFacet)
+    // ... (full IAppAuthBasicManagement surface forwarded)
+
+    // ── Cluster-mediated owner setting (see §9.1.3) ─────────────────────────
+    function __setOwnerFromCluster(address newOwner) external;
 }
 ```
 
-Storage: just `address cluster` in a single ERC-7201 slot (`teemesh.storage.ClusterMember`).
-Upgrade authority: `_authorizeUpgrade` checks `msg.sender == IAttest(cluster).clusterOwner()` (read from the diamond on each call so Safe rotations propagate). Same pattern as dstackgres's `DstackMember`.
+#### 9.1.1 Storage
+
+`teemesh.storage.ClusterMember` ERC-7201 namespace:
+
+```solidity
+struct Layout {
+    address cluster;          // the ClusterDiamond this member belongs to
+    address owner;            // dstack-derived secp256k1 address; address(0) until first dstack_register
+    // EIP-4337 v0.7 nonces are tracked in the EntryPoint, not here.
+}
+```
+
+#### 9.1.2 EIP-4337 validateUserOp
+
+Two-mode validation, gated on whether `owner` has been set:
+
+```
+if owner == address(0):
+    // Bootstrap mode: this is the very first call, must be the registration call.
+    // 1. The userOp.callData MUST be execute(target=cluster, value=0, data=<dstack_register selector + args>).
+    //    Reject otherwise.
+    // 2. Recover signer from userOp.signature against userOpHash (standard EIP-191 / ERC-1271).
+    // 3. Decode the inner dstack_register calldata. Recover the signer of the proof's bindingSig
+    //    against the registration bind-hash (the same recovery DstackFacet will do).
+    // 4. Require: the userOp signer (from step 2) == the bindingSig signer (from step 3).
+    //    This proves the UserOp is authorized by the same key that will validate the proof.
+    // 5. Accept. Validation data = 0 (no time window, no aggregator).
+
+if owner != address(0):
+    // Standard mode: signature must be from owner.
+    // ECDSA-recover from userOp.signature against userOpHash; require recovered == owner.
+    // Validation data = 0.
+```
+
+In both modes: if `missingAccountFunds > 0` (no paymaster sponsoring), transfer that amount back to the EntryPoint. v1 assumes paymaster sponsorship always — funds will always be 0 — but the conditional is required by EIP-4337 v0.7.
+
+`execute(target, value, data)` is gated on `msg.sender == ENTRY_POINT`. No other caller may invoke it.
+
+#### 9.1.3 Owner setting
+
+`__setOwnerFromCluster(newOwner)` is gated on `msg.sender == cluster` AND `owner == address(0)`. It can only be called once, only by the cluster diamond, and only if the owner has not yet been set. It is invoked by `DstackFacet.dstack_register` (§6.3 step 9.5 — added below) as part of the same transaction that validates the registration proof. Together with the bootstrap-mode validateUserOp check, this means:
+
+- The bootstrap UserOp authenticates the binding key (via the bindingSig recovery).
+- DstackFacet verifies the dstack KMS chain proves that binding key was granted to this CVM.
+- DstackFacet calls `__setOwnerFromCluster(bindingKeyAddress)` atomically.
+- All subsequent UserOps from this ClusterMember are validated against `owner` in standard mode.
+
+The bootstrap window is open for exactly one UserOp. After the registration tx mines, `owner` is set forever.
+
+#### 9.1.4 Upgrade authority
+
+`_authorizeUpgrade(newImpl)` checks `msg.sender == IAttest(cluster).clusterOwner()` — read fresh from the diamond on each call, so cluster-Safe rotations propagate without any per-member action. Same pattern as dstackgres's `DstackMember`.
 
 ### 9.2 ClusterMemberFactory
 
 ```solidity
 contract ClusterMemberFactory {
     address public immutable implementation;
-    address public immutable owner;       // TeeMesh org Safe — controls which impls are deployed
+    address public immutable factoryOwner;   // TeeMesh org Safe — gates impl swaps
 
     function deployMember(address cluster_, bytes32 salt)
         external
@@ -526,15 +609,64 @@ contract ClusterMemberFactory {
 }
 ```
 
-CREATE2 deploy of an ERC1967Proxy pointing at `implementation` (the ClusterMember impl) with the initializer calldata `initialize(cluster_)`. The salt is whatever the operator picks; conventionally `keccak256(abi.encode(cluster_, instanceSequenceNumber))`.
+CREATE2 deploy of an ERC1967Proxy pointing at `implementation` with init calldata `initialize(cluster_)`. The salt is operator-chosen; conventionally `keccak256(abi.encode(cluster_, instanceSequenceNumber))`. The CREATE2 address depends only on `(factory, impl, salt, cluster)` — not on the owner key — so the operator can predict it before the CVM ever boots, and dstack's `app_id` can be set to this predicted address as part of the compose config.
 
-`isOurMember` is the lookup DstackFacet uses in step 1 of registration — a simple `deployedMembers[account]` flag set during `deployMember`.
+`isOurMember(account)` is the boolean lookup DstackFacet uses in step 1 of registration and the gas webhook uses for sender-provenance — a simple `deployedMembers[account]` flag set during `deployMember`. The webhook reads this view at the bundler's verification step to decide whether to sponsor a UserOp.
 
 For v1, the factory is **per-org** (one factory deployed by the TeeMesh org Safe, shared across all clusters on the chain). Member impls can be upgraded by deploying a new implementation contract and registering it; existing members continue to point at their original impl until UUPS-upgraded individually.
 
 ---
 
-## 10. IndexerRegistry
+## 10. ClusterDiamondFactory
+
+The canonical per-chain factory for deploying ClusterDiamonds. Two consumers care about it:
+
+1. **Operators** call `deployCluster(InitArgs)` to atomically deploy a ClusterDiamond + DiamondInit and apply the initial facet cuts.
+2. **The gas-sponsorship webhook** calls `isDeployedCluster(address)` over RPC to decide whether a UserOp's target is a TeeMesh cluster the operator is willing to sponsor.
+
+```solidity
+contract ClusterDiamondFactory {
+    address public immutable factoryOwner;          // TeeMesh org Safe — gates upgrades
+    address public immutable diamondInitImpl;       // canonical DiamondInit contract
+    address public immutable attestFacet;           // canonical AttestFacet impl
+    address public immutable messageFacet;          // canonical MessageFacet impl
+    address public immutable networkFacet;          // canonical NetworkFacet impl
+    address public immutable dstackFacet;           // canonical DstackFacet impl
+    // Adding additional platform facets later is a factory upgrade (or a new factory).
+
+    function deployCluster(DiamondInit.InitArgs calldata args, bytes32 salt)
+        external
+        returns (address cluster);
+
+    function predictClusterAddress(bytes32 salt)
+        external
+        view
+        returns (address);
+
+    function isDeployedCluster(address account) external view returns (bool);
+
+    event ClusterDeployed(address indexed cluster, address indexed clusterOwner, bytes32 salt);
+}
+```
+
+`deployCluster(args, salt)`:
+
+1. Builds the standard FacetCut array (AttestFacet selectors, MessageFacet, NetworkFacet, DstackFacet — the v1 default cut).
+2. CREATE2-deploys `ClusterDiamond` at `predictClusterAddress(salt)` with the facet cuts + DiamondInit address + ABI-encoded `init(args)` calldata.
+3. ClusterDiamond's constructor delegatecalls DiamondInit, seeding the dstack KMS root, compose-hash allowlist, device allowlist, allowAnyDevice / requireTcbUpToDate flags, mesh CIDR, and cluster owner — all atomic per master spec §13 item 8.
+4. Marks `deployedClusters[address(diamond)] = true`.
+5. Calls `diamond.transferOwnership(args.clusterOwner)` — the cluster Safe must `acceptOwnership` separately.
+6. Emits `ClusterDeployed`.
+
+`isDeployedCluster(account)` is the read the gas webhook uses to validate UserOp targets. Cached in Cloudflare KV for 24h per the gas-webhook spec (see `docs/specs/gas-webhook.md`).
+
+`factoryOwner` controls only future factory upgrades (e.g. swapping in a new default facet set). It does **not** retain any authority over already-deployed clusters — each cluster is independently owned by its own Safe after `transferOwnership` lands.
+
+For v1, one ClusterDiamondFactory is deployed per chain (Sepolia for v1, mainnet for milestone B). The address is hardcoded into the gas webhook's env config and the sidecar binary (via the IndexerRegistry pattern — see §11).
+
+---
+
+## 11. IndexerRegistry
 
 A tiny per-chain registry that the CVM sidecar reads at startup to discover the Indexer.
 
@@ -562,17 +694,24 @@ A future v2 may key the registry by chain id and expose `indexerOf(uint256 chain
 
 ---
 
-## 11. Deployment scripts
+## 12. Deployment scripts
 
-### 11.1 DeployIndexerRegistry.s.sol
+The per-chain infrastructure (IndexerRegistry, ClusterMemberFactory, ClusterMember impl, DiamondInit impl, core facets, DstackFacet impl, ClusterDiamondFactory) is deployed once by the TeeMesh org Safe. Per-cluster deploys then go through the factory.
 
-One-shot deploy of the per-chain IndexerRegistry. Owner is the TeeMesh org Safe.
+### 12.1 DeployInfra.s.sol
 
-### 11.2 DeployClusterMemberFactory.s.sol
+One-shot, run once per chain by the TeeMesh org Safe. Deploys (in order):
 
-One-shot deploy of the per-chain `ClusterMemberFactory` + initial `ClusterMember` implementation. Owner is the TeeMesh org Safe.
+1. The four core/platform facet impls (`AttestFacet`, `MessageFacet`, `NetworkFacet`, `DstackFacet`).
+2. The `DiamondInit` impl.
+3. The `ClusterMember` impl.
+4. `ClusterMemberFactory(impl = ClusterMember)`.
+5. `ClusterDiamondFactory(diamondInitImpl, attestFacet, messageFacet, networkFacet, dstackFacet)`.
+6. `IndexerRegistry(owner = org Safe)`.
 
-### 11.3 DeployCluster.s.sol
+Logs every address into a chain-id-stamped JSON receipt under `script/deployments/<chainId>.json`. The sidecar binary hardcodes these per chain id; the gas webhook reads them from env config.
+
+### 12.2 DeployCluster.s.sol
 
 Per-cluster deploy. Reads a JSON config:
 
@@ -584,26 +723,30 @@ Per-cluster deploy. Reads a JSON config:
   "initialDeviceIds": ["0x..."],
   "allowAnyDevice": false,
   "requireTcbUpToDate": true,
-  "platformFacets": ["DstackFacet"]
+  "meshCidrIp": 167903232,          // 10.13.0.0 packed
+  "meshCidrPrefix": 16,
+  "salt": "0x..."
 }
 ```
 
 Pipeline:
 
-1. Deploy `DiamondInit`.
-2. Deploy all platform facets listed in `platformFacets` (DstackFacet only for v1).
-3. Deploy all core facets (AttestFacet, MessageFacet, NetworkFacet).
-4. Build the facetCuts array.
-5. ABI-encode `DiamondInit.init(InitArgs)` calldata.
-6. Deploy `ClusterDiamond(facetCuts, address(diamondInit), initCalldata)` — atomic.
-7. `transferOwnership(clusterOwner)` on the diamond. (Safe must `acceptOwnership` separately.)
-8. Log all addresses.
+1. Construct `DiamondInit.InitArgs` from the JSON.
+2. Call `ClusterDiamondFactory.deployCluster(initArgs, salt)`. The factory atomically deploys ClusterDiamond + applies the default facet cut + delegatecalls DiamondInit + transfers solidstate ownership to the cluster Safe (the cluster Safe must `acceptOwnership` separately).
+3. Log the deployed cluster address.
 
-Output: a JSON receipt with every address for downstream tooling (sidecar config, IndexerRegistry seeding, etc.).
+Output: a JSON receipt for downstream tooling (sidecar config, dstack compose-config app_id seeding, etc.).
+
+### 12.3 DeployMember.s.sol
+
+Per-CVM deploy. Reads `(clusterAddr, salt)`:
+
+1. Call `ClusterMemberFactory.deployMember(cluster_, salt)`. ClusterMember lands at the predicted CREATE2 address, initialized with `cluster_` and `owner = address(0)`.
+2. Log the predicted-and-confirmed address. This is what gets written into the dstack compose config as the CVM's `app_id`.
 
 ---
 
-## 12. Errors
+## 13. Errors
 
 All errors live in `src/errors/Errors.sol` and are imported where used so revert sigids are stable across compilations.
 
@@ -618,7 +761,7 @@ Categories:
 
 ---
 
-## 13. Events
+## 14. Events
 
 Every facet emits the events listed in its section. The Indexer (separate spec) consumes all of them. The minimum event set for v1 demo to be useful:
 
@@ -630,7 +773,7 @@ The rest (allowlist mutations, etc.) ride the same pipeline but aren't required 
 
 ---
 
-## 14. Tests (v1 scope)
+## 15. Tests (v1 scope)
 
 `test/` is split into:
 
@@ -647,7 +790,7 @@ No fuzz / invariant tests for v1. Add in milestone B.
 
 ---
 
-## 15. Open questions (component-level)
+## 16. Open questions (component-level)
 
 1. *(Resolved)* `MemberStorage.clusterOwner` and solidstate's owner are intentionally separate slots so DiamondCut authority and allowlist authority can diverge in principle. v1 ships the fused `transferBothOwners` / `acceptBothOwners` pair on AttestFacet for the common case where they should rotate together (a single cluster Safe), plus independent `transferClusterOwnership` / `acceptClusterOwnership` for the diverging case. See AttestFacet ownership-management section.
 2. **MessageFacet duplicate-envelope storage cost.** Tracking `envelopeNonces` is one cold SSTORE per send (~20k gas). For a noisy cluster this dominates per-send cost. Alternatives: drop the duplicate check entirely (let readers dedupe), use a bitmap, or bound the lookback window. v1 ships the strict check; revisit if gas becomes a demo blocker.

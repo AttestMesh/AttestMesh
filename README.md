@@ -32,15 +32,17 @@ Pre-alpha. The contracts are being extracted from dstackgres; the sidecar is bei
 TeeMesh is a monorepo. The protocol, on-chain primitives, CVM sidecar, and Indexer service all live in one tree so they evolve atomically.
 
 ```
-contracts/        Foundry workspace: diamond, core facets, platform facets, member contracts, IndexerRegistry
+contracts/        Foundry workspace: diamond, core facets, platform facets, ClusterMember (dstack + 4337), factories, IndexerRegistry
 sidecar/          Rust workspace: cluster-mesh-agent (the per-CVM sidecar)
 indexer/          Rust workspace: the TEE-attested event indexer
+services/
+  gas-sponsorship-webhook/   Cloudflare Worker: validates EIP-4337 paymaster sponsorship for TeeMesh UserOps
 docs/specs/       Specifications (start with teemesh-coordination-layer.md)
 docs/             Other design docs
 .claude/commands/ Holodeck slash commands (/warmup, /spec, /generate, ...)
 ```
 
-(`contracts/`, `sidecar/`, and `indexer/` will land as the matching specs get generated.)
+(Component directories land as the matching specs get generated.)
 
 ## Build
 
