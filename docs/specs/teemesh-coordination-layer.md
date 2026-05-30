@@ -356,9 +356,8 @@ v1 is a **working three-node demo on Base Sepolia** (milestone "A"). The goal is
 
 Open questions that still block v1:
 
-1. **DstackFacet bootstrapping.** On a fresh cluster, the cluster owner needs to seed dstack's `allowedKmsRoots` (plus an initial compose-hash / device-id allowlist) before any CVM can register. Does this happen via the diamond constructor (a `DiamondInit` contract delegatecalled during construction, dstackgres-style), or as a separate post-deploy admin call?
-2. **Indexer push transport.** gRPC streaming over HTTP/2, HTTP/2 server-sent events, or something else? Affects the sidecar's Rust dependency tree and the Indexer's tech stack.
-3. **Heartbeat parameters.** Interval (seconds), miss-threshold (consecutive missed heartbeats before a peer is marked down), and how the convergence calculation handles transient drops.
+1. **Indexer push transport.** gRPC streaming over HTTP/2, HTTP/2 server-sent events, or something else? Affects the sidecar's Rust dependency tree and the Indexer's tech stack.
+2. **Heartbeat parameters.** Interval (seconds), miss-threshold (consecutive missed heartbeats before a peer is marked down), and how the convergence calculation handles transient drops.
 
 ---
 
@@ -373,6 +372,7 @@ Open questions that still block v1:
 5. **Event delivery via a shared TEE-attested Indexer**, not direct chain polling from each CVM. Members trust the Indexer for liveness and completeness only; each push carries an RPC repro stub so correctness is independently verifiable per event. Follows the dstackgres monitoring-hub pattern.
 6. **Monorepo.** Contracts, CVM sidecar, and Indexer service all live in `TeeSQL/TeeMesh`. The protocol and its reference implementations evolve together; the spec in this repo is authoritative for the deployed Indexer it ships alongside.
 7. **No dstackgres compatibility, Postgres deferred.** TeeMesh is the generic mesh primitive. The existing TeeSQL Postgres-as-a-Service product is on hold and the existing dstackgres deployments on Base mainnet are not migration targets. dstackgres is referenced in §9 strictly as the *extraction source* — useful for understanding which moving parts were ripped out and why — not as a system we owe ABI compatibility to. A future Postgres application on top of TeeMesh is plausible but explicitly out of scope for v1.
+8. **Atomic constructor bootstrapping.** ClusterDiamond's constructor takes `(facetCuts, initContract, initCalldata)` and delegatecalls the init contract into its own storage on construction, seeding the dstack KMS root allowlist, the initial compose-hash / device-id allowlists, the cluster owner Safe, and any other per-platform-facet config in one transaction. The diamond is never reachable in a "deployed but unconfigured" state. Same pattern dstackgres's `DiamondInit` uses; the constructor-arg encoding burden is real but worth it for atomicity.
 
 ---
 
