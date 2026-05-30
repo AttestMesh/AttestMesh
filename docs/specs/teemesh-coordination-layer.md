@@ -53,15 +53,21 @@ What this spec deliberately does **not** include:
 │   │   ClusterMember proxies (one per CVM)               │          │
 │   └─────────────────────────────────────────────────────┘          │
 │                              ▲                                      │
-└──────────────────────────────┼──────────────────────────────────────┘
-                               │ register() / message / wg pubkey
-                               │
-                  ┌────────────┴────────────┐
-                  │   CVM sidecar            │
-                  │   (Rust, runs as a       │
-                  │    sidecar in each       │
-                  │    confidential VM)      │
-                  └─────────────────────────┘
+│                              │ event subscription (eth_getLogs)     │
+│                              │                                      │
+│   ┌──────────────────────────┴──────────────────────────┐           │
+│   │   Indexer (TEE service, watches many clusters)      │           │
+│   └────┬───────────────────────────────────────────────┘            │
+└────────┼─────────────────────┼──────────────────────────────────────┘
+         │                     │
+         │ signed event push   │ register() / publishWgKey() / send()
+         │ (+ RPC-repro stub)  │ via ClusterMember passthrough
+         ▼                     ▼
+        ┌─────────────────────────┐
+        │   CVM sidecar           │
+        │   (Rust, runs in each   │
+        │   confidential VM)      │
+        └─────────────────────────┘
 ```
 
 The diamond's surface area is split into two layers:
@@ -186,11 +192,70 @@ If a cluster supports multiple platforms (multiple platform facets installed), e
 
 ---
 
-## 6. CVM sidecar
+## 6. Indexer
+
+The cluster contract emits events for every state change: `MemberRegistered`, `WgKeyPublished`, `MessageSent`, allowlist mutations, owner transfers, facet swaps. The CVM sidecar (§7) needs to react to most of them — most obviously, a member must consume `MessageSent` events addressed to its memberId or it cannot bring up the wireguard mesh.
+
+Requiring every CVM to maintain its own chain RPC subscription is bad: it scales linearly with cluster size against a paid RPC, websocket subscriptions drop in CVMs that migrate or hibernate, and polling wastes work when a cluster is quiet. TeeMesh ships a **shared Indexer** that solves this for every cluster at once, following the same pattern dstackgres established with its monitoring-hub.
+
+### 6.1 Role
+
+The Indexer is a TEE-attested off-chain service that:
+
+1. Watches the chain (one RPC subscription, shared across every cluster it serves) for events emitted by any ClusterDiamond it has been asked to follow.
+2. For each event, identifies which cluster it belongs to and which members of that cluster have subscribed.
+3. Pushes the event to those members — and only those members.
+4. Pairs each push with two artefacts that let the member verify the push independently:
+   - the Indexer's **TEE attestation signature** over the pushed bytes (the Indexer's signing key is itself attested by its TEE; the cluster knows the Indexer's pubkey from on-chain discovery), and
+   - an **RPC repro stub** — the exact `eth_getLogs` / `eth_getTransactionReceipt` call (contract address, block range, topic filter) that, if a member runs it against any RPC provider, returns the same event bytes. The repro stub means the Indexer's claim is independently checkable, not just trust-the-signature.
+
+The Indexer covers many clusters but each push only goes to members of the specific cluster that emitted the event. There is no cross-cluster leak — a member of cluster A is not subscribed to and never receives events from cluster B.
+
+### 6.2 Trust posture
+
+The Indexer's TEE attestation commits to its code. Members trust the Indexer for:
+
+- **Liveness** of event delivery (the Indexer is online and pushing).
+- **Completeness** of event delivery within its subscription window (no event is silently dropped).
+
+Members do **not** have to trust the Indexer for:
+
+- **Correctness** of event data (the RPC repro stub lets them verify any push against any RPC provider).
+- **Confidentiality** of message contents (`MessageSent` ciphertext is sealed-boxed to the recipient; the Indexer sees the ciphertext but cannot decrypt).
+
+A member sidecar may sample pushes — issuing the repro stub against an independent RPC provider on (say) 1 in N events — without changing its steady-state cost much. The Indexer can therefore be operated by a third party with no loss of trust-minimization on data correctness.
+
+### 6.3 Discovery
+
+A member sidecar discovers the Indexer at startup by reading a known **IndexerRegistry** contract — a tiny on-chain registry mapping `chainId → (indexerEndpoint, indexerCodeId, indexerPubKey)`. The registry is owned by the TeeMesh org Safe and exists per chain we deploy on (Base mainnet for v1).
+
+The CVM sidecar reads the IndexerRegistry directly via RPC at startup — this is one of the only direct RPC reads the sidecar does. After Indexer subscription is established, all subsequent event ingestion goes through the Indexer.
+
+A cluster may override the default indexer by storing its own indexer reference in a cluster-scoped namespace (a later spec). v1 ships only the default-discovery path.
+
+### 6.4 Subscription protocol
+
+Member sidecar → Indexer over a long-lived bidirectional connection (transport TBD — see §11):
+
+1. Member opens a connection and presents `(memberId, clusterAddress, attestationProof)`.
+2. Indexer verifies that `memberId` exists in `clusterAddress`'s AttestFacet `MemberStorage` and that the attestation matches the recorded TEE pubkeys. (The Indexer is essentially re-running the same verification the platform facet did at registration time — but it can do so as an off-chain read since the cluster diamond is authoritative.)
+3. On success, Indexer adds the member to the cluster's subscriber set, records the highest delivered `blockNumber` for that member, and begins streaming events.
+4. Each event is delivered as a signed envelope: `{event, clusterAddress, blockNumber, txHash, logIndex, rpcReproStub, indexerAttestation, indexerSignature}`.
+5. Member verifies the signature against the Indexer's pubkey from IndexerRegistry. On signature mismatch (or attestation mismatch on the Indexer's first push of the session), the member tears down the subscription and re-discovers.
+
+Subscriptions are stateful: the Indexer remembers per-member delivery cursors so a reconnecting member catches up cleanly rather than losing events.
+
+### 6.5 Indexer infrastructure (v1)
+
+For v1 the Indexer ships as a single CVM image, run by TeeMesh-org, with whatever HA shape is operationally appropriate (load balancer + N replicas; each replica is independently attested). A future spec will treat the Indexer itself as a TeeMesh cluster — eating our own dog food, with members of the Indexer cluster mutually attesting each other through the same primitives this spec defines. v1 punts that recursion.
+
+---
+
+## 7. CVM sidecar
 
 A Rust binary (target: `cluster-mesh-agent`) shipped as an OCI image and included in CVM `docker-compose` files. Runs as a sidecar with elevated privileges (needs to configure wireguard) and a healthcheck that the application's main container can depend on.
 
-### 6.1 Boot sequence
+### 7.1 Boot sequence
 
 1. **Discover cluster address.** The sidecar reads its own member contract address from a `MEMBER_CONTRACT` env var or a file mounted from the dstack runtime. It calls `member.cluster()` to get the ClusterDiamond address.
 2. **Derive identity keys.** Using the TEE-derived seed, produce a single Curve25519 root from a known purpose string (e.g. `teemesh.identity.v1`), then derive:
@@ -200,24 +265,27 @@ A Rust binary (target: `cluster-mesh-agent`) shipped as an OCI image and include
 3. **Construct the attestation request.** The sidecar asks the TEE to produce an attestation quote whose user-data slot (`report_data` / equivalent) commits to `xPubKey || wgPubKey`. On dstack this is a `RawQuote` request with that 64-byte payload. The TEE will only emit such a quote if it actually controls those pubkeys, so the binding is forgery-resistant.
 4. **Register.** Bundle the quote into a platform-specific `Proof` shape and call the appropriate platform-facet selector — `dstack_register(proof, xPubKey, wgPubKey)` on a dstack CVM, `tdx_register(...)` on an Intel TDX CVM, etc. The CVM only knows its own platform; it does not need to enumerate the diamond's installed facets. On failure (verifier reverts, pattern not whitelisted), retry with backoff — but never silently proceed past this gate. Until registration succeeds, the sidecar never reports healthy.
 5. **Publish wireguard key.** Call `NetworkFacet.publishWgKey(wgPubKey)` through the member proxy. (In v1 we can fold this into `register` since registration already binds the wg pubkey; we keep the separate selector for rotation and resilience.)
-6. **Wait for peer endpoints.** Listen for `MessageSent` events on the member's channel. Each event whose decrypted payload is a `PeerEndpoint{ memberId, ip, port, wgPublicKey, expiresAt }` from an existing member is consumed: the sidecar configures the wireguard interface with the peer.
-7. **Send own endpoint.** For every other member the sidecar learns about (via `AttestFacet.listMembers()` plus inbound endpoint messages), encrypt a `PeerEndpoint` of self to the peer's x25519 pubkey via sealed-box and send it via MessageFacet.
-8. **Heartbeat.** For every wireguard peer, run a lightweight heartbeat — a periodic UDP packet over wireguard carrying (a) sender memberId, (b) timestamp, (c) the sender's view of which peers it currently considers connected. Heartbeats are signed with the Ed25519 key so they are not spoofable on the wire.
-9. **Liveness consensus gate.** The sidecar maintains a local view:
-   - A node is **live** iff at least one other node's heartbeat reports it as connected.
-   - The mesh is **converged** iff every live node reports the same connected-set, and that set equals the live set.
-   - Until the mesh is converged, the sidecar's healthcheck returns 503 and the application container does not start.
-10. **Become healthy.** Once converged, healthy is reported. Heartbeat continues for the life of the process; on transient drops the sidecar re-tries connection and the application's own logic decides whether to degrade.
+6. **Subscribe to the Indexer.** Read the IndexerRegistry contract for this chain to discover the Indexer endpoint and pubkey. Open a subscription (§6.4), presenting `(memberId, clusterAddress, attestationProof)`. From this point on, every `MessageSent`, `MemberRegistered`, `WgKeyPublished`, or other cluster event the sidecar cares about arrives as a signed Indexer push — the sidecar does not poll the chain directly for events.
+7. **Wait for peer endpoints.** Each Indexer push of a `MessageSent` event on the member's channel is decrypted (sealed-box, x25519). Payloads that parse as `PeerEndpoint{ memberId, ip, port, wgPublicKey, expiresAt }` from existing members are consumed: the sidecar configures the wireguard interface with the peer.
+8. **Send own endpoint.** For every other member the sidecar learns about (via `AttestFacet.listMembers()` plus inbound endpoint messages), encrypt a `PeerEndpoint` of self to the peer's x25519 pubkey via sealed-box and send it via MessageFacet.
+9. **Heartbeat.** For every wireguard peer, run a lightweight heartbeat — a periodic UDP packet over wireguard carrying (a) sender memberId, (b) timestamp, (c) the sender's view of which peers it currently considers connected. Heartbeats are signed with the Ed25519 key so they are not spoofable on the wire.
+10. **Liveness consensus gate.** The sidecar maintains a local view:
+    - A node is **live** iff at least one other node's heartbeat reports it as connected.
+    - The mesh is **converged** iff every live node reports the same connected-set, and that set equals the live set.
+    - Until the mesh is converged, the sidecar's healthcheck returns 503 and the application container does not start.
+11. **Become healthy.** Once converged, healthy is reported. Heartbeat continues for the life of the process; on transient drops the sidecar re-tries connection and the application's own logic decides whether to degrade. The Indexer subscription stays open for the life of the process; if it drops, the sidecar reconnects and resumes from its last-delivered cursor.
 
-### 6.2 Failure modes
+### 7.2 Failure modes
 
 - **Pattern revoked mid-flight.** If the cluster owner removes the attestation pattern between step 4 and the application coming up, no member already registered is forcibly removed (no on-chain eviction in v1); but new joiners cannot register, and a future re-register attempt (e.g. after a CVM restart) will fail. v1 punts cluster-driven eviction to a later spec.
+- **Indexer down.** If the Indexer is unreachable at boot, the sidecar stays in step 6 and reports unhealthy. The application container does not start. There is no v1 fallback to direct chain polling — operationally, the Indexer's HA shape is what guarantees liveness.
+- **Indexer signature/attestation mismatch.** Treated as adversarial: the sidecar tears down the subscription, re-reads IndexerRegistry, and retries. If the pubkey on chain has been rotated (legitimate operator action), the new subscription succeeds. If not, the sidecar fails closed and stays unhealthy.
 - **Message channel poisoned.** A malicious member could spam another member's channel with garbage. Decryption failures are silently dropped; the sidecar logs at debug only. Rate-limiting is not enforced on chain in v1.
 - **Liveness deadlock.** If the network is partitioned at startup such that no convergence is possible, the sidecar stays unhealthy indefinitely. This is intentional — degraded boot of an unmeshed mesh is worse than visible failure.
 
 ---
 
-## 7. Trust model
+## 8. Trust model
 
 The diamond's cluster owner (a Safe in production) controls:
 - Which platform facets are installed (via diamondCut).
@@ -235,7 +303,7 @@ Critically, **registration binding does not rely on per-CVM ECDSA**. The x25519 
 
 ---
 
-## 8. Differences from dstackgres
+## 9. Differences from dstackgres
 
 dstackgres is the codebase TeeMesh is being extracted from. The differences:
 
@@ -249,7 +317,7 @@ dstackgres is the codebase TeeMesh is being extracted from. The differences:
 
 ---
 
-## 9. Out of scope (v1)
+## 10. Out of scope (v1)
 
 - On-chain eviction of misbehaving members
 - Cluster-to-cluster federation
@@ -260,28 +328,32 @@ dstackgres is the codebase TeeMesh is being extracted from. The differences:
 
 ---
 
-## 10. Open questions
+## 11. Open questions
 
 These are tracked as open questions to resolve before the spec moves out of draft:
 
-1. **Target chain.** dstackgres lives on Base mainnet. Does TeeMesh keep that as the canonical deployment target, or are we aiming for chain-agnosticism from day one?
-2. **Member factory ownership.** Should the ClusterMemberFactory be diamond-owned (each cluster has its own factory) or shared across all clusters in the org? Per-platform member impls add a wrinkle here.
-3. **Reorg handling for registration.** Do we wait for finality before treating a member as registered, or accept and let upstream prune?
-4. **DstackFacet bootstrapping.** On a fresh cluster, the cluster owner needs to seed dstack's allowedKmsRoots before any CVM can register. Does this happen via the diamond constructor (init contract), or as a post-deploy admin call?
+1. **Member factory ownership.** Should the ClusterMemberFactory be diamond-owned (each cluster has its own factory) or shared across all clusters in the org? Per-platform member impls add a wrinkle here.
+2. **Reorg handling for registration.** Do we wait for finality before treating a member as registered, or accept and let upstream prune? The Indexer's per-member cursor needs an answer here too.
+3. **DstackFacet bootstrapping.** On a fresh cluster, the cluster owner needs to seed dstack's allowedKmsRoots before any CVM can register. Does this happen via the diamond constructor (init contract), or as a post-deploy admin call?
+4. **Indexer push transport.** gRPC streaming? HTTP/2 server-sent events? A custom protocol over libp2p? Each has different ops/observability/firewall trade-offs.
+5. **Indexer-side member-attestation cache.** On subscribe, the Indexer re-verifies the member's attestation. Do we cache the result with a TTL, or re-verify on every reconnect? Affects p99 reconnect latency vs freshness against on-chain eviction (if eviction lands later).
+6. **Member-side sampling cadence for Indexer pushes.** What fraction of pushes does a member spot-check via the RPC repro stub? Always (defeats the purpose), never (max trust in Indexer), or 1-in-N with N adjustable?
 
 ---
 
-## 11. Resolved design decisions
+## 12. Resolved design decisions
 
 (Decisions called during the spec's drafting that may otherwise look load-bearing without context.)
 
 1. **Heartbeat transport: UDP-over-wireguard, gossip-computed convergence** (not on chain via MessageFacet). Cheap, fast, no per-heartbeat gas. Off-chain observers wanting "is the mesh healthy" must consume from a member.
 2. **Curve25519-only on the per-CVM key path** (sealed-box on x25519 for messaging, Ed25519 for heartbeat signatures). Per-CVM keys are bound via attestation quote user-data commitments, not on-chain ECDSA. Per-CVM secp256k1 is gone.
 3. **Platform support = installed facet.** Each TEE platform is a facet on the diamond. Clusters install whichever platform facets they want to admit; the core facets (Attest / Message / Network) are platform-agnostic and never need to change as new platforms ship.
+4. **Target chain: Base mainnet.** Same chain as dstackgres. Chain-agnosticism is a v2+ concern; v1 deployment scripts, the IndexerRegistry instance, and the org Safe-owned addresses are all Base-specific.
+5. **Event delivery via a shared TEE-attested Indexer**, not direct chain polling from each CVM. Members trust the Indexer for liveness and completeness only; each push carries an RPC repro stub so correctness is independently verifiable per event. Follows the dstackgres monitoring-hub pattern.
 
 ---
 
-## 12. References
+## 13. References
 
 - [dstack — IAppAuth / IAppAuthBasicManagement](https://github.com/Dstack-TEE/dstack/blob/master/kms/auth-eth/contracts/)
 - [dstackgres contracts/teesql-group-auth](https://github.com/TeeSQL/dstackgres/tree/main/contracts/teesql-group-auth) — extraction source
