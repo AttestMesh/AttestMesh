@@ -4,7 +4,7 @@ Rust workspace for the TeeMesh Indexer — a TEE-attested off-chain service that
 
 One Indexer instance serves many clusters. Members subscribe over gRPC bidirectional streaming; subscriptions are stateful (per-member delivery cursors) so reconnects don't lose events.
 
-**Spec**: [`docs/specs/indexer.md`](../docs/specs/indexer.md) *(pending)*
+**Spec**: [`docs/specs/indexer.md`](../docs/specs/indexer.md)
 **Master spec**: [`docs/specs/teemesh-coordination-layer.md`](../docs/specs/teemesh-coordination-layer.md)
 
 Code lands here when the indexer spec is generated.
