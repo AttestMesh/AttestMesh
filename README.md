@@ -8,13 +8,16 @@ Any application that needs a mesh of TEE-attested peers — a database cluster, 
 
 ## Architecture at a glance
 
-- **ClusterDiamond** (ERC-2535 proxy) — the on-chain cluster contract. Comes with four default facets, all of which can be replaced or augmented via `diamondCut`:
-  - **DstackFacet** — implements dstack's `IAppAuthBasicManagement` so existing dstack tooling (phala-cli, dashboards) can manage compose-hash / device-id allowlists.
-  - **AttestFacet** — admin-whitelisted attestation patterns. CVMs that satisfy a pattern register themselves and publish a TEE-derived public key.
-  - **MessageFacet** — gated by cluster membership. Members send encrypted messages to each other; payloads are perma-stored on chain via events.
-  - **NetworkFacet** — gated by cluster membership. Members publish wireguard public keys and read peers' keys for mesh setup.
+- **ClusterDiamond** (ERC-2535 proxy) — the on-chain cluster contract. Surface is split into two layers:
+  - **Core facets** (always installed, platform-agnostic):
+    - **AttestFacet** — canonical "who is in this cluster" registry. Holds member records (TEE-derived x25519 pubkey, wg pubkey, metadata) and exposes `isClusterMember` to the rest of the diamond.
+    - **MessageFacet** — gated by cluster membership. Members send sealed-box-encrypted messages to each other; payloads are perma-stored on chain via events.
+    - **NetworkFacet** — gated by cluster membership. Members publish wireguard public keys and read peers' keys for mesh setup.
+  - **Platform facets** (one per TEE platform; cluster picks which to install via `diamondCut`):
+    - **DstackFacet** — ships in v1. Implements dstack's `IAppAuth` + `IAppAuthBasicManagement` so existing dstack tooling (phala-cli, dashboards, the dstack KMS) works unchanged. Verifies the dstack KMS signature chain and writes admitted members into AttestFacet's storage.
+    - **IntelTdxFacet / AmdSnpFacet / NvidiaCcFacet** — future. Each adds a new TEE platform without touching the core facets.
 - **ClusterMember** — per-CVM passthrough proxies, one per CVM. Address is deterministic and is what the TEE attestation chain commits to. Forwards a small fixed selector set into the diamond.
-- **CVM sidecar** (Rust) — boots inside every CVM, derives identity / messaging / wireguard keys from the TEE, registers with the cluster, exchanges endpoint info via MessageFacet, brings up the wireguard mesh, runs heartbeats, and only reports healthy once the mesh is converged.
+- **CVM sidecar** (Rust) — boots inside every CVM, derives identity / messaging / wireguard keys from a single Curve25519 TEE seed (x25519 for sealed-box, Ed25519 for heartbeat signatures), commits those pubkeys into the attestation quote's user-data slot, registers with the appropriate platform facet, exchanges endpoint info via MessageFacet, brings up the wireguard mesh, runs heartbeats, and only reports healthy once the mesh is converged.
 
 See [`docs/specs/teemesh-coordination-layer.md`](docs/specs/teemesh-coordination-layer.md) for the full design.
 
