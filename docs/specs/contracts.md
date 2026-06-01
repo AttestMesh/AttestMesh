@@ -1,7 +1,7 @@
-# TeeMesh Contracts — Component Spec
+# AttestMesh Contracts — Component Spec
 
 **Status**: Draft v0.1
-**Parent spec**: [`teemesh-coordination-layer.md`](./teemesh-coordination-layer.md)
+**Parent spec**: [`attestmesh-coordination-layer.md`](./attestmesh-coordination-layer.md)
 **Component**: `contracts/`
 **Last updated**: 2026-05-30
 
@@ -9,7 +9,7 @@
 
 ## 1. Purpose
 
-This spec defines the on-chain layer of TeeMesh v1: every Solidity contract under `contracts/`, the ERC-7201 storage layout, the external ABI of every facet, errors, events, and the bring-up flow.
+This spec defines the on-chain layer of AttestMesh v1: every Solidity contract under `contracts/`, the ERC-7201 storage layout, the external ABI of every facet, errors, events, and the bring-up flow.
 
 Code generation works from this spec. The parent spec defines *what* the system does at the architectural level; this spec defines *what gets compiled*.
 
@@ -45,8 +45,8 @@ contracts/
 │   │   │   ├── AttestFacet.sol           # member registry + isClusterMember
 │   │   │   ├── MessageFacet.sol          # encrypted member messaging
 │   │   │   └── NetworkFacet.sol          # wireguard pubkey publication
-│   │   └── platform/
-│   │       └── DstackFacet.sol           # dstack platform facet + IAppAuthBasicManagement
+│   │   └── attestor/
+│   │       └── DstackFacet.sol           # dstack attestor facet + IAppAuthBasicManagement
 │   ├── members/
 │   │   ├── ClusterMember.sol             # UUPS per-CVM contract: dstack passthrough + EIP-4337 smart wallet
 │   │   └── ClusterMemberFactory.sol      # deterministic CREATE2 deployer
@@ -75,7 +75,7 @@ contracts/
 ├── script/
 │   ├── DeployInfra.s.sol                 # one-shot per-chain: facets, factories, IndexerRegistry
 │   ├── DeployCluster.s.sol               # per-cluster: atomic ClusterDiamond + DiamondInit via the factory
-│   └── DeployMember.s.sol                # per-CVM: deploy ClusterMember via the factory
+│   └── DeployMember.s.sol                # per-node: deploy ClusterMember via the factory
 └── test/
     ├── unit/
     ├── integration/
@@ -92,16 +92,16 @@ Every facet reads / writes through a single ERC-7201 namespace; no facet ever to
 
 | Layout struct | Source string | Owner facet |
 |---|---|---|
-| `MemberStorage.Layout` | `teemesh.storage.Member` | AttestFacet (shared write from platform facets via internal selector) |
-| `MessageStorage.Layout` | `teemesh.storage.Message` | MessageFacet |
-| `NetworkStorage.Layout` | `teemesh.storage.Network` | NetworkFacet (shared write from AttestFacet for the wg-pubkey mirror) |
-| `DstackStorage.Layout` | `teemesh.storage.Dstack` | DstackFacet |
+| `MemberStorage.Layout` | `attestmesh.storage.Member` | AttestFacet (shared write from attestor facets via internal selector) |
+| `MessageStorage.Layout` | `attestmesh.storage.Message` | MessageFacet |
+| `NetworkStorage.Layout` | `attestmesh.storage.Network` | NetworkFacet (shared write from AttestFacet for the wg-pubkey mirror) |
+| `DstackStorage.Layout` | `attestmesh.storage.Dstack` | DstackFacet |
 
 The exact 32-byte slot per layout is computed via:
 
 ```solidity
 bytes32 internal constant SLOT =
-    keccak256(abi.encode(uint256(keccak256("teemesh.storage.<name>")) - 1))
+    keccak256(abi.encode(uint256(keccak256("attestmesh.storage.<name>")) - 1))
     & ~bytes32(uint256(0xff));
 ```
 
@@ -109,11 +109,11 @@ bytes32 internal constant SLOT =
 
 ### 4.1 MemberStorage.Layout
 
-This is the canonical layout. AttestFacet owns this namespace; platform facets write into it via the internal `_addMember` selector (§5.1).
+This is the canonical layout. AttestFacet owns this namespace; attestor facets write into it via the internal `_addMember` selector (§5.1).
 
 ```solidity
 struct MemberRecord {
-    bytes32 platformId;      // keccak256("teemesh.platform.dstack") etc.
+    bytes32 attestorId;      // keccak256("attestmesh.attestor.dstack") etc.
     address memberContract;  // ClusterMember address (also the EIP-4337 sender per §9)
     bytes32 xPubKey;         // x25519 public key for sealed-box
     bytes32 wgPubKey;        // wireguard public key (mirror; canonical source is NetworkStorage)
@@ -135,7 +135,7 @@ struct Layout {
 }
 ```
 
-`memberId` is `keccak256(abi.encode(clusterAddr, memberContract, platformId))`.
+`memberId` is `keccak256(abi.encode(clusterAddr, memberContract, attestorId))`.
 
 ### 4.2 MessageStorage.Layout
 
@@ -203,7 +203,7 @@ interface IAttest is IERC165 {
     event MemberRegistered(
         bytes32 indexed memberId,
         address indexed memberContract,
-        bytes32 indexed platformId,
+        bytes32 indexed attestorId,
         bytes32 xPubKey,
         bytes32 wgPubKey
     );
@@ -278,12 +278,12 @@ interface IMessage is IERC165 {
 
 On success, marks the nonce and emits `MessageSent`. Ciphertext bytes are emitted as event data only — never stored.
 
-**Reserved envelope ids** (TeeMesh-internal protocol messages — the contract treats them as opaque but the sidecar handles them specially):
+**Reserved envelope ids** (AttestMesh-internal protocol messages — the contract treats them as opaque but the sidecar handles them specially):
 
 | `envelopeId` source string | Purpose | Sender | Recipient |
 |---|---|---|---|
-| `"teemesh.csk.onboarding.v1"` | Cluster Shared Key onboarding (master spec §8) | Any existing member | A newly-registered onboardee |
-| `"teemesh.peer-endpoint.v1"` | Wireguard peer-endpoint exchange (master spec §7.1 step 7) | Any cluster member | Any cluster member |
+| `"attestmesh.csk.onboarding.v1"` | Cluster Shared Key onboarding (master spec §8) | Any existing member | A newly-registered onboardee |
+| `"attestmesh.peer-endpoint.v1"` | Wireguard peer-endpoint exchange (master spec §7.1 step 7) | Any cluster member | Any cluster member |
 
 The `DuplicateEnvelope` revert is what implements the CSK-onboarding-dedup race semantics: multiple existing members racing to onboard a new member will all pass the local "any prior onboarding tx?" check inside the racy window, both send, the first lands and the second reverts at zero protocol cost. v1 takes the dedup at face value — no rate-limiting beyond it.
 
@@ -309,7 +309,7 @@ interface INetwork is IERC165 {
 
 ---
 
-## 6. Platform facet: DstackFacet
+## 6. Attestor facet: DstackFacet
 
 **Storage**: `DstackStorage`.
 **Interfaces**: `IDstackFacet`, `IAppAuth`, `IAppAuthBasicManagement`.
@@ -341,7 +341,7 @@ event AllowAnyDeviceSet(bool allowAny);
 event RequireTcbUpToDateSet(bool requireUpToDate);
 ```
 
-Plus TeeMesh-specific additions (admin only):
+Plus AttestMesh-specific additions (admin only):
 
 ```solidity
 function addAllowedKmsRoot(address kmsRoot) external;         // onlyClusterOwner
@@ -406,20 +406,20 @@ Internal verification order (each step reverts with a named error on failure):
 5. **Device allowed** — `allowedDeviceIds[proof.derivedDeviceId] || allowAnyDevice` must be true. Reverts `DeviceNotAllowed()`.
 6. **App key → derived key** — verify `proof.derivedKeySig` is a valid secp256k1 signature by `proof.appKey` over `keccak256(abi.encode("dstack.instance", proof.derivedPubKey, proof.derivedInstanceId, proof.derivedDeviceId))`. Reverts `AppKeyDerivedSigInvalid()`.
 7. **TCB freshness** — if `requireTcbUpToDate`, then `keccak256(bytes(proof.tcbStatus)) == keccak256(bytes("UpToDate"))`. Reverts `TcbStale()`.
-8. **Binding** — compute `bindHash = keccak256(abi.encode(BIND_DOMAIN, address(this), memberContract, xPubKey, wgPubKey))` where `BIND_DOMAIN = "teemesh.bind.v1"`. Recover signer from `proof.bindingSig` over the EIP-191 prefixed bindHash. Recovered address must equal `deriveAddress(proof.derivedPubKey)`. Reverts `BindingSigInvalid()`.
+8. **Binding** — compute `bindHash = keccak256(abi.encode(BIND_DOMAIN, address(this), memberContract, xPubKey, wgPubKey))` where `BIND_DOMAIN = "attestmesh.bind.v1"`. Recover signer from `proof.bindingSig` over the EIP-191 prefixed bindHash. Recovered address must equal `deriveAddress(proof.derivedPubKey)`. Reverts `BindingSigInvalid()`.
 9. **Write member** — construct `MemberRecord`, call `IAttest(address(this))._addMember(rec)`, capture returned `memberId`, call `INetwork(address(this))._setWgPubKey(memberId, wgPubKey)` (folded for atomicity — see boot-flow note in master spec §7.1 step 5).
 9.5. **Set the ClusterMember's owner** — call `ClusterMember(memberContract).__setOwnerFromCluster(deriveAddress(proof.derivedPubKey))`. This closes the EIP-4337 bootstrap window for this member: every subsequent UserOp will be validated against `owner == bindingKeyAddress` in standard LightAccount mode. Reverts if `__setOwnerFromCluster` is rejected (which would only happen if the owner is somehow already set — unreachable in normal flow).
 10. **Emit** — `MemberRegistered` is emitted by `_addMember`. DstackFacet additionally emits `DstackMemberRegistered(memberId, proof.appComposeHash, proof.derivedDeviceId)` for indexer convenience.
 
 `DstackSigChain.sol` library provides the secp256k1 verification primitives (`recover`, `compressedToAddress`).
 
-### 6.4 platformId
+### 6.4 attestorId
 
 ```solidity
-bytes32 constant DSTACK_PLATFORM_ID = keccak256("teemesh.platform.dstack");
+bytes32 constant DSTACK_ATTESTOR_ID = keccak256("attestmesh.attestor.dstack");
 ```
 
-Stamped on every `MemberRecord.platformId` written by DstackFacet.
+Stamped on every `MemberRecord.attestorId` written by DstackFacet.
 
 ---
 
@@ -487,7 +487,7 @@ contract DiamondInit {
 
 All cluster-wide config — `clusterOwner`, `pendingClusterOwner`, `meshCidrIp`, `meshCidrPrefix` — lives in `MemberStorage` per the canonical layout in §4.1. AttestFacet's `meshCidr()` and `meshIpOf(bytes32)` view selectors (declared on `IAttest`, §5.1) are the read paths; `meshIpOf` performs the master-spec §7.3 derivation on chain for clients that don't want to re-implement it.
 
-For milestone B / multi-platform clusters, `InitArgs` extends with per-platform-facet init blobs. v1 is dstack-only.
+For milestone B / multi-attestation-method clusters, `InitArgs` extends with per-attestor-facet init blobs. v1 is dstack-only.
 
 ---
 
@@ -540,7 +540,7 @@ contract ClusterMember is
 
 #### 9.1.1 Storage
 
-`teemesh.storage.ClusterMember` ERC-7201 namespace:
+`attestmesh.storage.ClusterMember` ERC-7201 namespace:
 
 ```solidity
 struct Layout {
@@ -596,7 +596,7 @@ The bootstrap window is open for exactly one UserOp. After the registration tx m
 ```solidity
 contract ClusterMemberFactory {
     address public immutable implementation;
-    address public immutable factoryOwner;   // TeeMesh org Safe — gates impl swaps
+    address public immutable factoryOwner;   // AttestMesh org Safe — gates impl swaps
 
     function deployMember(address cluster_, bytes32 salt)
         external
@@ -617,7 +617,7 @@ CREATE2 deploy of an ERC1967Proxy pointing at `implementation` with init calldat
 
 `isOurMember(account)` is the boolean lookup DstackFacet uses in step 1 of registration and the gas webhook uses for sender-provenance — a simple `deployedMembers[account]` flag set during `deployMember`. The webhook reads this view at the bundler's verification step to decide whether to sponsor a UserOp.
 
-For v1, the factory is **per-org** (one factory deployed by the TeeMesh org Safe, shared across all clusters on the chain). Member impls can be upgraded by deploying a new implementation contract and registering it; existing members continue to point at their original impl until UUPS-upgraded individually.
+For v1, the factory is **per-org** (one factory deployed by the AttestMesh org Safe, shared across all clusters on the chain). Member impls can be upgraded by deploying a new implementation contract and registering it; existing members continue to point at their original impl until UUPS-upgraded individually.
 
 ---
 
@@ -626,17 +626,17 @@ For v1, the factory is **per-org** (one factory deployed by the TeeMesh org Safe
 The canonical per-chain factory for deploying ClusterDiamonds. Two consumers care about it:
 
 1. **Operators** call `deployCluster(InitArgs)` to atomically deploy a ClusterDiamond + DiamondInit and apply the initial facet cuts.
-2. **The gas-sponsorship webhook** calls `isDeployedCluster(address)` over RPC to decide whether a UserOp's target is a TeeMesh cluster the operator is willing to sponsor.
+2. **The gas-sponsorship webhook** calls `isDeployedCluster(address)` over RPC to decide whether a UserOp's target is an AttestMesh cluster the operator is willing to sponsor.
 
 ```solidity
 contract ClusterDiamondFactory {
-    address public immutable factoryOwner;          // TeeMesh org Safe — gates upgrades
+    address public immutable factoryOwner;          // AttestMesh org Safe — gates upgrades
     address public immutable diamondInitImpl;       // canonical DiamondInit contract
     address public immutable attestFacet;           // canonical AttestFacet impl
     address public immutable messageFacet;          // canonical MessageFacet impl
     address public immutable networkFacet;          // canonical NetworkFacet impl
     address public immutable dstackFacet;           // canonical DstackFacet impl
-    // Adding additional platform facets later is a factory upgrade (or a new factory).
+    // Adding additional attestor facets later is a factory upgrade (or a new factory).
 
     function deployCluster(DiamondInit.InitArgs calldata args, bytes32 salt)
         external
@@ -672,7 +672,7 @@ For v1, one ClusterDiamondFactory is deployed per chain (Sepolia for v1, mainnet
 
 ## 11. IndexerRegistry
 
-A tiny per-chain registry that the CVM sidecar reads at startup to discover the Indexer.
+A tiny per-chain registry that the node sidecar reads at startup to discover the Indexer.
 
 ```solidity
 contract IndexerRegistry {
@@ -683,7 +683,7 @@ contract IndexerRegistry {
         uint64 updatedAt;
     }
 
-    address public immutable owner;       // TeeMesh org Safe
+    address public immutable owner;       // AttestMesh org Safe
     IndexerRecord public current;
 
     function setIndexer(IndexerRecord calldata rec) external;   // onlyOwner
@@ -700,13 +700,13 @@ A future v2 may key the registry by chain id and expose `indexerOf(uint256 chain
 
 ## 12. Deployment scripts
 
-The per-chain infrastructure (IndexerRegistry, ClusterMemberFactory, ClusterMember impl, DiamondInit impl, core facets, DstackFacet impl, ClusterDiamondFactory) is deployed once by the TeeMesh org Safe. Per-cluster deploys then go through the factory.
+The per-chain infrastructure (IndexerRegistry, ClusterMemberFactory, ClusterMember impl, DiamondInit impl, core facets, DstackFacet impl, ClusterDiamondFactory) is deployed once by the AttestMesh org Safe. Per-cluster deploys then go through the factory.
 
 ### 12.1 DeployInfra.s.sol
 
-One-shot, run once per chain by the TeeMesh org Safe. Deploys (in order):
+One-shot, run once per chain by the AttestMesh org Safe. Deploys (in order):
 
-1. The four core/platform facet impls (`AttestFacet`, `MessageFacet`, `NetworkFacet`, `DstackFacet`).
+1. The four core/attestor facet impls (`AttestFacet`, `MessageFacet`, `NetworkFacet`, `DstackFacet`).
 2. The `DiamondInit` impl.
 3. The `ClusterMember` impl.
 4. `ClusterMemberFactory(impl = ClusterMember)`.
@@ -743,7 +743,7 @@ Output: a JSON receipt for downstream tooling (sidecar config, dstack compose-co
 
 ### 12.3 DeployMember.s.sol
 
-Per-CVM deploy. Reads `(clusterAddr, salt)`:
+Per-node deploy. Reads `(clusterAddr, salt)`:
 
 1. Call `ClusterMemberFactory.deployMember(cluster_, salt)`. ClusterMember lands at the predicted CREATE2 address, initialized with `cluster_` and `owner = address(0)`.
 2. Log the predicted-and-confirmed address. This is what gets written into the dstack compose config as the CVM's `app_id`.
@@ -782,7 +782,7 @@ The rest (allowlist mutations, etc.) ride the same pipeline but aren't required 
 `test/` is split into:
 
 - **unit/** — per-facet, mocked diamond storage. One test file per facet.
-- **integration/** — full bring-up through `DeployCluster.s.sol`, with a mock dstack KMS chain (sigs produced in-test). Three-CVM scenarios:
+- **integration/** — full bring-up through `DeployCluster.s.sol`, with a mock dstack KMS chain (sigs produced in-test). Three-node scenarios:
   1. Three members register successfully, exchange test messages, every pubkey readable.
   2. A fourth member tries to register with a non-allowed compose hash → reverts.
   3. A non-member tries to send a message → reverts.

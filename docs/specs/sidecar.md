@@ -1,7 +1,7 @@
-# TeeMesh Sidecar — Component Spec
+# AttestMesh Sidecar — Component Spec
 
 **Status**: Draft v0.1
-**Parent spec**: [`teemesh-coordination-layer.md`](./teemesh-coordination-layer.md) (especially §7, §8)
+**Parent spec**: [`attestmesh-coordination-layer.md`](./attestmesh-coordination-layer.md) (especially §7, §8)
 **Component**: `sidecar/`
 **Binary**: `cluster-mesh-agent`
 **Last updated**: 2026-05-30
@@ -10,7 +10,7 @@
 
 ## 1. Purpose
 
-The sidecar is the per-CVM process that turns "a CVM running in dstack" into "a TeeMesh cluster member." It owns key derivation, on-chain registration, Indexer subscription, wireguard setup, heartbeats, the first-convergence gate, the CSK lifecycle, and the gRPC façade the application container talks to. Master spec §7 defines *what* it does; this spec defines *what gets built*.
+The sidecar is the per-node process that turns "a CVM running in dstack" into "an AttestMesh cluster member." It owns key derivation, on-chain registration, Indexer subscription, wireguard setup, heartbeats, the first-convergence gate, the CSK lifecycle, and the gRPC façade the application container talks to. Master spec §7 defines *what* it does; this spec defines *what gets built*.
 
 ---
 
@@ -46,7 +46,7 @@ The sidecar is the per-CVM process that turns "a CVM running in dstack" into "a 
 
 ## 3. Process model
 
-One process per CVM. Runs as a docker-compose service named `mesh-agent`. The application container declares `depends_on: { mesh-agent: { condition: service_healthy } }` so it does not start until the sidecar reports converged + CSK-acquired.
+One process per node. Runs as a docker-compose service named `mesh-agent`. The application container declares `depends_on: { mesh-agent: { condition: service_healthy } }` so it does not start until the sidecar reports converged + CSK-acquired.
 
 Capabilities:
 - `NET_ADMIN` — wireguard interface management.
@@ -112,31 +112,31 @@ All configuration is via environment variables (no config files). The sidecar fa
 
 | Env var | Required | Default | Meaning |
 |---|---|---|---|
-| `MEMBER_CONTRACT` | yes | — | hex address of this CVM's ClusterMember proxy |
+| `MEMBER_CONTRACT` | yes | — | hex address of this node's ClusterMember proxy |
 | `CHAIN_ID` | yes | — | EVM chain id (`84532` for Base Sepolia v1, `8453` for Base mainnet) |
 | `RPC_URL` | yes | — | EVM RPC endpoint URL (read-only direct chain reads — §8.4) |
 | `BUNDLER_URL` | yes | — | EIP-4337 bundler RPC endpoint (Alchemy in v1). All state-mutating calls go through here. |
 | `INDEXER_REGISTRY_ADDR` | yes | — | hex address of the per-chain IndexerRegistry. (Hardcoded per chain id in v1 sidecar binary; env var allows overriding for tests.) |
 | `DSTACK_SOCKET` | no | `/var/run/dstack.sock` | path to dstack guest-agent socket |
-| `AGENT_GRPC_SOCKET` | no | `/var/run/teemesh/agent.sock` | path the app facade listens on |
+| `AGENT_GRPC_SOCKET` | no | `/var/run/attestmesh/agent.sock` | path the app facade listens on |
 | `HEALTH_HTTP_ADDR` | no | `127.0.0.1:9090` | HTTP /healthz endpoint (for docker-compose healthcheck) |
 | `LOG_FORMAT` | no | `json` | `json` or `pretty` |
 | `LOG_LEVEL` | no | `info` | standard `tracing` filter |
 
-No secrets in env vars. All key material is derived from the dstack TEE seed at runtime.
+No secrets in env vars. All key material is derived from the attestation-bound seed provided by the node's attestation method at runtime (on dstack: `derive_key`).
 
 ---
 
 ## 6. Key derivation
 
-All key material is derived via `dstack.derive_key(purpose, algo)` and never persisted in plaintext outside the sidecar's process memory + the dstack sealed store. (The master spec uses the same name; `derive_key` is the canonical dstack runtime API.)
+All key material is provided by the node's attestation method (on dstack: `dstack.derive_key(purpose, algo)`) and never persisted in plaintext outside the sidecar's process memory + the dstack sealed store. (The master spec uses the same name; `derive_key` is the canonical dstack runtime API.)
 
 | Purpose string | Algo | Used for |
 |---|---|---|
-| `teemesh.identity.v1` | curve25519 | Curve25519 root seed. x25519 (encryption) and Ed25519 (signing) are derived from this via standard ed25519 → curve25519 conversion (`x25519-dalek::PublicKey::from(&ed25519_sk)`) so they share one stored secret. |
-| `teemesh.wireguard.v1` | curve25519 | wireguard private key (Curve25519 scalar) |
-| `teemesh.binding.v1` | k256 | secp256k1 derived key whose address becomes the ClusterMember's `owner` after first registration. Signs (a) the one-shot dstack_register binding signature (master spec §4.2), and (b) every subsequent UserOpHash. One key, two recoverable signing surfaces. |
-| `teemesh.cluster-shared.v1` (purpose) / `csk-v1` (version) | aes-256 raw bytes | Cluster Shared Key. **Only derived by the originator.** Onboardees never call this. |
+| `attestmesh.identity.v1` | curve25519 | Curve25519 root seed. x25519 (encryption) and Ed25519 (signing) are derived from this via standard ed25519 → curve25519 conversion (`x25519-dalek::PublicKey::from(&ed25519_sk)`) so they share one stored secret. |
+| `attestmesh.wireguard.v1` | curve25519 | wireguard private key (Curve25519 scalar) |
+| `attestmesh.binding.v1` | k256 | secp256k1 derived key whose address becomes the ClusterMember's `owner` after first registration. Signs (a) the one-shot dstack_register binding signature (master spec §4.2), and (b) every subsequent UserOpHash. One key, two recoverable signing surfaces. |
+| `attestmesh.cluster-shared.v1` (purpose) / `csk-v1` (version) | aes-256 raw bytes | Cluster Shared Key. **Only derived by the originator.** Onboardees never call this. |
 
 All keys are wrapped in `zeroize::Zeroizing` containers and zeroed on drop. Cargo-deny is configured to reject any dependency that prints derived key material.
 
@@ -199,13 +199,13 @@ Every state change emits a `tracing::info!` event with a `phase` field (`booting
 
 ## 8. Chain interaction
 
-The sidecar never submits raw transactions to the chain. Every state-mutating call goes through EIP-4337 as a UserOperation submitted to an Alchemy bundler endpoint, sponsored by the Alchemy paymaster after the TeeMesh gas-sponsorship webhook approves (master spec §13 item 18, gas-webhook spec). The sidecar holds zero ETH.
+The sidecar never submits raw transactions to the chain. Every state-mutating call goes through EIP-4337 as a UserOperation submitted to an Alchemy bundler endpoint, sponsored by the Alchemy paymaster after the AttestMesh gas-sponsorship webhook approves (master spec §13 item 18, gas-webhook spec). The sidecar holds zero ETH.
 
 ### 8.1 Provider, bundler, signer
 
 - **EVM RPC provider** (read-only): `alloy-provider` HTTP transport against `RPC_URL`. Used only for the small set of direct startup reads listed in §8.4.
 - **Bundler RPC**: a separate HTTP client against `BUNDLER_URL` (Alchemy's `https://...api.g.alchemy.com/v2/<key>` endpoint with the `eth_sendUserOperation` namespace). The sidecar sends a single `eth_sendUserOperation` per outbound call and polls `eth_getUserOperationReceipt` until inclusion.
-- **Signer**: a single `alloy-signer-local::PrivateKeySigner` constructed from the `teemesh.binding.v1` k256 derived key. This is the key whose address gets set as the ClusterMember's `owner` during `dstack_register`. It signs:
+- **Signer**: a single `alloy-signer-local::PrivateKeySigner` constructed from the `attestmesh.binding.v1` k256 derived key. This is the key whose address gets set as the ClusterMember's `owner` during `dstack_register`. It signs:
   - The dstack-registration binding hash (recovered inside `DstackFacet.dstack_register`).
   - Every subsequent UserOpHash (recovered inside `ClusterMember.validateUserOp`).
 
@@ -312,7 +312,7 @@ The proto file itself is canonical for codegen; both this spec and indexer.md mu
 
 ### 10.1 Interface lifecycle
 
-- Interface name: `teemesh0` (single mesh per CVM in v1).
+- Interface name: `attestmesh0` (single mesh per node in v1).
 - Created at boot via netlink (`defguard_wireguard_rs`).
 - Listen port: random ephemeral, exposed in PeerEndpoint.
 - Self IP: derived per §7.3 from own `memberId` + cluster CIDR.
@@ -347,7 +347,7 @@ struct Heartbeat {
   uint32 sender_member_id_rest; // bytes 16..20 (memberId is 32 bytes; truncated for wire)
   // ... actually: send full 32-byte memberId
   bytes32 sender_member_id;
-  uint64 timestamp_ms;       // monotonic clock since unix epoch in CVM
+  uint64 timestamp_ms;       // monotonic clock since unix epoch in node
   uint16 connected_count;
   bytes32[] connected_member_ids;   // sender's current connected-set view
   bytes64 ed25519_signature;        // over keccak256(version || sender_member_id || timestamp_ms || connected_member_ids)
@@ -363,7 +363,7 @@ struct Heartbeat {
 
 ### 11.3 Receive loop
 
-- Bind UDP on `0.0.0.0:51820` on the `teemesh0` interface.
+- Bind UDP on `0.0.0.0:51820` on the `attestmesh0` interface.
 - For every received packet:
   - Verify Ed25519 signature against the sender's stored `ed25519_pub` (learned via PeerEndpoint, §7 step 7).
   - If sender's Ed25519 is not yet known: buffer the packet for up to 5 seconds, then drop. Log at debug.
@@ -451,7 +451,7 @@ message ClusterSharedKey { bytes key = 1; }   // 32 bytes
 ### 12.2 Transport
 
 - Unix domain socket at `AGENT_GRPC_SOCKET`. App container mounts the same socket directory.
-- No transport-level auth — the trust domain is the CVM. Anything inside the CVM is trusted.
+- No transport-level auth — the trust domain is the node. Anything inside the node is trusted.
 
 ### 12.3 Semantics
 
@@ -471,12 +471,12 @@ message ClusterSharedKey { bytes key = 1; }   // 32 bytes
 
 Per master spec §8.
 
-- **Originator path** (§8.1): derive via `dstack.derive_key("teemesh.cluster-shared.v1", "csk-v1") → [u8;32]`. Seal via `dstack.seal("teemesh.csk.v1", csk)`. Cache in process memory. Mark `csk_acquired = true`.
-- **Onboardee path** (§8.3): on every `MessageSent` event delivered to this member with `envelope_id == keccak256("teemesh.csk.onboarding.v1")`: sealed-box decrypt → validate `kind == "csk-onboarding-v1"` → read `csk` → check sender is a current cluster member by their event-asserted `senderMemberId` (already Indexer-verified) → seal via dstack → cache → mark `csk_acquired = true`. Subsequent CSK-onboarding events for self are no-ops.
-- **Restart path** (§7.1 step 4): `dstack.unseal("teemesh.csk.v1") → csk` → cache → mark `csk_acquired = true`.
+- **Originator path** (§8.1): derive via `dstack.derive_key("attestmesh.cluster-shared.v1", "csk-v1") → [u8;32]`. Seal via `dstack.seal("attestmesh.csk.v1", csk)`. Cache in process memory. Mark `csk_acquired = true`.
+- **Onboardee path** (§8.3): on every `MessageSent` event delivered to this member with `envelope_id == keccak256("attestmesh.csk.onboarding.v1")`: sealed-box decrypt → validate `kind == "csk-onboarding-v1"` → read `csk` → check sender is a current cluster member by their event-asserted `senderMemberId` (already Indexer-verified) → seal via dstack → cache → mark `csk_acquired = true`. Subsequent CSK-onboarding events for self are no-ops.
+- **Restart path** (§7.1 step 4): `dstack.unseal("attestmesh.csk.v1") → csk` → cache → mark `csk_acquired = true`.
 - **Onboarding a new peer** (steady-state, master spec §8.2): on `MemberRegistered` for a peer we don't know yet:
   1. Sleep `Uniform([0, 500])` ms.
-  2. Query the recipient's MessageFacet channel for envelope `keccak256("teemesh.csk.onboarding.v1")` — implemented as a single Indexer query (`get_envelope(recipient_member_id, envelope_id)`).
+  2. Query the recipient's MessageFacet channel for envelope `keccak256("attestmesh.csk.onboarding.v1")` — implemented as a single Indexer query (`get_envelope(recipient_member_id, envelope_id)`).
   3. If absent: sealed-box-encrypt the CSK with the new peer's `xPubKey`, submit `MessageFacet.send(...)`. If the tx reverts with `DuplicateEnvelope` (someone won the race), log at info and move on.
 
 ---
@@ -503,7 +503,7 @@ Phases reported (`MeshStatus.phase`):
 ## 15. Failure handling
 
 - **Registration revert** (any reason except `AlreadyRegistered` — see §7.1 step 4): exit non-zero. docker-compose restart policy applies; if the cause is allowlist-related, the loop continues until ops intervenes.
-- **Indexer down**: exponential backoff reconnect. Healthcheck phase stuck at `subscribing` for joiners; healthy CVMs stay healthy (first-converged gate fires once).
+- **Indexer down**: exponential backoff reconnect. Healthcheck phase stuck at `subscribing` for joiners; healthy nodes stay healthy (first-converged gate fires once).
 - **CSK envelope never arrives**: phase stuck at `waiting-csk` (onboardees). Operational fix required.
 - **Convergence never reached**: phase stuck at `heartbeating`. Same.
 - **wg netlink errors**: log at error, retry. Persistent failure → exit non-zero (capability issue or kernel mismatch).
@@ -542,5 +542,5 @@ No fuzz tests for v1. No mainnet-fork tests. No actual dstack hardware tests; th
 
 1. **`SubscribeMessages` catchup boundary.** Currently the sidecar's queue is "since process start." App restarts lose history. Should the sidecar persist incoming messages to a sealed disk store keyed by `(envelopeId, block_number)` so app restarts can replay? Adds storage; v1 leaves out. Application must dedup if it relies on idempotency.
 2. **Heartbeat packet encoding stability.** v1 uses `serde_cbor` via `ciborium` with a pinned canonical encoder. CBOR has multiple valid encodings of the same logical value, and the heartbeat's Ed25519 signature is over the encoded bytes — the canonicalization is what guarantees verification works across encoder versions.
-3. **Multiple cluster membership.** What if one CVM is a member of two TeeMesh clusters (e.g. a hypothetical Indexer dog-fooding scenario where the Indexer cluster's members are also subscribers to the customer clusters)? v1 sidecar is single-cluster only; this is a milestone B+ shape.
-4. **Bundler provider failover.** v1 ships single-provider (Alchemy). If Alchemy's bundler is down, the CVM cannot submit any UserOps and stays unable to send messages until it recovers. Milestone B adds Pimlico / Stackup as fallback endpoints, with health-checked round-robin.
+3. **Multiple cluster membership.** What if one node is a member of two AttestMesh clusters (e.g. a hypothetical Indexer dog-fooding scenario where the Indexer cluster's members are also subscribers to the customer clusters)? v1 sidecar is single-cluster only; this is a milestone B+ shape.
+4. **Bundler provider failover.** v1 ships single-provider (Alchemy). If Alchemy's bundler is down, the node cannot submit any UserOps and stays unable to send messages until it recovers. Milestone B adds Pimlico / Stackup as fallback endpoints, with health-checked round-robin.

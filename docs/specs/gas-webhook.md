@@ -1,7 +1,7 @@
-# TeeMesh Gas Sponsorship Webhook — Component Spec
+# AttestMesh Gas Sponsorship Webhook — Component Spec
 
 **Status**: Draft v0.1
-**Parent spec**: [`teemesh-coordination-layer.md`](./teemesh-coordination-layer.md) (especially §13 item 18)
+**Parent spec**: [`attestmesh-coordination-layer.md`](./attestmesh-coordination-layer.md) (especially §13 item 18)
 **Component**: `services/gas-sponsorship-webhook/`
 **Last updated**: 2026-05-30
 
@@ -9,7 +9,7 @@
 
 ## 1. Purpose
 
-The webhook is the policy gate between Alchemy's EIP-4337 paymaster and the rest of the world. It exists so that the TeeMesh org's Alchemy paymaster balance can only be drained by legitimate TeeMesh UserOperations — never by anyone who happens to know the paymaster's public surface.
+The webhook is the policy gate between Alchemy's EIP-4337 paymaster and the rest of the world. It exists so that the AttestMesh org's Alchemy paymaster balance can only be drained by legitimate AttestMesh UserOperations — never by anyone who happens to know the paymaster's public surface.
 
 Flow:
 
@@ -18,9 +18,9 @@ Flow:
 3. Alchemy paymaster POSTs the UserOp to *this webhook's URL with a shared-secret token*.
 4. Webhook runs cheap static checks, then a single cached `eth_call` to `ClusterDiamondFactory.isDeployedCluster(target)`.
 5. Webhook returns `{approved: true|false}`.
-6. On `true`, Alchemy's paymaster signs the sponsorship fields, the bundler bundles, gas is paid by Alchemy and billed to the TeeMesh org account.
+6. On `true`, Alchemy's paymaster signs the sponsorship fields, the bundler bundles, gas is paid by Alchemy and billed to the AttestMesh org account.
 
-This pattern is ported directly from dstackgres's `services/gas-sponsorship-webhook/`. The differences in TeeMesh are narrower scope (one selector allowlist instead of dstackgres's broader set), different canonical factory address, and the worker lives in a new Cloudflare Worker deployment rather than dstackgres's existing one.
+This pattern is ported directly from dstackgres's `services/gas-sponsorship-webhook/`. The differences in AttestMesh are narrower scope (one selector allowlist instead of dstackgres's broader set), different canonical factory address, and the worker lives in a new Cloudflare Worker deployment rather than dstackgres's existing one.
 
 ---
 
@@ -171,7 +171,7 @@ export const ALLOWED_SELECTORS = [
   selectorOf("acceptBothOwners()"),
   selectorOf("acceptOwnership()"),                  // solidstate SafeOwnable accept side; cluster Safe calls this after deploy
 
-  // dstack allowlist mutations (cluster owner does these from the Safe, not from a CVM,
+  // dstack allowlist mutations (cluster owner does these from the Safe, not from a node,
   // but include them so an ops Safe operated via 4337 can manage allowlists too):
   selectorOf("addComposeHash(bytes32)"),
   selectorOf("removeComposeHash(bytes32)"),
@@ -220,5 +220,5 @@ Negative answers (`false`) are cached with a shorter TTL (10 min) so a new clust
 ## 11. Open questions
 
 1. **Rate limiting.** The Alchemy dashboard's per-sender cap is the first defense. Should the webhook add its own (e.g. "no more than N approvals per sender per minute")? v1: no; revisit if we see abuse.
-2. **Multi-cluster sponsorship policy.** v1 sponsors every UserOp targeting any TeeMesh cluster on this chain. Milestone B might want per-cluster opt-in (some clusters self-fund; some are sponsored). Not in v1.
+2. **Multi-cluster sponsorship policy.** v1 sponsors every UserOp targeting any AttestMesh cluster on this chain. Milestone B might want per-cluster opt-in (some clusters self-fund; some are sponsored). Not in v1.
 3. **Token rotation.** `ALCHEMY_WEBHOOK_TOKEN` is the only secret. Rotating means coordinated update of Alchemy's dashboard + the worker env. v1 documents the runbook; milestone B may add a HMAC-style signed request to Alchemy in place of the shared secret if/when Alchemy ships it.

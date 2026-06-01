@@ -1,18 +1,18 @@
-# TeeMesh Indexer — Component Spec
+# AttestMesh Indexer — Component Spec
 
 **Status**: Draft v0.1
-**Parent spec**: [`teemesh-coordination-layer.md`](./teemesh-coordination-layer.md) (especially §6)
+**Parent spec**: [`attestmesh-coordination-layer.md`](./attestmesh-coordination-layer.md) (especially §6)
 **Component**: `indexer/`
-**Binary**: `teemesh-indexer`
+**Binary**: `attestmesh-indexer`
 **Last updated**: 2026-05-30
 
 ---
 
 ## 1. Purpose
 
-The Indexer is the off-chain event distribution layer. It watches every TeeMesh ClusterDiamond on its target chain (any diamond it has been asked to follow), and pushes events to the specific members of the cluster that emitted them — eliminating the need for each CVM sidecar to maintain its own chain RPC subscription. Master spec §6 defines *what* it does at the architectural level; this spec defines *what gets built*.
+The Indexer is the off-chain event distribution layer. It watches every AttestMesh ClusterDiamond on its target chain (any diamond it has been asked to follow), and pushes events to the specific members of the cluster that emitted them — eliminating the need for each node sidecar to maintain its own chain RPC subscription. Master spec §6 defines *what* it does at the architectural level; this spec defines *what gets built*.
 
-Each push is signed by the Indexer's TEE-derived key and paired with an `eth_getLogs`-style "repro stub" so subscribing members can independently verify any individual push against any chain RPC provider they trust. The Indexer is therefore trusted by members for liveness and completeness of event delivery, but not for correctness of event contents.
+Each push is signed by the Indexer's attestation-bound key and paired with an `eth_getLogs`-style "repro stub" so subscribing members can independently verify any individual push against any chain RPC provider they trust. The Indexer is therefore trusted by members for liveness and completeness of event delivery, but not for correctness of event contents.
 
 ---
 
@@ -45,7 +45,7 @@ Each push is signed by the Indexer's TEE-derived key and paired with an `eth_get
 
 ## 3. Process model
 
-A single process runs inside a TEE-attested CVM. v1 ships **one instance** per chain (Sepolia for v1; Base mainnet for milestone B); HA is deferred. Master spec §13 item 5 captures the operational shape — multi-replica + dog-fooded-on-TeeMesh shapes remain open but are explicitly deferred.
+A single process runs inside a dstack CVM. v1 ships **one instance** per chain (Sepolia for v1; Base mainnet for milestone B); HA is deferred. Master spec §13 item 5 captures the operational shape — multi-replica + dog-fooded-on-AttestMesh shapes remain open but are explicitly deferred.
 
 Runtime requirements:
 
@@ -74,7 +74,7 @@ indexer/
 ├── src/
 │   ├── main.rs                      # entry, arg parsing, tokio runtime
 │   ├── config.rs                    # env-var schema + load
-│   ├── identity.rs                  # TEE key derivation, sealing, attestation request
+│   ├── identity.rs                  # attestation-bound key derivation, sealing, attestation request
 │   ├── chain/
 │   │   ├── mod.rs                   # provider setup
 │   │   ├── watcher.rs               # block-by-block eth_getLogs poll
@@ -112,13 +112,13 @@ Env vars only.
 | `INDEXER_GRPC_ADDR` | no | `0.0.0.0:50051` | gRPC listen address |
 | `HEALTH_HTTP_ADDR` | no | `0.0.0.0:9090` | HTTP /healthz + /metrics endpoint |
 | `DSTACK_SOCKET` | no | `/var/run/dstack.sock` | dstack guest-agent socket |
-| `STATE_DIR` | no | `/var/lib/teemesh-indexer` | sled/rocksdb data dir (mounted as a persistent volume) |
+| `STATE_DIR` | no | `/var/lib/attestmesh-indexer` | sled/rocksdb data dir (mounted as a persistent volume) |
 | `BLOCK_POLL_INTERVAL_MS` | no | `2000` | how often to call `eth_blockNumber` |
 | `BLOCK_BATCH_SIZE` | no | `200` | max blocks per `eth_getLogs` request when catching up |
 | `LOG_LEVEL` | no | `info` | `tracing` filter |
 | `LOG_FORMAT` | no | `json` | `json` or `pretty` |
 
-No secrets. The TEE seed is sufficient for all key material.
+No secrets. The dstack TEE seed is sufficient for all key material.
 
 ---
 
@@ -128,8 +128,8 @@ The Indexer's identity is derived from its TEE seed at boot, the same way sideca
 
 | Purpose string | Algo | Used for |
 |---|---|---|
-| `teemesh.indexer.signing.v1` | ed25519 | signing every push envelope. Pubkey is what IndexerRegistry's `pubKey` field points to. |
-| `teemesh.indexer.tls.v1` | ed25519 | TLS server certificate for the gRPC listener (milestone B; v1 terminates TLS at a load balancer). |
+| `attestmesh.indexer.signing.v1` | ed25519 | signing every push envelope. Pubkey is what IndexerRegistry's `pubKey` field points to. |
+| `attestmesh.indexer.tls.v1` | ed25519 | TLS server certificate for the gRPC listener (milestone B; v1 terminates TLS at a load balancer). |
 
 The signing key is stable across restarts (deterministic from the TEE seed). It is NOT sealed-stored — it's re-derived every boot from `dstack.derive_key`.
 
@@ -138,7 +138,7 @@ The signing key is stable across restarts (deterministic from the TEE seed). It 
 At boot, the Indexer requests a TEE quote whose user-data slot commits to its signing pubkey:
 
 ```
-report_data = keccak256(abi.encode("teemesh.indexer.v1", indexer_signing_pubkey))
+report_data = keccak256(abi.encode("attestmesh.indexer.v1", indexer_signing_pubkey))
 ```
 
 The 32-byte hash fits in the 64-byte report_data slot with zero padding. This quote is what the Indexer attaches to its first push envelope per subscriber session — proving to the subscribing member that the Indexer's signing pubkey was actually derived inside the attested TEE code.
@@ -256,7 +256,7 @@ message SubscribeMessage {
 message Hello {
   bytes32 cluster_addr = 1;
   bytes32 member_id = 2;
-  bytes attestation = 3;       // sidecar's TEE attestation proof; unused by v1 indexer (see §8.3)
+  bytes attestation = 3;       // sidecar's attestation proof; unused by v1 indexer (see §8.3)
   uint64 from_block = 4;       // resume cursor; 0 means "from this member's MemberRegistered"
 }
 
@@ -307,7 +307,7 @@ For each incoming `Subscribe(stream)`:
 
 ### 8.3 Attestation verification on subscribe
 
-v1 takes the subscribing member's claim at face value. The on-chain MemberStorage already records the result of platform-facet attestation verification; the Indexer trusts that the diamond did its job at registration time and that `memberId` existing in storage is sufficient proof of membership. The `Hello.attestation` field is reserved for future use — when milestone B adds member-eviction or member-key-rotation, the Indexer will need to re-verify on every subscribe to ensure it isn't streaming events to a recently-evicted member. v1 ignores the field.
+v1 takes the subscribing member's claim at face value. The on-chain MemberStorage already records the result of attestor-facet verification; the Indexer trusts that the diamond did its job at registration time and that `memberId` existing in storage is sufficient proof of membership. The `Hello.attestation` field is reserved for future use — when milestone B adds member-eviction or member-key-rotation, the Indexer will need to re-verify on every subscribe to ensure it isn't streaming events to a recently-evicted member. That re-verification re-runs the member's registration check off-chain, dispatching to the attestor for the member's attestation method and confirming the attestation matches the recorded pubkeys per that method. v1 ignores the field.
 
 ### 8.4 Backpressure
 
@@ -372,7 +372,7 @@ v1 sidecar does this opt-in only (master spec §11 was deferred to milestone B; 
 After constructing a `PushEnvelope` (with `indexer_signature` and `indexer_attestation` zeroed):
 
 1. Serialize the envelope to canonical CBOR (same encoder as the sidecar's heartbeat — sidecar spec §17 item 2).
-2. Compute `signing_input = keccak256("teemesh.indexer.envelope.v1" || canonical_cbor_bytes)`.
+2. Compute `signing_input = keccak256("attestmesh.indexer.envelope.v1" || canonical_cbor_bytes)`.
 3. Sign with the Indexer's Ed25519 key.
 4. Set `indexer_signature = signature`.
 5. Set `indexer_attestation` on the *first* envelope of each session, then `None` thereafter (the sidecar caches the attestation result for the duration of the stream).
@@ -424,7 +424,7 @@ HTTP at `HEALTH_HTTP_ADDR`:
 
 `tests/integration/` runs the Indexer against an anvil chain. The harness:
 
-1. Deploys the TeeMesh infra and a single cluster (using forge scripts compiled into the test fixture).
+1. Deploys the AttestMesh infra and a single cluster (using forge scripts compiled into the test fixture).
 2. Boots the Indexer pointing at anvil's RPC.
 3. Spins up three mock subscribers (in-process gRPC clients) presenting different `(cluster, member_id)` tuples.
 4. Asserts:
@@ -443,5 +443,5 @@ No mainnet-fork tests. No fuzz tests for v1.
 
 1. **Multi-cluster ordering across the chain.** v1's block-watcher pulls logs in chain order; per-cluster queues preserve that order. But the dispatch loop is per-cluster, so two events emitted in the same block by different clusters can arrive at their subscribers in either order. This doesn't matter today (each cluster's events are independent), but if the dog-fooded Indexer-cluster shape ever lands, we'd need cross-cluster ordering for the Indexer's own coordination events. v1 leaves cross-cluster ordering undefined.
 2. **Sled vs rocksdb.** Sled is "production-ready" per its docs but has known edge cases under sustained heavy write. v1 picks sled for ergonomics; if write pressure becomes an issue in milestone B we switch. The DB is behind a small trait (`CursorStore`) so the swap is a single-file change.
-3. **TLS for the gRPC listener.** v1 terminates TLS at a load balancer in front of the Indexer (the Indexer speaks h2c internally). Milestone B: the Indexer terminates TLS itself using its TEE-derived `teemesh.indexer.tls.v1` keypair, and subscribing members pin the cert against the IndexerRegistry pubkey. v1's "trust the LB" posture is fine because the LB is in the same trust domain as the Indexer (TeeMesh-org-operated), but the milestone-B shape eliminates that intermediate trust.
+3. **TLS for the gRPC listener.** v1 terminates TLS at a load balancer in front of the Indexer (the Indexer speaks h2c internally). Milestone B: the Indexer terminates TLS itself using its attestation-bound `attestmesh.indexer.tls.v1` keypair, and subscribing members pin the cert against the IndexerRegistry pubkey. v1's "trust the LB" posture is fine because the LB is in the same trust domain as the Indexer (AttestMesh-org-operated), but the milestone-B shape eliminates that intermediate trust.
 4. **Subscription scaling.** v1 holds one open gRPC stream per subscribed member. For a cluster of 50 members spread across 10 clusters, that's 500 open streams. tonic + tokio handles this fine on a single instance. For ~10,000+ streams (milestone B at scale), we'd shard subscribers across Indexer instances by member_id hash. v1 stays single-instance.
