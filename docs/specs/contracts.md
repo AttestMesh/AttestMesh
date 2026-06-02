@@ -727,7 +727,7 @@ Per-cluster deploy. Reads a JSON config:
   "initialDeviceIds": ["0x..."],
   "allowAnyDevice": false,
   "requireTcbUpToDate": true,
-  "meshCidrIp": 167903232,          // 10.13.0.0 packed
+  "meshCidrIp": 168624128,          // 10.13.0.0 packed (0x0a0d0000)
   "meshCidrPrefix": 16,
   "salt": "0x..."
 }

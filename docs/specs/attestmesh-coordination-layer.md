@@ -22,7 +22,7 @@ What this spec deliberately does **not** include:
 - Higher-level cluster semantics like leader election, sharding, or quorum protocols — those belong on top of AttestMesh, in the application layer.
 - A control plane for cluster *operators* — administrative actions like adding attestation patterns are on-chain calls gated on the cluster owner; this spec does not define a dashboard, CLI, or SaaS service.
 
-**Join invariant.** Any client may join an AttestMesh cluster iff it can present, to an installed attestor facet, a proof that (a) it runs software the facet's allowlist approves and (b) that proof is cryptographically bound to the x25519/wireguard public keys it publishes on chain. Only the nature of the proof varies between attestation methods; everything downstream of registration is method-agnostic.
+**Join invariant.** Any client may join an AttestMesh cluster iff it can present, to an installed attestor facet, a valid proof that (a) it runs software the facet's allowlist approves and (b) that proof is cryptographically bound to the x25519/wireguard public keys it publishes on chain. Only the nature of the proof varies between attestation methods; everything downstream of registration is method-agnostic.
 
 ---
 
@@ -106,7 +106,7 @@ The attestation-method-agnostic member registry — the canonical "who is in thi
 Storage:
 
 - **Members**: an indexed map of `memberId → MemberRecord`, where each record carries (a) the attestorId the member was admitted under, (b) the member's attestation-bound x25519 public key (used by MessageFacet), (c) the wireguard public key (mirrored from NetworkFacet for one-shot reads), (d) the member-contract address.
-- **Indices**: `memberIdOf[address] → memberId`, `members[]` for enumeration, `memberCount`.
+- **Indices**: `memberIdOf[address] → memberId`, `memberIds` for enumeration, `memberCount`.
 - **Cluster-wide config** (consolidated from the cluster's `DiamondInit`): `clusterOwner`, `pendingClusterOwner`, `meshCidrIp`, `meshCidrPrefix`. See contracts spec §4.1 for the canonical layout.
 
 External surface (all view):
@@ -434,7 +434,7 @@ dstackgres is the codebase AttestMesh is being extracted from. The differences:
 - **Verifier as facet, not external contract.** dstackgres has a separate `DstackVerifier` UUPS contract registered with `TEEBridge` via an adapter registry. AttestMesh folds that role directly into the attestor facet: there is no separate verifier contract, no adapter registry, no `IVerifier` interface needed cross-method. Each method's verification logic is library code linked into its facet.
 - **MessageFacet is new.** dstackgres has nothing equivalent — endpoint exchange there happens via `signalEndpoint(bytes ciphertext, ...)` on `WgMeshFacet`. AttestMesh splits this cleanly: messaging is one facet, networking is another.
 - **Wireguard signalling is decoupled from endpoint registry.** dstackgres stores endpoint blobs on chain; AttestMesh stores only wg public keys on chain and pushes endpoint info through MessageFacet so deployment topology is not leaked.
-- **Curve25519 for the CVM's operational keys.** dstackgres derives a per-CVM secp256k1 key and uses it for cluster-side operations via the dstackgres control plane. AttestMesh derives x25519 + Ed25519 + wireguard from Curve25519 for the operational surface; the per-CVM secp256k1 key from the dstack KMS is reused only for (a) the one-shot registration binding signature and (b) signing EIP-4337 UserOpHashes for sponsored paymaster submission. No long-lived per-CVM ECDSA key exists beyond what attestation produces.
+- **Curve25519 for the node's operational keys.** dstackgres derives a per-CVM secp256k1 key and uses it for cluster-side operations via the dstackgres control plane. AttestMesh derives x25519 + Ed25519 + wireguard from Curve25519 for the operational surface; the per-CVM secp256k1 key from the dstack KMS is reused only for (a) the one-shot registration binding signature and (b) signing EIP-4337 UserOpHashes for sponsored paymaster submission. No long-lived per-CVM ECDSA key exists beyond what attestation produces.
 
 ---
 
