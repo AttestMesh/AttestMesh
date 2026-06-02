@@ -1,0 +1,31 @@
+# AttestMesh gas-sponsorship-webhook — Cloudflare Worker config.
+#
+# Secrets (NOT committed; set via `wrangler secret put <NAME>`):
+#   RPC_URL                — Alchemy/other EVM RPC used for the eth_call lookups.
+#   ALCHEMY_WEBHOOK_TOKEN  — shared secret Alchemy includes as `?token=` on POST /.
+#
+# See docs/specs/gas-webhook.md §4 for the full configuration table.
+
+name = "attestmesh-gas-sponsorship-webhook"
+main = "src/index.ts"
+compatibility_date = "2024-09-23"
+
+# Plaintext configuration (spec §4). These are safe to commit; secrets are not.
+[vars]
+EXPECTED_CHAIN_ID = "84532"
+# ClusterDiamondFactory address deployed by DeployInfra.s.sol (placeholder until deploy).
+CANONICAL_CLUSTER_FACTORY = "0x0000000000000000000000000000000000000000"
+# ClusterMemberFactory address deployed by DeployInfra.s.sol (placeholder until deploy).
+CANONICAL_MEMBER_FACTORY = "0x0000000000000000000000000000000000000000"
+CACHE_TTL_SECONDS = "86400"
+LOG_LEVEL = "info"
+
+# KV namespace bindings (spec §4, §8). Replace the placeholder ids with the real
+# namespace ids from `wrangler kv:namespace create <NAME>` before deploying.
+[[kv_namespaces]]
+binding = "FACTORY_PROVENANCE_CACHE"
+id = "REPLACE_WITH_FACTORY_PROVENANCE_CACHE_ID"
+
+[[kv_namespaces]]
+binding = "MEMBER_PROVENANCE_CACHE"
+id = "REPLACE_WITH_MEMBER_PROVENANCE_CACHE_ID"
