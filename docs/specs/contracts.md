@@ -132,6 +132,8 @@ struct Layout {
     // Per-cluster wireguard mesh CIDR (DiamondInit-seeded; immutable thereafter in v1):
     uint32 meshCidrIp;       // packed network address, big-endian (e.g. 0x0a0d0000 for 10.13.0.0)
     uint8 meshCidrPrefix;    // e.g. 16 for /16
+
+    bytes32 cskCommitment;   // keccak256(CSK); set once by the originator (master §8.1)
 }
 ```
 
@@ -199,6 +201,14 @@ interface IAttest is IERC165 {
     function meshCidr() external view returns (uint32 ip, uint8 prefix);
     function meshIpOf(bytes32 memberId) external view returns (uint32);
 
+    // ── CSK commitment ────────────────────────────────────────────
+    // setCskCommitment: originator-only (memberIdOf[msg.sender] == memberIds[0]),
+    //   set-once; stores keccak256(csk) so onboardees can verify a CSK pulled
+    //   off-chain over the mesh. Reverts NotOriginator()/CskCommitmentAlreadySet().
+    function setCskCommitment(bytes32 commitment) external;
+    // cskCommitment: the committed keccak256(csk), or 0 if unset.
+    function cskCommitment() external view returns (bytes32);
+
     // ── Events ────────────────────────────────────────────────────
     event MemberRegistered(
         bytes32 indexed memberId,
@@ -207,6 +217,7 @@ interface IAttest is IERC165 {
         bytes32 xPubKey,
         bytes32 wgPubKey
     );
+    event CskCommitmentSet(bytes32 commitment);
 }
 ```
 
@@ -282,10 +293,9 @@ On success, marks the nonce and emits `MessageSent`. Ciphertext bytes are emitte
 
 | `envelopeId` source string | Purpose | Sender | Recipient |
 |---|---|---|---|
-| `"attestmesh.csk.onboarding.v1"` | Cluster Shared Key onboarding (master spec §8) | Any existing member | A newly-registered onboardee |
 | `"attestmesh.peer-endpoint.v1"` | Wireguard peer-endpoint exchange (master spec §7.1 step 7) | Any cluster member | Any cluster member |
 
-The `DuplicateEnvelope` revert is what implements the CSK-onboarding-dedup race semantics: multiple existing members racing to onboard a new member will all pass the local "any prior onboarding tx?" check inside the racy window, both send, the first lands and the second reverts at zero protocol cost. v1 takes the dedup at face value — no rate-limiting beyond it.
+The `DuplicateEnvelope` revert is a general per-`(recipient, envelopeId)` idempotency guard: for any reserved envelope, the first `send` to a given recipient lands and any subsequent send carrying the same `envelopeId` to that recipient reverts at zero protocol cost. For example, a member re-sending a `PeerEndpoint` after a network retry is deduped rather than emitting a second `MessageSent`. v1 takes the dedup at face value — no rate-limiting beyond it.
 
 ### 5.3 NetworkFacet
 
@@ -761,6 +771,7 @@ Categories:
 - **Dstack allowlist**: `ComposeHashNotAllowed()`, `DeviceNotAllowed()`, `TcbStale()`.
 - **Binding**: `BindingSigInvalid()`.
 - **Messaging**: `DuplicateEnvelope()`, `RecipientNotMember()`.
+- **CSK commitment**: `NotOriginator()`, `CskCommitmentAlreadySet()`.
 - **Admin**: `NotClusterOwner()`, `ClusterDestroyed()` (reserved for milestone B; not used in v1).
 
 ---

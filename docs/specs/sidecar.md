@@ -25,7 +25,7 @@ The sidecar is the per-node process that turns "a CVM running in dstack" into "a
 | Crate | Purpose |
 |---|---|
 | `tokio` (full) | async runtime |
-| `tonic` + `prost` | gRPC client (Indexer) + server (app facade) |
+| `tonic` + `prost` | gRPC client (Indexer) + servers (app facade over UDS, peer control over mesh) |
 | `alloy` (`alloy-primitives`, `alloy-provider`, `alloy-signer`, `alloy-sol-types`) | EVM RPC reads, signing, ABI binding |
 | `alloy-rpc-types-bundler` (or hand-rolled wrappers if upstream isn't ready) | EIP-4337 v0.7 bundler RPC (`eth_sendUserOperation`, `eth_estimateUserOperationGas`, `eth_getUserOperationReceipt`, `eth_getUserOperationNonce`) |
 | `dalek-cryptography` family (`x25519-dalek`, `ed25519-dalek`) | Curve25519 ops |
@@ -40,6 +40,7 @@ The sidecar is the per-node process that turns "a CVM running in dstack" into "a
 
 - gRPC `.proto` for the Indexer subscription (`proto/indexer.proto`) — shared with the indexer component.
 - gRPC `.proto` for the app facade (`proto/agent.proto`) — owned by this component.
+- gRPC `.proto` for the peer-control service (`proto/peer.proto`) — owned by this component.
 - Solidity ABI bindings for AttestFacet / DstackFacet / NetworkFacet / MessageFacet / IndexerRegistry via `alloy-sol-types` / `sol!` macro from the JSON ABIs emitted by `forge build` in `contracts/`.
 
 ---
@@ -67,8 +68,9 @@ sidecar/
 ├── Cargo.toml                       # workspace root (single crate for v1)
 ├── proto/
 │   ├── indexer.proto                # shared with indexer/; v1 lives here, indexer/ imports
-│   └── agent.proto                  # owned here; defines the app facade
-├── build.rs                         # tonic-build for the two protos + alloy sol! bindings
+│   ├── agent.proto                  # owned here; defines the app facade
+│   └── peer.proto                   # owned here; defines the peer-control service (CSK pull over mesh)
+├── build.rs                         # tonic-build for the three protos + alloy sol! bindings
 ├── src/
 │   ├── main.rs                      # entry, arg parsing, tokio runtime spawn
 │   ├── config.rs                    # env-var schema + load
@@ -92,12 +94,13 @@ sidecar/
 │   │   ├── mod.rs                   # send/receive loops
 │   │   ├── packet.rs                # wire format + ed25519 sign/verify
 │   │   └── liveness.rs              # the rolling view + convergence calc
-│   ├── csk.rs                       # origination, onboarding receive/send, sealed storage
-│   ├── envelopes.rs                 # PeerEndpoint + CskOnboardingV1 (de)serialize + sealed-box
+│   ├── csk.rs                       # origination + commitment publish, peer pull (request + serve), sealed storage
+│   ├── envelopes.rs                 # PeerEndpoint (de)serialize + sealed-box
 │   ├── state/
 │   │   ├── mod.rs                   # the bring-up state machine
 │   │   └── gates.rs                 # first-convergence + CSK-acquired gating
-│   ├── agent_grpc.rs                # app-facing tonic server
+│   ├── agent_grpc.rs                # app-facing tonic server (UDS)
+│   ├── peer_grpc.rs                 # peer-control tonic server (bound to mesh IP)
 │   └── health.rs                    # healthcheck endpoints (gRPC + HTTP fallback)
 └── tests/
     ├── integration/                 # end-to-end with mock dstack + mock indexer
@@ -160,14 +163,15 @@ States:
   FreshRegister → DetermineCskRole → (Originator | Onboardee)
   Restart → ReuseMember → SkipToPublishWg
   LostState → Exit(non-zero)
-  Originator → DeriveCsk → SealCsk → PublishWg
+  Originator → DeriveCsk → SealCsk → PublishCskCommitment → PublishWg
   Onboardee → SubscribeIndexer (parallel with PublishWg)
   PublishWg → SubscribeIndexer (if not already)
-  SubscribeIndexer → WaitPeerEndpoints (and, if Onboardee, WaitCskEnvelope in parallel)
-  WaitPeerEndpoints + WaitCskEnvelope (gated) → ConfigureWireguard → StartHeartbeat
+  SubscribeIndexer → WaitPeerEndpoints
+  WaitPeerEndpoints → ConfigureWireguard → StartHeartbeat
   StartHeartbeat → ComputeConvergence → FirstConverged
+  ConfigureWireguard → (Onboardee, on first live tunnel) PullCsk → CskAcquired
   FirstConverged + CskAcquired → Healthy
-  Healthy → SteadyState (handles new joiners, peer drops, indexer reconnects)
+  Healthy → SteadyState (handles new joiners, peer drops, indexer reconnects; serves peer CSK-pull requests)
 ```
 
 ### 7.1 Step-by-step
@@ -184,16 +188,16 @@ The 12 numbered steps from master spec §7.1 map onto modules as follows. This i
 | 5 Publish wireguard | `chain::network_facet::publish` | one tx; idempotent (no-op if value unchanged) |
 | 6 Subscribe to Indexer | `indexer_client::connect` | reads `IndexerRegistry` → opens gRPC stream |
 | 7 Wait peer endpoints | `envelopes::handle_message_sent` | decrypt sealed-box, parse, hand to wg + heartbeat |
-| 7' Wait CSK envelope (onboardee) | `csk::wait_for_onboarding` | parallel with 7 |
+| 7' Pull CSK (onboardee) | `csk::pull_from_peer` | after first live tunnel |
 | 8 Send own endpoint | `envelopes::send_peer_endpoint` | per discovered peer |
 | 9 Heartbeat | `heartbeat::send_loop` + `heartbeat::recv_loop` | 2s interval, 3-miss threshold |
 | 10 Convergence gate | `state::gates::first_converged` | fires exactly once |
 | 11 Become healthy | `health::set_ready` | dual-gate: first-converged AND CSK-acquired |
-| 12 Steady-state | `state::steady_state` | handles new-member onboarding (with [0,500]ms backoff), peer drops, indexer reconnects |
+| 12 Steady-state | `state::steady_state` | serves peer CSK-pull requests, handles peer drops, indexer reconnects |
 
 ### 7.2 State transitions are observable
 
-Every state change emits a `tracing::info!` event with a `phase` field (`booting`, `registering`, `subscribing`, `waiting-peers`, `waiting-csk`, `wg-configuring`, `heartbeating`, `converging`, `healthy`). The healthcheck (§14) exposes the current phase so operators can diagnose where a boot stuck.
+Every state change emits a `tracing::info!` event with a `phase` field (`booting`, `registering`, `subscribing`, `waiting-peers`, `pulling-csk`, `wg-configuring`, `heartbeating`, `converging`, `healthy`). The healthcheck (§14) exposes the current phase so operators can diagnose where a boot stuck.
 
 ---
 
@@ -241,6 +245,7 @@ Used at startup, before the Indexer subscription is established:
 - `IndexerRegistry.current()` — finds the v1 Indexer endpoint + pubkey.
 - `AttestFacet.memberOf(memberAddr)` — restart detection (§7.1 step 4).
 - `AttestFacet.memberCount()` — CSK-role determination (§7.1 step 4a).
+- `AttestFacet.cskCommitment()` — verifying a pulled CSK against the on-chain commitment (§13 onboardee path). Read when a pull response arrives rather than at startup, but uses the same direct-RPC path.
 
 Every other chain read goes via the Indexer.
 
@@ -301,7 +306,7 @@ The proto file itself is canonical for codegen; both this spec and indexer.md mu
 
 - Read `IndexerRegistry.current()` at boot. Cache `indexerPubKey` and `endpoint`.
 - Open a single bidi stream. Send `Hello`. Verify the first `PushEnvelope`'s `indexer_attestation` matches the registry's `codeId`. Verify `indexer_signature` against the registry's `pubKey`.
-- On every push: verify signature, decode event, dispatch to the appropriate handler (`MessageSent` → envelopes; `MemberRegistered` → state machine + maybe-onboard; `WgKeyPublished` → wg peer-key refresh; `MemberRemoved` (milestone B) → wg peer drop).
+- On every push: verify signature, decode event, dispatch to the appropriate handler (`MessageSent` → envelopes; `MemberRegistered` → state machine; `WgKeyPublished` → wg peer-key refresh; `MemberRemoved` (milestone B) → wg peer drop).
 - On every successfully-handled push: send `Ack(blockNumber, logIndex)` so the Indexer can advance its cursor for this subscriber.
 - On stream drop: exponential backoff `min(2^n s, 30s)` reconnect; resume from last-acked cursor. Re-read `IndexerRegistry.current()` on each retry in case the Indexer pubkey rotated.
 - Sampling spot-check: every Nth push (configurable, default disabled in v1, off-by-design opt-in), execute `rpc_repro` against `RPC_URL` and compare. Mismatch → log loudly, do not abort.
@@ -456,7 +461,7 @@ message ClusterSharedKey { bytes key = 1; }   // 32 bytes
 ### 12.3 Semantics
 
 - `SendMessage`: sidecar encrypts payload with sealed-box to `recipient_member_id`'s `xPubKey` (read from local cache → fallback `AttestFacet.xPubKeyOf` via RPC), submits `MessageFacet.send(recipient, envelope_id, ciphertext)`. Returns when the tx is mined (12s on Sepolia worst case). On revert (`DuplicateEnvelope`, `RecipientNotMember`), returns `FailedPrecondition` with a descriptive message.
-- `SubscribeMessages`: stream every successfully-decrypted incoming message whose recipient is self and whose kind is *not* a sidecar-internal type (`peer-endpoint.v1`, `csk-onboarding.v1`). Failed decryptions are silently dropped. Catchup behavior: streams everything the sidecar has accumulated since startup; the app is expected to handle dedup if it restarts.
+- `SubscribeMessages`: stream every successfully-decrypted incoming message whose recipient is self and whose kind is *not* the sidecar-internal type `peer-endpoint.v1`. Failed decryptions are silently dropped. Catchup behavior: streams everything the sidecar has accumulated since startup; the app is expected to handle dedup if it restarts.
 - `SubscribePeerEvents`: stream `PeerJoined` (on MemberRegistered + endpoint) and `PeerLiveness` (on heartbeat status changes).
 - `GetClusterSharedKey`: returns the 32-byte CSK. Returns `Unavailable` before acquisition.
 - `GetSelf` / `GetMeshStatus` / `ListPeers`: trivial reads of in-memory state.
@@ -465,19 +470,44 @@ message ClusterSharedKey { bytes key = 1; }   // 32 bytes
 
 - `SubscribeMessages` and `SubscribePeerEvents` use bounded channels (capacity 1024). On full channel, the sidecar logs at warn and drops the *oldest* unconsumed event. The app should consume promptly or lose history. Milestone B revisits with explicit backpressure.
 
+### 12.5 Peer-control gRPC
+
+Distinct from the app-facing façade (§12.1–§12.4). This is a second tonic server (`src/peer_grpc.rs`) bound to the node's **mesh IP** on the `attestmesh0` wireguard interface — not the app UDS — so the only callers are other cluster members reachable over the encrypted mesh. It carries the CSK peer-pull described in §13.
+
+```proto
+// proto/peer.proto — owned by this component
+service PeerControl {
+  rpc RequestClusterSharedKey(CskRequest) returns (SealedCsk);
+}
+
+message CskRequest {
+  bytes32 requester_member_id = 1;
+}
+message SealedCsk {
+  bytes sealed_csk = 1;        // CSK sealed-boxed (x25519) to the requester's on-chain xPubKey
+}
+```
+
+Semantics:
+- `RequestClusterSharedKey`: the responder verifies `requester_member_id` is a current member (its `xPubKey` exists in `AttestFacet`), then returns the CSK sealed-boxed to that `xPubKey`. If the responder does not hold the CSK yet, it returns gRPC `Unavailable`. See §13 for both the request (onboardee pull) and serve sides.
+
 ---
 
 ## 13. Cluster Shared Key handling
 
 Per master spec §8.
 
-- **Originator path** (§8.1): derive via `dstack.derive_key("attestmesh.cluster-shared.v1", "csk-v1") → [u8;32]`. Seal via `dstack.seal("attestmesh.csk.v1", csk)`. Cache in process memory. Mark `csk_acquired = true`.
-- **Onboardee path** (§8.3): on every `MessageSent` event delivered to this member with `envelope_id == keccak256("attestmesh.csk.onboarding.v1")`: sealed-box decrypt → validate `kind == "csk-onboarding-v1"` → read `csk` → check sender is a current cluster member by their event-asserted `senderMemberId` (already Indexer-verified) → seal via dstack → cache → mark `csk_acquired = true`. Subsequent CSK-onboarding events for self are no-ops.
+- **Originator path** (§8.1): derive via `dstack.derive_key("attestmesh.cluster-shared.v1", "csk-v1") → [u8;32]`. Seal via `dstack.seal("attestmesh.csk.v1", csk)`. Cache in process memory. Mark `csk_acquired = true`. Then publish the commitment once: `AttestFacet.setCskCommitment(keccak256(csk))` (master §8.1). The CSK itself never goes on chain — only the commitment does.
+- **Onboardee path** (§8.3, peer pull): once the onboardee has ≥1 live wireguard tunnel to a member, it pulls the CSK over the mesh rather than waiting for any on-chain envelope:
+  1. Pick a connected peer and call `PeerControl.RequestClusterSharedKey(CskRequest { requester_member_id: self.memberId })` on its peer-control endpoint (the responder's mesh IP — see §12.5).
+  2. If the responder returns gRPC `Unavailable` (it doesn't hold the CSK yet), try another connected peer.
+  3. On a `SealedCsk { sealed_csk }` response: sealed-box open with this node's x25519 private key → verify `keccak256(csk) == AttestFacet.cskCommitment()` (a direct on-chain view read, like the `memberCount()` read in §8.4). On mismatch, discard and try another connected peer.
+  4. On success: `dstack.seal("attestmesh.csk.v1", csk)`, cache in process memory, mark `csk_acquired = true`.
 - **Restart path** (§7.1 step 4): `dstack.unseal("attestmesh.csk.v1") → csk` → cache → mark `csk_acquired = true`.
-- **Onboarding a new peer** (steady-state, master spec §8.2): on `MemberRegistered` for a peer we don't know yet:
-  1. Sleep `Uniform([0, 500])` ms.
-  2. Query the recipient's MessageFacet channel for envelope `keccak256("attestmesh.csk.onboarding.v1")` — implemented as a single Indexer query (`get_envelope(recipient_member_id, envelope_id)`).
-  3. If absent: sealed-box-encrypt the CSK with the new peer's `xPubKey`, submit `MessageFacet.send(...)`. If the tx reverts with `DuplicateEnvelope` (someone won the race), log at info and move on.
+- **Serving a peer's pull** (steady-state, master spec §8.2): a member that already holds the CSK answers `PeerControl.RequestClusterSharedKey` from a peer over the mesh:
+  1. Verify the requester is a current cluster member — its `xPubKey` exists in `AttestFacet` for `requester_member_id`.
+  2. Sealed-box-encrypt the CSK to that `xPubKey` and return it as `SealedCsk { sealed_csk }`. No `MessageFacet.send`, no on-chain transaction, no `[0,500]ms` backoff, no `DuplicateEnvelope` handling.
+  3. If this node does not hold the CSK yet, return gRPC `Unavailable`.
 
 ---
 
@@ -493,7 +523,7 @@ Phases reported (`MeshStatus.phase`):
 - `registering` — pre-`dstack_register` tx
 - `subscribing` — opening Indexer stream
 - `waiting-peers` — Indexer connected, awaiting `PeerEndpoint` envelopes
-- `waiting-csk` — onboardees only: awaiting `csk-onboarding-v1` envelope
+- `pulling-csk` — onboardees only: pulling the CSK from a connected peer over the mesh
 - `wg-configuring` — adding peers to wireguard
 - `heartbeating` — peers added, awaiting first convergence
 - `healthy` — both gates passed; the application container is now allowed to start
@@ -504,7 +534,7 @@ Phases reported (`MeshStatus.phase`):
 
 - **Registration revert** (any reason except `AlreadyRegistered` — see §7.1 step 4): exit non-zero. docker-compose restart policy applies; if the cause is allowlist-related, the loop continues until ops intervenes.
 - **Indexer down**: exponential backoff reconnect. Healthcheck phase stuck at `subscribing` for joiners; healthy nodes stay healthy (first-converged gate fires once).
-- **CSK envelope never arrives**: phase stuck at `waiting-csk` (onboardees). Operational fix required.
+- **CSK pull fails (no reachable peer holds it)**: phase stuck at `pulling-csk` (onboardees). Operational fix required.
 - **Convergence never reached**: phase stuck at `heartbeating`. Same.
 - **wg netlink errors**: log at error, retry. Persistent failure → exit non-zero (capability issue or kernel mismatch).
 - **dstack socket unavailable**: exit non-zero at boot; cannot operate without the runtime.
@@ -520,18 +550,18 @@ Phases reported (`MeshStatus.phase`):
 - `envelopes::{seal,open}` round-trip.
 - `heartbeat::packet::{sign,verify}` round-trip; malformed sig rejection.
 - `heartbeat::liveness::compute` against fixture views.
-- `csk::{originator_derive,onboardee_receive,steady_state_onboard}` against mock Indexer events.
+- `csk::{originator_derive, onboardee_pull, serve_pull}` against a mock peer-control endpoint + a mock `cskCommitment()` read.
 
 ### 16.2 Integration
 
 `tests/integration/` runs a fake dstack socket + a fake Indexer + a foundry-anvil RPC, brings up three sidecar instances, asserts:
 
 1. All three reach `healthy`.
-2. Originator derives CSK; onboardees receive it; all three `GetClusterSharedKey` return identical bytes.
+2. Originator derives CSK; onboardees pull it; all three `GetClusterSharedKey` return identical bytes.
 3. Each sidecar's `ListPeers` returns the other two.
 4. Heartbeat liveness reflects connection state.
 5. `SendMessage` from A to B is observed in B's `SubscribeMessages` stream as a decrypted payload; not observed in C's stream.
-6. Killing the originator and bringing up a fourth onboardee still succeeds (one of the remaining two onboards them).
+6. Killing the originator and bringing up a fourth onboardee still succeeds (the fourth pulls from one of the remaining two).
 7. Killing the Indexer mid-flight: existing healthy sidecars stay healthy; a fresh sidecar boots and stays at `subscribing` phase.
 
 No fuzz tests for v1. No mainnet-fork tests. No actual dstack hardware tests; those are milestone B.

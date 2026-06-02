@@ -163,6 +163,7 @@ export const ALLOWED_SELECTORS = [
   selectorOf("dstack_register(DstackProof,address,bytes32,bytes32)"),
   selectorOf("publishWgKey(bytes32)"),
   selectorOf("send(bytes32,bytes32,bytes)"),
+  selectorOf("setCskCommitment(bytes32)"),         // originator publishes keccak256(CSK) once (master §8.1)
 
   // Cluster ownership transitions (used during deploy + Safe rotation):
   selectorOf("transferClusterOwnership(address)"),
