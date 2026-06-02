@@ -1,6 +1,6 @@
 # AttestMesh Gas Sponsorship Webhook — Component Spec
 
-**Status**: Draft v0.1
+**Status**: Implemented v1 (was Draft v0.1; 2026-06-02)
 **Parent spec**: [`attestmesh-coordination-layer.md`](./attestmesh-coordination-layer.md) (especially §13 item 18)
 **Component**: `services/gas-sponsorship-webhook/`
 **Last updated**: 2026-05-30

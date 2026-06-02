@@ -1,6 +1,6 @@
 # AttestMesh Sidecar — Component Spec
 
-**Status**: Draft v0.1
+**Status**: Implemented v1 (was Draft v0.1; 2026-06-02)
 **Parent spec**: [`attestmesh-coordination-layer.md`](./attestmesh-coordination-layer.md) (especially §7, §8)
 **Component**: `sidecar/`
 **Binary**: `cluster-mesh-agent`

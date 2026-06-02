@@ -1,6 +1,6 @@
 # AttestMesh — Coordination Layer Master Spec
 
-**Status**: Draft v0.4
+**Status**: Implemented v1 (was Draft v0.4; 2026-06-02)
 **Authors**: LSDan
 **Last updated**: 2026-06-02
 
@@ -129,7 +129,7 @@ Events:
 Internal surface (callable only by other facets in the same diamond, gated on `address(this) == msg.sender` or equivalent):
 
 - `_addMember(MemberRecord) → memberId`
-- `_setWgPubKey(memberId, bytes32)`
+- `_setWgMirror(memberId, bytes32)` — updates the denormalized wg-pubkey mirror in MemberStorage. The canonical wg-pubkey writer is `NetworkFacet._setWgPubKey` (it owns NetworkStorage and calls this for the mirror); the two selectors are split so neither clashes in the diamond cut. See contracts spec §5.1/§5.3.
 
 AttestFacet does **not** verify attestation proofs itself. Verification lives in attestor facets. AttestFacet is purely the member-registry side of the bookkeeping.
 

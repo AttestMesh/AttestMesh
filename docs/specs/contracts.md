@@ -1,6 +1,6 @@
 # AttestMesh Contracts — Component Spec
 
-**Status**: Draft v0.1
+**Status**: Implemented v1 (was Draft v0.1; 2026-06-02)
 **Parent spec**: [`attestmesh-coordination-layer.md`](./attestmesh-coordination-layer.md)
 **Component**: `contracts/`
 **Last updated**: 2026-05-30
@@ -134,6 +134,7 @@ struct Layout {
     uint8 meshCidrPrefix;    // e.g. 16 for /16
 
     bytes32 cskCommitment;   // keccak256(CSK); set once by the originator (master §8.1)
+    address memberFactory;   // canonical per-chain ClusterMemberFactory (DstackFacet isOurMember check, §6.3 step 1)
 }
 ```
 
@@ -191,7 +192,7 @@ interface IAttest is IERC165 {
     function memberOf(address account) external view returns (MemberStorage.MemberRecord memory);
     function memberById(bytes32 memberId) external view returns (MemberStorage.MemberRecord memory);
     function xPubKeyOf(bytes32 memberId) external view returns (bytes32);
-    function wgPubKeyOf(bytes32 memberId) external view returns (bytes32);
+    function wgPubKeyOf(bytes32 memberId) external view returns (bytes32); // convenience mirror — see the de-collision note below; the diamond serves NetworkFacet's selector
     function listMembers() external view returns (bytes32[] memory);
     function memberCount() external view returns (uint256);
 
@@ -225,10 +226,12 @@ interface IAttest is IERC165 {
 
 ```solidity
 function _addMember(MemberStorage.MemberRecord calldata rec) external returns (bytes32 memberId);
-function _setWgPubKey(bytes32 memberId, bytes32 wgPubKey) external;
+function _setWgMirror(bytes32 memberId, bytes32 wgPubKey) external;
 ```
 
 `_addMember` reverts if `memberIdOf[rec.memberContract] != 0` (no double-registration).
+
+**Selector de-collision (wg pubkey).** The wg-pubkey read (`wgPubKeyOf`) and the canonical wg-pubkey writer are logically shared between AttestFacet (the denormalized `MemberRecord.wgPubKey` mirror) and NetworkFacet (the canonical `NetworkStorage` value), but a diamond can register each 4-byte selector on only one facet. The v1 cut therefore registers `wgPubKeyOf(bytes32)` and the canonical internal writer `_setWgPubKey` on **NetworkFacet** (§5.3); AttestFacet exposes only the mirror updater `_setWgMirror` (above) and keeps an *unregistered* `wgPubKeyOf` implementation for reads against MemberStorage. This is the same resolution the master spec applies to `listMembers` (master §3.3).
 
 **Cluster-ownership management.** Two distinct ownership concepts live on the diamond — the solidstate owner (DiamondCut authority, exposed by `SolidStateDiamond`'s SafeOwnable) and the cluster owner (allowlist + admin authority, stored in `MemberStorage.clusterOwner`). In production both are typically the same Safe; the runbook for rotating that Safe needs to update both. AttestFacet exposes both an independent transfer for the cluster-owner side and a fused helper for the common case where both should move together.
 
@@ -299,13 +302,18 @@ The `DuplicateEnvelope` revert is a general per-`(recipient, envelopeId)` idempo
 
 ### 5.3 NetworkFacet
 
-**Storage**: `NetworkStorage` + writes to `MemberStorage` (via AttestFacet's internal `_setWgPubKey`).
+**Storage**: `NetworkStorage` + writes to `MemberStorage` (via AttestFacet's internal `_setWgMirror`).
 **Interface**: `INetwork`.
 
 ```solidity
 interface INetwork is IERC165 {
     function publishWgKey(bytes32 wgPubKey) external;
     function wgPubKeyOf(bytes32 memberId) external view returns (bytes32);
+
+    // Canonical internal writer, gated msg.sender == address(this). Called by
+    // DstackFacet at registration (§6.3 step 9) and by publishWgKey; writes
+    // NetworkStorage and updates the MemberStorage mirror via AttestFacet._setWgMirror.
+    function _setWgPubKey(bytes32 memberId, bytes32 wgPubKey) external;
 
     event WgKeyPublished(bytes32 indexed memberId, bytes32 wgPubKey);
 }
@@ -314,7 +322,7 @@ interface INetwork is IERC165 {
 `publishWgKey`:
 - Reverts if `msg.sender` is not a cluster member.
 - Writes `wgPubKey` to `NetworkStorage.wgPubKeys[senderMemberId]`.
-- Calls `AttestFacet._setWgPubKey(senderMemberId, wgPubKey)` to update the mirror.
+- Calls `AttestFacet._setWgMirror(senderMemberId, wgPubKey)` to update the mirror.
 - Emits `WgKeyPublished`.
 
 ---
@@ -340,7 +348,7 @@ function allowedComposeHashes(bytes32) external view returns (bool);
 function allowedDeviceIds(bytes32) external view returns (bool);
 function allowAnyDevice() external view returns (bool);
 function requireTcbUpToDate() external view returns (bool);
-function owner() external view returns (address);             // returns cluster owner from MemberStorage
+function owner() external view returns (address);             // returns cluster owner from MemberStorage. NOTE: NOT registered in the diamond cut — the SolidState SafeOwnable base already owns the owner() selector (the solidstate owner), which equals MemberStorage.clusterOwner in the common single-Safe deployment. DstackFacet implements owner() but it stays unregistered.
 function version() external view returns (uint256);           // returns 1 in v1
 
 event ComposeHashAdded(bytes32 indexed composeHash);
@@ -473,6 +481,7 @@ contract DiamondInit {
         bool requireTcbUpToDate;
         uint32 meshCidrIp;                // network address of the cluster's wireguard CIDR (e.g. 10.13.0.0 → 0x0a0d0000)
         uint8 meshCidrPrefix;             // prefix length (e.g. 16 for /16). Sidecars compute peer IPs deterministically.
+        address memberFactory;            // canonical per-chain ClusterMemberFactory; read by DstackFacet for the on-chain isOurMember provenance check (§6.3 step 1)
     }
 
     function init(InitArgs calldata args) external {
@@ -491,6 +500,7 @@ contract DiamondInit {
         m.clusterOwner = args.clusterOwner;
         m.meshCidrIp = args.meshCidrIp;
         m.meshCidrPrefix = args.meshCidrPrefix;
+        m.memberFactory = args.memberFactory;
     }
 }
 ```
@@ -652,7 +662,7 @@ contract ClusterDiamondFactory {
         external
         returns (address cluster);
 
-    function predictClusterAddress(bytes32 salt)
+    function predictClusterAddress(DiamondInit.InitArgs calldata args, bytes32 salt)
         external
         view
         returns (address);
