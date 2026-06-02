@@ -1,0 +1,67 @@
+[package]
+name = "cluster-mesh-agent"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.78"
+description = "AttestMesh node sidecar — registration, mesh bring-up, heartbeats, CSK"
+
+[lib]
+name = "cluster_mesh_agent"
+path = "src/lib.rs"
+
+[[bin]]
+name = "cluster-mesh-agent"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+tokio-stream = { version = "0.1", features = ["net"] }
+tonic = "0.12"
+prost = "0.13"
+prost-types = "0.13"
+
+# Curve25519 operational keys + sealed boxes
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+crypto_box = { version = "0.9", features = ["std"] }
+blake2 = "0.10"
+zeroize = { version = "1", features = ["derive"] }
+
+# Hashing / encoding
+sha3 = "0.10"
+ciborium = "0.2"
+serde = { version = "1", features = ["derive"] }
+hex = "0.4"
+rand = "0.8"
+base64 = "0.22"
+
+# EVM RPC reads, signing, ABI, bundler RPC
+alloy = { version = "0.8", features = [
+    "providers",
+    "provider-http",
+    "signers",
+    "signer-local",
+    "sol-types",
+    "rpc-types-eth",
+    "contract",
+    "network",
+] }
+reqwest = { version = "0.12", features = ["json"] }
+serde_json = "1"
+
+# Observability + errors
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
+anyhow = "1"
+thiserror = "1"
+async-trait = "0.1"
+
+# Health endpoint
+axum = "0.7"
+
+[build-dependencies]
+tonic-build = "0.12"
+protoc-bin-vendored = "3"
+
+[dev-dependencies]
+tempfile = "3"
