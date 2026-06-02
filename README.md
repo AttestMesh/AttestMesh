@@ -16,7 +16,7 @@ Any application that needs a mesh of attested peers — a database cluster, a pr
   - **Attestor facets** (one per attestation method; cluster picks which to install via `diamondCut`):
     - **DstackFacet** — ships in v1. Implements dstack's `IAppAuth` + `IAppAuthBasicManagement` so existing dstack tooling (phala-cli, dashboards, the dstack KMS) works unchanged. Verifies the dstack KMS signature chain and writes admitted members into AttestFacet's storage.
     - **IntelTdxFacet / AmdSnpFacet / NvidiaCcFacet** — future. Each adds a new attestation method without touching the core facets.
-- **ClusterMember** — per-node passthrough proxies, one per node. Address is deterministic and is what the attestation chain commits to. Forwards a small fixed selector set into the diamond.
+- **ClusterMember** — one per node, combining two roles on a single deterministic address: a dstack-style app proxy (so dstack tooling and the KMS recognize the node via `IAppAuth`) and an EIP-4337 smart wallet (so the sidecar submits gasless, paymaster-sponsored UserOps). The address is what the attestation chain commits to and what the diamond sees as `msg.sender`.
 - **Indexer** — a shared attested off-chain service that watches all cluster contracts on a chain, pairs each event with a signed attestation and an RPC repro stub, and pushes events only to the members of the cluster that emitted them. Members trust the Indexer for liveness/completeness; correctness stays independently verifiable per event. Follows the dstackgres monitoring-hub pattern.
 - **Cluster Shared Key (CSK)** — a single 32-byte symmetric key every member of a cluster holds. Derived deterministically by the first member to register via dstack key-derivation; distributed to subsequent members via sealed-box-encrypted on-chain envelopes with built-in dedup. The cluster contract never sees the plaintext. Exposed to the application container through the sidecar gRPC; application uses it for whatever cluster-wide encryption it needs.
 - **Node sidecar** (Rust) — boots inside every node, derives identity / messaging / wireguard keys from a single Curve25519 attestation-bound seed (x25519 for sealed-box, Ed25519 for heartbeat signatures), commits those pubkeys into the attestation quote's user-data slot, registers with the appropriate attestor facet, subscribes to the Indexer, exchanges endpoint info via MessageFacet, brings up the wireguard mesh, runs heartbeats, and only reports healthy once the mesh is converged.
@@ -25,7 +25,7 @@ See [`docs/specs/attestmesh-coordination-layer.md`](docs/specs/attestmesh-coordi
 
 ## Status
 
-Pre-alpha. The contracts are being extracted from dstackgres; the sidecar is being built fresh. There are open design questions tracked at the end of the master spec.
+Pre-alpha. The contracts are being extracted from dstackgres; the sidecar is being built fresh. Resolved design decisions (and any remaining open questions) are tracked at the end of the master spec.
 
 ## Repo layout
 
