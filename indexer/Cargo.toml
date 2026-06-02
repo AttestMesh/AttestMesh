@@ -1,0 +1,73 @@
+[package]
+name = "attestmesh-indexer"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.78"
+description = "AttestMesh Indexer — attested off-chain event distribution for ClusterDiamonds"
+
+# A lib target exposes every module to the unit/integration tests; the bin is a thin
+# wrapper that calls into it.
+[lib]
+name = "attestmesh_indexer"
+path = "src/lib.rs"
+
+[[bin]]
+name = "attestmesh-indexer"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+tokio-stream = "0.1"
+tonic = "0.12"
+prost = "0.13"
+
+# EVM RPC reads (eth_getLogs / eth_blockNumber / eth_chainId), ABI event decoding,
+# contract view calls. Mirrors the sidecar's validated alloy 0.8 feature set.
+alloy = { version = "0.8", features = [
+    "providers",
+    "provider-http",
+    "signers",
+    "signer-local",
+    "sol-types",
+    "rpc-types-eth",
+    "contract",
+    "network",
+] }
+# RLP for the verifiable event_data field of the push envelope.
+alloy-rlp = "0.3"
+
+# Identity + envelope signing.
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+zeroize = { version = "1", features = ["derive"] }
+sha3 = "0.10"
+# Deterministic CBOR for the envelope-signing view (same encoder family the sidecar
+# uses for its heartbeat — sidecar spec §17 item 2).
+ciborium = "0.2"
+
+# Persistent per-(cluster, member) cursor store (spec §9).
+sled = "0.34"
+
+# Observability + errors.
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
+anyhow = "1"
+thiserror = "1"
+async-trait = "0.1"
+
+# Health + metrics HTTP endpoint (spec §12).
+axum = "0.7"
+prometheus = "0.13"
+
+# dstack UDS prod client + misc encoding.
+reqwest = { version = "0.12", features = ["json"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+hex = "0.4"
+rand = "0.8"
+
+[build-dependencies]
+tonic-build = "0.12"
+protoc-bin-vendored = "3"
+
+[dev-dependencies]
+tempfile = "3"
