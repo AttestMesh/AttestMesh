@@ -1,0 +1,114 @@
+// SPDX-License-Identifier: MIT
+pragma solidity 0.8.24;
+
+import { Test } from "forge-std/Test.sol";
+import { MessageHashUtils } from "@openzeppelin/contracts/utils/cryptography/MessageHashUtils.sol";
+import {
+    PackedUserOperation
+} from "@account-abstraction/contracts/interfaces/PackedUserOperation.sol";
+
+import { ClusterMember } from "../../src/members/ClusterMember.sol";
+import { ClusterMemberFactory } from "../../src/members/ClusterMemberFactory.sol";
+import { IDstackFacet } from "../../src/interfaces/IDstackFacet.sol";
+
+/// @notice Exercises ClusterMember.validateUserOp bootstrap + standard modes
+///         without a live EntryPoint/bundler (contracts spec §9.1.2).
+contract ClusterMemberUserOpTest is Test {
+    ClusterMemberFactory internal factory;
+    ClusterMember internal member;
+    address internal cluster = address(0xC0FFEE);
+    address internal entryPoint;
+
+    uint256 internal constant BIND_PRIV = 0xB17D;
+    bytes32 internal constant XPUB = bytes32("xpub");
+    bytes32 internal constant WGPUB = bytes32("wgpub");
+
+    function setUp() public {
+        address impl = address(new ClusterMember());
+        factory = new ClusterMemberFactory(impl, address(0xA11CE));
+        member = ClusterMember(payable(factory.deployMember(cluster, keccak256("m1"))));
+        entryPoint = member.ENTRY_POINT();
+    }
+
+    function test_bootstrapAcceptsMatchingSigner() public {
+        bytes32 userOpHash = keccak256("uoh-1");
+        PackedUserOperation memory op = _bootstrapOp(BIND_PRIV, BIND_PRIV, userOpHash);
+
+        vm.prank(entryPoint);
+        uint256 validationData = member.validateUserOp(op, userOpHash, 0);
+        assertEq(validationData, 0, "should accept when userOp signer == binding signer");
+    }
+
+    function test_bootstrapRejectsMismatchedSigner() public {
+        bytes32 userOpHash = keccak256("uoh-2");
+        // UserOp signed by a different key than the binding.
+        PackedUserOperation memory op = _bootstrapOp(BIND_PRIV, 0xBEEF, userOpHash);
+
+        vm.prank(entryPoint);
+        uint256 validationData = member.validateUserOp(op, userOpHash, 0);
+        assertEq(validationData, 1, "should reject mismatched signer");
+    }
+
+    function test_standardModeAfterOwnerSet() public {
+        // Cluster installs the owner (simulating the dstack_register callback).
+        vm.prank(cluster);
+        member.__setOwnerFromCluster(vm.addr(BIND_PRIV));
+
+        bytes32 userOpHash = keccak256("uoh-3");
+        PackedUserOperation memory op;
+        op.sender = address(member);
+        op.signature = _sign(BIND_PRIV, MessageHashUtils.toEthSignedMessageHash(userOpHash));
+
+        vm.prank(entryPoint);
+        assertEq(member.validateUserOp(op, userOpHash, 0), 0);
+
+        // Wrong signer fails.
+        op.signature = _sign(0xBEEF, MessageHashUtils.toEthSignedMessageHash(userOpHash));
+        vm.prank(entryPoint);
+        assertEq(member.validateUserOp(op, userOpHash, 0), 1);
+    }
+
+    function test_onlyEntryPointCanValidate() public {
+        PackedUserOperation memory op;
+        vm.expectRevert();
+        member.validateUserOp(op, keccak256("x"), 0);
+    }
+
+    function test_executeOnlyEntryPoint() public {
+        vm.expectRevert();
+        member.execute(cluster, 0, "");
+    }
+
+    // ── helpers ───────────────────────────────────────────────────────────────
+
+    /// Build a bootstrap UserOp whose callData is execute(cluster, 0, dstack_register(...))
+    /// with the binding sig from `bindPriv`, and the outer userOp signed by `opPriv`.
+    function _bootstrapOp(uint256 bindPriv, uint256 opPriv, bytes32 userOpHash)
+        internal
+        view
+        returns (PackedUserOperation memory op)
+    {
+        bytes32 bindHash = MessageHashUtils.toEthSignedMessageHash(
+            keccak256(abi.encode("attestmesh.bind.v1", cluster, address(member), XPUB, WGPUB))
+        );
+
+        IDstackFacet.DstackProof memory proof;
+        proof.advisoryIds = new string[](0);
+        proof.bindingSig = _sign(bindPriv, bindHash);
+
+        bytes memory inner = abi.encodeWithSelector(
+            IDstackFacet.dstack_register.selector, proof, address(member), XPUB, WGPUB
+        );
+        bytes memory callData =
+            abi.encodeWithSelector(ClusterMember.execute.selector, cluster, uint256(0), inner);
+
+        op.sender = address(member);
+        op.callData = callData;
+        op.signature = _sign(opPriv, MessageHashUtils.toEthSignedMessageHash(userOpHash));
+    }
+
+    function _sign(uint256 priv, bytes32 digest) internal pure returns (bytes memory) {
+        (uint8 v, bytes32 r, bytes32 s) = vm.sign(priv, digest);
+        return abi.encodePacked(r, s, v);
+    }
+}

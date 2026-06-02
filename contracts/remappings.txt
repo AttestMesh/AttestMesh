@@ -1,0 +1,5 @@
+@openzeppelin/contracts/=lib/openzeppelin-contracts/contracts/
+@openzeppelin/contracts-upgradeable/=lib/openzeppelin-contracts-upgradeable/contracts/
+@solidstate/contracts/=lib/solidstate-solidity/contracts/
+@account-abstraction/contracts/=lib/account-abstraction/contracts/
+forge-std/=lib/forge-std/src/
