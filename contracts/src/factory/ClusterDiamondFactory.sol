@@ -65,15 +65,19 @@ contract ClusterDiamondFactory {
         emit ClusterDeployed(cluster, args.clusterOwner, salt);
     }
 
-    function predictClusterAddress(bytes32 salt) external view returns (address) {
-        // NB: the constructor args (facet addresses, init calldata) are part of the
-        // CREATE2 init code, but only the salt varies per call here. Callers that
-        // need an exact prediction must pass the same InitArgs to deployCluster.
+    /// @notice Exact CREATE2 prediction. The init calldata (and thus the address)
+    ///         depends on `args`, so the same `args` must be passed to deployCluster.
+    function predictClusterAddress(DiamondInit.InitArgs calldata args, bytes32 salt)
+        external
+        view
+        returns (address)
+    {
         IERC2535DiamondCutInternal.FacetCut[] memory cuts =
             ClusterCut.buildFacetCuts(attestFacet, messageFacet, networkFacet, dstackFacet);
+        bytes memory initCalldata = abi.encodeCall(DiamondInit.init, (args));
         bytes32 initCodeHash = keccak256(
             abi.encodePacked(
-                type(ClusterDiamond).creationCode, abi.encode(cuts, diamondInitImpl, bytes(""))
+                type(ClusterDiamond).creationCode, abi.encode(cuts, diamondInitImpl, initCalldata)
             )
         );
         return Create2.computeAddress(salt, initCodeHash);

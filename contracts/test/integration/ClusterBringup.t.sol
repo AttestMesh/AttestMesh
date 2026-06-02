@@ -245,6 +245,34 @@ contract ClusterBringupTest is Test {
         assertEq(IAttest(cluster).meshIpOf(bytes32(uint256(0xaa))), 168680749); // 10.13.221.45
     }
 
+    // ── factory address prediction is exact (audit R5) ────────────────────────
+
+    function test_predictClusterAddressMatchesDeploy() public {
+        DiamondInit.InitArgs memory args = _initArgs();
+        bytes32 salt = keccak256("cluster-2");
+        address predicted = clusterFactory.predictClusterAddress(args, salt);
+        address deployed = clusterFactory.deployCluster(args, salt);
+        assertEq(predicted, deployed, "prediction must match the deployed CREATE2 address");
+    }
+
+    function _initArgs() internal view returns (DiamondInit.InitArgs memory) {
+        bytes32[] memory composes = new bytes32[](1);
+        composes[0] = COMPOSE;
+        bytes32[] memory devices = new bytes32[](1);
+        devices[0] = DEVICE;
+        return DiamondInit.InitArgs({
+            clusterOwner: address(this),
+            kmsRootSigner: kms.rootAddress(),
+            initialComposeHashes: composes,
+            initialDeviceIds: devices,
+            allowAnyDevice: false,
+            requireTcbUpToDate: false,
+            meshCidrIp: 0x0a0d0000,
+            meshCidrPrefix: 16,
+            memberFactory: address(memberFactory)
+        });
+    }
+
     // ── helpers ───────────────────────────────────────────────────────────────
 
     function _register(
