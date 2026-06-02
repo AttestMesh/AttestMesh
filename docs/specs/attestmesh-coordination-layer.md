@@ -369,7 +369,7 @@ Immediately after deriving and sealing, the originator publishes the CSK commitm
 
 The CSK is delivered over the wireguard mesh, never on chain. `PeerEndpoint` exchange (§7.1) brings up the mesh; once an onboardee has at least one live tunnel to a member that already holds the CSK, it pulls:
 
-1. **Request.** The onboardee calls `PeerControl.RequestClusterSharedKey(self.memberId)` on a connected peer over a sidecar-to-sidecar gRPC channel bound to the mesh interface (sidecar spec §12.5). The request rides inside the wireguard tunnel, so it is already authenticated and encrypted in transit.
+1. **Request.** The onboardee calls `PeerControl.RequestClusterSharedKey(CskRequest{ requester_member_id: self.memberId })` on a connected peer over a sidecar-to-sidecar gRPC channel bound to the mesh interface (sidecar spec §12.5). The request rides inside the wireguard tunnel, so it is already authenticated and encrypted in transit.
 2. **Serve.** A peer that holds the CSK verifies the requester is a current cluster member (its `xPubKey` exists in AttestFacet) and returns the CSK **sealed-boxed to that `xPubKey`** — defense-in-depth, so even a compromised wireguard session key never exposes the plaintext. A peer that does not yet hold the CSK (itself a not-yet-onboarded onboardee) returns `Unavailable`; the originator always holds it.
 3. **Verify + seal.** The onboardee opens the sealed box with its x25519 private key, checks `keccak256(csk) == AttestFacet.cskCommitment()`, and on match seals the CSK to its store (§8.5). On mismatch or `Unavailable`, it tries another connected peer.
 
