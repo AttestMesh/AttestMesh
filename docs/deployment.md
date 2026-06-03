@@ -89,6 +89,24 @@ Canonical receipt: `contracts/script/deployments/8453.json` (written by `DeployI
 | 2026-06-03 | Phala auth | ⚠ not found: no `phala` on PATH, no `~/.phala*` store, no `PHALA_CLOUD_API_KEY` in env/`~/.teesql`; `npx phala` says "not authenticated". Needs `PHALA_CLOUD_API_KEY` exported (dstackgres CLI reads that env var) or `phala login`. Blocks only D5 (CVM boot). |
 | 2026-06-03 | next (unblocked) | **Milestone-A code** for Track D — needed regardless of Phala: (1) fix the `isAppAllowed` boot deadlock; (2) add a `DstackRuntime` KMS-sig-chain request method (grounded against dstackgres's real dstack guest-agent client); (3) wire `state::run()`; (4) sidecar OCI image. Then ONE infra+cluster redeploy with the fixed `DstackFacet` (+ refresh webhook factory addrs). Track C (indexer) can run un-attested for bring-up. |
 
+## Milestone-A reference: the real dstack guest-agent API
+
+(From dstackgres `crates/teesql-data-sidecar/.../dstack.rs` — the `DstackClient`.)
+The dstack guest agent listens on a unix socket (`/var/run/dstack.sock`) or
+`http://localhost:8090`, prpc-style JSON POST:
+- **`/Info`** → `{ app_id, instance_id, compose_hash, app_name, device_id, app_cert, tcb_info, key_provider_info }`
+- **`/GetKey`** (path, purpose) → **`{ key: hex, signature_chain: Vec<String> }`** ← the KMS sig chain
+- `/GetQuote` (report_data) → quote; `/Sign` (algorithm, data); `/GetTlsKey`
+
+So the `DstackRuntime` trait (sidecar/src/dstack.rs) needs `get_key(path, purpose) -> { key, signature_chain }`
+and `info() -> { app_id, compose_hash, instance_id, device_id, ... }`. The on-chain
+`DstackProof` (codeId, app/kms signatures, app/derived compressed pubkeys, messageHash)
+is assembled from `signature_chain` + the derived key. **Next:** read dstackgres
+`group_auth.rs` for the exact `signature_chain` → proof mapping — this is the
+ground-truth check on AttestMesh's on-chain `DstackSigChain` preimages (premortem risk A/B/C).
+NOTE: dstack's real `app_id` (from `/Info`) is what `codeId` must equal — confirm it is the
+ClusterMember address in the AttestMesh model (it is set as the CVM's app_id at deploy).
+
 ## Phala auth (action needed for D5)
 
 To deploy a real CVM, export the Phala Cloud API key the way the dstackgres CLI expects:
