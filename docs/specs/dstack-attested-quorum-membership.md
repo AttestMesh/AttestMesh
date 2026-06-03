@@ -1,10 +1,12 @@
 # dstack-Attested Quorum Membership (premortem fix #1, v2)
 
-**Status:** DRAFT
+**Status:** SUPERSEDED — its premortem (`docs/premortems/premortem-transcript-1780495534.md`) found no-Sybil-resistance + verifier-not-reusable + bootstrap/TCB/F2 holes. Replaced by the extraction approach: [`dstack-auth-extraction.md`](./dstack-auth-extraction.md) (port dstackgres's proven auth code instead of reinventing).
 **Author:** LSDan
 **Created:** 2026-06-03
 **Last Updated:** 2026-06-03
 **Supersedes:** `dstack-registration-rework.md` (rejected by its own premortem — P1/P2/P6)
+
+> **Not implemented.** This invented a >50% peer-quorum membership model whose premortem found it had no Sybil resistance (attested ≠ independent) and over-claimed a reusable off-chain verifier. The live design is `dstack-auth-extraction.md` — owner-gated allowlist + dstack KMS boot gate + on-chain `verifySigChain`, all **ported from dstackgres** which already implements it.
 **Premortems:** `docs/premortems/premortem-transcript-1780448684.md` (original), `…-1780453627.md` (the rework that this replaces)
 **Parent specs:** `attestmesh-coordination-layer.md` §1/§4/§9/§10, `contracts.md` §6, `sidecar.md` §6/§8/§13
 
