@@ -4,12 +4,19 @@
 //! computes the binding hash the derived key signs.
 
 use super::abi;
+use crate::dstack::DstackRuntime;
 use alloy::primitives::{keccak256, Address, Bytes, B256};
 use alloy::signers::k256::ecdsa::{RecoveryId, Signature as K256Sig, SigningKey, VerifyingKey};
 use alloy::signers::local::PrivateKeySigner;
 use alloy::signers::Signer;
 use alloy::sol_types::{SolCall, SolValue};
 use anyhow::{ensure, Context, Result};
+
+/// dstack key path/purpose for AttestMesh's registration (binding) key. The proof's
+/// app->derived signature is over the "ethereum:" label regardless (see build_kms_material);
+/// these select which derived key the guest agent returns. Confirm against a live node.
+const KEY_PATH: &str = "attestmesh-binding-v1";
+const KEY_PURPOSE: &str = "ethereum";
 
 /// EIP-712-style message-domain tag (distinct from the dstack derive-key purpose
 /// `attestmesh.binding.v1`). Must match DstackFacet.BIND_DOMAIN on chain.
@@ -158,6 +165,39 @@ pub async fn build_proof(
     ))
 }
 
+/// End-to-end: pull the KMS chain from the dstack runtime (`/Info` + `/GetKey`) and
+/// assemble the full registration proof the sidecar submits. Returns the proof and the
+/// derived signer (which becomes the ClusterMember's EIP-4337 owner). The proof satisfies
+/// the on-chain `DstackSigChain.verify` (see the e2e tests).
+pub async fn build_proof_from_runtime(
+    dstack: &dyn DstackRuntime,
+    cluster: Address,
+    member: Address,
+    x_pub: B256,
+    wg_pub: B256,
+) -> Result<(abi::DstackProof, PrivateKeySigner)> {
+    let info = dstack.info().await?;
+    let dk = dstack.get_key(KEY_PATH, KEY_PURPOSE).await?;
+    ensure!(
+        dk.signature_chain.len() >= 2,
+        "signature_chain must be [app_sig, kms_sig, ...], got {}",
+        dk.signature_chain.len()
+    );
+    let signer = PrivateKeySigner::from_slice(&dk.key).context("derived key from dstack")?;
+    let proof = build_proof(
+        &signer,
+        &info.app_id,
+        dk.signature_chain[0].clone(),
+        dk.signature_chain[1].clone(),
+        cluster,
+        member,
+        x_pub,
+        wg_pub,
+    )
+    .await?;
+    Ok((proof, signer))
+}
+
 /// ABI-encode `dstack_register(proof, member, xPub, wgPub)` for the inner UserOp call.
 pub fn build_register_calldata(
     proof: abi::DstackProof,
@@ -296,5 +336,118 @@ mod tests {
         // (4) messageHash pins (cluster, member, xPub, wgPub).
         assert_eq!(proof.messageHash, bind_hash(cluster, member, x_pub, wg_pub));
         assert_eq!(proof.purpose, "ethereum");
+    }
+
+    /// A dstack runtime mock that returns a *valid* signing chain (real app + KMS sigs)
+    /// so the full runtime -> proof path can be verified end to end, all three links.
+    struct SigningMock {
+        app: SigningKey,
+        kms: SigningKey,
+        derived: [u8; 32],
+        app_id: [u8; 20],
+    }
+
+    #[async_trait::async_trait]
+    impl crate::dstack::DstackRuntime for SigningMock {
+        async fn derive_key(&self, _: &str, _: &str) -> Result<zeroize::Zeroizing<[u8; 32]>> {
+            Ok(zeroize::Zeroizing::new([0u8; 32]))
+        }
+        async fn get_quote(&self, _: [u8; 64]) -> Result<Vec<u8>> {
+            Ok(vec![])
+        }
+        async fn seal(&self, _: &str, _: &[u8]) -> Result<()> {
+            Ok(())
+        }
+        async fn unseal(&self, _: &str) -> Result<Option<Vec<u8>>> {
+            Ok(None)
+        }
+        async fn info(&self) -> Result<crate::dstack::DstackInfo> {
+            Ok(crate::dstack::DstackInfo {
+                app_id: self.app_id.to_vec(),
+                ..Default::default()
+            })
+        }
+        async fn get_key(&self, _: &str, _: &str) -> Result<crate::dstack::DstackKey> {
+            let derived_compressed = compressed_pubkey(&self.derived)?;
+            // app signs "ethereum:" + hex(derivedCompressedPubkey).
+            let ah = keccak256(format!("ethereum:{}", hex::encode(&derived_compressed)).as_bytes());
+            let (asig, ar) = self.app.sign_prehash_recoverable(&ah.0)?;
+            let mut app_sig = asig.to_bytes().to_vec();
+            app_sig.push(27 + ar.to_byte());
+            // KMS signs "dstack-kms-issued:" || bytes20(app_id) || appCompressedPubkey.
+            let app_compressed = self
+                .app
+                .verifying_key()
+                .to_encoded_point(true)
+                .as_bytes()
+                .to_vec();
+            let mut kpre = Vec::new();
+            kpre.extend_from_slice(b"dstack-kms-issued:");
+            kpre.extend_from_slice(&self.app_id);
+            kpre.extend_from_slice(&app_compressed);
+            let (ksig, kr) = self.kms.sign_prehash_recoverable(&keccak256(&kpre).0)?;
+            let mut kms_sig = ksig.to_bytes().to_vec();
+            kms_sig.push(27 + kr.to_byte());
+            Ok(crate::dstack::DstackKey {
+                key: self.derived.to_vec(),
+                signature_chain: vec![app_sig, kms_sig],
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn build_proof_from_runtime_all_three_links_verify() {
+        let app = SigningKey::from_slice(&[0x22u8; 32]).unwrap();
+        let kms = SigningKey::from_slice(&[0x33u8; 32]).unwrap();
+        let mock = SigningMock {
+            app: app.clone(),
+            kms: kms.clone(),
+            derived: [0x11u8; 32],
+            app_id: [0xABu8; 20],
+        };
+        let cluster = address!("000000000000000000000000000000000000000a");
+        let member = address!("000000000000000000000000000000000000000b");
+        let x_pub = B256::repeat_byte(0x33);
+        let wg_pub = B256::repeat_byte(0x44);
+
+        let (proof, signer) = build_proof_from_runtime(&mock, cluster, member, x_pub, wg_pub)
+            .await
+            .unwrap();
+
+        // app link: appCompressedPubkey is the signer of the "ethereum:" preimage.
+        let app_compressed = app
+            .verifying_key()
+            .to_encoded_point(true)
+            .as_bytes()
+            .to_vec();
+        assert_eq!(
+            proof.appCompressedPubkey.as_ref(),
+            app_compressed.as_slice()
+        );
+        // KMS link: kmsSignature recovers the KMS key over the "dstack-kms-issued:" preimage.
+        let mut kpre = Vec::new();
+        kpre.extend_from_slice(b"dstack-kms-issued:");
+        kpre.extend_from_slice(&proof.codeId.0[..20]);
+        kpre.extend_from_slice(proof.appCompressedPubkey.as_ref());
+        let kms_compressed = kms
+            .verifying_key()
+            .to_encoded_point(true)
+            .as_bytes()
+            .to_vec();
+        assert_eq!(
+            recover_compressed(&keccak256(&kpre).0, &proof.kmsSignature).unwrap(),
+            kms_compressed,
+            "KMS signature must recover the KMS root"
+        );
+        // derived link: messageSignature over EIP-191(messageHash) recovers the derived key.
+        let derived_compressed = compressed_pubkey(signer.to_bytes().as_slice()).unwrap();
+        let eth = eth_signed_message_hash(proof.messageHash);
+        assert_eq!(
+            recover_compressed(&eth.0, &proof.messageSignature).unwrap(),
+            derived_compressed
+        );
+        // bindings.
+        assert_eq!(&proof.codeId.0[..20], &[0xABu8; 20]);
+        assert_eq!(proof.messageHash, bind_hash(cluster, member, x_pub, wg_pub));
     }
 }
