@@ -20,7 +20,7 @@ export type Selector = Hex;
  * `DstackFacet.dstack_register(...)` in contracts. If the struct layout changes,
  * this tuple (and therefore the selector) changes with it.
  */
-const DSTACK_PROOF_TUPLE = "(bytes,bytes,bytes,bytes32,bytes,bytes,bytes32,bytes32,string,string[],bytes)";
+const DSTACK_PROOF_TUPLE = "(bytes32,bytes32,bytes,bytes,bytes,bytes,bytes,string)";
 
 /**
  * Canonical signatures of every cluster operation the operator will sponsor (spec §7).

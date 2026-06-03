@@ -14,12 +14,12 @@ describe("selectors", () => {
   });
 
   it("dstack_register selector is computed over the EXPANDED struct tuple", () => {
-    // Sanity: the allowlist must contain the tuple-expanded selector (0x3f330b63),
+    // Sanity: the allowlist must contain the tuple-expanded selector (0x537d491c),
     // NOT a selector computed against the struct *name* (which viem cannot hash).
     const expanded = toFunctionSelector(
-      "dstack_register((bytes,bytes,bytes,bytes32,bytes,bytes,bytes32,bytes32,string,string[],bytes),address,bytes32,bytes32)",
+      "dstack_register((bytes32,bytes32,bytes,bytes,bytes,bytes,bytes,string),address,bytes32,bytes32)",
     );
-    expect(expanded).toBe("0x3f330b63");
+    expect(expanded).toBe("0x537d491c");
     expect(ALLOWED_SELECTORS.has(expanded)).toBe(true);
   });
 
