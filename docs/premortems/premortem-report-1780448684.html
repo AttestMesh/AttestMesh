@@ -1,0 +1,171 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Premortem v2 (dstack-grounded) — Deploying the AttestMesh v1 Cluster</title>
+<style>
+  :root{--bg:#0a0e1a;--panel:#121829;--panel2:#0e1422;--ink:#e8ecf6;--muted:#97a2c0;--line:#222c44;--accent:#7aa2ff;--danger:#ff5d6c;--warn:#ffb454;--ok:#54d6a0}
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif}
+  .wrap{max-width:1080px;margin:0 auto;padding:40px 22px 80px}
+  h1{font-size:29px;margin:0 0 6px;letter-spacing:-.3px}
+  .sub{color:var(--muted);margin:0 0 4px}
+  .v2{display:inline-block;margin:14px 8px 6px 0;padding:7px 13px;border-radius:999px;background:rgba(84,214,160,.1);color:var(--ok);border:1px solid rgba(84,214,160,.4);font-weight:600;font-size:12.5px;letter-spacing:.3px}
+  .verdict{display:inline-block;margin:14px 0 6px;padding:7px 13px;border-radius:999px;background:rgba(255,93,108,.12);color:var(--danger);border:1px solid rgba(255,93,108,.4);font-weight:600;font-size:12.5px;letter-spacing:.3px}
+  h2{font-size:13px;text-transform:uppercase;letter-spacing:1.4px;color:var(--muted);margin:36px 0 14px;border-bottom:1px solid var(--line);padding-bottom:8px}
+  .changed{background:linear-gradient(180deg,rgba(122,162,255,.08),rgba(122,162,255,.02));border:1px solid #2b3a63;border-radius:14px;padding:18px 20px;margin:12px 0}
+  .changed h3{margin:0 0 8px;font-size:16px;color:#bcd0ff}
+  .changed ul{margin:6px 0 0}
+  .syn{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:20px 22px;margin:12px 0}
+  .syn h3{margin:0 0 6px;font-size:16px}
+  .tag{font-size:11px;text-transform:uppercase;letter-spacing:1px;font-weight:700}
+  .t-likely{color:var(--warn)}.t-danger{color:var(--danger)}.t-hidden{color:var(--accent)}
+  ol,ul{margin:8px 0 0;padding-left:20px}li{margin:6px 0}
+  code{background:var(--panel2);border:1px solid var(--line);border-radius:5px;padding:1px 5px;font-size:12px;color:#cdd7f5}
+  .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(330px,1fr));gap:16px;margin-top:14px}
+  .card{background:var(--panel);border:1px solid var(--line);border-left-width:4px;border-radius:12px;padding:16px 17px;display:flex;flex-direction:column}
+  .card .hd{display:flex;justify-content:space-between;align-items:flex-start;gap:8px;margin-bottom:8px}
+  .card h4{margin:0;font-size:14.5px;line-height:1.35}
+  .sev{flex:none;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.6px;padding:3px 7px;border-radius:6px;white-space:nowrap}
+  .sev.cert{background:rgba(255,93,108,.15);color:var(--danger);border:1px solid rgba(255,93,108,.35)}
+  .sev.high{background:rgba(255,180,84,.13);color:var(--warn);border:1px solid rgba(255,180,84,.32)}
+  .sev.low{background:rgba(84,214,160,.12);color:var(--ok);border:1px solid rgba(84,214,160,.32)}
+  .lbl{font-size:10.5px;text-transform:uppercase;letter-spacing:.8px;color:var(--muted);margin:11px 0 3px;font-weight:700}
+  .story{color:#d4dbf0;font-size:13.5px}.assume{color:#f0d9b0;font-size:13px;font-style:italic}.warn{color:#bfe9d6;font-size:13px}
+  .delta{font-size:11px;font-weight:700;margin-left:6px}.delta.up{color:var(--danger)}.delta.dn{color:var(--ok)}.delta.same{color:var(--muted)}
+  footer{margin-top:46px;color:var(--muted);font-size:12px;border-top:1px solid var(--line);padding-top:16px}
+  .scope{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:12px;margin-top:6px}
+  .scope div{background:var(--panel2);border:1px solid var(--line);border-radius:10px;padding:12px 14px}
+  .scope .k{font-size:10.5px;text-transform:uppercase;letter-spacing:.8px;color:var(--muted)}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Premortem — Deploying the AttestMesh v1 Cluster</h1>
+  <p class="sub">Frame: it's a few weeks from now. We deployed the three-node demo on Base Sepolia and it failed. This is why it died.</p>
+  <span class="v2">v2 · re-grounded against the actual dstack source (dstack-tee/dstack)</span>
+  <span class="verdict">≥3 independent certain showstoppers gate registration alone</span>
+
+  <div class="scope">
+    <div><div class="k">What</div>The AttestMesh v1 three-node demo on Base Sepolia: infra → Indexer → gas-webhook/paymaster → ClusterDiamond → 3 ClusterMembers → 3 dstack CVMs that register, mesh, distribute the CSK, and go healthy.</div>
+    <div><div class="k">Who</div>The AttestMesh org (infra + Indexer + paymaster) and three node operators. This demo <em>is</em> the end-to-end proof.</div>
+    <div><div class="k">Success</div>All 3 register on chain, the wg mesh converges, the CSK reaches all 3, every healthcheck returns 200, app containers start.</div>
+    <div><div class="k">Method</div>7 failure modes, the dstack-touching ones re-grounded in the real dstack repo (KMS contracts, <code>kms/src/crypto.rs</code>, <code>guest-agent/rpc/proto/agent_rpc.proto</code>, basefiles). 2026-06-03.</div>
+  </div>
+
+  <h2>What the dstack source changed</h2>
+  <div class="changed">
+    <h3>Reading the real dstack code sharpened two failures and downgraded one</h3>
+    <ul>
+      <li><b>F1 — sharpened to an exact, documented mismatch.</b> dstack does <b>no</b> on-chain signature verification (<code>DstackApp.isAppAllowed</code> is a pure allowlist gate); it signs <code>keccak256("dstack-kms-issued" ‖ ":" ‖ app_id ‖ sec1_pubkey)</code> off chain (<code>kms/src/crypto.rs</code>). AttestMesh verifies an invented <code>keccak256(abi.encode("dstack.app", appKey, composeHash))</code> chain on chain — a different domain, encoding, fields, and level count. A real proof cannot verify.</li>
+      <li><b>F4 — sharpened.</b> The guest agent is prpc/protobuf (<code>GetKey{path,purpose,algorithm}</code>, <code>DeriveK256Key</code>, <code>GetQuote</code>), not JSON <code>/DeriveKey</code>; and there is <b>no <code>Seal</code>/<code>Unseal</code></b> — persistence is the encrypted rootfs.</li>
+      <li><b>F3 — DOWNGRADED from certain to low.</b> dstack CVMs <em>do</em> ship wireguard (<code>/etc/wireguard/*.conf</code>, gateway <code>wg.conf</code>); the "no wireguard at all" premise was wrong.</li>
+      <li><b>A positive:</b> AttestMesh's <code>IAppAuth.AppBootInfo</code> + <code>isAppAllowed</code> mirror dstack <em>exactly</em> — the boot-gate side is correct. The team mirrored what was visible in dstack's <em>contracts</em> and invented what lives in its <em>Rust</em>.</li>
+    </ul>
+  </div>
+
+  <h2>Synthesis</h2>
+
+  <div class="syn">
+    <span class="tag t-likely">Most likely / clearest failure</span>
+    <h3>F1 — the on-chain registration verifier checks a signature format dstack never produces.</h3>
+    <p>Not a tuning bug: <code>DstackSigChain</code> + <code>dstack_register</code> were authored without reading <code>dstack/kms/src/crypto.rs</code>. dstack signs <code>keccak256("dstack-kms-issued:" ‖ app_id ‖ sec1_pubkey)</code> (recoverable, off chain) and does only an allowlist check on chain; AttestMesh recovers an <code>abi.encode("dstack.app", appKey, composeHash)</code> preimage that has no counterpart in dstack. Every real CVM reverts at <code>KmsAppKeySigInvalid</code>. With F4 (the client can't even speak prpc) and F2 (the UserOp can't validate), <b>three certain showstoppers gate registration before a single member exists.</b></p>
+  </div>
+
+  <div class="syn">
+    <span class="tag t-danger">Most dangerous failure</span>
+    <h3>CSK persistence built on a primitive dstack doesn't have (F4) against an immutable on-chain commitment.</h3>
+    <p><code>seal</code>/<code>unseal</code> don't exist in dstack. The originator can re-derive the CSK deterministically, but an onboardee that pulled it has nowhere durable to put it under the current design — while its <code>keccak256(CSK)</code> commitment is already immutable on chain. A naive "derived something, commit it" path can strand the cluster with a committed-but-unrecoverable key. Persist to the encrypted rootfs or re-pull on restart — by design, not as an afterthought.</p>
+  </div>
+
+  <div class="syn">
+    <span class="tag t-hidden">The hidden assumption (sharpened)</span>
+    <h3>The team read dstack's contracts and invented dstack's Rust.</h3>
+    <p>AttestMesh mirrored <code>IAppAuth.AppBootInfo</code> and <code>isAppAllowed</code> <em>exactly</em> (they're in <code>.sol</code> files) — but invented the guest-agent protocol and the KMS signature format (which live in dstack's Rust: <code>agent_rpc.proto</code>, <code>crypto.rs</code>), then validated the inventions with mocks that encode the same inventions. The boundary of what was actually read from dstack is precisely the boundary between what works and what is fictional.</p>
+  </div>
+
+  <div class="syn">
+    <h3 style="margin-top:2px">The revised plan (dstack-concrete)</h3>
+    <ol>
+      <li><b>dstack client → prpc.</b> Generate from <code>agent_rpc.proto</code> (or use dstack's SDK): <code>GetKey{path,purpose,algorithm}</code>, <code>DeriveK256Key</code>, <code>GetQuote{report_data}</code>, <code>Info</code>. Drop <code>seal</code>/<code>unseal</code>: re-derive the originator CSK deterministically; persist the onboardee CSK to the encrypted rootfs (or re-pull on restart).</li>
+      <li><b>Re-architect the verifier (F1) — choose deliberately:</b> (a) match dstack on chain — recover <code>keccak256("dstack-kms-issued:" ‖ app_id ‖ sec1_pubkey)</code> against an allowlisted KMS k256 address, binding compose-hash→app_id→member via dstack's app registry / the quote; or (b) adopt dstack's model — off-chain KMS verifies the quote, on chain you only run <code>isAppAllowed</code> (simpler, but reintroduces a trusted off-chain attestor — a real decision for "the chain is the source of truth").</li>
+      <li><b>Capture a real proof.</b> Pull one live <code>DeriveK256KeyResponse</code> + <code>GetQuote</code> from a real dstack CVM; add a forge fork-test replaying it against <code>DstackFacet</code>. Highest-value single validation; blocks deploy until green.</li>
+      <li><b>F2:</b> reorder <code>bundler.rs::submit</code> to sponsor-then-sign; land one real UserOp on Sepolia.</li>
+      <li><b>F5:</b> implement the Indexer <code>event_data</code> RLP decode + dispatch; anvil test A→B peer config.</li>
+      <li><b>F3:</b> confirm the sidecar container has <code>NET_ADMIN</code> + wg/ip; remove the <code>.ok()</code> swallow (downgraded, not dismissed).</li>
+      <li><b>F6/F7:</b> fix the originator race (order by <code>MemberRegistered</code> block+logIndex), rehearse 3-node on anvil, add per-phase health detail + a runbook.</li>
+    </ol>
+  </div>
+
+  <div class="syn">
+    <h3 style="margin-top:2px">Pre-deploy checklist</h3>
+    <ul>
+      <li>☐ A forge fork-test replays a <b>real</b> <code>k256_signature_chain</code> + quote against <code>DstackFacet</code> and passes (F1).</li>
+      <li>☐ A prpc <code>GetKey</code>/<code>DeriveK256Key</code> round-trips against a real guest agent (F4).</li>
+      <li>☐ One sponsored registration UserOp lands on Sepolia and emits <code>MemberRegistered</code> (F2).</li>
+      <li>☐ A's PeerEndpoint configures a wg peer on B in an anvil integration test (F5).</li>
+      <li>☐ 3-node all-healthy once on a local harness, with the CSK persisted/re-derived across a restart (F4/F6).</li>
+    </ul>
+  </div>
+
+  <h2>The seven failure modes (dstack-re-graded)</h2>
+  <div class="grid">
+
+    <div class="card" style="border-left-color:#ff5d6c">
+      <div class="hd"><h4>F1 · On-chain verifier checks a signature dstack never produces<span class="delta up">▲ sharpened</span></h4><span class="sev cert">Certain</span></div>
+      <div class="story">dstack signs <code>keccak256("dstack-kms-issued" ‖ ":" ‖ app_id ‖ sec1_pubkey)</code> (recoverable, off chain; <code>kms/src/crypto.rs</code>) and does only an allowlist check on chain (<code>DstackApp.isAppAllowed</code>). AttestMesh recovers <code>keccak256(abi.encode("dstack.app", appKey, composeHash))</code> — different domain, encoding, bound fields, and level count. Real <code>k256_signature_chain</code> can't recover → <code>dstack_register</code> reverts for every node. The mock encoded AttestMesh's own invention, so 17 tests pass while reality fails.</div>
+      <div class="lbl">Underlying assumption</div><div class="assume">dstack emits an <code>abi.encode</code>-shaped, compose-hash-committing, 3-level chain verifiable on chain — when it signs a raw-concat preimage off chain and only allowlist-checks on chain.</div>
+      <div class="lbl">Early warning signs</div><div class="warn">A fork-test on a real proof reverts; <code>DstackSigChain</code>'s <code>"dstack.app"</code> string appears nowhere in <code>dstack/kms/src/crypto.rs</code>.</div>
+    </div>
+
+    <div class="card" style="border-left-color:#ff7a45">
+      <div class="hd"><h4>F2 · EIP-4337 signature dies once Alchemy inserts paymaster data<span class="delta same">— unchanged</span></h4><span class="sev cert">Certain</span></div>
+      <div class="story"><code>bundler.rs::submit</code> signs the userOpHash while <code>paymaster==None</code>; Alchemy fills <code>paymasterAndData</code> after the webhook approves; the EntryPoint recomputes the hash, <code>validateUserOp</code> recovers a different signer, and every registration op reverts (<code>AA24</code>). The sidecar treats it as transient and retries forever. Now coupled to F1: the binding key is a dstack k256 key whose provenance proof is the same broken chain.</div>
+      <div class="lbl">Underlying assumption</div><div class="assume">A signature computed before <code>paymasterAndData</code> is populated still validates afterward.</div>
+      <div class="lbl">Early warning signs</div><div class="warn"><code>AA24 signature error</code> on every registration; no test asserts hash equality across the paymaster handshake.</div>
+    </div>
+
+    <div class="card" style="border-left-color:#54d6a0">
+      <div class="hd"><h4>F3 · Wireguard on the real CVMs<span class="delta dn">▼ downgraded</span></h4><span class="sev low">Low</span></div>
+      <div class="story">dstack CVMs ship wireguard (rootfs <code>/etc/wireguard/*.conf</code>; gateway <code>wg.conf</code>), so the "no module/binaries" premise was wrong — this is no longer a guaranteed showstopper. Residual risk: AttestMesh's second <code>attestmesh0</code> interface still needs <code>NET_ADMIN</code> + wg/ip reachable in the sidecar's container, and <code>state::run</code> still <code>.ok()</code>-swallows <code>create_interface</code> failures, so a real problem would be silent.</div>
+      <div class="lbl">Underlying assumption</div><div class="assume">The dstack CVM has no wireguard (it does).</div>
+      <div class="lbl">Early warning signs</div><div class="warn">Residual: the <code>.ok()</code> swallow + whether the app container is granted <code>NET_ADMIN</code>.</div>
+    </div>
+
+    <div class="card" style="border-left-color:#e85d9c">
+      <div class="hd"><h4>F4 · dstack client is the wrong protocol + assumes a nonexistent seal<span class="delta up">▲ sharpened</span></h4><span class="sev cert">Certain</span></div>
+      <div class="story"><code>UnixSocketDstack</code> POSTs JSON <code>/DeriveKey</code> with <code>{"path":purpose,"purpose":subkey}</code>; real dstack is prpc/protobuf (<code>GetKey{path,purpose,algorithm}</code> / <code>DeriveK256Key</code> / <code>GetQuote</code>) — wrong protocol, method, and field mapping; the first call fails. And <code>seal</code>/<code>unseal</code> don't exist — the sidecar's <code>dstack.seal(...)</code> calls a nonexistent RPC; persistence is the encrypted rootfs. The originator can re-derive (deterministic <code>GetKey</code>); onboardees must persist to disk or re-pull.</div>
+      <div class="lbl">Underlying assumption</div><div class="assume">dstack exposes a JSON HTTP <code>/DeriveKey</code> + a <code>seal</code>/<code>unseal</code> RPC; in fact it's prpc and persistence is the encrypted disk.</div>
+      <div class="lbl">Early warning signs</div><div class="warn">No test instantiates <code>UnixSocketDstack</code>; <code>grep -r Seal dstack/guest-agent</code> returns nothing; a prpc client from <code>agent_rpc.proto</code> shows the mismatch immediately.</div>
+    </div>
+
+    <div class="card" style="border-left-color:#7aa2ff">
+      <div class="hd"><h4>F5 · Sidecar verifies Indexer pushes but never decodes/acts on them<span class="delta same">— unchanged</span></h4><span class="sev cert">Certain</span></div>
+      <div class="story"><code>connect_and_run</code> verifies the push signature, <code>tracing::debug!</code>s, and ends at <code>let _ = &shared;</code>. The RLP <code>event_data</code> decode/dispatch is a TODO, so <code>MessageSent</code> never becomes a <code>PeerEndpoint</code> and <code>wg::add_peer</code> is never called. Registration succeeds, the stream looks healthy, every signature verifies — and <code>ListPeers</code> stays empty. The mesh's only learning mechanism is a no-op behind a green light.</div>
+      <div class="lbl">Underlying assumption</div><div class="assume">"Signature-verified and logged" equals "consumed and acted upon."</div>
+      <div class="lbl">Early warning signs</div><div class="warn"><code>add_peer</code>/handshake counters stay zero while <code>verified indexer push</code> climbs; no test drives <code>connect_and_run</code>.</div>
+    </div>
+
+    <div class="card" style="border-left-color:#54d6a0">
+      <div class="hd"><h4>F6 · Convergence + CSK distribution deadlock under real async timing<span class="delta same">— unchanged</span></h4><span class="sev high">High</span></div>
+      <div class="story">Two nodes read <code>memberCount()</code> in the same block before either tx confirms — both see <code>0</code>, neither becomes originator, all sit at <code>pulling-csk</code> forever. Even when one wins, the strict <code>active == live</code> gate never latches across staggered boots: the window slides faster than the last node joins, so the three views are never simultaneously equal.</div>
+      <div class="lbl">Underlying assumption</div><div class="assume">A system validated only on a synchronized logical clock with all peers at t=0 behaves the same when three real nodes boot at independent wall-clock times.</div>
+      <div class="lbl">Early warning signs</div><div class="warn">Two+ nodes read the originator before any <code>MemberRegistered</code> confirms; <code>cskCommitment()</code> stays <code>0x0</code>; <code>is_converged</code> flaps by exactly the last-joined node.</div>
+    </div>
+
+    <div class="card" style="border-left-color:#9a7aff">
+      <div class="hd"><h4>F7 · Never integration-tested; every dependency a fail-closed SPOF<span class="delta same">— unchanged</span></h4><span class="sev high">High</span></div>
+      <div class="story">Three sidecars wedge in different phases (A pre-registration, B subscribed-but-empty, C waiting on B), each silently at 503 with no signal of which dependency it's blocked on, no cross-node correlation, no orchestrator. The §16.2/§14.2 harnesses are <code>#[ignore]</code>d; the first real inter-process contact is in front of the audience. Green unit tests created false confidence exactly at the seams.</div>
+      <div class="lbl">Underlying assumption</div><div class="assume">Components that pass their own unit tests compose correctly across seams on first contact, so end-to-end testing is a formality.</div>
+      <div class="lbl">Early warning signs</div><div class="warn">CI has never produced a passing multi-process/anvil run; the components were authored by different agents with no shared seam contract.</div>
+    </div>
+
+  </div>
+
+  <footer>
+    Premortem v2 · 2026-06-03 · target: <b>deploying the AttestMesh v1 cluster</b> · re-grounded against <b>github.com/dstack-tee/dstack</b> (KMS contracts, <code>kms/src/crypto.rs</code>, <code>guest-agent/rpc/proto/agent_rpc.proto</code>, basefiles) · supersedes the initial run · companion transcript: <code>premortem-transcript-1780448684.md</code>
+  </footer>
+</div>
+</body>
+</html>
