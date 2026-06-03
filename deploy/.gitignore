@@ -5,3 +5,4 @@ env.local.sh
 logs/
 node_modules/
 bun.lock
+smithers.db*

@@ -75,19 +75,22 @@ source deploy/env.sh                                   # load ~/.teesql creds
 ## Deployed addresses — Base mainnet (8453)
 
 Canonical receipt: `contracts/script/deployments/8453.json` (written by `DeployInfra`).
+**Current = the fixed-facet redeploy** (DstackFacet with the cold-start deadlock fix +
+the `allowedAppIds` allowlist). The earlier set (`0xB1fA7AD…`/`0x624a5bcE…`) is superseded
+and orphaned on-chain.
 
 | Contract | Address |
 |---|---|
-| ClusterDiamondFactory | `0xB1fA7AD056A9Af1E3f4E1f8b6A147bE79CCfBd1d` |
-| ClusterMemberFactory | `0xeE8159e67b07aA71b4938b5ea5a9ED63dC4f6e65` |
-| ClusterMember impl | `0x7D8F186C1d3cC5bb92B014a5873A931eE8402713` |
-| IndexerRegistry | `0x6579B19387f18AA9D9eb24a9Ce8De6b21c52708c` |
-| DiamondInit | `0x6524c8aF358B739A32E315ed4530183d2d52339B` |
-| AttestFacet | `0x437f66a2FF552ccE284bE5ADdF930506bF1bE641` |
-| MessageFacet | `0x996F442669236E6843B6Bf063f7704D4aDeDd8c4` |
-| NetworkFacet | `0x4eFf3b7A5b8b4888bf8C80855BCB1FaAa59D727F` |
-| DstackFacet | `0xA5a9346665339369Cb9D78C622176a5cD14dd445` |
-| **ClusterDiamond `attestmesh-1`** | **`0x624a5bcE50ffD6b950a2b03edee1a10E3DF0b712`** (owner=deployer; KMS root + compose hash seeded; allowAnyDevice; 10.13.0.0/16) |
+| ClusterDiamondFactory | `0xf6E85fD138E3208d3AAE63ce4E2A33f20e82b9fb` |
+| ClusterMemberFactory | `0xFf9f438EFdAa197f4ae59D1d711C4f09640b8417` |
+| ClusterMember impl | `0xd05223da04B4E73AC02ECA9638D490f45f765843` |
+| IndexerRegistry | `0xbC003686943fB957100E517D3CEf66c52B5CDdBf` |
+| DiamondInit | `0xe3C9CE59b6c164c7b4c81f686C876EB85198cFC3` |
+| AttestFacet | `0x10532164ca3BdaCf1dAd13Fb534262DEc5aAA9AA` |
+| MessageFacet | `0x0F67cd8c1D8A2F71d2bb8091B2eb166E6b6bB564` |
+| NetworkFacet | `0x6AB2b7D506c85C7A9eA22f2ECcE0cc9191006159` |
+| DstackFacet | `0xe9d463974c6E833DC38794d7f2DC5AB692352968` |
+| **ClusterDiamond `attestmesh-1`** | **`0xA46273adC86c772C7D8daE896a5fbfdDA2B6ccFA`** (owner=deployer; KMS root + compose hash seeded; allowAnyDevice; 10.13.0.0/16; **cold-start gate verified live**) |
 
 ## Status log
 
@@ -99,7 +102,9 @@ Canonical receipt: `contracts/script/deployments/8453.json` (written by `DeployI
 | 2026-06-03 | **B gas-webhook (Cloudflare)** | ✔ live at `attestmesh-gas-sponsorship-webhook.teesql-aa-webhook.workers.dev`; chain 8453 + real factory addrs, 2 KV namespaces, secrets set (RPC_URL, ALCHEMY_WEBHOOK_TOKEN→`~/.teesql/attestmesh-webhook-token`); `GET /healthz`=200. CF token: `~/.teesql/cloudflare-wrangler.toml` (the teebox-llc one lacks Workers-KV perms). |
 | 2026-06-03 | B3 (todo, hardening) | point the Alchemy Gas Manager policy `56444921…` at the webhook URL + token (dashboard/Admin API). Sponsorship works via the policy's own rules without it; the webhook is the custom provenance gate. |
 | 2026-06-03 | Phala auth | ⚠ not found: no `phala` on PATH, no `~/.phala*` store, no `PHALA_CLOUD_API_KEY` in env/`~/.teesql`; `npx phala` says "not authenticated". Needs `PHALA_CLOUD_API_KEY` exported (dstackgres CLI reads that env var) or `phala login`. Blocks only D5 (CVM boot). |
-| 2026-06-03 | next (unblocked) | **Milestone-A code** for Track D — needed regardless of Phala: (1) fix the `isAppAllowed` boot deadlock; (2) add a `DstackRuntime` KMS-sig-chain request method (grounded against dstackgres's real dstack guest-agent client); (3) wire `state::run()`; (4) sidecar OCI image. Then ONE infra+cluster redeploy with the fixed `DstackFacet` (+ refresh webhook factory addrs). Track C (indexer) can run un-attested for bring-up. |
+| 2026-06-03 | **milestone-A code** | ✔ done + tested: cold-start deadlock fix; `DstackRuntime` `/GetKey`+`/Info`; `build_kms_material` (app-pubkey recovery) + `build_proof` — e2e test proves a sidecar-built proof passes the on-chain `DstackSigChain.verify` (37 sidecar tests). |
+| 2026-06-03 | **fixed-facet redeploy (final on-chain)** | ✔ infra+cluster redeployed with the deadlock fix; `0xA46273…ccFA`; **`isAppAllowed(allowlisted, unregistered app_id) = (true,"")` verified live** (cold-start works); webhook redeployed to the new factories, `/healthz`=200. |
+| 2026-06-03 | **remaining = Phala-gated only** | wire `build_proof` into `state::run()` + the live submit, then `phala deploy` a CVM (app_id = a member addr, owner-allowlisted via `addAllowedAppId`) → on-chain registration. All of it needs a live CVM/bundler to validate → needs `~/.teesql/phala-cloud-api.key`. |
 
 ## Milestone-A reference: the real dstack guest-agent API
 

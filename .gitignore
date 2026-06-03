@@ -30,3 +30,7 @@ dist/
 
 # Logs
 *.log
+
+# smithers runtime state
+smithers.db*
+deploy/smithers.db*

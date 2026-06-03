@@ -14,10 +14,10 @@ compatibility_date = "2024-09-23"
 # Live deployment: Base mainnet (8453); AttestMesh infra from script/deployments/8453.json.
 [vars]
 EXPECTED_CHAIN_ID = "8453"
-# ClusterDiamondFactory address deployed by DeployInfra.s.sol on Base mainnet.
-CANONICAL_CLUSTER_FACTORY = "0xB1fA7AD056A9Af1E3f4E1f8b6A147bE79CCfBd1d"
-# ClusterMemberFactory address deployed by DeployInfra.s.sol on Base mainnet.
-CANONICAL_MEMBER_FACTORY = "0xeE8159e67b07aA71b4938b5ea5a9ED63dC4f6e65"
+# ClusterDiamondFactory address deployed by DeployInfra.s.sol on Base mainnet (fixed-facet redeploy).
+CANONICAL_CLUSTER_FACTORY = "0xf6E85fD138E3208d3AAE63ce4E2A33f20e82b9fb"
+# ClusterMemberFactory address deployed by DeployInfra.s.sol on Base mainnet (fixed-facet redeploy).
+CANONICAL_MEMBER_FACTORY = "0xFf9f438EFdAa197f4ae59D1d711C4f09640b8417"
 CACHE_TTL_SECONDS = "86400"
 LOG_LEVEL = "info"
 
