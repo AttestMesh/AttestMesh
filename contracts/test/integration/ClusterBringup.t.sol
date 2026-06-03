@@ -15,16 +15,18 @@ import { ClusterDiamondFactory } from "../../src/factory/ClusterDiamondFactory.s
 import { IAttest } from "../../src/interfaces/IAttest.sol";
 import { IMessage } from "../../src/interfaces/IMessage.sol";
 import { INetwork } from "../../src/interfaces/INetwork.sol";
+import { IAppAuth } from "../../src/interfaces/IAppAuth.sol";
 import { IDstackFacet } from "../../src/interfaces/IDstackFacet.sol";
 import { IClusterMember } from "../../src/interfaces/IClusterMember.sol";
 
 import { MockKmsChain } from "../helpers/MockKmsChain.sol";
+import { DstackSigChain } from "../../src/libraries/DstackSigChain.sol";
 import {
-    ComposeHashNotAllowed,
     NotClusterMember,
     AlreadyRegistered,
     DuplicateEnvelope,
-    RecipientNotMember
+    CodeIdMismatch,
+    BindingMismatch
 } from "../../src/errors/Errors.sol";
 
 contract ClusterBringupTest is Test {
@@ -65,33 +67,15 @@ contract ClusterBringupTest is Test {
             orgSafe, diamondInit, attestFacet, messageFacet, networkFacet, dstackFacet
         );
 
-        // ── Cluster ───────────────────────────────────────────────────────────
-        bytes32[] memory composes = new bytes32[](1);
-        composes[0] = COMPOSE;
-        bytes32[] memory devices = new bytes32[](1);
-        devices[0] = DEVICE;
-
-        DiamondInit.InitArgs memory args = DiamondInit.InitArgs({
-            clusterOwner: address(this),
-            kmsRootSigner: kms.rootAddress(),
-            initialComposeHashes: composes,
-            initialDeviceIds: devices,
-            allowAnyDevice: false,
-            requireTcbUpToDate: false,
-            meshCidrIp: 0x0a0d0000, // 10.13.0.0
-            meshCidrPrefix: 16,
-            memberFactory: address(memberFactory)
-        });
-
-        cluster = clusterFactory.deployCluster(args, keccak256("cluster-1"));
+        cluster = clusterFactory.deployCluster(_initArgs(), keccak256("cluster-1"));
     }
 
     // ── Scenario 1: three members register, exchange messages ─────────────────
 
     function test_threeMembersRegisterAndMessage() public {
-        (address mA, bytes32 idA) = _register(COMP3, 3, keccak256("inst-A"), "xpub-A", "wg-A", 0);
-        (address mB, bytes32 idB) = _register(COMP4, 4, keccak256("inst-B"), "xpub-B", "wg-B", 1);
-        (, bytes32 idC) = _register(COMP5, 5, keccak256("inst-C"), "xpub-C", "wg-C", 2);
+        (address mA, bytes32 idA) = _register(COMP3, 3, "xpub-A", "wg-A", 0);
+        (address mB, bytes32 idB) = _register(COMP4, 4, "xpub-B", "wg-B", 1);
+        (, bytes32 idC) = _register(COMP5, 5, "xpub-C", "wg-C", 2);
 
         assertEq(IAttest(cluster).memberCount(), 3);
 
@@ -122,29 +106,22 @@ contract ClusterBringupTest is Test {
         IMessage(cluster).send(idC, env, ct);
     }
 
-    // ── Scenario 2: non-allowed compose hash reverts ──────────────────────────
+    // ── Scenario 2: the KMS boot gate rejects a non-allowed compose hash ───────
+    // Compose hash is no longer self-asserted at registration (it is not part of the
+    // signed KMS chain); it is the boot-gate policy the dstack KMS enforces before the
+    // CVM boots. So we assert the gate (isAppAllowed), not the registration call.
 
-    function test_badComposeHashReverts() public {
-        address m = memberFactory.deployMember(cluster, keccak256("bad"));
-        IDstackFacet.DstackProof memory proof = kms.buildProof(
-            MockKmsChain.DerivedKey({ priv: 6, compressed: COMP6 }),
-            keccak256("not-allowed-compose"),
-            keccak256("inst-bad"),
-            DEVICE,
-            "UpToDate",
-            cluster,
-            m,
-            bytes32("xpub-bad"),
-            bytes32("wg-bad")
-        );
-        vm.expectRevert(ComposeHashNotAllowed.selector);
-        IDstackFacet(cluster).dstack_register(proof, m, bytes32("xpub-bad"), bytes32("wg-bad"));
+    function test_bootGateRejectsBadComposeHash() public {
+        IAppAuth.AppBootInfo memory info = _bootInfo(address(0xBEEF), keccak256("not-allowed"));
+        (bool ok, string memory reason) = IAppAuth(cluster).isAppAllowed(info);
+        assertFalse(ok);
+        assertEq(reason, "compose hash not allowed");
     }
 
     // ── Scenario 3: non-member send reverts ───────────────────────────────────
 
     function test_nonMemberSendReverts() public {
-        (, bytes32 idA) = _register(COMP3, 3, keccak256("inst-A"), "xpub-A", "wg-A", 0);
+        (, bytes32 idA) = _register(COMP3, 3, "xpub-A", "wg-A", 0);
         vm.prank(address(0xDEAD));
         vm.expectRevert(NotClusterMember.selector);
         IMessage(cluster).send(idA, keccak256("env"), bytes("x"));
@@ -153,13 +130,9 @@ contract ClusterBringupTest is Test {
     // ── Scenario 4: re-register reverts ───────────────────────────────────────
 
     function test_reRegisterReverts() public {
-        (address mA,) = _register(COMP3, 3, keccak256("inst-A"), "xpub-A", "wg-A", 0);
+        (address mA,) = _register(COMP3, 3, "xpub-A", "wg-A", 0);
         IDstackFacet.DstackProof memory proof = kms.buildProof(
             MockKmsChain.DerivedKey({ priv: 3, compressed: COMP3 }),
-            COMPOSE,
-            keccak256("inst-A"),
-            DEVICE,
-            "UpToDate",
             cluster,
             mA,
             bytes32("xpub-A"),
@@ -169,40 +142,103 @@ contract ClusterBringupTest is Test {
         IDstackFacet(cluster).dstack_register(proof, mA, bytes32("xpub-A"), bytes32("wg-A"));
     }
 
-    // ── Scenario 5: owner removes compose hash; existing OK, new reverts ──────
+    // ── Scenario 5: owner removes compose hash; boot gate then rejects it ──────
 
-    function test_removeComposeHashBlocksNewJoiners() public {
-        _register(COMP3, 3, keccak256("inst-A"), "xpub-A", "wg-A", 0);
+    function test_removeComposeHashBlocksBootGate() public {
+        IAppAuth.AppBootInfo memory info = _bootInfo(address(0xBEEF), COMPOSE);
+
+        // Before removal the compose branch passes (the gate fails later, on device).
+        (, string memory reasonBefore) = IAppAuth(cluster).isAppAllowed(info);
+        assertTrue(
+            keccak256(bytes(reasonBefore)) != keccak256(bytes("compose hash not allowed")),
+            "compose should pass before removal"
+        );
 
         // Cluster owner removes the compose hash.
         DstackFacet(cluster).removeComposeHash(COMPOSE);
 
-        // Existing member still works (send).
-        (, bytes32 idA) = (address(0), IAttest(cluster).memberIdOf(_memberAddr(0)));
-        assertTrue(idA != bytes32(0));
+        // Now the gate rejects specifically on the compose branch.
+        (bool okAfter, string memory reasonAfter) = IAppAuth(cluster).isAppAllowed(info);
+        assertFalse(okAfter);
+        assertEq(reasonAfter, "compose hash not allowed");
+    }
 
-        // New registration with the now-removed hash reverts.
-        address mB = memberFactory.deployMember(cluster, keccak256("salt-1"));
+    // ── Scenario 6: a proof signed by a non-allowlisted KMS root is rejected ───
+
+    function test_kmsRootNotAllowedReverts() public {
+        address m = memberFactory.deployMember(cluster, keccak256("salt-kms"));
         IDstackFacet.DstackProof memory proof = kms.buildProof(
-            MockKmsChain.DerivedKey({ priv: 4, compressed: COMP4 }),
-            COMPOSE,
-            keccak256("inst-B"),
-            DEVICE,
-            "UpToDate",
+            MockKmsChain.DerivedKey({ priv: 6, compressed: COMP6 }),
             cluster,
-            mB,
-            bytes32("xpub-B"),
-            bytes32("wg-B")
+            m,
+            bytes32("xpub-k"),
+            bytes32("wg-k")
         );
-        vm.expectRevert(ComposeHashNotAllowed.selector);
-        IDstackFacet(cluster).dstack_register(proof, mB, bytes32("xpub-B"), bytes32("wg-B"));
+        // Owner removes the only allowlisted KMS root; the sig chain no longer roots
+        // in a trusted KMS, so verify() reverts.
+        DstackFacet(cluster).removeAllowedKmsRoot(kms.rootAddress());
+        vm.expectRevert(DstackSigChain.InvalidSigChain.selector);
+        IDstackFacet(cluster).dstack_register(proof, m, bytes32("xpub-k"), bytes32("wg-k"));
+    }
+
+    // ── Scenario 7: the attested app_id (codeId) must equal the member contract ─
+
+    function test_codeIdMismatchReverts() public {
+        address mA = memberFactory.deployMember(cluster, keccak256("salt-a"));
+        address mB = memberFactory.deployMember(cluster, keccak256("salt-b"));
+        // Proof attests app_id = mA, but we try to register mB.
+        IDstackFacet.DstackProof memory proof = kms.buildProof(
+            MockKmsChain.DerivedKey({ priv: 6, compressed: COMP6 }),
+            cluster,
+            mA,
+            bytes32("xpub"),
+            bytes32("wg")
+        );
+        vm.expectRevert(CodeIdMismatch.selector);
+        IDstackFacet(cluster).dstack_register(proof, mB, bytes32("xpub"), bytes32("wg"));
+    }
+
+    // ── Scenario 8: the binding message must commit to the exact keys ──────────
+
+    function test_bindingMismatchReverts() public {
+        address m = memberFactory.deployMember(cluster, keccak256("salt-bind"));
+        // Proof binds (xpub-1, wg-1); call register with different keys.
+        IDstackFacet.DstackProof memory proof = kms.buildProof(
+            MockKmsChain.DerivedKey({ priv: 6, compressed: COMP6 }),
+            cluster,
+            m,
+            bytes32("xpub-1"),
+            bytes32("wg-1")
+        );
+        vm.expectRevert(BindingMismatch.selector);
+        IDstackFacet(cluster).dstack_register(proof, m, bytes32("xpub-2"), bytes32("wg-2"));
+    }
+
+    // ── Drift guard: the KMS preimage literal is exactly "dstack-kms-issued:" ──
+    // If MockKmsChain or DstackSigChain ever drift from dstack's real preimage, this
+    // independent recompute of the literal would stop recovering the KMS root.
+
+    function test_dstackKmsIssuedPreimageLiteral() public {
+        address m = memberFactory.deployMember(cluster, keccak256("salt-lit"));
+        IDstackFacet.DstackProof memory proof = kms.buildProof(
+            MockKmsChain.DerivedKey({ priv: 6, compressed: COMP6 }),
+            cluster,
+            m,
+            bytes32("xpub"),
+            bytes32("wg")
+        );
+        bytes32 kmsMsgHash = keccak256(
+            abi.encodePacked("dstack-kms-issued:", bytes20(proof.codeId), proof.appCompressedPubkey)
+        );
+        address recovered = DstackSigChain.recover(kmsMsgHash, proof.kmsSignature);
+        assertEq(recovered, kms.rootAddress(), "KMS sig must be over the dstack-kms-issued literal");
     }
 
     // ── CSK commitment: originator-only, set-once ─────────────────────────────
 
     function test_cskCommitmentOriginatorOnly() public {
-        (address mA,) = _register(COMP3, 3, keccak256("inst-A"), "xpub-A", "wg-A", 0);
-        (address mB,) = _register(COMP4, 4, keccak256("inst-B"), "xpub-B", "wg-B", 1);
+        (address mA,) = _register(COMP3, 3, "xpub-A", "wg-A", 0);
+        (address mB,) = _register(COMP4, 4, "xpub-B", "wg-B", 1);
 
         bytes32 commitment = keccak256("csk-commitment");
 
@@ -225,7 +261,7 @@ contract ClusterBringupTest is Test {
     // ── mesh IP derivation is deterministic and in-CIDR ───────────────────────
 
     function test_meshIpInCidr() public {
-        (, bytes32 idA) = _register(COMP3, 3, keccak256("inst-A"), "xpub-A", "wg-A", 0);
+        (, bytes32 idA) = _register(COMP3, 3, "xpub-A", "wg-A", 0);
         uint32 ip = IAttest(cluster).meshIpOf(idA);
         // Inside 10.13.0.0/16 → high 16 bits == 0x0a0d.
         assertEq(ip & 0xFFFF0000, 0x0a0d0000);
@@ -267,7 +303,7 @@ contract ClusterBringupTest is Test {
             initialDeviceIds: devices,
             allowAnyDevice: false,
             requireTcbUpToDate: false,
-            meshCidrIp: 0x0a0d0000,
+            meshCidrIp: 0x0a0d0000, // 10.13.0.0
             meshCidrPrefix: 16,
             memberFactory: address(memberFactory)
         });
@@ -278,31 +314,32 @@ contract ClusterBringupTest is Test {
     function _register(
         bytes memory comp,
         uint256 priv,
-        bytes32 instanceId,
         bytes32 xPub,
         bytes32 wgPub,
         uint256 saltSeq
     ) internal returns (address member, bytes32 memberId) {
         member = memberFactory.deployMember(cluster, keccak256(abi.encode("member", saltSeq)));
         IDstackFacet.DstackProof memory proof = kms.buildProof(
-            MockKmsChain.DerivedKey({ priv: priv, compressed: comp }),
-            COMPOSE,
-            instanceId,
-            DEVICE,
-            "UpToDate",
-            cluster,
-            member,
-            xPub,
-            wgPub
+            MockKmsChain.DerivedKey({ priv: priv, compressed: comp }), cluster, member, xPub, wgPub
         );
         memberId = IDstackFacet(cluster).dstack_register(proof, member, xPub, wgPub);
-        // Stash for _memberAddr lookups.
-        _members.push(member);
     }
 
-    address[] internal _members;
-
-    function _memberAddr(uint256 i) internal view returns (address) {
-        return _members[i];
+    function _bootInfo(address appId, bytes32 composeHash)
+        internal
+        pure
+        returns (IAppAuth.AppBootInfo memory)
+    {
+        return IAppAuth.AppBootInfo({
+            appId: appId,
+            composeHash: composeHash,
+            instanceId: address(0),
+            deviceId: bytes32(0),
+            mrAggregated: bytes32(0),
+            mrSystem: bytes32(0),
+            osImageHash: bytes32(0),
+            tcbStatus: "UpToDate",
+            advisories: new string[](0)
+        });
     }
 }

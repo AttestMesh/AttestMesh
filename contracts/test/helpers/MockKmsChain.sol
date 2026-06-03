@@ -4,10 +4,14 @@ pragma solidity 0.8.24;
 import { Vm } from "forge-std/Vm.sol";
 import { MessageHashUtils } from "@openzeppelin/contracts/utils/cryptography/MessageHashUtils.sol";
 import { IDstackFacet } from "../../src/interfaces/IDstackFacet.sol";
+import { DstackSigChain } from "../../src/libraries/DstackSigChain.sol";
 
 /// @notice In-test dstack KMS sig-chain producer (contracts spec §15 helpers).
-///         Root = private key 1, app key = private key 2 (canonical secp256k1
-///         vectors). Each member supplies its own derived key.
+///         Emits proofs in dstack's *real* on-chain format (the preimages ported
+///         from TeeSQL/dstackgres), so DstackFacet.dstack_register verifies them the
+///         same way it would a proof captured from a live CVM. Root = private key 1,
+///         app key = private key 2 (canonical secp256k1 vectors); each member supplies
+///         its own derived key.
 contract MockKmsChain {
     Vm internal constant vm = Vm(0x7109709ECfa91a80626fF3989D68f67F5b1DD12D);
 
@@ -20,6 +24,12 @@ contract MockKmsChain {
 
     string internal constant BIND_DOMAIN = "attestmesh.bind.v1";
 
+    /// dstack key-derivation purpose label for the app->derived signature. The real
+    /// label is supplied per-proof by the dstack runtime (dstackgres treats it as a
+    /// proof field, not a constant); this placeholder must be confirmed against a
+    /// captured proof once a live dstack node exists. The facet does not constrain it.
+    string internal constant PURPOSE = "app-key";
+
     function rootAddress() external pure returns (address) {
         return 0x7E5F4552091A69125d5DfCb7b8C2659029395Bdf; // vm.addr(1)
     }
@@ -29,41 +39,37 @@ contract MockKmsChain {
         bytes compressed;
     }
 
-    /// @notice Build a valid DstackProof for `memberContract` joining `cluster`.
+    /// @notice Build a valid real-format DstackProof for `memberContract` joining
+    ///         `cluster`. codeId = bytes20(memberContract): the dstack app_id is the
+    ///         member contract address.
     function buildProof(
         DerivedKey memory derived,
-        bytes32 composeHash,
-        bytes32 instanceId,
-        bytes32 deviceId,
-        string memory tcbStatus,
         address cluster,
         address memberContract,
         bytes32 xPubKey,
         bytes32 wgPubKey
     ) public returns (IDstackFacet.DstackProof memory proof) {
-        proof.kmsRootPubKey = ROOT_COMP;
-        proof.appKey = APP_COMP;
-        proof.appComposeHash = composeHash;
-        proof.derivedPubKey = derived.compressed;
-        proof.derivedInstanceId = instanceId;
-        proof.derivedDeviceId = deviceId;
-        proof.tcbStatus = tcbStatus;
-        proof.advisoryIds = new string[](0);
+        proof.codeId = bytes32(bytes20(memberContract));
+        proof.derivedCompressedPubkey = derived.compressed;
+        proof.appCompressedPubkey = APP_COMP;
+        proof.purpose = PURPOSE;
 
-        // KMS root -> app key (raw keccak hash).
-        bytes32 hApp = keccak256(abi.encode("dstack.app", APP_COMP, composeHash));
-        proof.appKeySig = _sign(ROOT_PRIV, hApp);
-
-        // App key -> derived key (raw keccak hash).
-        bytes32 hDerived =
-            keccak256(abi.encode("dstack.instance", derived.compressed, instanceId, deviceId));
-        proof.derivedKeySig = _sign(APP_PRIV, hDerived);
-
-        // Derived key signs the binding (EIP-191 prefixed).
-        bytes32 bindHash = MessageHashUtils.toEthSignedMessageHash(
-            keccak256(abi.encode(BIND_DOMAIN, cluster, memberContract, xPubKey, wgPubKey))
+        // App key signs "purpose:hex(derivedCompressedPubkey)" (raw keccak).
+        bytes32 appMsgHash = keccak256(
+            abi.encodePacked(PURPOSE, ":", DstackSigChain.bytesToHex(derived.compressed))
         );
-        proof.bindingSig = _sign(derived.priv, bindHash);
+        proof.appSignature = _sign(APP_PRIV, appMsgHash);
+
+        // KMS root signs "dstack-kms-issued:" || bytes20(codeId) || appCompressedPubkey.
+        bytes32 kmsMsgHash =
+            keccak256(abi.encodePacked("dstack-kms-issued:", bytes20(proof.codeId), APP_COMP));
+        proof.kmsSignature = _sign(ROOT_PRIV, kmsMsgHash);
+
+        // Derived key signs the EIP-191 message of the registration binding hash.
+        proof.messageHash =
+            keccak256(abi.encode(BIND_DOMAIN, cluster, memberContract, xPubKey, wgPubKey));
+        proof.messageSignature =
+            _sign(derived.priv, MessageHashUtils.toEthSignedMessageHash(proof.messageHash));
     }
 
     function _sign(uint256 priv, bytes32 digest) internal pure returns (bytes memory) {

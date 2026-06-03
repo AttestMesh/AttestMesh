@@ -3,10 +3,16 @@ pragma solidity 0.8.24;
 
 import { ECDSA } from "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
 
-/// @title DstackSigChain — secp256k1 primitives for the dstack KMS sig chain.
-/// @notice Provides ecrecover-based signature recovery plus secp256k1 public-key
-///         -> address derivation (incl. point decompression) so the dstack KMS
-///         chain can be verified entirely on chain (contracts spec §6.3).
+import { IDstackFacet } from "../interfaces/IDstackFacet.sol";
+
+/// @title DstackSigChain — on-chain verification of the dstack KMS signature chain.
+/// @notice Ports the verification primitive from TeeSQL/dstackgres (`DstackSigChain`),
+///         rebranded for AttestMesh but preserving dstack's *exact* preimages and
+///         encodings, so a proof produced by a real dstack CVM verifies unchanged.
+///         The chain is: KMS root -> app key -> derived key -> registration message.
+/// @dev    Pure/view. Storage for the trusted KMS-root set lives in the caller; the
+///         caller passes itself as the registry so this library stays storage-free.
+///         secp256k1 point decompression uses the 0x05 modexp precompile.
 library DstackSigChain {
     /// secp256k1 field prime p.
     uint256 internal constant P =
@@ -17,6 +23,56 @@ library DstackSigChain {
 
     error InvalidPubKeyLength();
     error PointNotOnCurve();
+    error InvalidSigChain();
+
+    /// @notice Verify a dstack KMS sig-chain proof. Reverts on any failure.
+    /// @param p the proof presented by a CVM sidecar.
+    /// @param registry contract answering `allowedKmsRoots(address)` for the trusted
+    ///        KMS-root set (the DstackFacet passes itself).
+    /// @return codeId the verified codeId (`bytes20(app_id)` left-aligned) — the caller
+    ///         binds this against the member contract.
+    /// @return derivedKey the derived key's EOA — the registration signer / member owner.
+    function verify(IDstackFacet.DstackProof memory p, IDstackFacet registry)
+        internal
+        view
+        returns (bytes32 codeId, address derivedKey)
+    {
+        // codeId = bytes32(bytes20(app_id)): the address occupies the top 20 bytes and
+        // the bottom 12 must be zero. bytes20(p.codeId) below takes the leftmost 20
+        // bytes, and the KMS signature was computed over the raw 20-byte app_id.
+        if ((uint256(p.codeId) << 160) != 0) revert InvalidSigChain();
+
+        // Step 1: the app key signs "purpose:hex(derivedCompressedPubkey)" -> app EOA.
+        address recoveredApp;
+        {
+            string memory derivedHex = bytesToHex(p.derivedCompressedPubkey);
+            bytes32 appMsgHash = keccak256(abi.encodePacked(p.purpose, ":", derivedHex));
+            recoveredApp = recover(appMsgHash, p.appSignature);
+        }
+
+        // Step 2: the KMS root signs "dstack-kms-issued:" || bytes20(app_id) || appPubkey.
+        {
+            bytes32 kmsMsgHash = keccak256(
+                abi.encodePacked("dstack-kms-issued:", bytes20(p.codeId), p.appCompressedPubkey)
+            );
+            address kmsSigner = recover(kmsMsgHash, p.kmsSignature);
+            if (!registry.allowedKmsRoots(kmsSigner)) revert InvalidSigChain();
+        }
+
+        derivedKey = compressedToAddress(p.derivedCompressedPubkey);
+
+        // Step 3: the derived key signs the registration messageHash (EIP-191 wrapped).
+        {
+            bytes32 ethHash =
+                keccak256(abi.encodePacked("\x19Ethereum Signed Message:\n32", p.messageHash));
+            if (recover(ethHash, p.messageSignature) != derivedKey) revert InvalidSigChain();
+        }
+
+        // Step 4: the app pubkey must match the recovered app signer.
+        if (recoveredApp != compressedToAddress(p.appCompressedPubkey)) revert InvalidSigChain();
+
+        return (p.codeId, derivedKey);
+    }
 
     /// @notice Recover the signer address from a 65-byte secp256k1 signature over `digest`.
     function recover(bytes32 digest, bytes memory signature) internal pure returns (address) {
@@ -52,6 +108,18 @@ library DstackSigChain {
         }
 
         return address(uint160(uint256(keccak256(abi.encodePacked(x, y)))));
+    }
+
+    /// @notice Lowercase hex of `data` with no `0x` prefix. Used to reconstruct the
+    ///         dstack app->derived preimage `"purpose:" || hex(derivedCompressedPubkey)`.
+    function bytesToHex(bytes memory data) internal pure returns (string memory) {
+        bytes memory alphabet = "0123456789abcdef";
+        bytes memory str = new bytes(data.length * 2);
+        for (uint256 i = 0; i < data.length; i++) {
+            str[i * 2] = alphabet[uint8(data[i] >> 4)];
+            str[i * 2 + 1] = alphabet[uint8(data[i] & 0x0f)];
+        }
+        return string(str);
     }
 
     /// @notice Recover y for a compressed point given x and the parity prefix.

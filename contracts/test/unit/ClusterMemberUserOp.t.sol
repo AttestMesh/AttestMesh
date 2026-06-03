@@ -88,13 +88,13 @@ contract ClusterMemberUserOpTest is Test {
         view
         returns (PackedUserOperation memory op)
     {
-        bytes32 bindHash = MessageHashUtils.toEthSignedMessageHash(
-            keccak256(abi.encode("attestmesh.bind.v1", cluster, address(member), XPUB, WGPUB))
-        );
+        bytes32 messageHash =
+            keccak256(abi.encode("attestmesh.bind.v1", cluster, address(member), XPUB, WGPUB));
 
         IDstackFacet.DstackProof memory proof;
-        proof.advisoryIds = new string[](0);
-        proof.bindingSig = _sign(bindPriv, bindHash);
+        proof.messageHash = messageHash;
+        proof.messageSignature =
+            _sign(bindPriv, MessageHashUtils.toEthSignedMessageHash(messageHash));
 
         bytes memory inner = abi.encodeWithSelector(
             IDstackFacet.dstack_register.selector, proof, address(member), XPUB, WGPUB

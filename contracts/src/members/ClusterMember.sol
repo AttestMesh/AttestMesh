@@ -154,7 +154,7 @@ contract ClusterMember is
         bytes32 bindHash = keccak256(
                 abi.encode(BIND_DOMAIN, clusterAddr, address(this), xPubKey, wgPubKey)
             ).toEthSignedMessageHash();
-        return ECDSA.recover(bindHash, proof.bindingSig);
+        return ECDSA.recover(bindHash, proof.messageSignature);
     }
 
     // ── Cluster-mediated owner setting (contracts spec §9.1.3) ────────────────

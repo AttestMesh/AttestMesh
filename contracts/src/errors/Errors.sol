@@ -10,18 +10,12 @@ error NotOurMember();
 error AlreadyRegistered();
 error NotClusterMember();
 
-// ── Dstack KMS chain ────────────────────────────────────────────────────────
-error KmsRootNotAllowed();
-error KmsAppKeySigInvalid();
-error AppKeyDerivedSigInvalid();
-
-// ── Dstack allowlist ────────────────────────────────────────────────────────
-error ComposeHashNotAllowed();
-error DeviceNotAllowed();
-error TcbStale();
-
-// ── Binding ─────────────────────────────────────────────────────────────────
-error BindingSigInvalid();
+// ── Dstack registration ───────────────────────────────────────────────────────
+// The KMS sig-chain itself reverts with DstackSigChain.InvalidSigChain; these guard
+// the facet-level binding of the proof to this member + registration message. Compose
+// hash / device / TCB are enforced at the KMS boot gate (isAppAllowed), not here.
+error CodeIdMismatch(); // proof.codeId != bytes20(memberContract)
+error BindingMismatch(); // proof.messageHash != keccak256(bind domain, cluster, member, xPub, wgPub)
 
 // ── Messaging ───────────────────────────────────────────────────────────────
 error DuplicateEnvelope();

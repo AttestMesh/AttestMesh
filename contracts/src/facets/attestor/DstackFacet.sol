@@ -1,8 +1,6 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.24;
 
-import { MessageHashUtils } from "@openzeppelin/contracts/utils/cryptography/MessageHashUtils.sol";
-
 import { IDstackFacet } from "../../interfaces/IDstackFacet.sol";
 import { IAppAuth } from "../../interfaces/IAppAuth.sol";
 import { IAppAuthBasicManagement } from "../../interfaces/IAppAuthBasicManagement.sol";
@@ -16,25 +14,17 @@ import { DstackStorage } from "../../storage/DstackStorage.sol";
 import { ClusterAccess } from "../../access/ClusterAccess.sol";
 import { DstackSigChain } from "../../libraries/DstackSigChain.sol";
 
-import {
-    NotOurMember,
-    KmsRootNotAllowed,
-    KmsAppKeySigInvalid,
-    AppKeyDerivedSigInvalid,
-    ComposeHashNotAllowed,
-    DeviceNotAllowed,
-    TcbStale,
-    BindingSigInvalid
-} from "../../errors/Errors.sol";
+import { NotOurMember, CodeIdMismatch, BindingMismatch } from "../../errors/Errors.sol";
 
 /// @title DstackFacet — the dstack attestor facet (contracts spec §6).
-/// @notice Verifies the dstack KMS 3-level secp256k1 sig chain + a binding
-///         signature, then writes the member into the shared registry. Also
-///         implements dstack's IAppAuth boot gate and IAppAuthBasicManagement
-///         allowlist surface so existing dstack tooling works unchanged.
+/// @notice Verifies the dstack KMS signature chain (KMS root -> app key -> derived
+///         key -> registration message) via the DstackSigChain library, binds the
+///         attested app_id to the member contract, then writes the member into the
+///         shared registry. Also implements dstack's IAppAuth boot gate and
+///         IAppAuthBasicManagement allowlist surface so existing dstack tooling works
+///         unchanged — the allowlist is the boot-gate policy the KMS enforces, not a
+///         registration-time self-assertion.
 contract DstackFacet is IDstackFacet, IAppAuth, IAppAuthBasicManagement, ClusterAccess {
-    using MessageHashUtils for bytes32;
-
     bytes32 public constant DSTACK_ATTESTOR_ID = keccak256("attestmesh.attestor.dstack");
     string internal constant BIND_DOMAIN = "attestmesh.bind.v1";
 
@@ -146,62 +136,29 @@ contract DstackFacet is IDstackFacet, IAppAuth, IAppAuthBasicManagement, Cluster
         bytes32 xPubKey,
         bytes32 wgPubKey
     ) external returns (bytes32 memberId) {
-        DstackStorage.Layout storage d = DstackStorage.layout();
-
-        // 1. memberContract is one of ours.
+        // 1. memberContract was deployed by our factory.
         address factory = MemberStorage.layout().memberFactory;
         if (!IClusterMemberFactory(factory).isOurMember(memberContract)) revert NotOurMember();
 
-        // 2. KMS root allowed.
-        address rootAddr = DstackSigChain.compressedToAddress(proof.kmsRootPubKey);
-        if (!d.allowedKmsRoots[rootAddr]) revert KmsRootNotAllowed();
+        // 2. The KMS-attested app_id (codeId) must be exactly this member contract.
+        if (proof.codeId != bytes32(bytes20(memberContract))) revert CodeIdMismatch();
 
-        // 3. KMS root -> app key.
-        bytes32 hApp = keccak256(abi.encode("dstack.app", proof.appKey, proof.appComposeHash));
-        if (DstackSigChain.recover(hApp, proof.appKeySig) != rootAddr) {
-            revert KmsAppKeySigInvalid();
-        }
+        // 3. The signed registration message must bind exactly this
+        //    (cluster, member, xPubKey, wgPubKey). The derived key signs the EIP-191
+        //    message of it (checked inside verify); here we pin the preimage so the
+        //    proof can't be replayed for a different member or different keys.
+        bytes32 expectedMsg =
+            keccak256(abi.encode(BIND_DOMAIN, address(this), memberContract, xPubKey, wgPubKey));
+        if (proof.messageHash != expectedMsg) revert BindingMismatch();
 
-        // 4. Compose hash allowed.
-        if (!d.allowedComposeHashes[proof.appComposeHash]) revert ComposeHashNotAllowed();
+        // 4. Verify the dstack KMS sig chain: a trusted KMS root issued the app key,
+        //    the app key authorised the derived key, and the derived key signed the
+        //    registration message. Compose hash / device / TCB are the boot-gate
+        //    policy (isAppAllowed), enforced by the KMS before the CVM boots — not
+        //    re-asserted here (the sig chain proves the node passed that gate).
+        (, address derivedKey) = DstackSigChain.verify(proof, IDstackFacet(address(this)));
 
-        // 5. Device allowed.
-        if (!d.allowedDeviceIds[proof.derivedDeviceId] && !d.allowAnyDevice) {
-            revert DeviceNotAllowed();
-        }
-
-        // 6. App key -> derived key.
-        address appKeyAddr = DstackSigChain.compressedToAddress(proof.appKey);
-        bytes32 hDerived = keccak256(
-            abi.encode(
-                "dstack.instance",
-                proof.derivedPubKey,
-                proof.derivedInstanceId,
-                proof.derivedDeviceId
-            )
-        );
-        if (DstackSigChain.recover(hDerived, proof.derivedKeySig) != appKeyAddr) {
-            revert AppKeyDerivedSigInvalid();
-        }
-
-        // 7. TCB freshness.
-        if (
-            d.requireTcbUpToDate
-                && keccak256(bytes(proof.tcbStatus)) != keccak256(bytes("UpToDate"))
-        ) {
-            revert TcbStale();
-        }
-
-        // 8. Binding signature (EIP-191 prefixed bind hash).
-        address derivedAddr = DstackSigChain.compressedToAddress(proof.derivedPubKey);
-        bytes32 bindHash = keccak256(
-                abi.encode(BIND_DOMAIN, address(this), memberContract, xPubKey, wgPubKey)
-            ).toEthSignedMessageHash();
-        if (DstackSigChain.recover(bindHash, proof.bindingSig) != derivedAddr) {
-            revert BindingSigInvalid();
-        }
-
-        // 9. Write member + canonical wg key (folded for atomicity).
+        // 5. Write the member + canonical wg key (folded for atomicity).
         memberId = IAttest(address(this))
             ._addMember(
                 MemberStorage.MemberRecord({
@@ -214,10 +171,10 @@ contract DstackFacet is IDstackFacet, IAppAuth, IAppAuthBasicManagement, Cluster
             );
         INetwork(address(this))._setWgPubKey(memberId, wgPubKey);
 
-        // 9.5. Install the binding key as the ClusterMember's EIP-4337 owner.
-        IClusterMember(memberContract).__setOwnerFromCluster(derivedAddr);
+        // 6. Install the derived key as the ClusterMember's EIP-4337 owner (decision #3).
+        IClusterMember(memberContract).__setOwnerFromCluster(derivedKey);
 
-        // 10. Emit dstack-specific event (MemberRegistered already emitted by _addMember).
-        emit DstackMemberRegistered(memberId, proof.appComposeHash, proof.derivedDeviceId);
+        // 7. Emit dstack-specific event (MemberRegistered already emitted by _addMember).
+        emit DstackMemberRegistered(memberId, proof.codeId, derivedKey);
     }
 }

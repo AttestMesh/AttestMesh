@@ -3,21 +3,23 @@ pragma solidity 0.8.24;
 
 /// @title IDstackFacet — dstack attestor facet registration surface (contracts spec §6.3).
 interface IDstackFacet {
-    /// @notice dstack KMS sig-chain proof + binding signature (contracts spec §6.3).
+    /// @notice The dstack KMS signature-chain proof a CVM sidecar presents at
+    ///         registration. Mirrors dstack's real KMS issuance chain (ported from
+    ///         the verification primitive in TeeSQL/dstackgres `DstackSigChain`):
+    ///         KMS root -> app key -> derived key -> registration message.
+    /// @dev `codeId` is `bytes20(app_id)` left-aligned in a bytes32; in AttestMesh the
+    ///      dstack `app_id` is the ClusterMember contract address. The compose hash,
+    ///      device id, and TCB status are NOT part of the signed chain — they are the
+    ///      KMS *boot-gate* policy (see `isAppAllowed`), enforced before the CVM boots.
     struct DstackProof {
-        // KMS sig chain
-        bytes kmsRootPubKey; // compressed (33B) or uncompressed (64/65B) secp256k1
-        bytes appKey; // compressed/uncompressed secp256k1 derived for compose-hash X
-        bytes appKeySig; // KMS root signature over keccak256("dstack.app", appKey, appComposeHash)
-        bytes32 appComposeHash; // compose hash the KMS bound to
-        bytes derivedPubKey; // the one-shot binding signer pubkey
-        bytes derivedKeySig; // app-key signature over keccak256("dstack.instance", derivedPubKey, instanceId, deviceId)
-        bytes32 derivedInstanceId; // instance id the app key bound to
-        bytes32 derivedDeviceId; // device id the app key bound to
-        string tcbStatus;
-        string[] advisoryIds;
-        // Binding signature from the derived key over the EIP-191-prefixed registration message
-        bytes bindingSig;
+        bytes32 codeId; // bytes20(app_id) left-aligned; app_id == ClusterMember address
+        bytes32 messageHash; // the registration binding hash the derived key signed (pre-EIP-191)
+        bytes messageSignature; // derived-key signature over the EIP-191 message of messageHash
+        bytes appSignature; // app-key signature over "purpose:hex(derivedCompressedPubkey)"
+        bytes kmsSignature; // KMS-root sig over "dstack-kms-issued:" || bytes20(codeId) || appCompressedPubkey
+        bytes derivedCompressedPubkey; // 33-byte compressed SEC1 (the registration signer / member owner)
+        bytes appCompressedPubkey; // 33-byte compressed SEC1 (the dstack app key)
+        string purpose; // dstack key-derivation purpose label for the app->derived signature
     }
 
     function dstack_register(
@@ -32,7 +34,7 @@ interface IDstackFacet {
     function removeAllowedKmsRoot(address kmsRoot) external;
     function allowedKmsRoots(address kmsRoot) external view returns (bool);
 
-    event DstackMemberRegistered(bytes32 indexed memberId, bytes32 composeHash, bytes32 deviceId);
+    event DstackMemberRegistered(bytes32 indexed memberId, bytes32 codeId, address derivedKey);
     event KmsRootAdded(address indexed kmsRoot);
     event KmsRootRemoved(address indexed kmsRoot);
 }
