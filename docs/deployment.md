@@ -50,15 +50,27 @@ D. Node (dstack CVM via Phala)   ── MILESTONE-A WORK ──►  needs A,B,C
    "not authenticated". Resolve before D5 (find the key or `phala login`).
 ```
 
-## Standardized routines (smithers)
+## Standardized routines (smithers + logged bash)
 
-Order-sensitive / repeated routines are authored as durable `smithers` workflows under
-`deploy/workflows/` so they survive crashes, can resume, and log every step:
-- `onchain` — A1→A2→A3 in order, idempotent, writes receipts.
-- `node` — D4→D5→D6 loop per node (build → push → create CVM → wait boot → verify
-  on-chain registration), the most repetitive/ordering-sensitive routine.
+Standardized two layers deep:
+- **Logged bash routines** (`deploy/onchain.sh`, `deploy/node.sh`) hold the actual,
+  idempotent commands; every step tees to `deploy/logs/` via `deploy/lib.sh::run_step`,
+  so on a re-run you see exactly what failed. `onchain.sh infra` no-ops if already
+  deployed (`FORCE=1` to redeploy); `node.sh` is gated on `PHALA_CLOUD_API_KEY` and fails
+  loudly with the unblock instruction.
+- **A durable smithers workflow** (`deploy/workflows/deploy.tsx`) sequences those routines
+  as crash-recoverable, resumable compute steps: preflight → infra → cluster → node.
+  Validated with `smithers graph` (renders the ordered 4-task plan). `deploy/package.json`
+  pins `smithers-orchestrator@0.22.0` + `zod@^4` (needs Zod 4's `.clone()`).
 
-Run: `source deploy/env.sh && smithers up deploy/workflows/onchain.tsx`.
+Run:
+```bash
+source deploy/env.sh                                   # load ~/.teesql creds
+( cd deploy && bun install )                           # once — deduped smithers deps
+( cd deploy && bunx smithers-orchestrator up workflows/deploy.tsx --input '{"node":"node-1"}' )
+# resume from the failed step after fixing it:  … up workflows/deploy.tsx --run-id <id> --resume true
+# or a single routine directly:  deploy/onchain.sh all   /   deploy/node.sh node-1 all
+```
 
 ## Deployed addresses — Base mainnet (8453)
 

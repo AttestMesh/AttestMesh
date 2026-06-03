@@ -3,3 +3,5 @@ env.local.sh
 *.env
 .smithers/
 logs/
+node_modules/
+bun.lock

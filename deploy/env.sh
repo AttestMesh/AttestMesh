@@ -34,6 +34,14 @@ export KMS_CONTRACT="0x2f83172A49584C017F2B256F0FB2Dca14126Ba9C"
 # Basescan key for `forge verify` (read from hub.env if present)
 export BASESCAN_API_KEY="$(grep -oE '^BASESCAN_API_KEY=.*' "$TEESQL/hub.env" 2>/dev/null | cut -d= -f2- | tr -d '[:space:]' || true)"
 
+# Phala Cloud API key for `phala deploy` (Track D5 / node bring-up). The non-interactive
+# shell can't see an interactive `phala login`, so the deploy routines read it from a
+# file. To unblock node deployment: write the key to $TEESQL/phala-cloud-api.key
+# (or export PHALA_CLOUD_API_KEY before sourcing). Optional — only D5 needs it.
+if [ -z "${PHALA_CLOUD_API_KEY:-}" ] && [ -f "$TEESQL/phala-cloud-api.key" ]; then
+    export PHALA_CLOUD_API_KEY="$(_read "$TEESQL/phala-cloud-api.key")"
+fi
+
 export PATH="$HOME/.foundry/bin:$PATH"
 set +euo pipefail 2>/dev/null || true
 echo "env loaded: chain=$CHAIN_ID deployer=$DEPLOYER_ADDR org_safe=$ORG_SAFE kms_root=$KMS_ROOT"
