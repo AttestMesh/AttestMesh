@@ -86,4 +86,11 @@ Canonical receipt: `contracts/script/deployments/8453.json` (written by `DeployI
 | 2026-06-03 | **A2 DeployCluster** `attestmesh-1` | ✔ `0x624a…b712`; owner=deployer, allowedKmsRoots[real]=true, allowedComposeHashes[real]=true, allowAnyDevice, meshIp(1)=10.13.124.237 (matches sidecar vector) |
 | 2026-06-03 | **B gas-webhook (Cloudflare)** | ✔ live at `attestmesh-gas-sponsorship-webhook.teesql-aa-webhook.workers.dev`; chain 8453 + real factory addrs, 2 KV namespaces, secrets set (RPC_URL, ALCHEMY_WEBHOOK_TOKEN→`~/.teesql/attestmesh-webhook-token`); `GET /healthz`=200. CF token: `~/.teesql/cloudflare-wrangler.toml` (the teebox-llc one lacks Workers-KV perms). |
 | 2026-06-03 | B3 (todo, hardening) | point the Alchemy Gas Manager policy `56444921…` at the webhook URL + token (dashboard/Admin API). Sponsorship works via the policy's own rules without it; the webhook is the custom provenance gate. |
-| 2026-06-03 | next | Track C (indexer), then Track D (node — milestone-A wiring) |
+| 2026-06-03 | Phala auth | ⚠ not found: no `phala` on PATH, no `~/.phala*` store, no `PHALA_CLOUD_API_KEY` in env/`~/.teesql`; `npx phala` says "not authenticated". Needs `PHALA_CLOUD_API_KEY` exported (dstackgres CLI reads that env var) or `phala login`. Blocks only D5 (CVM boot). |
+| 2026-06-03 | next (unblocked) | **Milestone-A code** for Track D — needed regardless of Phala: (1) fix the `isAppAllowed` boot deadlock; (2) add a `DstackRuntime` KMS-sig-chain request method (grounded against dstackgres's real dstack guest-agent client); (3) wire `state::run()`; (4) sidecar OCI image. Then ONE infra+cluster redeploy with the fixed `DstackFacet` (+ refresh webhook factory addrs). Track C (indexer) can run un-attested for bring-up. |
+
+## Phala auth (action needed for D5)
+
+To deploy a real CVM, export the Phala Cloud API key the way the dstackgres CLI expects:
+`export PHALA_CLOUD_API_KEY=<key>` (or `npx phala login`). Everything up to the CVM boot
+proceeds without it.
