@@ -13,6 +13,30 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 use zeroize::Zeroizing;
 
+/// A dstack-derived key plus its KMS signature chain (guest-agent `/GetKey`).
+/// Validated against dstackgres `group_auth.rs`: `signature_chain` is
+/// `[app_signature, kms_signature, ...]`. The app key signs
+/// `"ethereum:" + hex(compressed_pubkey(key))`; the KMS root signs
+/// `"dstack-kms-issued:" || bytes20(app_id) || app_compressed_pubkey`.
+#[derive(Debug, Clone, Default)]
+pub struct DstackKey {
+    /// The derived secp256k1 private key, raw bytes (>= 32).
+    pub key: Vec<u8>,
+    /// `[app_signature, kms_signature, ...]`, each raw signature bytes.
+    pub signature_chain: Vec<Vec<u8>>,
+}
+
+/// CVM identity from the guest-agent `/Info`. `app_id` is the dstack app_id — in
+/// AttestMesh it equals the ClusterMember contract address (and `codeId = bytes20(app_id)`).
+#[derive(Debug, Clone, Default)]
+pub struct DstackInfo {
+    pub app_id: Vec<u8>,
+    pub compose_hash: Vec<u8>,
+    pub instance_id: Vec<u8>,
+    pub device_id: Vec<u8>,
+    pub tcb_status: String,
+}
+
 /// The dstack runtime surface the sidecar depends on. Deterministic per TEE state:
 /// the same purpose/subkey yields the same bytes across restarts of the same CVM,
 /// but differs across CVMs (dstack keys by app_id).
@@ -29,6 +53,15 @@ pub trait DstackRuntime: Send + Sync {
 
     /// Unseal previously sealed bytes, or `None` if nothing was sealed under `label`.
     async fn unseal(&self, label: &str) -> Result<Option<Vec<u8>>>;
+
+    /// Fetch a dstack-derived key + its KMS signature chain (guest-agent `/GetKey`).
+    /// This is the registration-proof material: the derived key signs the binding
+    /// message, and `signature_chain` carries the app + KMS signatures the on-chain
+    /// `DstackFacet.dstack_register` verifies.
+    async fn get_key(&self, path: &str, purpose: &str) -> Result<DstackKey>;
+
+    /// CVM identity from the guest-agent `/Info` (app_id, compose_hash, instance/device id, tcb).
+    async fn info(&self) -> Result<DstackInfo>;
 }
 
 /// In-memory mock for tests. `root_seed` stands in for the per-CVM TEE state, so two
@@ -90,6 +123,45 @@ impl DstackRuntime for MockDstack {
     async fn unseal(&self, label: &str) -> Result<Option<Vec<u8>>> {
         Ok(self.store.lock().unwrap().get(label).cloned())
     }
+
+    async fn get_key(&self, path: &str, purpose: &str) -> Result<DstackKey> {
+        let k = self.derive_key(path, purpose).await?;
+        // Shape-valid placeholder chain so callers can exercise the [app_sig, kms_sig]
+        // layout. Real signatures come from a live KMS; the contract-side MockKmsChain
+        // exercises real-format verification.
+        let app_sig = Keccak256::digest(
+            [
+                b"mock-app-sig:".as_ref(),
+                self.root_seed.as_slice(),
+                k.as_slice(),
+            ]
+            .concat(),
+        )
+        .to_vec();
+        let kms_sig =
+            Keccak256::digest([b"mock-kms-sig:".as_ref(), self.root_seed.as_slice()].concat())
+                .to_vec();
+        Ok(DstackKey {
+            key: k.as_slice().to_vec(),
+            signature_chain: vec![app_sig, kms_sig],
+        })
+    }
+
+    async fn info(&self) -> Result<DstackInfo> {
+        Ok(DstackInfo {
+            app_id: self.root_seed[..20].to_vec(),
+            compose_hash: Keccak256::digest(
+                [b"mock-compose:".as_ref(), self.root_seed.as_slice()].concat(),
+            )
+            .to_vec(),
+            instance_id: Keccak256::digest(
+                [b"mock-instance:".as_ref(), self.root_seed.as_slice()].concat(),
+            )[..20]
+                .to_vec(),
+            device_id: Keccak256::digest(b"mock-device").to_vec(),
+            tcb_status: "UpToDate".to_string(),
+        })
+    }
 }
 
 /// Best-effort production client speaking JSON over the dstack guest-agent UDS.
@@ -147,6 +219,51 @@ impl DstackRuntime for UnixSocketDstack {
             _ => Ok(None),
         }
     }
+
+    async fn get_key(&self, path: &str, purpose: &str) -> Result<DstackKey> {
+        let body = serde_json::json!({ "path": path, "purpose": purpose });
+        let resp = self.request("/GetKey", &body).await?;
+        let key_hex = resp
+            .get("key")
+            .and_then(|v| v.as_str())
+            .context("GetKey: missing key")?;
+        let key = hex::decode(key_hex.trim_start_matches("0x")).context("GetKey: bad key hex")?;
+        let signature_chain = resp
+            .get("signature_chain")
+            .and_then(|v| v.as_array())
+            .context("GetKey: missing signature_chain")?
+            .iter()
+            .map(|s| {
+                let h = s.as_str().context("signature_chain entry not a string")?;
+                hex::decode(h.trim_start_matches("0x")).context("signature_chain: bad hex")
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(DstackKey {
+            key,
+            signature_chain,
+        })
+    }
+
+    async fn info(&self) -> Result<DstackInfo> {
+        let resp = self.request("/Info", &serde_json::json!({})).await?;
+        let hexf = |k: &str| -> Vec<u8> {
+            resp.get(k)
+                .and_then(|v| v.as_str())
+                .map(|s| hex::decode(s.trim_start_matches("0x")).unwrap_or_default())
+                .unwrap_or_default()
+        };
+        Ok(DstackInfo {
+            app_id: hexf("app_id"),
+            compose_hash: hexf("compose_hash"),
+            instance_id: hexf("instance_id"),
+            device_id: hexf("device_id"),
+            tcb_status: resp
+                .get("tcb_status")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string(),
+        })
+    }
 }
 
 impl UnixSocketDstack {
@@ -171,5 +288,34 @@ impl UnixSocketDstack {
             .map(|p| p + 4)
             .context("malformed dstack response")?;
         Ok(serde_json::from_slice(&resp[body_start..])?)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn mock_get_key_and_info_shapes() {
+        // Validates the dstack /GetKey + /Info shapes the registration proof is built
+        // from (signature_chain = [app_sig, kms_sig]; app_id is a 20-byte address).
+        let d = MockDstack::from_label("cvm-1");
+        let k = d.get_key("attestmesh", "ethereum").await.unwrap();
+        assert_eq!(
+            k.signature_chain.len(),
+            2,
+            "signature_chain = [app_sig, kms_sig]"
+        );
+        assert_eq!(k.key.len(), 32);
+        assert!(!k.signature_chain[0].is_empty() && !k.signature_chain[1].is_empty());
+        // Deterministic per CVM state (same seed → same key).
+        assert_eq!(
+            k.key,
+            d.get_key("attestmesh", "ethereum").await.unwrap().key
+        );
+
+        let info = d.info().await.unwrap();
+        assert_eq!(info.app_id.len(), 20, "app_id is a 20-byte address");
+        assert_eq!(info.tcb_status, "UpToDate");
     }
 }
