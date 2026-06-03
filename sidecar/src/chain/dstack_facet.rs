@@ -6,6 +6,8 @@
 use super::abi;
 use alloy::primitives::{keccak256, Address, Bytes, B256};
 use alloy::signers::k256::ecdsa::{RecoveryId, Signature as K256Sig, SigningKey, VerifyingKey};
+use alloy::signers::local::PrivateKeySigner;
+use alloy::signers::Signer;
 use alloy::sol_types::{SolCall, SolValue};
 use anyhow::{ensure, Context, Result};
 
@@ -111,6 +113,51 @@ pub fn build_kms_material(
     })
 }
 
+/// EIP-191 personal-sign hash of a 32-byte message (matches Solidity
+/// `MessageHashUtils.toEthSignedMessageHash`): `keccak256("\x19Ethereum Signed
+/// Message:\n32" || hash)`.
+pub fn eth_signed_message_hash(hash: B256) -> B256 {
+    let mut v = Vec::with_capacity(28 + 32);
+    v.extend_from_slice(b"\x19Ethereum Signed Message:\n32");
+    v.extend_from_slice(hash.as_slice());
+    keccak256(v)
+}
+
+/// Build the complete on-chain `DstackProof` the sidecar submits to register: assemble
+/// the KMS material (app pubkey recovery + codeId), pin the binding `messageHash` to
+/// (cluster, member, xPub, wgPub), and sign its EIP-191 message with the derived key.
+/// The result satisfies the on-chain `DstackSigChain.verify` checks (see the e2e test).
+#[allow(clippy::too_many_arguments)]
+pub async fn build_proof(
+    derived_signer: &PrivateKeySigner,
+    app_id: &[u8],
+    app_signature: Vec<u8>,
+    kms_signature: Vec<u8>,
+    cluster: Address,
+    member: Address,
+    x_pub: B256,
+    wg_pub: B256,
+) -> Result<abi::DstackProof> {
+    let derived_priv = derived_signer.to_bytes();
+    let material = build_kms_material(
+        app_id,
+        derived_priv.as_slice(),
+        app_signature,
+        kms_signature,
+    )?;
+    let message_hash = bind_hash(cluster, member, x_pub, wg_pub);
+    // alloy `sign_message` applies the EIP-191 prefix, exactly as the contract recovers.
+    let sig = derived_signer
+        .sign_message(message_hash.as_slice())
+        .await
+        .context("sign binding message")?;
+    Ok(assemble_proof(
+        material,
+        message_hash,
+        sig.as_bytes().to_vec(),
+    ))
+}
+
 /// ABI-encode `dstack_register(proof, member, xPub, wgPub)` for the inner UserOp call.
 pub fn build_register_calldata(
     proof: abi::DstackProof,
@@ -190,5 +237,64 @@ mod tests {
             m.code_id.0[20..].iter().all(|&b| b == 0),
             "codeId upper 12 bytes zero"
         );
+    }
+
+    #[tokio::test]
+    async fn build_proof_passes_onchain_verification_logic() {
+        // Build a full proof, then run the same checks DstackSigChain.verify does on
+        // chain — proving a sidecar-built proof verifies against the deployed contract.
+        let derived = PrivateKeySigner::from_slice(&[0x11u8; 32]).unwrap();
+        let derived_compressed = compressed_pubkey(derived.to_bytes().as_slice()).unwrap();
+
+        // app key signs "ethereum:" + hex(derivedCompressedPubkey).
+        let app = SigningKey::from_slice(&[0x22u8; 32]).unwrap();
+        let app_compressed = app
+            .verifying_key()
+            .to_encoded_point(true)
+            .as_bytes()
+            .to_vec();
+        let app_msg_hash =
+            keccak256(format!("ethereum:{}", hex::encode(&derived_compressed)).as_bytes());
+        let (asig, arec) = app.sign_prehash_recoverable(&app_msg_hash.0).unwrap();
+        let mut app_sig = asig.to_bytes().to_vec();
+        app_sig.push(27 + arec.to_byte());
+
+        let app_id = [0xABu8; 20];
+        let cluster = address!("000000000000000000000000000000000000000a");
+        let member = address!("000000000000000000000000000000000000000b");
+        let x_pub = B256::repeat_byte(0x33);
+        let wg_pub = B256::repeat_byte(0x44);
+
+        let proof = build_proof(
+            &derived,
+            &app_id,
+            app_sig,
+            vec![9u8; 65],
+            cluster,
+            member,
+            x_pub,
+            wg_pub,
+        )
+        .await
+        .unwrap();
+
+        // (1) app step: appCompressedPubkey == the signer of the "ethereum:" preimage.
+        assert_eq!(
+            proof.appCompressedPubkey.as_ref(),
+            app_compressed.as_slice()
+        );
+        // (2) codeId binding = bytes20(app_id).
+        assert_eq!(&proof.codeId.0[..20], &app_id);
+        assert!(proof.codeId.0[20..].iter().all(|&b| b == 0));
+        // (3) derived/binding step: messageSignature over EIP-191(messageHash) recovers the derived key.
+        let eth = eth_signed_message_hash(proof.messageHash);
+        let recovered = recover_compressed(&eth.0, &proof.messageSignature).unwrap();
+        assert_eq!(
+            recovered, derived_compressed,
+            "derived key must sign the bind message"
+        );
+        // (4) messageHash pins (cluster, member, xPub, wgPub).
+        assert_eq!(proof.messageHash, bind_hash(cluster, member, x_pub, wg_pub));
+        assert_eq!(proof.purpose, "ethereum");
     }
 }
