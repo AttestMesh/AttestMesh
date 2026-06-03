@@ -68,3 +68,20 @@ sol! {
     // ClusterMember.execute — the outer wrapper the gas webhook gates on.
     function execute(address target, uint256 value, bytes data) external;
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloy::sol_types::SolCall;
+
+    /// Cross-language ABI guard (audit AUDIT_1780519998 finding 2). The
+    /// `dstack_register` selector is keccak256 of its canonical signature, which
+    /// expands the full `DstackProof` tuple — so pinning the same literal here
+    /// (alloy `sol!`), in the contracts (`IDstackFacet.dstack_register.selector`,
+    /// `test/unit/Selectors.t.sol`), and in the gas-webhook (`selectors.spec.ts`)
+    /// makes any field-order/type drift in one encoder fail that language's test.
+    #[test]
+    fn dstack_register_selector_is_pinned() {
+        assert_eq!(dstack_registerCall::SELECTOR, [0x53, 0x7d, 0x49, 0x1c]);
+    }
+}
