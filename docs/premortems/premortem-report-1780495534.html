@@ -1,0 +1,144 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Premortem — the v2 design (dstack-attested-quorum-membership)</title>
+<style>
+  :root{--bg:#0a0e1a;--panel:#121829;--panel2:#0e1422;--ink:#e8ecf6;--muted:#97a2c0;--line:#222c44;--accent:#7aa2ff;--danger:#ff5d6c;--warn:#ffb454;--ok:#54d6a0}
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif}
+  .wrap{max-width:1080px;margin:0 auto;padding:40px 22px 80px}
+  h1{font-size:27px;margin:0 0 6px;letter-spacing:-.3px}
+  .sub{color:var(--muted);margin:0 0 4px}
+  .kill{display:block;margin:16px 0 4px;padding:12px 16px;border-radius:12px;background:rgba(255,93,108,.13);color:#ffb9c0;border:1px solid rgba(255,93,108,.45);font-weight:600;font-size:14px}
+  .meta{display:block;margin:10px 0 4px;padding:12px 16px;border-radius:12px;background:rgba(122,162,255,.1);color:#bcd0ff;border:1px solid #2b3a63;font-size:14px}
+  h2{font-size:13px;text-transform:uppercase;letter-spacing:1.4px;color:var(--muted);margin:34px 0 14px;border-bottom:1px solid var(--line);padding-bottom:8px}
+  .syn{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:20px 22px;margin:12px 0}
+  .syn h3{margin:0 0 6px;font-size:16px}
+  .tag{font-size:11px;text-transform:uppercase;letter-spacing:1px;font-weight:700}
+  .t-likely{color:var(--warn)}.t-danger{color:var(--danger)}.t-hidden{color:var(--accent)}.t-meta{color:#9a7aff}
+  ol,ul{margin:8px 0 0;padding-left:20px}li{margin:6px 0}
+  code{background:var(--panel2);border:1px solid var(--line);border-radius:5px;padding:1px 5px;font-size:12px;color:#cdd7f5}
+  .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(330px,1fr));gap:16px;margin-top:14px}
+  .card{background:var(--panel);border:1px solid var(--line);border-left-width:4px;border-radius:12px;padding:16px 17px;display:flex;flex-direction:column}
+  .card .hd{display:flex;justify-content:space-between;align-items:flex-start;gap:8px;margin-bottom:8px}
+  .card h4{margin:0;font-size:14.5px;line-height:1.35}
+  .sev{flex:none;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.6px;padding:3px 7px;border-radius:6px;white-space:nowrap}
+  .sev.cert{background:rgba(255,93,108,.15);color:var(--danger);border:1px solid rgba(255,93,108,.35)}
+  .sev.high{background:rgba(255,180,84,.13);color:var(--warn);border:1px solid rgba(255,180,84,.32)}
+  .sev.strat{background:rgba(154,122,255,.14);color:#b9a6ff;border:1px solid rgba(154,122,255,.34)}
+  .lbl{font-size:10.5px;text-transform:uppercase;letter-spacing:.8px;color:var(--muted);margin:11px 0 3px;font-weight:700}
+  .story{color:#d4dbf0;font-size:13.5px}.assume{color:#f0d9b0;font-size:13px;font-style:italic}.warn{color:#bfe9d6;font-size:13px}
+  footer{margin-top:46px;color:var(--muted);font-size:12px;border-top:1px solid var(--line);padding-top:16px}
+  .scope{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:12px;margin-top:6px}
+  .scope div{background:var(--panel2);border:1px solid var(--line);border-radius:10px;padding:12px 14px}
+  .scope .k{font-size:10.5px;text-transform:uppercase;letter-spacing:.8px;color:var(--muted)}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Premortem — the v2 design (<code>dstack-attested-quorum-membership</code>)</h1>
+  <p class="sub">We built it as specced. Frame: months from now, it failed — the quorum was subverted, the verification broke, or the coordination didn't scale.</p>
+  <div class="kill">Second strong negative result. v2 dissolves the rejected rework's P1/P2, but introduces a <b>fatal Sybil hole (V1)</b>, rests on a dstack verifier that <b>isn't a reusable library (V2)</b>, and suffers <b>correlated TCB mass-eviction (V4)</b>, a <b>bootstrap chicken-and-egg (V3)</b>, <b>F2 coupling that makes votes un-landable (V5)</b>, and the same <b>"why on chain" erosion (V6)</b>.</div>
+  <div class="meta"><b>Meta-finding (across both fix premortems):</b> we keep trying to make the chain do trustless attestation, and every approach either can't, is insecure, or guts the thesis. The real, unmade decision is <b>chain-as-VERIFIER vs chain-as-COORDINATOR</b> — make it explicitly, instead of iterating governance mechanics.</div>
+
+  <div class="scope">
+    <div><div class="k">What</div>On-chain attestation policy + off-chain mutual DCAP verification + a >50% multisig of members for admission/eviction. Attestation = per-instance TDX quote (report_data binds pubkeys). Self-asserted voting key. Owner = policy + genesis + break-glass.</div>
+    <div><div class="k">Who</div>The team building it; operators/nodes who need only attested, approved-software, <em>independent</em> nodes to govern.</div>
+    <div><div class="k">Success</div>The quorum admits only genuine independent attested nodes; verification is reliable; the chain has a defensible reason to exist.</div>
+    <div><div class="k">Method</div>6 parallel investigators grounded in the spec + the real dstack source (verifier/, ra-tls/, dcap-qvl, kms/, guest-agent, attestation.md) + the AttestMesh code. 2026-06-03.</div>
+  </div>
+
+  <h2>Synthesis — read this first</h2>
+
+  <div class="syn">
+    <span class="tag t-likely">Most likely / most immediate</span>
+    <h3>V5 — nothing works until F2 is fixed, then admission is an O(N) stall.</h3>
+    <p>Votes are EIP-4337 UserOps through <code>bundler.rs::submit</code>, which (lines 63-69) signs the userOpHash before Alchemy inserts <code>paymasterAndData</code> → every op rejected (premortem F2) → no vote lands → member #2 is never admitted. Even fixed, a majority of the <em>full</em> set must each verify off-chain and land a vote tx per join; slow eviction keeps <code>memberCount</code> inflated, <em>raising</em> the threshold — worse as the cluster grows.</p>
+  </div>
+
+  <div class="syn">
+    <span class="tag t-danger">Most dangerous</span>
+    <h3>V1 — no Sybil resistance. A >50% multisig of attested nodes is not a multisig of distinct parties.</h3>
+    <p>Attestation proves "runs approved software," not "is an independent party." One operator runs a majority of CVMs that legitimately pass every peer's DCAP check, holds all their self-asserted voting keys, and votes them as a bloc — owning admission and eviction. It admits non-attested confederates (its majority just votes yes; the contract verifies nothing) and evicts the honest minority. The data-plane DCAP gate doesn't help (takeover nodes run the <em>good</em> image); the vote-audit hash is forensics, not prevention. The original design avoided this because the <b>owner curated membership</b> — the move to a peer quorum introduced the Sybil surface while removing the chain's verification role.</p>
+  </div>
+
+  <div class="syn">
+    <span class="tag t-hidden">The hidden assumption</span>
+    <h3>That "attested" = "independent" — and that holding attestation state on chain is itself the value.</h3>
+    <p>Democratizing admission to a quorum of attested nodes assumes they're distinct honest parties, which attestation never establishes (V1). And the "reuse dstack's verifier" plan assumed a reusable offline library (V2) — but dstack's verifier downloads the OS image and recomputes measurements with <code>dstack-mr</code> and is an HTTP service, not a <code>verify(quote)→bool</code> lib.</p>
+  </div>
+
+  <div class="syn">
+    <span class="tag t-meta">The fork to decide</span>
+    <h3>Chain-as-VERIFIER vs chain-as-COORDINATOR.</h3>
+    <ul>
+      <li><b>VERIFIER (trustless):</b> the only design where the chain enforces something no single party is trusted for is <b>on-chain DCAP quote verification</b> (the deferred path) — heavy (gas, PCS/cert mgmt, <code>dcap-qvl</code>-on-EVM), milestone-scale, but it's the defensible on-chain product.</li>
+      <li><b>COORDINATOR (pragmatic):</b> verification is off-chain; the chain is policy + registry + encrypted messaging + governance. Then <b>answer "why on chain" honestly</b> (neutral shared state, censorship-resistance, multi-tenant Indexer) and <b>fix Sybil with owner-curated admission, not a peer quorum.</b></li>
+    </ul>
+  </div>
+
+  <div class="syn">
+    <h3 style="margin-top:2px">The revised plan</h3>
+    <ol>
+      <li><b>Don't build v2 as specced.</b> Sound on P1/P2, unsound on Sybil (V1), over-claims reusable verification (V2).</li>
+      <li><b>For the realistic use case — owner-deployed cluster infrastructure — owner-curated admission is correct and Sybil-sound.</b> The owner deploys the nodes, so the owner authorizes membership (the original allowlist + factory model); attestation ensures approved software. The >50% quorum solved <em>decentralized</em> admission — a problem an owner-operated cluster doesn't have. Keep mutual off-chain attestation for the <em>data plane</em>.</li>
+      <li><b>Make the verifier-vs-coordinator fork explicit and written down</b> with the "why on chain" answer (V6).</li>
+      <li><b>Implementation facts under any model:</b> dstack's verifier is not a drop-in lib (vendor <code>dcap-qvl</code> + <code>dstack-mr</code>, own the TCB-acceptance policy — <code>validate_tcb</code> doesn't gate on <code>tcb_status</code>); <b>fix F2 first</b>; design a <b>pre-membership rendezvous transport</b> (RA-TLS is cert-only, <code>peer_grpc</code> is wireguard-only); handle <b>correlated TCB recovery</b> (tolerate <code>SwHardeningNeeded</code> + a grace, not instant mass-eviction).</li>
+    </ol>
+  </div>
+
+  <h2>The six failure modes</h2>
+  <div class="grid">
+
+    <div class="card" style="border-left-color:#ff5d6c">
+      <div class="hd"><h4>V1 · No Sybil resistance (attested ≠ independent)</h4><span class="sev cert">Certain</span></div>
+      <div class="story">One operator runs a majority of CVMs on the approved image — all pass every peer's DCAP check — holds all their self-asserted voting keys, and votes the bloc. Past <code>floor(N/2)+1</code> she owns admission + eviction: admits non-attested confederates, evicts the honest minority. Data-plane DCAP doesn't help (her nodes run the good image); the audit hash is forensics. A multisig of attested nodes ≠ a multisig of distinct parties.</div>
+      <div class="lbl">Underlying assumption</div><div class="assume">Attestation of approved software was conflated with proof of independent operatorship.</div>
+      <div class="lbl">Early warning signs</div><div class="warn">Growth dominated by nodes sharing FMSPC/ASN/PCCS fingerprints with no distinctness check in <code>proposeMember</code>/<code>voteAdmit</code>; correlated <code>ownerKey</code>s while distinct operating entities stay flat.</div>
+    </div>
+
+    <div class="card" style="border-left-color:#ff7a45">
+      <div class="hd"><h4>V2 · dstack's verifier isn't a reusable library</h4><span class="sev cert">Certain</span></div>
+      <div class="story"><code>CvmVerifier::verify()</code> (verifier/src/verification.rs:400) doesn't check measurements against an allowlist — it <b>downloads the OS image</b> and recomputes MRTD/RTMR with <code>dstack-mr</code>, in a Rocket HTTP binary. The reusable surface is <code>dcap-qvl</code>/<code>dstack-attest</code>; you hand-build the policy layer. Needs live PCCS collateral (FMSPC-keyed) — no collateral, no verified peer, no mesh/vote. And <code>validate_tcb</code> doesn't gate on <code>tcb_status</code> — your TCB policy is unverified (too lax admits bad, too strict rejects good).</div>
+      <div class="lbl">Underlying assumption</div><div class="assume">dstack ships peer-quote verification as a reusable, offline library.</div>
+      <div class="lbl">Early warning signs</div><div class="warn">"Reuse the verifier" becomes vendoring <code>dcap-qvl</code>+<code>dstack-mr</code>+PCCS plumbing; real-TDX tests fail with "Failed to get collateral" or MRTD/RTMR mismatch after an image/TCB update.</div>
+    </div>
+
+    <div class="card" style="border-left-color:#e85d9c">
+      <div class="hd"><h4>V3 · Bootstrap chicken-and-egg + unverified genesis</h4><span class="sev high">High</span></div>
+      <div class="story">A newcomer must let a majority DCAP-verify it over "RA-TLS" — but dstack's <code>ra-tls</code> is cert-format only (no listener); the only member transport is <code>peer_grpc</code> (wireguard-only, gated on being verified) and <code>PeerEndpoint</code> over member-only <code>MessageFacet</code>. So a non-member has no channel to be verified → admissions dry up. And member #1 enters by owner fiat with zero peer verification; at N=1 it's the whole majority and can admit accomplices before any honest peer checks it.</div>
+      <div class="lbl">Underlying assumption</div><div class="assume">"Verify each other over RA-TLS" is a usable bootstrap primitive; owner-fiat genesis is a safe stand-in for verification.</div>
+      <div class="lbl">Early warning signs</div><div class="warn">No transport is named for the attestation exchange; a fresh <code>proposeMember</code> accrues zero votes; no test ever DCAP-verifies the genesis node.</div>
+    </div>
+
+    <div class="card" style="border-left-color:#ffb454">
+      <div class="hd"><h4>V4 · Correlated TCB-recovery mass-eviction</h4><span class="sev high">High</span></div>
+      <div class="story">Intel publishes a TDX recovery; within one PCCS refresh every node's <code>dcap-qvl</code> flips <code>UpToDate</code>→<code>OutOfDate</code> (status is Intel-controlled, identical for the homogeneous fleet). The policy accepts only <code>UpToDate</code>, so every member fails every peer at re-attestation and files <code>voteEvict</code> on everyone; <code>memberCount</code> collapses below quorum in one block-span → wedge (break-glass can't re-admit). Separately, near 50% eviction oscillates on transient slowness/reboots.</div>
+      <div class="lbl">Underlying assumption</div><div class="assume">Re-attestation failure is independent and node-local, so symmetric >50% eviction safely removes one bad node.</div>
+      <div class="lbl">Early warning signs</div><div class="warn"><code>voteEvict</code> spike all citing the same fresh advisory/<code>tcb_status</code> transition; <code>memberCount</code> saw-tooth churn with reason "unreachable/timed-out re-attest."</div>
+    </div>
+
+    <div class="card" style="border-left-color:#7aa2ff">
+      <div class="hd"><h4>V5 · O(N) admission + coupling to the broken F2 transport</h4><span class="sev cert">Certain</span></div>
+      <div class="story">Every join needs a majority of the full set to each verify + land a <code>voteAdmit</code> UserOp; clusters churn, so wall-clock is dominated by overlapping ceremonies blocked on the slowest member, and inflated <code>memberCount</code> raises the threshold. And none land: votes are UserOps through <code>bundler.rs::submit</code>, which signs before <code>paymasterAndData</code> is inserted (F2) → <code>AA24</code> reject on every op → no quorum ever forms. One bundler + webhook is a censorable chokepoint for the whole control plane.</div>
+      <div class="lbl">Underlying assumption</div><div class="assume">Per-event all-member majority voting is cheap and reliable, and the gasless UserOp transport works.</div>
+      <div class="lbl">Early warning signs</div><div class="warn">A 3–5-node rehearsal where <code>proposeMember</code> never reaches quorum (offline node or <code>AA24</code> on <code>voteAdmit</code>); pending-admission latency climbs with size; <code>memberCount</code> drifts above live count.</div>
+    </div>
+
+    <div class="card" style="border-left-color:#9a7aff">
+      <div class="hd"><h4>V6 · Strategic — the chain verifies nothing → "Safe + a message board"</h4><span class="sev strat">Strategic</span></div>
+      <div class="story">§1's "attestation chain the cluster contract verifies" and the Join invariant die; §4.1's attestor-facet checks evaporate. What remains is a registry + relay + key bulletin + a vote tally — each a thing a Safe or coordinator already does. The chain can't see whether a voter ran DCAP (quoteHash is self-asserted in the vote), can't tell honest from colluding signers, can't enforce independence — it only orders votes and stores ciphertext. Fix #1 collapsed into DstackApp; fix #2 collapses into "Safe + bulletin board."</div>
+      <div class="lbl">Underlying assumption</div><div class="assume">A public chain adds value by holding attestation-derived state, when its only defensible value is independently verifying what no single party is trusted for.</div>
+      <div class="lbl">Early warning signs</div><div class="warn">"Why not a Safe + a coordinator service?" is answered operationally, not "the chain verifies attestation no operator is trusted to"; the Indexer/paymaster stack's only consumers already share a DCAP'd mesh and could swap the bytes peer-to-peer.</div>
+    </div>
+
+  </div>
+
+  <footer>
+    Premortem of the v2 design · 2026-06-03 · target: <b>docs/specs/dstack-attested-quorum-membership.md</b> · grounded in github.com/dstack-tee/dstack (verifier/, ra-tls/, dcap-qvl, kms/, guest-agent, attestation.md) + the AttestMesh code · companion transcript: <code>premortem-transcript-1780495534.md</code>
+  </footer>
+</div>
+</body>
+</html>
