@@ -382,7 +382,7 @@ function isAppAllowed(IAppAuth.AppBootInfo calldata bootInfo)
 Returns `(true, "")` iff:
 - `bootInfo.composeHash` is in `allowedComposeHashes`, AND
 - `bootInfo.deviceId` is in `allowedDeviceIds` or `allowAnyDevice` is true, AND
-- `bootInfo.appId` is registered as one of this cluster's ClusterMember addresses (looked up via `MemberStorage.memberIdOf`), AND
+- `bootInfo.appId` is owner-allowlisted (`allowedAppIds`, seeded before first boot via `addAllowedAppId`) **or** already a registered member (`MemberStorage.memberIdOf`) — the allowlist path admits a freshly-deployed member at first boot, breaking the cold-start deadlock (the node can't register until it boots, but the KMS gates boot on this check), AND
 - if `requireTcbUpToDate`, then `bootInfo.tcbStatus == "UpToDate"`.
 
 This is the call the dstack KMS makes at CVM boot. Implemented as a view because dstack expects it that way.

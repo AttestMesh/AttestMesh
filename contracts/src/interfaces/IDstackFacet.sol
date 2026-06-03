@@ -34,7 +34,14 @@ interface IDstackFacet {
     function removeAllowedKmsRoot(address kmsRoot) external;
     function allowedKmsRoots(address kmsRoot) external view returns (bool);
 
+    // Owner-seeded app_id allowlist (boot-gate cold-start; contracts spec §6.2).
+    function addAllowedAppId(address appId) external;
+    function removeAllowedAppId(address appId) external;
+    function allowedAppIds(address appId) external view returns (bool);
+
     event DstackMemberRegistered(bytes32 indexed memberId, bytes32 codeId, address derivedKey);
     event KmsRootAdded(address indexed kmsRoot);
     event KmsRootRemoved(address indexed kmsRoot);
+    event AppIdAllowed(address indexed appId);
+    event AppIdDisallowed(address indexed appId);
 }

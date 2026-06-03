@@ -88,7 +88,7 @@ library ClusterCut {
     }
 
     function _dstackSelectors() private pure returns (bytes4[] memory s) {
-        s = new bytes4[](16);
+        s = new bytes4[](19);
         s[0] = IAppAuthBasicManagement.addComposeHash.selector;
         s[1] = IAppAuthBasicManagement.removeComposeHash.selector;
         s[2] = IAppAuthBasicManagement.addDevice.selector;
@@ -105,6 +105,9 @@ library ClusterCut {
         s[13] = IDstackFacet.allowedKmsRoots.selector;
         s[14] = IDstackFacet.dstack_register.selector;
         s[15] = IAppAuth.isAppAllowed.selector;
+        s[16] = IDstackFacet.addAllowedAppId.selector;
+        s[17] = IDstackFacet.removeAllowedAppId.selector;
+        s[18] = IDstackFacet.allowedAppIds.selector;
         // DSTACK_ATTESTOR_ID() getter is intentionally not registered — the
         // constant is derivable off chain (keccak256("attestmesh.attestor.dstack")).
     }

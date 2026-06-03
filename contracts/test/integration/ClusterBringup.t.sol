@@ -163,6 +163,32 @@ contract ClusterBringupTest is Test {
         assertEq(reasonAfter, "compose hash not allowed");
     }
 
+    // ── Boot gate: owner-allowlisted app_id boots before it has registered ─────
+    // Regression for the cold-start deadlock (premortem 1780517097 / audit finding 3):
+    // the KMS calls isAppAllowed at boot, before registration, so the gate must admit
+    // an owner-pre-approved app_id that is not yet a member.
+
+    function test_bootGateAcceptsAllowlistedUnregisteredAppId() public {
+        address m = memberFactory.deployMember(cluster, keccak256("boot-1"));
+        IAppAuth.AppBootInfo memory info = _bootInfo(m, COMPOSE);
+
+        // Not yet allowlisted nor registered → the gate rejects on the appId branch.
+        (bool ok0, string memory r0) = IAppAuth(cluster).isAppAllowed(info);
+        assertFalse(ok0);
+        assertEq(r0, "appId not allowlisted");
+
+        // Owner pre-approves the (not-yet-registered) member address → cold-start boot passes.
+        DstackFacet(cluster).addAllowedAppId(m);
+        (bool ok1, string memory r1) = IAppAuth(cluster).isAppAllowed(info);
+        assertTrue(ok1, "cold-start boot must be allowed once the app_id is allowlisted");
+        assertEq(r1, "");
+
+        // Removing it closes the gate again.
+        DstackFacet(cluster).removeAllowedAppId(m);
+        (bool ok2,) = IAppAuth(cluster).isAppAllowed(info);
+        assertFalse(ok2);
+    }
+
     // ── Scenario 6: a proof signed by a non-allowlisted KMS root is rejected ───
 
     function test_kmsRootNotAllowedReverts() public {
@@ -334,7 +360,7 @@ contract ClusterBringupTest is Test {
             appId: appId,
             composeHash: composeHash,
             instanceId: address(0),
-            deviceId: bytes32(0),
+            deviceId: DEVICE, // allowlisted, so probes reach branches past the device check
             mrAggregated: bytes32(0),
             mrSystem: bytes32(0),
             osImageHash: bytes32(0),

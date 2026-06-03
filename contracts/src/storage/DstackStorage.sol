@@ -15,6 +15,13 @@ library DstackStorage {
         mapping(address kmsRoot => bool allowed) allowedKmsRoots;
         bool allowAnyDevice;
         bool requireTcbUpToDate;
+        // Owner-seeded app_id (ClusterMember address) allowlist. Lets the KMS boot gate
+        // (isAppAllowed) admit a freshly-deployed member that has NOT yet registered —
+        // the operator pre-approves the predicted member address before the CVM boots,
+        // breaking the cold-start deadlock (registration can't happen until the node
+        // boots, but the node can't boot until the gate passes). Appended last to keep
+        // the ERC-7201 layout of the existing fields stable.
+        mapping(address appId => bool allowed) allowedAppIds;
     }
 
     function layout() internal pure returns (Layout storage l) {

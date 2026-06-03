@@ -101,6 +101,25 @@ contract DstackFacet is IDstackFacet, IAppAuth, IAppAuthBasicManagement, Cluster
         return DstackStorage.layout().allowedKmsRoots[kmsRoot];
     }
 
+    // ── Owner-seeded app_id allowlist (boot-gate, contracts spec §6.2) ─────────
+    // The operator pre-approves a member's app_id (its ClusterMember address, known
+    // ahead of boot via the factory's predictMemberAddress) so the KMS boot gate can
+    // admit it before it has registered. Owner-operated directly (own gas).
+
+    function addAllowedAppId(address appId) external onlyClusterOwner {
+        DstackStorage.layout().allowedAppIds[appId] = true;
+        emit AppIdAllowed(appId);
+    }
+
+    function removeAllowedAppId(address appId) external onlyClusterOwner {
+        DstackStorage.layout().allowedAppIds[appId] = false;
+        emit AppIdDisallowed(appId);
+    }
+
+    function allowedAppIds(address appId) external view returns (bool) {
+        return DstackStorage.layout().allowedAppIds[appId];
+    }
+
     // ── IAppAuth boot gate (contracts spec §6.2) ──────────────────────────────
 
     function isAppAllowed(IAppAuth.AppBootInfo calldata bootInfo)
@@ -115,9 +134,15 @@ contract DstackFacet is IDstackFacet, IAppAuth, IAppAuthBasicManagement, Cluster
         if (!d.allowedDeviceIds[bootInfo.deviceId] && !d.allowAnyDevice) {
             return (false, "device not allowed");
         }
-        if (MemberStorage.layout().memberIdOf[bootInfo.appId] == bytes32(0)) {
-            // appId must be one of this cluster's registered ClusterMembers.
-            return (false, "appId not a cluster member");
+        if (
+            !d.allowedAppIds[bootInfo.appId]
+                && MemberStorage.layout().memberIdOf[bootInfo.appId] == bytes32(0)
+        ) {
+            // appId must be an owner-allowlisted app_id (approved before first boot)
+            // or an already-registered member. This breaks the cold-start deadlock:
+            // the operator pre-approves the predicted ClusterMember address so the KMS
+            // releases keys at first boot, before the node has registered.
+            return (false, "appId not allowlisted");
         }
         if (
             d.requireTcbUpToDate
