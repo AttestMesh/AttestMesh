@@ -11,12 +11,13 @@ main = "src/index.ts"
 compatibility_date = "2024-09-23"
 
 # Plaintext configuration (spec §4). These are safe to commit; secrets are not.
+# Live deployment: Base mainnet (8453); AttestMesh infra from script/deployments/8453.json.
 [vars]
-EXPECTED_CHAIN_ID = "84532"
-# ClusterDiamondFactory address deployed by DeployInfra.s.sol (placeholder until deploy).
-CANONICAL_CLUSTER_FACTORY = "0x0000000000000000000000000000000000000000"
-# ClusterMemberFactory address deployed by DeployInfra.s.sol (placeholder until deploy).
-CANONICAL_MEMBER_FACTORY = "0x0000000000000000000000000000000000000000"
+EXPECTED_CHAIN_ID = "8453"
+# ClusterDiamondFactory address deployed by DeployInfra.s.sol on Base mainnet.
+CANONICAL_CLUSTER_FACTORY = "0xB1fA7AD056A9Af1E3f4E1f8b6A147bE79CCfBd1d"
+# ClusterMemberFactory address deployed by DeployInfra.s.sol on Base mainnet.
+CANONICAL_MEMBER_FACTORY = "0xeE8159e67b07aA71b4938b5ea5a9ED63dC4f6e65"
 CACHE_TTL_SECONDS = "86400"
 LOG_LEVEL = "info"
 
@@ -24,8 +25,8 @@ LOG_LEVEL = "info"
 # namespace ids from `wrangler kv:namespace create <NAME>` before deploying.
 [[kv_namespaces]]
 binding = "FACTORY_PROVENANCE_CACHE"
-id = "REPLACE_WITH_FACTORY_PROVENANCE_CACHE_ID"
+id = "9d310e659b8a4c14a3959e08be470657"
 
 [[kv_namespaces]]
 binding = "MEMBER_PROVENANCE_CACHE"
-id = "REPLACE_WITH_MEMBER_PROVENANCE_CACHE_ID"
+id = "8e6ce681beca4a0ea4e60625bcae63cc"
