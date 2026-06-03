@@ -40,19 +40,18 @@ sol! {
 
     // ── Submit calls (encoded as inner UserOp calldata) ───────────────────────
 
+    // Real dstack KMS sig-chain proof shape (ported from TeeSQL/dstackgres). Field
+    // order MUST match contracts' IDstackFacet.DstackProof exactly (ABI + selector).
     #[derive(Debug)]
     struct DstackProof {
-        bytes kmsRootPubKey;
-        bytes appKey;
-        bytes appKeySig;
-        bytes32 appComposeHash;
-        bytes derivedPubKey;
-        bytes derivedKeySig;
-        bytes32 derivedInstanceId;
-        bytes32 derivedDeviceId;
-        string tcbStatus;
-        string[] advisoryIds;
-        bytes bindingSig;
+        bytes32 codeId;
+        bytes32 messageHash;
+        bytes messageSignature;
+        bytes appSignature;
+        bytes kmsSignature;
+        bytes derivedCompressedPubkey;
+        bytes appCompressedPubkey;
+        string purpose;
     }
 
     function dstack_register(

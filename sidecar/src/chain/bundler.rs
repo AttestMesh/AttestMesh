@@ -1,6 +1,15 @@
 //! EIP-4337 v0.7 bundler RPC client (sidecar spec §8.2, §2.1). Hand-rolled JSON-RPC
 //! (the spec sanctions this where upstream isn't ready). All state-mutating calls go
 //! through here; the sidecar holds zero ETH and relies on paymaster sponsorship.
+//!
+//! **Sponsor-then-sign (premortem F2).** The v0.7 `userOpHash` commits to
+//! `paymasterAndData` (it is part of the packed struct the EntryPoint hashes). So the
+//! signature MUST be computed over the *final* op — after the paymaster fields are
+//! populated. The earlier flow signed first and let the paymaster fill the fields
+//! afterwards, which changed the on-chain hash and made `validateUserOp` recover the
+//! wrong signer (EntryPoint rejects with AA24). We therefore request gas + paymaster
+//! sponsorship via `alchemy_requestGasAndPaymasterAndData`, populate the op, and only
+//! then hash + sign. (Flow mirrors TeeSQL/dstackgres's gas_payment/alchemy.rs.)
 
 use super::userop::UserOperation;
 use alloy::primitives::{Address, Bytes, B256, U256};
@@ -10,20 +19,34 @@ use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
 use std::time::Duration;
 
+/// A shape-valid dummy 65-byte secp256k1 signature used for gas/paymaster estimation
+/// before the real signature exists. r/s nonzero, v = 0x1c. ClusterMember.validateUserOp
+/// recovers a (wrong) address from it, which is fine for estimation — the bundler only
+/// needs realistic calldata size.
+const DUMMY_SIGNATURE: &str = "0xfffffffffffffffffffffffffffffff0000000000000000000000000000000007aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa1c";
+
 pub struct BundlerClient {
     http: reqwest::Client,
     url: String,
     entry_point: Address,
     chain_id: u64,
+    /// Alchemy Gas Manager policy id used by `alchemy_requestGasAndPaymasterAndData`.
+    gas_policy_id: String,
 }
 
 impl BundlerClient {
-    pub fn new(url: impl Into<String>, entry_point: Address, chain_id: u64) -> Self {
+    pub fn new(
+        url: impl Into<String>,
+        entry_point: Address,
+        chain_id: u64,
+        gas_policy_id: impl Into<String>,
+    ) -> Self {
         Self {
             http: reqwest::Client::new(),
             url: url.into(),
             entry_point,
             chain_id,
+            gas_policy_id: gas_policy_id.into(),
         }
     }
 
@@ -45,22 +68,15 @@ impl BundlerClient {
         Ok(resp.get("result").cloned().unwrap_or(Value::Null))
     }
 
-    /// Build, sign, submit, and await inclusion. Returns the underlying tx hash.
+    /// Build, sponsor, sign, submit, and await inclusion. Returns the underlying tx hash.
     pub async fn submit(&self, signer: &PrivateKeySigner, mut op: UserOperation) -> Result<B256> {
         op.nonce = self.get_nonce(op.sender).await.unwrap_or(U256::ZERO);
 
-        // Gas estimation (+20% headroom), best-effort fee defaults.
-        if let Ok(est) = self
-            .rpc(
-                "eth_estimateUserOperationGas",
-                json!([userop_json(&op), self.entry_point]),
-            )
-            .await
-        {
-            apply_estimate(&mut op, &est);
-        }
+        // F2: request gas + paymaster sponsorship and populate the op BEFORE signing.
+        self.apply_sponsorship(&mut op).await?;
 
-        // Compute hash with current fields, sign EIP-191 message of it.
+        // The op is now final (incl. paymasterAndData). Hash it and sign the EIP-191
+        // message of the hash, exactly as ClusterMember.validateUserOp will recover.
         let hash = op.user_op_hash(self.entry_point, self.chain_id);
         let sig = signer
             .sign_message(hash.as_slice())
@@ -79,6 +95,28 @@ impl BundlerClient {
             serde_json::from_value(sent).context("parse userOpHash from bundler")?;
 
         self.await_receipt(user_op_hash).await
+    }
+
+    /// Ask Alchemy for gas limits + paymaster sponsorship for `op` (using a dummy
+    /// signature), then populate the op. Must run before signing (F2).
+    async fn apply_sponsorship(&self, op: &mut UserOperation) -> Result<()> {
+        let partial = json!({
+            "sender": op.sender,
+            "nonce": format!("0x{:x}", op.nonce),
+            "callData": op.call_data,
+            "signature": DUMMY_SIGNATURE,
+        });
+        let params = json!([{
+            "policyId": self.gas_policy_id,
+            "entryPoint": self.entry_point,
+            "dummySignature": DUMMY_SIGNATURE,
+            "userOperation": partial,
+        }]);
+        let resp = self
+            .rpc("alchemy_requestGasAndPaymasterAndData", params)
+            .await
+            .context("alchemy_requestGasAndPaymasterAndData")?;
+        apply_sponsorship_response(op, &resp)
     }
 
     async fn get_nonce(&self, sender: Address) -> Result<U256> {
@@ -103,22 +141,33 @@ impl BundlerClient {
     }
 }
 
-fn apply_estimate(op: &mut UserOperation, est: &Value) {
-    let g = |k: &str| -> Option<U256> {
-        est.get(k)
+/// Populate `op`'s gas + paymaster fields from an `alchemy_requestGasAndPaymasterAndData`
+/// result. Pure (no I/O) so the F2 invariant can be unit-tested without a live bundler.
+fn apply_sponsorship_response(op: &mut UserOperation, resp: &Value) -> Result<()> {
+    let req_u256 = |k: &str| -> Result<U256> {
+        resp.get(k)
             .and_then(|v| v.as_str())
             .and_then(|s| U256::from_str_radix(s.trim_start_matches("0x"), 16).ok())
+            .with_context(|| format!("sponsorship response missing/invalid {k}"))
     };
-    let pad = |x: U256| x * U256::from(120u64) / U256::from(100u64);
-    if let Some(x) = g("callGasLimit") {
-        op.call_gas_limit = pad(x);
+    op.call_gas_limit = req_u256("callGasLimit")?;
+    op.verification_gas_limit = req_u256("verificationGasLimit")?;
+    op.pre_verification_gas = req_u256("preVerificationGas")?;
+    op.max_fee_per_gas = req_u256("maxFeePerGas")?;
+    op.max_priority_fee_per_gas = req_u256("maxPriorityFeePerGas")?;
+
+    // Paymaster fields are present whenever the policy sponsors this op.
+    if let Some(pm) = resp.get("paymaster").and_then(|v| v.as_str()) {
+        op.paymaster = Some(pm.parse().context("paymaster address")?);
+        op.paymaster_verification_gas_limit = req_u256("paymasterVerificationGasLimit")?;
+        op.paymaster_post_op_gas_limit = req_u256("paymasterPostOpGasLimit")?;
+        let pd = resp
+            .get("paymasterData")
+            .and_then(|v| v.as_str())
+            .context("sponsorship response has paymaster but no paymasterData")?;
+        op.paymaster_data = pd.parse::<Bytes>().context("paymasterData")?;
     }
-    if let Some(x) = g("verificationGasLimit") {
-        op.verification_gas_limit = pad(x);
-    }
-    if let Some(x) = g("preVerificationGas") {
-        op.pre_verification_gas = pad(x);
-    }
+    Ok(())
 }
 
 /// Serialize a UserOperation to the v0.7 unpacked JSON shape Alchemy expects.
@@ -142,4 +191,81 @@ pub fn userop_json(op: &UserOperation) -> Value {
         m["paymasterData"] = json!(op.paymaster_data);
     }
     m
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_sponsorship() -> Value {
+        json!({
+            "callGasLimit": "0x186a0",
+            "verificationGasLimit": "0x186a0",
+            "preVerificationGas": "0xc350",
+            "maxFeePerGas": "0x3b9aca00",
+            "maxPriorityFeePerGas": "0xf4240",
+            "paymaster": "0x1111111111111111111111111111111111111111",
+            "paymasterVerificationGasLimit": "0x10000",
+            "paymasterPostOpGasLimit": "0x8000",
+            "paymasterData": "0xdeadbeef"
+        })
+    }
+
+    #[test]
+    fn sponsorship_response_populates_gas_and_paymaster() {
+        let mut op = UserOperation::new(
+            Address::repeat_byte(1),
+            U256::ZERO,
+            Bytes::from(vec![1, 2, 3]),
+        );
+        apply_sponsorship_response(&mut op, &sample_sponsorship()).unwrap();
+        assert_eq!(op.call_gas_limit, U256::from(100_000u64));
+        assert_eq!(op.max_fee_per_gas, U256::from(1_000_000_000u64));
+        assert!(op.paymaster.is_some());
+        assert_eq!(op.paymaster_data.len(), 4); // 0xdeadbeef
+    }
+
+    #[test]
+    fn sponsorship_response_allows_no_paymaster() {
+        let mut op = UserOperation::new(Address::repeat_byte(1), U256::ZERO, Bytes::new());
+        let resp = json!({
+            "callGasLimit": "0x186a0",
+            "verificationGasLimit": "0x186a0",
+            "preVerificationGas": "0xc350",
+            "maxFeePerGas": "0x1",
+            "maxPriorityFeePerGas": "0x1"
+        });
+        apply_sponsorship_response(&mut op, &resp).unwrap();
+        assert!(op.paymaster.is_none());
+    }
+
+    /// F2 regression guard: the v0.7 userOpHash MUST commit to paymasterAndData, so a
+    /// signature computed before sponsorship would not match the EntryPoint's hash.
+    /// Signing must therefore happen AFTER `apply_sponsorship` (see `submit`).
+    #[test]
+    fn user_op_hash_commits_to_paymaster_fields() {
+        let ep = Address::repeat_byte(0xEE);
+        let mk = || {
+            let mut op = UserOperation::new(
+                Address::repeat_byte(1),
+                U256::from(7u64),
+                Bytes::from(vec![9]),
+            );
+            op.call_gas_limit = U256::from(100_000u64);
+            op.verification_gas_limit = U256::from(100_000u64);
+            op.pre_verification_gas = U256::from(50_000u64);
+            op.max_fee_per_gas = U256::from(1u64);
+            op.max_priority_fee_per_gas = U256::from(1u64);
+            op
+        };
+        let without = mk().user_op_hash(ep, 84532);
+        let mut with = mk();
+        with.paymaster = Some(Address::repeat_byte(0x22));
+        with.paymaster_data = Bytes::from(vec![0xde, 0xad]);
+        let with_hash = with.user_op_hash(ep, 84532);
+        assert_ne!(
+            without, with_hash,
+            "paymasterAndData must change the userOpHash; sign AFTER sponsorship (F2)"
+        );
+    }
 }

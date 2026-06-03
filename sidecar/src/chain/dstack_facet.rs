@@ -18,36 +18,37 @@ pub fn bind_hash(cluster: Address, member: Address, x_pub: B256, wg_pub: B256) -
     keccak256(enc)
 }
 
-/// Raw KMS sig-chain material as produced by the dstack runtime (one-to-one with
-/// the on-chain DstackProof, minus the binding signature which the sidecar adds).
+/// Raw KMS sig-chain material as produced by the dstack runtime: the codeId
+/// (bytes20(app_id) left-aligned), the app + derived 33-byte compressed SEC1
+/// pubkeys, the KMS-root and app signatures, and the dstack key-derivation purpose
+/// label. The binding `messageHash`/`messageSignature` are computed and signed by
+/// the sidecar (see `bind_hash` + `assemble_proof`), not the runtime.
 #[derive(Debug, Clone, Default)]
 pub struct KmsChainMaterial {
-    pub kms_root_pubkey: Vec<u8>,
-    pub app_key: Vec<u8>,
-    pub app_key_sig: Vec<u8>,
-    pub app_compose_hash: B256,
-    pub derived_pubkey: Vec<u8>,
-    pub derived_key_sig: Vec<u8>,
-    pub derived_instance_id: B256,
-    pub derived_device_id: B256,
-    pub tcb_status: String,
-    pub advisory_ids: Vec<String>,
+    pub code_id: B256,
+    pub app_compressed_pubkey: Vec<u8>,
+    pub app_signature: Vec<u8>,
+    pub kms_signature: Vec<u8>,
+    pub derived_compressed_pubkey: Vec<u8>,
+    pub purpose: String,
 }
 
-/// Assemble the on-chain proof from runtime material + the sidecar's binding sig.
-pub fn assemble_proof(m: KmsChainMaterial, binding_sig: Vec<u8>) -> abi::DstackProof {
+/// Assemble the on-chain proof from runtime material + the sidecar's binding hash
+/// and derived-key signature over its EIP-191 message.
+pub fn assemble_proof(
+    m: KmsChainMaterial,
+    message_hash: B256,
+    message_signature: Vec<u8>,
+) -> abi::DstackProof {
     abi::DstackProof {
-        kmsRootPubKey: Bytes::from(m.kms_root_pubkey),
-        appKey: Bytes::from(m.app_key),
-        appKeySig: Bytes::from(m.app_key_sig),
-        appComposeHash: m.app_compose_hash,
-        derivedPubKey: Bytes::from(m.derived_pubkey),
-        derivedKeySig: Bytes::from(m.derived_key_sig),
-        derivedInstanceId: m.derived_instance_id,
-        derivedDeviceId: m.derived_device_id,
-        tcbStatus: m.tcb_status,
-        advisoryIds: m.advisory_ids,
-        bindingSig: Bytes::from(binding_sig),
+        codeId: m.code_id,
+        messageHash: message_hash,
+        messageSignature: Bytes::from(message_signature),
+        appSignature: Bytes::from(m.app_signature),
+        kmsSignature: Bytes::from(m.kms_signature),
+        derivedCompressedPubkey: Bytes::from(m.derived_compressed_pubkey),
+        appCompressedPubkey: Bytes::from(m.app_compressed_pubkey),
+        purpose: m.purpose,
     }
 }
 

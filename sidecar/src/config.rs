@@ -11,6 +11,8 @@ pub struct Config {
     pub chain_id: u64,
     pub rpc_url: String,
     pub bundler_url: String,
+    /// Alchemy Gas Manager policy id for sponsored UserOps (sidecar spec §8.2).
+    pub gas_policy_id: String,
     pub indexer_registry_addr: Address,
     pub dstack_socket: String,
     pub agent_grpc_socket: String,
@@ -34,6 +36,7 @@ impl Config {
             chain_id: req("CHAIN_ID")?.parse().context("CHAIN_ID")?,
             rpc_url: req("RPC_URL")?,
             bundler_url: req("BUNDLER_URL")?,
+            gas_policy_id: opt("GAS_POLICY_ID", ""),
             indexer_registry_addr: req("INDEXER_REGISTRY_ADDR")?
                 .parse()
                 .context("INDEXER_REGISTRY_ADDR")?,
