@@ -1,0 +1,160 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Premortem — Deploying the AttestMesh v1 Cluster</title>
+<style>
+  :root{
+    --bg:#0a0e1a; --panel:#121829; --panel2:#0e1422; --ink:#e8ecf6; --muted:#97a2c0;
+    --line:#222c44; --accent:#7aa2ff; --danger:#ff5d6c; --warn:#ffb454; --ok:#54d6a0;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif}
+  .wrap{max-width:1080px;margin:0 auto;padding:40px 22px 80px}
+  h1{font-size:30px;margin:0 0 6px;letter-spacing:-.3px}
+  .sub{color:var(--muted);margin:0 0 4px}
+  .verdict{display:inline-block;margin:18px 0 6px;padding:8px 14px;border-radius:999px;background:rgba(255,93,108,.12);color:var(--danger);border:1px solid rgba(255,93,108,.4);font-weight:600;font-size:13px;letter-spacing:.4px;text-transform:uppercase}
+  h2{font-size:13px;text-transform:uppercase;letter-spacing:1.4px;color:var(--muted);margin:38px 0 14px;border-bottom:1px solid var(--line);padding-bottom:8px}
+  .syn{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:20px 22px;margin:12px 0}
+  .syn h3{margin:0 0 6px;font-size:16px}
+  .syn .tag{font-size:11px;text-transform:uppercase;letter-spacing:1px;font-weight:700}
+  .t-likely{color:var(--warn)} .t-danger{color:var(--danger)} .t-hidden{color:var(--accent)}
+  ol,ul{margin:8px 0 0;padding-left:20px} li{margin:6px 0}
+  code{background:var(--panel2);border:1px solid var(--line);border-radius:5px;padding:1px 5px;font-size:12.5px;color:#cdd7f5}
+  .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(330px,1fr));gap:16px;margin-top:14px}
+  .card{background:var(--panel);border:1px solid var(--line);border-left-width:4px;border-radius:12px;padding:16px 17px;display:flex;flex-direction:column}
+  .card .hd{display:flex;justify-content:space-between;align-items:flex-start;gap:8px;margin-bottom:8px}
+  .card h4{margin:0;font-size:15px;line-height:1.35}
+  .sev{flex:none;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.6px;padding:3px 7px;border-radius:6px;white-space:nowrap}
+  .sev.cert{background:rgba(255,93,108,.15);color:var(--danger);border:1px solid rgba(255,93,108,.35)}
+  .sev.high{background:rgba(255,180,84,.13);color:var(--warn);border:1px solid rgba(255,180,84,.32)}
+  .lbl{font-size:10.5px;text-transform:uppercase;letter-spacing:.8px;color:var(--muted);margin:11px 0 3px;font-weight:700}
+  .story{color:#d4dbf0;font-size:13.5px}
+  .assume{color:#f0d9b0;font-size:13px;font-style:italic}
+  .warn{color:#bfe9d6;font-size:13px}
+  .meta{display:flex;gap:18px;flex-wrap:wrap;color:var(--muted);font-size:12.5px;margin-top:6px}
+  footer{margin-top:46px;color:var(--muted);font-size:12px;border-top:1px solid var(--line);padding-top:16px}
+  .scope{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:12px;margin-top:6px}
+  .scope div{background:var(--panel2);border:1px solid var(--line);border-radius:10px;padding:12px 14px}
+  .scope .k{font-size:10.5px;text-transform:uppercase;letter-spacing:.8px;color:var(--muted)}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Premortem — Deploying the AttestMesh v1 Cluster</h1>
+  <p class="sub">Frame: it's a few weeks from now. We deployed the three-node demo on Base Sepolia and it failed. This is why it died.</p>
+  <div class="verdict">Verdict — not a risk profile, a certainty: ≥4 independent guaranteed showstoppers</div>
+
+  <div class="scope">
+    <div><div class="k">What</div>The AttestMesh v1 three-node demo on Base Sepolia (master §11): infra → Indexer → gas-webhook/paymaster → ClusterDiamond → 3 ClusterMembers → 3 dstack CVMs that register, mesh, distribute the CSK, and go healthy.</div>
+    <div><div class="k">Who</div>The AttestMesh org (infra + Indexer + paymaster) and three node operators. This demo <em>is</em> the end-to-end proof.</div>
+    <div><div class="k">Success</div>All 3 register on chain, the wireguard mesh converges, the CSK reaches all 3, every healthcheck returns 200, app containers start.</div>
+    <div><div class="k">Investigation</div>7 parallel deep-dive agents, each grounded in the actual repository code. Today: 2026-06-03.</div>
+  </div>
+
+  <h2>Synthesis — read this first</h2>
+
+  <div class="syn">
+    <span class="tag t-likely">Most likely failure</span>
+    <h3>The first real-world boundary the sidecar touches — the dstack guest agent — rejects it at boot (F4).</h3>
+    <p>Chronologically the earliest fatal seam. <code>UnixSocketDstack</code> POSTs hand-guessed routes (<code>/DeriveKey</code>, <code>/Seal</code>) with a confused <code>{"path","purpose"}</code> body; the real dstack agent speaks Tappd/prpc and may not even expose <code>seal</code>/<code>unseal</code>. <code>derive_key</code> fails → no keys → boot aborts before anything else can run. But "most likely" undersells it: <b>F1, F2, F4, and F5 are each ~100% to fire on first contact with the real world.</b> The honest probability that the demo works as-built is ≈0.</p>
+  </div>
+
+  <div class="syn">
+    <span class="tag t-danger">Most dangerous failure</span>
+    <h3>Silent, irreversible CSK loss (F4 insidious branch / F6 originator race).</h3>
+    <p>If <code>derive_key</code> happens to return 32 decodable bytes, the originator commits an <em>immutable</em> <code>keccak256(CSK)</code> on chain — but if <code>seal</code>/<code>unseal</code> don't truly round-trip (or the originator races/crashes), the CSK is gone forever after the first restart, with the commitment permanently fixed. The cluster bricks <em>after</em> appearing to pass. Unrecoverable beats merely-broken.</p>
+  </div>
+
+  <div class="syn">
+    <span class="tag t-hidden">The hidden assumption</span>
+    <h3>"147 green unit tests" was equated with "it works."</h3>
+    <p>Every test runs against a mock or stub at exactly the four places the system meets reality — the dstack runtime, the dstack KMS proof the on-chain verifier checks, the Alchemy bundler/paymaster, and the live Indexer→sidecar event wire. The mocks were authored alongside the code they validate, so they encode the same assumptions and <em>cannot</em> catch a wrong belief about an external contract. The test suite is green precisely where confidence is least earned.</p>
+  </div>
+
+  <div class="syn">
+    <h3 style="margin-top:2px">The revised plan — don't deploy the demo yet; climb the validation ladder first</h3>
+    <ol>
+      <li><b>Treat the current build as a spec-faithful prototype, not a deployable artifact.</b> Cancel the 3-node Sepolia demo until the four real-world seams are validated in isolation.</li>
+      <li><b>dstack runtime (F4):</b> stand up one real dstack CVM, <code>curl --unix-socket</code> the guest agent, capture the true <code>derive_key</code>/<code>get_quote</code>/<code>seal</code> API, and rewrite <code>UnixSocketDstack</code> against it. If <code>seal</code>/<code>unseal</code> don't exist, redesign CSK persistence before anything commits a commitment on chain.</li>
+      <li><b>dstack KMS verifier (F1):</b> capture one real <code>DstackProof</code> from that CVM and add a <code>forge</code> fork-test replaying it against the deployed <code>DstackFacet</code>. Fix the preimages/key-encoding until a <em>real</em> proof verifies — not the mock.</li>
+      <li><b>EIP-4337 (F2):</b> reorder <code>bundler.rs::submit</code> to request paymaster sponsorship <em>first</em>, then compute the userOpHash and sign — and land one real sponsored registration UserOp on Sepolia before scaling to three.</li>
+      <li><b>Indexer wire (F5):</b> implement the RLP <code>event_data</code> decode + dispatch in <code>indexer_client::connect_and_run</code> (it is currently a <code>tracing::debug!</code> no-op), and add the §16.2 anvil test asserting A's PeerEndpoint becomes a configured wg peer on B.</li>
+      <li><b>wireguard (F3):</b> confirm the CVM image ships the <code>wireguard</code> module + iproute2 + <code>NET_ADMIN</code>; remove the <code>.ok()</code> on <code>create_interface</code> so a missing mesh fails loud instead of marching into a doomed heartbeat phase.</li>
+      <li><b>timing/originator (F6):</b> make originator selection robust to the <code>memberCount()</code> race (derive it from <code>MemberRegistered</code> block+logIndex ordering, not a post-hoc read) and rehearse the 3-node bring-up on local anvil + 3 sidecars before Sepolia.</li>
+      <li><b>diagnostics (F7):</b> add per-phase health detail so a stuck node reports <em>which</em> dependency it's blocked on, and write a one-page deploy runbook + smoke test that exercises every seam.</li>
+    </ol>
+  </div>
+
+  <div class="syn">
+    <h3 style="margin-top:2px">Pre-deploy checklist — verify each before touching the Sepolia demo</h3>
+    <ul>
+      <li>☐ A <code>forge</code> fork-test replays a <b>real recorded</b> dstack proof against the deployed <code>DstackFacet</code> and passes (F1).</li>
+      <li>☐ One real, paymaster-sponsored registration UserOp lands on Sepolia and emits <code>MemberRegistered</code> — proving F2 + F1 + webhook + paymaster funding together.</li>
+      <li>☐ <code>ip link show attestmesh0</code> shows an up interface inside the actual dstack CVM image, and a wg handshake completes between two CVMs (F3).</li>
+      <li>☐ An integration test asserts A's PeerEndpoint → B configures a wg peer — i.e. the Indexer decode wire is connected (F5).</li>
+      <li>☐ The 3-node bring-up reaches all-healthy at least once on a local anvil + sidecar harness, with the CSK pulled by both onboardees (F4/F6).</li>
+    </ul>
+  </div>
+
+  <h2>The seven failure modes</h2>
+  <div class="grid">
+
+    <div class="card" style="border-left-color:#ff5d6c">
+      <div class="hd"><h4>F1 · On-chain dstack verifier was built against a mock KMS chain</h4><span class="sev cert">Certain</span></div>
+      <div class="story">Real dstack KMS returns a TDX quote + cert chain over its <em>own</em> canonical preimages/encodings — not the hand-authored ecrecover chain over <code>abi.encode("dstack.app",…)</code> the verifier checks. <code>dstack_register</code> reverts <code>KmsAppKeySigInvalid</code> on every node; <code>_addMember</code> never runs; the cluster is born empty. The sidecar retries 10× and exits non-zero.</div>
+      <div class="lbl">Underlying assumption</div><div class="assume">Real dstack KMS output is shaped exactly like the hand-authored mock (ecrecover-able secp256k1 over AttestMesh-chosen preimages), not a TDX quote over dstack's own encodings.</div>
+      <div class="lbl">Early warning signs</div><div class="warn">A fork-test replaying one real recorded proof reverts; <code>compressedToAddress(kms_root_pubkey)</code> isn't in <code>allowedKmsRoots</code> on the first real socket call.</div>
+    </div>
+
+    <div class="card" style="border-left-color:#ff7a45">
+      <div class="hd"><h4>F2 · EIP-4337 signature dies once Alchemy inserts paymaster data</h4><span class="sev cert">Certain</span></div>
+      <div class="story"><code>bundler.rs::submit</code> computes and signs the userOpHash while <code>paymaster==None</code>. Alchemy fills <code>paymasterAndData</code> <em>after</em> the webhook approves; the EntryPoint then recomputes the hash over the populated field, <code>validateUserOp</code> recovers a different signer, returns <code>SIG_VALIDATION_FAILED</code>, and every registration op reverts (<code>AA24</code>). The sidecar treats it as a transient "webhook declined" and retries forever.</div>
+      <div class="lbl">Underlying assumption</div><div class="assume">A signature computed before <code>paymasterAndData</code> is populated still validates afterward — i.e. the v0.7 userOpHash is stable across the paymaster handshake.</div>
+      <div class="lbl">Early warning signs</div><div class="warn"><code>AA24 signature error</code> on every registration; no test asserts <code>user_op_hash</code> equality between a <code>paymaster=None</code> op and the same op with paymaster fields filled.</div>
+    </div>
+
+    <div class="card" style="border-left-color:#ffb454">
+      <div class="hd"><h4>F3 · Wireguard never establishes on the real CVMs</h4><span class="sev high">High</span></div>
+      <div class="story"><code>CommandWg::create_interface</code> runs <code>ip link add … type wireguard</code>; the CVM image lacks the module/iproute2/<code>NET_ADMIN</code>, so it fails — but <code>create_interface(…).ok()</code> in <code>state::run</code> swallows it and boot marches into <code>Heartbeating</code>. Packets to the mesh /32s drop at the host, <code>is_converged</code> never latches, healthcheck stays 503 forever.</div>
+      <div class="lbl">Underlying assumption</div><div class="assume">A <code>MeshControl</code> that passed only against <code>MockWg</code> behaves the same on a real kernel — and would fail loud, not be swallowed by <code>.ok()</code>.</div>
+      <div class="lbl">Early warning signs</div><div class="warn">Every node sits in <code>Heartbeating</code> with zero received heartbeats; <code>ip link show attestmesh0</code> says "device does not exist" despite a clean boot log.</div>
+    </div>
+
+    <div class="card" style="border-left-color:#e85d9c">
+      <div class="hd"><h4>F4 · The dstack runtime client is a guessed UDS stub</h4><span class="sev cert">Certain</span></div>
+      <div class="story"><code>UnixSocketDstack</code> POSTs <code>/DeriveKey</code> with <code>{"path","purpose"}</code>; the real agent speaks Tappd/prpc and returns a keypair/cert, not <code>{"key":"0x…"}</code>. Node 1 dies at boot (<code>missing key</code> / <code>malformed dstack response</code>). Insidious branch: if it half-works, <code>seal</code>/<code>unseal</code> (which real dstack may not expose) silently no-op and the CSK is unrecoverable after restart — with its commitment already immutable on chain.</div>
+      <div class="lbl">Underlying assumption</div><div class="assume">A reverse-engineered guess at dstack's paths, JSON shapes, and primitive set (incl. a <code>seal</code>/<code>unseal</code> that may not exist) equals the real protocol because the mock round-tripped.</div>
+      <div class="lbl">Early warning signs</div><div class="warn">No test ever instantiates <code>UnixSocketDstack</code>; a <code>curl --unix-socket</code> against a real CVM 404s <code>/DeriveKey</code>/<code>/Seal</code>.</div>
+    </div>
+
+    <div class="card" style="border-left-color:#7aa2ff">
+      <div class="hd"><h4>F5 · Sidecar verifies Indexer pushes but never decodes/acts on them</h4><span class="sev cert">Certain</span></div>
+      <div class="story">Registration succeeds, the gRPC stream is up, every signature verifies, logs scroll <code>verified indexer push</code> — yet <code>connect_and_run</code> ends at <code>tracing::debug!</code> + <code>let _ = &shared;</code>. The RLP <code>event_data</code> decode/dispatch is a TODO, so <code>MessageSent</code> is never turned into a <code>PeerEndpoint</code> and <code>wg::add_peer</code> is never called. <code>ListPeers</code> stays empty: three nodes that see the chain but not each other.</div>
+      <div class="lbl">Underlying assumption</div><div class="assume">"Signature-verified and logged" was tacitly equated with "consumed and acted upon," so a healthy stream was assumed to mean a converging mesh.</div>
+      <div class="lbl">Early warning signs</div><div class="warn"><code>add_peer</code> / handshake counters stay at zero while <code>verified indexer push</code> climbs; no test drives <code>connect_and_run</code> across the gRPC boundary.</div>
+    </div>
+
+    <div class="card" style="border-left-color:#54d6a0">
+      <div class="hd"><h4>F6 · Convergence + CSK distribution deadlock under real async timing</h4><span class="sev high">High</span></div>
+      <div class="story">Two nodes read <code>memberCount()</code> in the same block before either tx confirms — both see <code>0</code>, neither becomes originator, the CSK is never derived, all sit at <code>pulling-csk</code> forever. Even when one does win, the strict <code>active == live</code> gate never latches across staggered boots: the window slides faster than the last node joins, so the three views are never simultaneously equal.</div>
+      <div class="lbl">Underlying assumption</div><div class="assume">A system validated only against a synchronized logical clock with all peers present at t=0 behaves identically when three real nodes boot, register, and tunnel at independent wall-clock times.</div>
+      <div class="lbl">Early warning signs</div><div class="warn">Two+ nodes log the originator read before any <code>MemberRegistered</code> confirms (<code>cskCommitment()</code> stays <code>0x0</code>); <code>is_converged</code> flaps false, differing by exactly the last-joined node each tick.</div>
+    </div>
+
+    <div class="card" style="border-left-color:#9a7aff">
+      <div class="hd"><h4>F7 · Never integration-tested; every dependency a fail-closed SPOF</h4><span class="sev high">High</span></div>
+      <div class="story">Three sidecars wedge in <em>different</em> phases — A pre-registration (webhook denial), B subscribed-but-empty (registry/cert mismatch), C waiting on B's peer signal — each silently at 503 with no signal of which dependency it's blocked on, no cross-node correlation, no orchestrator. The §16.2/§14.2 harnesses are <code>#[ignore]</code>d; the first time the processes talk for real is in front of the audience.</div>
+      <div class="lbl">Underlying assumption</div><div class="assume">Components that each pass their own unit tests compose correctly across their seams on first contact, so end-to-end testing is a formality.</div>
+      <div class="lbl">Early warning signs</div><div class="warn">CI has never produced a passing multi-process / anvil-backed run; the four components were authored by different agents with no shared seam contract or interop test.</div>
+    </div>
+
+  </div>
+
+  <footer>
+    Premortem run 2026-06-03 · target: <b>deploying the AttestMesh v1 cluster (Base Sepolia three-node demo)</b> · method: Gary Klein prospective-hindsight, 7 parallel code-grounded investigators · companion transcript: <code>premortem-transcript-1780445293.md</code>
+  </footer>
+</div>
+</body>
+</html>
