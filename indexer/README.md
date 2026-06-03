@@ -7,7 +7,7 @@ One Indexer instance serves many clusters. Members subscribe over gRPC bidirecti
 **Spec**: [`docs/specs/indexer.md`](../docs/specs/indexer.md)
 **Master spec**: [`docs/specs/attestmesh-coordination-layer.md`](../docs/specs/attestmesh-coordination-layer.md)
 
-Code lands here when the indexer spec is generated.
+Implemented: block-watcher (`eth_getLogs` polling + per-member relevance filtering), sled-backed per-member delivery cursors, signed-envelope gRPC with RPC repro stubs, identity derivation, and a health endpoint (35 unit tests).
 
 ## Quick reference
 

@@ -25,7 +25,7 @@ See [`docs/specs/attestmesh-coordination-layer.md`](docs/specs/attestmesh-coordi
 
 ## Status
 
-Pre-alpha. The contracts are being extracted from dstackgres; the sidecar is being built fresh. Resolved design decisions (and any remaining open questions) are tracked at the end of the master spec.
+Pre-alpha. All four components — contracts, sidecar, indexer, and gas-webhook — are **implemented and unit-tested** (155 tests green). The remaining gap is end-to-end wiring: the sidecar's bring-up state machine (`state::run`) is still a stub, so the modules (registration, mesh, messaging) are tested in isolation but the binary cannot yet register a node end-to-end. That wiring — plus a live dstack KMS-chain integration and validation — is **milestone A** (see `docs/specs/sidecar.md §1.1` and the master spec §11). Resolved design decisions and open questions are tracked at the end of the master spec.
 
 ## Repo layout
 
@@ -42,20 +42,21 @@ docs/audits/      Project audit reports (latest only; git history holds previous
 .claude/commands/ Holodeck slash commands (/warmup, /spec, /generate, ...)
 ```
 
-(Component directories land as the matching specs get generated.)
-
 ## Build
 
 ```bash
 forge build                  # contracts
-cargo build --release        # sidecar
+cargo build --release        # sidecar  (also: cargo build in indexer/)
+npm --prefix services/gas-sponsorship-webhook ci   # gas-webhook
 ```
 
 ## Test
 
 ```bash
-forge test -vvv              # contracts
-cargo test                   # sidecar
+( cd contracts && forge test -vvv )                       # 22 tests
+( cd sidecar  && cargo test )                             # 33 tests
+( cd indexer  && cargo test )                             # 35 tests
+( cd services/gas-sponsorship-webhook && npm test )       # 65 tests
 ```
 
 ## Development workflow

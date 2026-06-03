@@ -3,7 +3,7 @@
 **Status**: Implemented v1 (was Draft v0.1; 2026-06-02)
 **Parent spec**: [`attestmesh-coordination-layer.md`](./attestmesh-coordination-layer.md)
 **Component**: `contracts/`
-**Last updated**: 2026-05-30
+**Last updated**: 2026-06-03
 
 ---
 

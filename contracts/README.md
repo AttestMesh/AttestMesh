@@ -20,7 +20,7 @@ Dependencies are cloned into `lib/` (solidstate v0.0.61, OZ 5.1, account-abstrac
 
 ```bash
 forge build              # compile
-forge test -vvv          # run tests (17 passing)
+forge test -vvv          # run tests (22 passing)
 forge fmt --check        # lint
 ```
 

@@ -24,7 +24,7 @@ The `MeshControl` trait abstracts wireguard (command-based impl + mock) so the c
 
 ```bash
 cargo build --release
-cargo test                    # 30 unit tests
+cargo test                    # 33 unit tests (bring-up wiring is milestone A — see docs/specs/sidecar.md §1.1)
 cargo clippy -- -D warnings
 cargo fmt --check
 ```

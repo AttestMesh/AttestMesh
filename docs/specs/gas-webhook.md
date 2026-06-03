@@ -3,7 +3,7 @@
 **Status**: Implemented v1 (was Draft v0.1; 2026-06-02)
 **Parent spec**: [`attestmesh-coordination-layer.md`](./attestmesh-coordination-layer.md) (especially §13 item 18)
 **Component**: `services/gas-sponsorship-webhook/`
-**Last updated**: 2026-05-30
+**Last updated**: 2026-06-03
 
 ---
 
@@ -160,7 +160,8 @@ The inner-selector allowlist is the *exact set* of cluster operations the operat
 ```typescript
 export const ALLOWED_SELECTORS = [
   // Member-driven operations:
-  selectorOf("dstack_register(DstackProof,address,bytes32,bytes32)"),
+  // NB: the selector is over the EXPANDED DstackProof tuple, not the struct name → 0x537d491c
+  selectorOf("dstack_register((bytes32,bytes32,bytes,bytes,bytes,bytes,bytes,string),address,bytes32,bytes32)"),
   selectorOf("publishWgKey(bytes32)"),
   selectorOf("send(bytes32,bytes32,bytes)"),
   selectorOf("setCskCommitment(bytes32)"),         // originator publishes keccak256(CSK) once (master §8.1)

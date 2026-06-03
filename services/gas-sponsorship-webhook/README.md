@@ -8,7 +8,7 @@ When the sidecar submits an EIP-4337 UserOp via Alchemy's bundler, the bundler a
 **Master spec**: [`docs/specs/attestmesh-coordination-layer.md`](../../docs/specs/attestmesh-coordination-layer.md) (§13 item 18)
 **Source pattern**: ported and repurposed from dstackgres's `services/gas-sponsorship-webhook/`.
 
-Code lands here when the spec is generated.
+Implemented: the policy validator (chain id, `ClusterMember.execute` outer selector, inner-selector allowlist, value-0, and `ClusterDiamondFactory` provenance checks) over a viem RPC client (65 unit tests).
 
 ## Quick reference
 

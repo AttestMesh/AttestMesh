@@ -1,16 +1,20 @@
 # AttestMesh Sidecar — Component Spec
 
-**Status**: Implemented v1 (was Draft v0.1; 2026-06-02)
+**Status**: Modules implemented + unit-tested (v1); end-to-end bring-up wiring is **Milestone A** (see §1.1)
 **Parent spec**: [`attestmesh-coordination-layer.md`](./attestmesh-coordination-layer.md) (especially §7, §8)
 **Component**: `sidecar/`
 **Binary**: `cluster-mesh-agent`
-**Last updated**: 2026-05-30
+**Last updated**: 2026-06-03
 
 ---
 
 ## 1. Purpose
 
 The sidecar is the per-node process that turns "a CVM running in dstack" into "an AttestMesh cluster member." It owns key derivation, on-chain registration, Indexer subscription, wireguard setup, heartbeats, the first-convergence gate, the CSK lifecycle, and the gRPC façade the application container talks to. Master spec §7 defines *what* it does; this spec defines *what gets built*.
+
+### 1.1 Implementation status (v1)
+
+The protocol **modules** are implemented and unit-tested (33 tests: keys, CIDR, sealed-box, heartbeat, liveness, CSK, userop, bind-hash, bundler/F2, facet calldata builders, envelope verify). What is **not yet wired** is the bring-up orchestration: `state::run()` is a stub that derives keys, discovers the cluster, sets `Phase::Registering`, and starts the health server — it does **not** yet drive registration, the bundler submit, Indexer subscription, peer exchange, heartbeats, or the gRPC servers. Those components exist and are tested in isolation, but nothing constructs them on the run path, so the binary cannot yet register a node end-to-end. Completing this is **Milestone A**, gated on one missing seam: the `DstackRuntime` trait (§6) has no KMS-sig-chain request method, so `dstack_register` proof material can't yet be sourced from the runtime, and the real dstack KMS-chain format must be confirmed against a live node. The end-to-end harness (§16.2, `tests/integration.rs`) is `#[ignore]`d for the same reason. **In short: module-complete and green, but not yet wired into a working binary.**
 
 ---
 
