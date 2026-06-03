@@ -24,11 +24,12 @@ contract MockKmsChain {
 
     string internal constant BIND_DOMAIN = "attestmesh.bind.v1";
 
-    /// dstack key-derivation purpose label for the app->derived signature. The real
-    /// label is supplied per-proof by the dstack runtime (dstackgres treats it as a
-    /// proof field, not a constant); this placeholder must be confirmed against a
-    /// captured proof once a live dstack node exists. The facet does not constrain it.
-    string internal constant PURPOSE = "app-key";
+    /// dstack key-derivation purpose label for the app->derived signature. Confirmed
+    /// against dstackgres `group_auth.rs`: dstack's app key signs
+    /// `"ethereum:" + hex(derivedCompressedPubkey)`, i.e. purpose = "ethereum". The
+    /// facet does not constrain the value; it only has to match what the sidecar puts
+    /// in the proof (the sidecar will read signature_chain[0]=app_sig, [1]=kms_sig).
+    string internal constant PURPOSE = "ethereum";
 
     function rootAddress() external pure returns (address) {
         return 0x7E5F4552091A69125d5DfCb7b8C2659029395Bdf; // vm.addr(1)
