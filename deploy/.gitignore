@@ -1,0 +1,5 @@
+# never commit secrets or runtime state
+env.local.sh
+*.env
+.smithers/
+logs/
