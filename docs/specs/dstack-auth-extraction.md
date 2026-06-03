@@ -1,6 +1,6 @@
 # dstack Auth Extraction — SURGICAL scope (verification primitive only)
 
-**Status:** DRAFT
+**Status:** IMPLEMENTED
 **Author:** LSDan
 **Created:** 2026-06-03
 **Last Updated:** 2026-06-03
@@ -19,20 +19,20 @@ This spec is therefore narrowed to a **surgical extraction**: bring the *correct
 ## Requirements
 
 ### Must Have
-- [ ] **Port the verification primitive.** Replace `contracts/src/libraries/DstackSigChain.sol` with the real dstackgres logic, rebranded but preserving the exact preimages/encodings:
+- [x] **Port the verification primitive.** Replaced `contracts/src/libraries/DstackSigChain.sol` with the real dstackgres logic, rebranded but preserving the exact preimages/encodings:
   - KMS step: recover `keccak256(abi.encodePacked("dstack-kms-issued:", bytes20(codeId), appCompressedPubkey))` → signer must be an allowlisted KMS root.
   - app step: recover `keccak256(abi.encodePacked(purpose, ":", hex(derivedCompressedPubkey)))` → must equal `compressedToAddress(appCompressedPubkey)`.
   - derived/binding step: recover EIP-191 of `messageHash` → must equal `compressedToAddress(derivedCompressedPubkey)`.
-  - keep the existing `compressedToAddress` (secp256k1 decompression via modexp) — it is already correct and unit-tested.
-- [ ] **Rewrite the attestor facet's registration** (`DstackFacet.dstack_register` / `IDstackFacet.DstackProof`) to the real `Proof` shape + the `verifySigChain` flow, while **keeping v1's diamond**: v1's `MemberStorage`, `memberId = keccak256(abi.encode(cluster, member, attestorId))`, `MessageFacet`, `NetworkFacet`, the EIP-4337 `ClusterMember`, the factories — all unchanged. Bind `codeId == bytes20(memberContract)` (the dstack `app_id` is the ClusterMember address) and set the ClusterMember owner to the derived key (decision #3). The binding `messageHash` continues to commit to `(cluster, member, xPubKey, wgPubKey)`.
-- [ ] **Drop the self-asserted composeHash check at registration** (premortem P1). Approved-software is enforced by the dstack KMS boot gate (`isAppAllowed`, which the KMS queries against the on-chain allowlist) + the KMS-sig-chain verification (which proves the node passed that gate). The on-chain `allowedComposeHashes`/`allowedDeviceIds`/`allowedKmsRoots` allowlist stays — it is the boot-gate policy and the KMS-root set.
-- [ ] **Fix the mock + add a real-format fixture.** Rewrite `test/helpers/MockKmsChain.sol` to produce proofs in the **real** format (real preimages, the real `Proof` struct), and add a test that asserts on the literal `"dstack-kms-issued:"` so the preimage can never silently drift. Add a checked-in fixture proof (real-format; a genuinely captured one from a live CVM is a follow-up once a dstack node exists).
-- [ ] **Fix F2** in `sidecar/src/chain/bundler.rs`: request gas + paymaster fields **before** computing the userOpHash and signing (sponsor-then-sign), so the signed hash matches the on-chain `validateUserOp`. Use dstackgres's `gas_payment/alchemy.rs` as a **read-only reference** (do not port across alloy 0.8→1).
-- [ ] **`forge test` green** against the real-format proof; **`cargo build`/`cargo test` green** for the sidecar.
+  - kept the existing `compressedToAddress` (secp256k1 decompression via modexp) — already correct and unit-tested.
+- [x] **Rewrote the attestor facet's registration** (`DstackFacet.dstack_register` / `IDstackFacet.DstackProof`) to the real `Proof` shape + the `verify` flow, while **keeping v1's diamond**: v1's `MemberStorage`, `memberId = keccak256(abi.encode(cluster, member, attestorId))`, `MessageFacet`, `NetworkFacet`, the EIP-4337 `ClusterMember`, the factories — all unchanged. Binds `codeId == bytes20(memberContract)` and sets the ClusterMember owner to the derived key (decision #3). The binding `messageHash` commits to `(cluster, member, xPubKey, wgPubKey)`.
+- [x] **Dropped the self-asserted composeHash check at registration** (premortem P1). Approved-software is enforced by the dstack KMS boot gate (`isAppAllowed`, which the KMS queries against the on-chain allowlist) + the KMS-sig-chain verification (which proves the node passed that gate). The on-chain `allowedComposeHashes`/`allowedDeviceIds`/`allowedKmsRoots` allowlist stays — it is the boot-gate policy and the KMS-root set.
+- [x] **Fixed the mock + literal drift guard.** `test/helpers/MockKmsChain.sol` now produces real-format proofs (real preimages, the real `Proof` struct, reusing the library's `bytesToHex` so the app preimage can't drift), and `test_dstackKmsIssuedPreimageLiteral` asserts on the literal `"dstack-kms-issued:"`. A genuinely captured proof from a live CVM remains a follow-up (see Open Questions).
+- [x] **Fixed F2** in `sidecar/src/chain/bundler.rs`: `submit` now requests gas + paymaster fields via `alchemy_requestGasAndPaymasterAndData` **before** computing the userOpHash and signing (sponsor-then-sign). `gas_payment/alchemy.rs` used as a read-only reference (no alloy bump).
+- [x] **`forge test` green** (22 contract tests) against the real-format proof; **`cargo build`/`cargo test` green** (33 sidecar tests).
 
 ### Should Have
-- [ ] A `forge fmt`/`clippy`-clean result preserved.
-- [ ] A short note in the contracts README pointing at dstackgres as the verification reference.
+- [x] `forge fmt --check` clean; `cargo clippy -- -D warnings` clean; `cargo fmt --check` clean.
+- [x] Verification-reference note added to `docs/specs/contracts.md §6.3` (points at `TeeSQL/dstackgres` as the canonical proof-format reference).
 
 ### Must NOT Have (the chimera guards)
 - No `teesql.storage.*` namespace, no second `memberId` formula, no second member contract (`DstackMember`), no second CIDR (`10.42.0.0/24`) — ever, in the tree.
@@ -58,8 +58,9 @@ Not the wholesale port (rejected). Not the CSK-persistence / originator-selectio
 Everything else in `contracts/src` and `sidecar/src` is untouched.
 
 ## Open Questions
-- [ ] A genuinely **captured** real dstack proof (vs a real-format synthesized one) requires a live dstack CVM + KMS; until then the fixture is real-*format*. Flag where the format must still be confirmed against a node.
-- [ ] Confirm the exact `purpose` string dstack uses for the app→derived signature (read it from the real `DstackKmsAdapterFacet._verifySigChain` + a captured proof).
+- [ ] A genuinely **captured** real dstack proof (vs a real-format synthesized one) requires a live dstack CVM + KMS; until then `MockKmsChain` is real-*format*. The on-chain preimages are pinned by `test_dstackKmsIssuedPreimageLiteral`; the remaining unknown is whether a captured proof matches field-for-field.
+- [ ] Confirm the exact `purpose` string dstack uses for the app→derived signature. It is a proof field (not a constant) on both sides, so the chain verifies regardless of its value; `MockKmsChain.PURPOSE = "app-key"` is a placeholder to replace once a captured proof exists.
+- [ ] **FOUND while implementing — out of this spec's scope, recommended next.** `DstackFacet.isAppAllowed` (the KMS boot gate) requires `MemberStorage.memberIdOf[appId] != 0`, i.e. the appId must already be a *registered* member. But in the owner-gated flow the KMS calls `isAppAllowed` at **boot**, before the node registers — so as written the gate would refuse first boot (chicken-and-egg), and registration relies on a gate that can't pass. The compose branch is checked first so the dropped-self-assertion is still covered by tests, but the gate's appId branch needs to check an owner-seeded app_id allowlist (per the user's flow step 1) or `isOurMember(appId)` rather than prior registration. This is load-bearing for the P1 safety argument (compose is enforced *only* at the gate now) and should be the immediate follow-up. A pre-existing v1 design point, not introduced by this change.
 
 ## Validation
 1. `forge test` passes with `MockKmsChain` producing real-format proofs, and a test asserting `"dstack-kms-issued:"` is the KMS preimage prefix.
@@ -70,9 +71,16 @@ Everything else in `contracts/src` and `sidecar/src` is untouched.
 
 | Requirement | Implementation | Tests |
 |---|---|---|
+| Port verification primitive (real preimages) | `contracts/src/libraries/DstackSigChain.sol` (`verify` + `bytesToHex`; kept `recover`/`compressedToAddress`) | `test/unit/DstackSigChain.t.sol`; `ClusterBringup.t.sol::test_dstackKmsIssuedPreimageLiteral` |
+| Real `Proof` shape | `contracts/src/interfaces/IDstackFacet.sol::DstackProof`; `sidecar/src/chain/abi.rs::DstackProof` | `ClusterBringup.t.sol`; `selectors.spec.ts` (tuple selector `0x537d491c`) |
+| Registration on the real chain, bind codeId + messageHash, owner = derived key | `contracts/src/facets/attestor/DstackFacet.sol::dstack_register` | `ClusterBringup.t.sol::{test_threeMembersRegisterAndMessage,test_kmsRootNotAllowedReverts,test_codeIdMismatchReverts,test_bindingMismatchReverts}` |
+| Drop self-asserted compose/device/TCB at registration; keep boot-gate policy | `DstackFacet` (checks removed; `isAppAllowed` unchanged) | `ClusterBringup.t.sol::{test_bootGateRejectsBadComposeHash,test_removeComposeHashBlocksBootGate}` |
+| Bootstrap proof field rename | `contracts/src/members/ClusterMember.sol::_recoverBindingSigner` (`proof.messageSignature`) | `test/unit/ClusterMemberUserOp.t.sol` |
+| F2 sponsor-then-sign | `sidecar/src/chain/bundler.rs::{submit,apply_sponsorship,apply_sponsorship_response}`; `config.rs::gas_policy_id` | `bundler.rs::{user_op_hash_commits_to_paymaster_fields,sponsorship_response_*}` |
 
 ## Changelog
 
 | Date | Author | Changes |
 |---|---|---|
 | 2026-06-03 | LSDan | Narrowed from a wholesale dstackgres port to a surgical extraction of the verification primitive + the F2 fix (per premortem `…-1780498753`). |
+| 2026-06-03 | LSDan | Implemented the surgical extraction: real preimages + `verify`, real `DstackProof` shape across contracts/sidecar/webhook, dropped self-asserted compose/device/TCB at registration, F2 sponsor-then-sign. 22 contract + 33 sidecar + 65 webhook tests green; fmt/clippy clean. Reconciled `contracts.md §6.3/§13/§9.1` and `sidecar.md §8.2/§5`. Flagged the `isAppAllowed` boot-gate appId deadlock as the recommended follow-up. |

@@ -390,21 +390,18 @@ This is the call the dstack KMS makes at CVM boot. Implemented as a view because
 ### 6.3 Registration
 
 ```solidity
+// dstack's real KMS issuance chain (preimages ported verbatim from
+// TeeSQL/dstackgres's DstackSigChain). codeId = bytes20(app_id) left-aligned;
+// in AttestMesh the dstack app_id IS the ClusterMember contract address.
 struct DstackProof {
-    // KMS sig chain
-    bytes kmsRootPubKey;          // compressed secp256k1
-    bytes appKey;                 // compressed secp256k1 derived for compose-hash X
-    bytes appKeySig;              // KMS root signature over appKey + binding
-    bytes32 appComposeHash;       // compose hash the KMS bound to
-    bytes derivedPubKey;          // compressed secp256k1 — the one-shot binding signer
-    bytes derivedKeySig;          // app key signature over derivedPubKey + binding
-    bytes32 derivedInstanceId;    // instance id the app key bound to
-    bytes32 derivedDeviceId;      // device id the app key bound to
-    string tcbStatus;
-    string[] advisoryIds;
-
-    // Binding signature from the derived key over the registration message
-    bytes bindingSig;             // secp256k1 sig over keccak256(REGISTRATION_DOMAIN)
+    bytes32 codeId;                 // bytes20(app_id) left-aligned; app_id == ClusterMember addr
+    bytes32 messageHash;            // registration binding hash the derived key signed (pre-EIP-191)
+    bytes messageSignature;         // derived-key sig over the EIP-191 message of messageHash
+    bytes appSignature;             // app-key sig over "purpose:" || hex(derivedCompressedPubkey)
+    bytes kmsSignature;             // KMS-root sig over "dstack-kms-issued:" || bytes20(codeId) || appCompressedPubkey
+    bytes derivedCompressedPubkey;  // 33-byte compressed SEC1 (registration signer / member owner)
+    bytes appCompressedPubkey;      // 33-byte compressed SEC1 (the dstack app key)
+    string purpose;                 // dstack key-derivation purpose label for the app->derived sig
 }
 
 function dstack_register(
@@ -415,21 +412,22 @@ function dstack_register(
 ) external returns (bytes32 memberId);
 ```
 
-Internal verification order (each step reverts with a named error on failure):
+Internal verification order:
 
 1. **`memberContract` is one of ours** — look up `ClusterMemberFactory.isOurMember(memberContract)`. Reverts `NotOurMember()`.
-2. **KMS root allowed** — `allowedKmsRoots[deriveAddress(proof.kmsRootPubKey)]` must be true. Reverts `KmsRootNotAllowed()`.
-3. **KMS root → app key** — verify `proof.appKeySig` is a valid secp256k1 signature by `proof.kmsRootPubKey` over `keccak256(abi.encode("dstack.app", proof.appKey, proof.appComposeHash))`. Reverts `KmsAppKeySigInvalid()`.
-4. **Compose hash allowed** — `allowedComposeHashes[proof.appComposeHash]` must be true. Reverts `ComposeHashNotAllowed()`.
-5. **Device allowed** — `allowedDeviceIds[proof.derivedDeviceId] || allowAnyDevice` must be true. Reverts `DeviceNotAllowed()`.
-6. **App key → derived key** — verify `proof.derivedKeySig` is a valid secp256k1 signature by `proof.appKey` over `keccak256(abi.encode("dstack.instance", proof.derivedPubKey, proof.derivedInstanceId, proof.derivedDeviceId))`. Reverts `AppKeyDerivedSigInvalid()`.
-7. **TCB freshness** — if `requireTcbUpToDate`, then `keccak256(bytes(proof.tcbStatus)) == keccak256(bytes("UpToDate"))`. Reverts `TcbStale()`.
-8. **Binding** — compute `bindHash = keccak256(abi.encode(BIND_DOMAIN, address(this), memberContract, xPubKey, wgPubKey))` where `BIND_DOMAIN = "attestmesh.bind.v1"`. Recover signer from `proof.bindingSig` over the EIP-191 prefixed bindHash. Recovered address must equal `deriveAddress(proof.derivedPubKey)`. Reverts `BindingSigInvalid()`.
-9. **Write member** — construct `MemberRecord`, call `IAttest(address(this))._addMember(rec)`, capture returned `memberId`, call `INetwork(address(this))._setWgPubKey(memberId, wgPubKey)` (folded for atomicity — see boot-flow note in master spec §7.1 step 5).
-9.5. **Set the ClusterMember's owner** — call `ClusterMember(memberContract).__setOwnerFromCluster(deriveAddress(proof.derivedPubKey))`. This closes the EIP-4337 bootstrap window for this member: every subsequent UserOp will be validated against `owner == bindingKeyAddress` in standard LightAccount mode. Reverts if `__setOwnerFromCluster` is rejected (which would only happen if the owner is somehow already set — unreachable in normal flow).
-10. **Emit** — `MemberRegistered` is emitted by `_addMember`. DstackFacet additionally emits `DstackMemberRegistered(memberId, proof.appComposeHash, proof.derivedDeviceId)` for indexer convenience.
+2. **codeId binds the member** — `proof.codeId == bytes32(bytes20(memberContract))`: the KMS-attested `app_id` must be exactly this ClusterMember. Reverts `CodeIdMismatch()`.
+3. **Binding preimage pinned** — `proof.messageHash == keccak256(abi.encode(BIND_DOMAIN, address(this), memberContract, xPubKey, wgPubKey))` where `BIND_DOMAIN = "attestmesh.bind.v1"`. This stops a valid proof being replayed for a different member or different keys. Reverts `BindingMismatch()`.
+4. **KMS sig chain** — `DstackSigChain.verify(proof, this)` checks all three links and reverts `InvalidSigChain()` on any failure:
+   - *app → derived*: recover `proof.appSignature` over `keccak256(abi.encodePacked(proof.purpose, ":", hex(proof.derivedCompressedPubkey)))`; the signer must equal `compressedToAddress(proof.appCompressedPubkey)`.
+   - *KMS → app*: recover `proof.kmsSignature` over `keccak256(abi.encodePacked("dstack-kms-issued:", bytes20(proof.codeId), proof.appCompressedPubkey))`; the signer must be an allowlisted KMS root (`allowedKmsRoots`).
+   - *derived → message*: recover `proof.messageSignature` over the EIP-191 message of `proof.messageHash`; the signer must equal `compressedToAddress(proof.derivedCompressedPubkey)` (the returned `derivedKey`).
+5. **Write member** — construct `MemberRecord`, call `IAttest(address(this))._addMember(rec)`, capture returned `memberId`, call `INetwork(address(this))._setWgPubKey(memberId, wgPubKey)` (folded for atomicity — see boot-flow note in master spec §7.1 step 5).
+6. **Set the ClusterMember's owner** — call `ClusterMember(memberContract).__setOwnerFromCluster(derivedKey)`. This closes the EIP-4337 bootstrap window for this member: every subsequent UserOp is validated against `owner == derivedKey` in standard mode.
+7. **Emit** — `MemberRegistered` is emitted by `_addMember`. DstackFacet additionally emits `DstackMemberRegistered(memberId, proof.codeId, derivedKey)` for indexer convenience.
 
-`DstackSigChain.sol` library provides the secp256k1 verification primitives (`recover`, `compressedToAddress`).
+**Compose hash / device / TCB are NOT verified here.** They are not part of dstack's signed KMS chain — they are the *boot-gate policy* the KMS enforces via `isAppAllowed` (§6.2) before the CVM boots. A valid sig chain proves the node booted through a KMS root we trust, which in turn enforced that policy; re-asserting a sidecar-supplied compose hash on chain would be a self-assertion (it would prove nothing the chain doesn't already, and was a defect in the pre-extraction design). The on-chain `allowedComposeHashes`/`allowedDeviceIds` allowlist remains as that boot-gate policy.
+
+`DstackSigChain.sol` ports the verification primitive (preimages + `verify`, plus the secp256k1 `recover`/`compressedToAddress`) from `TeeSQL/dstackgres`; that repo is the canonical reference for the proof format. A genuinely captured proof from a live dstack CVM (vs the real-*format* one `MockKmsChain` synthesises) and the exact `purpose` label are confirmed once a dstack node exists.
 
 ### 6.4 attestorId
 
@@ -580,9 +578,9 @@ if owner == address(0):
     // 1. The userOp.callData MUST be execute(target=cluster, value=0, data=<dstack_register selector + args>).
     //    Reject otherwise.
     // 2. Recover signer from userOp.signature against userOpHash (standard EIP-191 / ERC-1271).
-    // 3. Decode the inner dstack_register calldata. Recover the signer of the proof's bindingSig
+    // 3. Decode the inner dstack_register calldata. Recover the signer of the proof's messageSignature
     //    against the registration bind-hash (the same recovery DstackFacet will do).
-    // 4. Require: the userOp signer (from step 2) == the bindingSig signer (from step 3).
+    // 4. Require: the userOp signer (from step 2) == the messageSignature signer (from step 3).
     //    This proves the UserOp is authorized by the same key that will validate the proof.
     // 5. Accept. Validation data = 0 (no time window, no aggregator).
 
@@ -598,9 +596,9 @@ In both modes: if `missingAccountFunds > 0` (no paymaster sponsoring), transfer 
 
 #### 9.1.3 Owner setting
 
-`__setOwnerFromCluster(newOwner)` is gated on `msg.sender == cluster` AND `owner == address(0)`. It can only be called once, only by the cluster diamond, and only if the owner has not yet been set. It is invoked by `DstackFacet.dstack_register` (§6.3 step 9.5 — added below) as part of the same transaction that validates the registration proof. Together with the bootstrap-mode validateUserOp check, this means:
+`__setOwnerFromCluster(newOwner)` is gated on `msg.sender == cluster` AND `owner == address(0)`. It can only be called once, only by the cluster diamond, and only if the owner has not yet been set. It is invoked by `DstackFacet.dstack_register` (§6.3 step 6) as part of the same transaction that validates the registration proof. Together with the bootstrap-mode validateUserOp check, this means:
 
-- The bootstrap UserOp authenticates the binding key (via the bindingSig recovery).
+- The bootstrap UserOp authenticates the binding key (via the messageSignature recovery).
 - DstackFacet verifies the dstack KMS chain proves that binding key was granted to this CVM.
 - DstackFacet calls `__setOwnerFromCluster(bindingKeyAddress)` atomically.
 - All subsequent UserOps from this ClusterMember are validated against `owner` in standard mode.
@@ -777,9 +775,9 @@ All errors live in `src/errors/Errors.sol` and are imported where used so revert
 Categories:
 
 - **Membership**: `NotOurMember()`, `AlreadyRegistered()`, `NotClusterMember()`.
-- **Dstack KMS chain**: `KmsRootNotAllowed()`, `KmsAppKeySigInvalid()`, `AppKeyDerivedSigInvalid()`.
-- **Dstack allowlist**: `ComposeHashNotAllowed()`, `DeviceNotAllowed()`, `TcbStale()`.
-- **Binding**: `BindingSigInvalid()`.
+- **Dstack KMS chain**: `DstackSigChain.InvalidSigChain()` (any sig-chain link fails — KMS root not allowlisted, or app/derived/KMS signature mismatch), plus `DstackSigChain.{InvalidPubKeyLength, PointNotOnCurve}()` for malformed pubkeys.
+- **Dstack registration binding**: `CodeIdMismatch()` (attested app_id ≠ member contract), `BindingMismatch()` (messageHash ≠ the (cluster, member, xPub, wgPub) preimage).
+- **Boot gate**: compose hash / device / TCB are enforced by `isAppAllowed` (which returns a reason string, not a revert), not at registration.
 - **Messaging**: `DuplicateEnvelope()`, `RecipientNotMember()`.
 - **CSK commitment**: `NotOriginator()`, `CskCommitmentAlreadySet()`.
 - **Admin**: `NotClusterOwner()`, `ClusterDestroyed()` (reserved for milestone B; not used in v1).

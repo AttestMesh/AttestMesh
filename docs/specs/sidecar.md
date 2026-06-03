@@ -119,6 +119,7 @@ All configuration is via environment variables (no config files). The sidecar fa
 | `CHAIN_ID` | yes | — | EVM chain id (`84532` for Base Sepolia v1, `8453` for Base mainnet) |
 | `RPC_URL` | yes | — | EVM RPC endpoint URL (read-only direct chain reads — §8.4) |
 | `BUNDLER_URL` | yes | — | EIP-4337 bundler RPC endpoint (Alchemy in v1). All state-mutating calls go through here. |
+| `GAS_POLICY_ID` | no | `` | Alchemy Gas Manager policy id for `alchemy_requestGasAndPaymasterAndData` (sponsored UserOps — §8.2). |
 | `INDEXER_REGISTRY_ADDR` | yes | — | hex address of the per-chain IndexerRegistry. (Hardcoded per chain id in v1 sidecar binary; env var allows overriding for tests.) |
 | `DSTACK_SOCKET` | no | `/var/run/dstack.sock` | path to dstack guest-agent socket |
 | `AGENT_GRPC_SOCKET` | no | `/var/run/attestmesh/agent.sock` | path the app facade listens on |
@@ -221,9 +222,9 @@ For every outbound call (`dstack_register`, `publishWgKey`, `send`, etc.):
 
 1. **Wrap as execute calldata.** The actual selector + args (e.g. `dstack_register(...)`) is encoded as `data`, then wrapped as `ClusterMember.execute(target=clusterDiamond, value=0, data=...)` to match the gas-webhook policy (gas-webhook spec §6 step 4).
 2. **Construct PackedUserOperation v0.7.** Sender = our ClusterMember address. Nonce = next from `eth_getUserOperationNonce(memberAddr, key=0)` (we use a single nonce key for v1; 2D nonces remain available for future use).
-3. **Gas estimation.** `eth_estimateUserOperationGas` via the bundler. Add 20% headroom.
-4. **Paymaster fields.** Empty (`paymaster = null`). Alchemy's bundler fills these in after the webhook approves and the paymaster service signs.
-5. **Sign userOpHash.** Compute per EIP-4337 v0.7 (keccak over the packed bytes + EntryPoint + chainId). Sign with the binding key.
+3. **Request sponsorship + gas (before signing).** Call `alchemy_requestGasAndPaymasterAndData` (Gas Manager policy `GAS_POLICY_ID`) with the partial UserOp and a dummy signature. The Alchemy Gas Manager calls the AttestMesh gas-sponsorship webhook to approve, then returns the gas limits **and** the paymaster fields (`paymaster`, `paymasterData`, paymaster gas limits), scoped to this exact op.
+4. **Populate the op.** Apply the returned gas limits and paymaster fields to the UserOperation. The op is now final.
+5. **Sign userOpHash (sponsor-then-sign).** Compute the v0.7 userOpHash over the now-final op — the hash commits to `paymasterAndData` — and sign with the binding key. **Ordering is mandatory:** signing before the paymaster fields are populated produces a hash that differs from the one the EntryPoint recomputes, so `validateUserOp` recovers the wrong signer and the op is rejected with `AA24` (premortem F2).
 6. **Submit.** `eth_sendUserOperation`. Returns a userOpHash.
 7. **Poll for inclusion.** `eth_getUserOperationReceipt(userOpHash)` every 2 seconds, up to 60 seconds. On success, return the underlying `txHash`. On timeout, surface to the state machine as a transient failure.
 
@@ -232,7 +233,7 @@ For every outbound call (`dstack_register`, `publishWgKey`, `send`, etc.):
 The very first UserOp from a fresh ClusterMember invokes `dstack_register`. At that moment the ClusterMember's `owner` field is still `address(0)` and validateUserOp uses the bootstrap path (contracts spec §9.1.2):
 
 - The signature on `userOpHash` is from the binding key.
-- The bindingSig inside the inner `dstack_register` calldata is also from the binding key (signed over the bind-hash described in contracts spec §6.3 step 8).
+- The `messageSignature` inside the inner `dstack_register` proof is also from the binding key (signed over the EIP-191 message of the registration bind-hash; see contracts spec §6.3 step 4, *derived → message*).
 - ClusterMember's validateUserOp recovers both and requires them to match.
 
 The sidecar does not need to do anything different on its end — it constructs the UserOp the same way it constructs any other one. The chicken-and-egg is resolved entirely contract-side.
