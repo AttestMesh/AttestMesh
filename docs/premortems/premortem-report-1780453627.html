@@ -1,0 +1,144 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Premortem — the FIX (dstack-registration-rework)</title>
+<style>
+  :root{--bg:#0a0e1a;--panel:#121829;--panel2:#0e1422;--ink:#e8ecf6;--muted:#97a2c0;--line:#222c44;--accent:#7aa2ff;--danger:#ff5d6c;--warn:#ffb454;--ok:#54d6a0}
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif}
+  .wrap{max-width:1080px;margin:0 auto;padding:40px 22px 80px}
+  h1{font-size:28px;margin:0 0 6px;letter-spacing:-.3px}
+  .sub{color:var(--muted);margin:0 0 4px}
+  .kill{display:block;margin:16px 0 4px;padding:12px 16px;border-radius:12px;background:rgba(255,93,108,.13);color:#ffb9c0;border:1px solid rgba(255,93,108,.45);font-weight:600;font-size:14px}
+  h2{font-size:13px;text-transform:uppercase;letter-spacing:1.4px;color:var(--muted);margin:34px 0 14px;border-bottom:1px solid var(--line);padding-bottom:8px}
+  .syn{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:20px 22px;margin:12px 0}
+  .syn h3{margin:0 0 6px;font-size:16px}
+  .tag{font-size:11px;text-transform:uppercase;letter-spacing:1px;font-weight:700}
+  .t-likely{color:var(--warn)}.t-danger{color:var(--danger)}.t-hidden{color:var(--accent)}
+  ol,ul{margin:8px 0 0;padding-left:20px}li{margin:6px 0}
+  code{background:var(--panel2);border:1px solid var(--line);border-radius:5px;padding:1px 5px;font-size:12px;color:#cdd7f5}
+  .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(330px,1fr));gap:16px;margin-top:14px}
+  .card{background:var(--panel);border:1px solid var(--line);border-left-width:4px;border-radius:12px;padding:16px 17px;display:flex;flex-direction:column}
+  .card .hd{display:flex;justify-content:space-between;align-items:flex-start;gap:8px;margin-bottom:8px}
+  .card h4{margin:0;font-size:14.5px;line-height:1.35}
+  .sev{flex:none;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.6px;padding:3px 7px;border-radius:6px;white-space:nowrap}
+  .sev.cert{background:rgba(255,93,108,.15);color:var(--danger);border:1px solid rgba(255,93,108,.35)}
+  .sev.high{background:rgba(255,180,84,.13);color:var(--warn);border:1px solid rgba(255,180,84,.32)}
+  .sev.strat{background:rgba(154,122,255,.14);color:#b9a6ff;border:1px solid rgba(154,122,255,.34)}
+  .lbl{font-size:10.5px;text-transform:uppercase;letter-spacing:.8px;color:var(--muted);margin:11px 0 3px;font-weight:700}
+  .story{color:#d4dbf0;font-size:13.5px}.assume{color:#f0d9b0;font-size:13px;font-style:italic}.warn{color:#bfe9d6;font-size:13px}
+  footer{margin-top:46px;color:var(--muted);font-size:12px;border-top:1px solid var(--line);padding-top:16px}
+  .scope{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:12px;margin-top:6px}
+  .scope div{background:var(--panel2);border:1px solid var(--line);border-radius:10px;padding:12px 14px}
+  .scope .k{font-size:10.5px;text-transform:uppercase;letter-spacing:.8px;color:var(--muted)}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Premortem — the FIX (<code>dstack-registration-rework</code>)</h1>
+  <p class="sub">We premortemed the drafted fix itself. Frame: it's months from now, we built it exactly as specced, and it failed.</p>
+  <div class="kill">This premortem killed the plan. The fix as specced fails on ≥3 <b>certain</b> technical dimensions (P2, P3, P4) <em>and</em> is strategically self-defeating (P1+P6). The architecture decision it encodes — adopt dstack's allowlist-gate model, trust the KMS off chain — should be revisited before any code is written.</div>
+
+  <div class="scope">
+    <div><div class="k">What</div>A rework that on chain verifies one real dstack KMS signature + an allowlist on proof-supplied fields + a pubkey binding, trusting the dstack KMS for the quote; sidecar rewritten to prpc with encrypted-disk CSK persistence. Both ends of the registration seam.</div>
+    <div><div class="k">Who</div>The team building the fix; operators/nodes who need registration to work AND be secure.</div>
+    <div><div class="k">Success</div>A real dstack CVM registers by verifying a real proof; the model is sound; the sidecar talks to the real guest agent; the CSK survives restarts.</div>
+    <div><div class="k">Method</div>6 parallel investigators, each grounded in the spec + the real dstack source (kms contracts, kms/src/crypto.rs + main_service, guest-agent + ra-rpc, basefiles, attestation.md). 2026-06-03.</div>
+  </div>
+
+  <h2>Synthesis — read this first</h2>
+
+  <div class="syn">
+    <span class="tag t-likely">Most likely failure</span>
+    <h3>P2 — dstack's app-key / app_id model doesn't map to per-member identity (and it's certain).</h3>
+    <p>dstack's <code>get_app_key</code> takes <code>app_id</code> from the <em>verified TDX quote's</em> boot_info, not from the caller, and only issues keys to apps in <code>DstackKms.registeredApps</code> gated by <code>allowedOsImages</code>. Using arbitrary ClusterMember addresses as <code>app_id</code>s means the KMS returns <b>"App not registered"</b> and refuses to issue a key — registration can't start. Run members under one registered app and <code>derive_k256_key(parent, app_id)</code> hands every instance the <b>same</b> key → identical EIP-4337 owner → the second <code>dstack_register</code> reverts duplicate. The spec's central assumption ("the KMS will sign a unique key for our chosen app_id") is false.</p>
+  </div>
+
+  <div class="syn">
+    <span class="tag t-danger">Most dangerous failure</span>
+    <h3>P1 + P6 — the fix is both insecure and self-defeating.</h3>
+    <p>dstack's <code>dstack-kms-issued</code> signature binds <code>app_id</code>+pubkey only, <b>not the compose hash</b>. The gate checks <code>proof.composeHash</code>, a self-asserted field — so a holder of any KMS-issued key registers while claiming an allowlisted hash but running unapproved software. That makes §9's "approved software" guarantee fictional, and P6 shows it simultaneously guts the thesis: §1's "anchored to an attestation chain <em>the cluster contract verifies</em>" and §10's "verifier as facet" both go false, leaving <code>DstackFacet</code> ≈ dstack's own <code>DstackApp.isAppAllowed</code> + a registry. The review question "why not just deploy DstackApp + a messaging contract?" has no answer. The fix could pass every test and still lose.</p>
+  </div>
+
+  <div class="syn">
+    <span class="tag t-hidden">The hidden assumption</span>
+    <h3>That the attestation-verification layer is swappable plumbing.</h3>
+    <p>The fix assumes AttestMesh could "adopt dstack's model" cheaply. But <em>the chain independently verifying attestation is the reason AttestMesh exists.</em> Decision B (trust the KMS off chain) negotiates away the anchor — the spec's own Open Question 2 and Non-Requirements already admit it. Swapping the verifier for a trusted-KMS gate doesn't simplify the project; it deletes its differentiator.</p>
+  </div>
+
+  <div class="syn">
+    <h3 style="margin-top:2px">The revised plan — revisit the architecture before writing code</h3>
+    <ol>
+      <li><b>Do not implement the spec as drafted.</b> The premortem invalidates Decision B on security (P1), strategy (P6), and feasibility (P2).</li>
+      <li><b>Stand up a real dstack CVM + KMS first</b> and answer empirically — these gate everything: can the KMS issue a key for an AttestMesh-controlled <code>app_id</code>, or must each member be a registered dstack app? What's actually in the TDX quote's <code>report_data</code>? Is the rootfs ephemeral (it is — dm-verity) and where is the LUKS data disk?</li>
+      <li><b>Reconsider per-instance, quote-based binding.</b> The master spec's <em>original</em> rule (§4.1) binds <code>xPub‖wgPub</code> into the TDX quote's <code>report_data</code> — per-instance, sidesteps the per-app-key collision (P2), and (if the quote is verified on chain or by an on-chain DCAP/verifier) preserves the "chain verifies attestation" thesis (P6). Re-evaluate the on-chain-quote path the draft deferred as the <em>primary</em>, not the fallback.</li>
+      <li><b>Implementation facts now fixed (any architecture):</b> the dstack client must speak <b>prpc/ra-rpc over HTTP/1</b> (Rocket, <code>POST /prpc/Service.Method</code>), not tonic gRPC (P3); CSK persistence targets the <b>LUKS data disk</b> (<code>/dstack</code>), not the verity rootfs (P4); the real-proof capture needs an owner + provenance metadata + ≥2 captures to diff (P5).</li>
+    </ol>
+  </div>
+
+  <div class="syn">
+    <h3 style="margin-top:2px">Pre-implementation checklist</h3>
+    <ul>
+      <li>☐ A real dstack CVM+KMS exists; we've confirmed whether/how it issues a signed key for an AttestMesh <code>app_id</code> (P2).</li>
+      <li>☐ We've dumped a real <code>GetQuote</code> and inspected <code>report_data</code> + the <code>k256_signature_chain</code> layout + where <code>tcb_status</code> lives (P5/P1).</li>
+      <li>☐ The architecture decision (on-chain quote/report_data binding vs trust-KMS) is re-made with those facts, security + thesis implications written down (P1/P6).</li>
+      <li>☐ A throwaway prpc round-trip from the sidecar to a real guest agent succeeds before any contract work (P3).</li>
+      <li>☐ A reboot test confirms the CSK survives on the data disk, or the originator re-derives without local state (P4).</li>
+    </ul>
+  </div>
+
+  <h2>The six failure modes</h2>
+  <div class="grid">
+
+    <div class="card" style="border-left-color:#ff5d6c">
+      <div class="hd"><h4>P2 · dstack app-key/app_id model doesn't map to per-member identity</h4><span class="sev cert">Certain</span></div>
+      <div class="story">KMS <code>get_app_key</code> derives <code>app_id</code> from the verified quote, not the caller, and only signs for apps in <code>DstackKms.registeredApps</code>. Ad-hoc ClusterMember <code>app_id</code>s → "App not registered" (no key issued). Under one registered app, <code>derive_k256_key(parent,app_id)</code> gives every instance the same key → identical owner → duplicate-member revert. Per-instance uniqueness lives in <code>instance_id</code> (disk key only), never in the anchored k256 app key.</div>
+      <div class="lbl">Underlying assumption</div><div class="assume">The KMS will derive and sign a unique k256 key for an arbitrary app_id we choose.</div>
+      <div class="lbl">Early warning signs</div><div class="warn"><code>DeriveK256Key</code> returns "App not registered" for unregistered members; two members on one image share <code>appKeyAddr</code> and the 2nd register reverts.</div>
+    </div>
+
+    <div class="card" style="border-left-color:#ff7a45">
+      <div class="hd"><h4>P1 · composeHash is self-asserted (the gate binds nothing)</h4><span class="sev cert">Certain</span></div>
+      <div class="story">dstack's <code>sign_message</code> hashes <code>[prefix, ":", app_id, sec1_pubkey]</code> — the compose hash is <b>not</b> in the signed bytes. The gate checks <code>proof.composeHash</code>, a string the registrant typed. Anyone holding a KMS-issued key for their app_id pastes in an allowlisted hash, signs the binding, and registers while running unapproved software. The chain never saw the quote that measured the software.</div>
+      <div class="lbl">Underlying assumption</div><div class="assume">Recovering one KMS sig over app_id+pubkey transitively authenticates the separately-supplied composeHash.</div>
+      <div class="lbl">Early warning signs</div><div class="warn">Registration succeeds where <code>proof.composeHash</code> ≠ the registrant's own <code>Info→AppInfo</code> hash; the replay fixture signs a synthetic preimage with a free composeHash → green CI, zero binding.</div>
+    </div>
+
+    <div class="card" style="border-left-color:#e85d9c">
+      <div class="hd"><h4>P3 · prpc ≠ gRPC — tonic can't talk to the guest agent</h4><span class="sev cert">Certain</span></div>
+      <div class="story">dstack's guest agent is Rocket (HTTP/1.1) serving <code>POST /prpc/&lt;Service&gt;.&lt;Method&gt;</code> with protobuf-or-JSON bodies, <code>Content-Type: application/json</code> — dstack's own ra-rpc, consumed by <code>prpc_build</code>, not <code>tonic-build</code>. A tonic client speaks HTTP/2 gRPC framing; the connection fails before any RPC. The team rediscovers the original "guessed the protocol" failure one layer down: the <code>.proto</code> pins the messages, not dstack's transport.</div>
+      <div class="lbl">Underlying assumption</div><div class="assume">A <code>.proto</code> with service/rpc blocks implies gRPC/HTTP-2, so tonic codegen interoperates.</div>
+      <div class="lbl">Early warning signs</div><div class="warn">dstack's ra-rpc/SDK imports <code>rocket</code>/<code>reqwest</code>/<code>prpc</code> and zero tonic/h2; the first live call dies with an h2 framing error while the same messages round-trip against a tonic mock.</div>
+    </div>
+
+    <div class="card" style="border-left-color:#ffb454">
+      <div class="hd"><h4>P4 · CSK persistence targets ephemeral rootfs → restart deadlock</h4><span class="sev high">High</span></div>
+      <div class="story">dstack's rootfs is <code>rootfs.img.verity</code> (dm-verity, read-only, measured into RTMR2). Durable state is a separate LUKS volume mounted at <code>/var/volatile/dstack/persistent</code> → <code>/dstack</code>. <code>${STATE_DIR}/csk</code> on the rootfs is volatile, so every restart wipes the onboardee's CSK; the restart path always re-pulls; re-pull needs a live tunnel that a cold boot lacks → stuck at <code>pulling-csk</code> forever (F6 on every reboot). The originator's <code>seal/unseal</code> still call nonexistent dstack RPCs.</div>
+      <div class="lbl">Underlying assumption</div><div class="assume"><code>${STATE_DIR}</code> / "the dstack-encrypted rootfs" is durable across restarts.</div>
+      <div class="lbl">Early warning signs</div><div class="warn">Post-reboot, <code>${STATE_DIR}/csk</code> is missing and the agent re-pulls every boot; <code>mount</code> shows it on an overlay/tmpfs, not under <code>/dstack</code>.</div>
+    </div>
+
+    <div class="card" style="border-left-color:#7aa2ff">
+      <div class="hd"><h4>P5 · captured-proof fixture: unowned dependency + single-version snapshot</h4><span class="sev high">High</span></div>
+      <div class="story">Capturing a real proof needs TDX hardware + a deployed KMS + on-chain <code>DstackApp</code> wiring — an "infra prerequisite" nobody owns, so the one gating test is un-runnable and the engineer re-guesses Open Question #1, reproducing the original F1 bug. Once captured, the fixture freezes one CVM's bytes: <code>k256_signature_chain</code> is a 2-element vector whose layout can shift, <code>tcb_status</code> lives inside the <code>tcb_info</code> JSON (not a proto field), TCB status varies by platform/date, KMS roots rotate → green CI, red on a real newer CVM.</div>
+      <div class="lbl">Underlying assumption</div><div class="assume">One captured proof is a stable spec of "a real dstack proof," not a single sample of a versioned, time-varying distribution.</div>
+      <div class="lbl">Early warning signs</div><div class="warn">The fixture lands with no provenance (dstack SHA, proto version, KMS root, TCB date) and no second capture to diff; the "stand up a CVM/KMS" ticket has no assignee.</div>
+    </div>
+
+    <div class="card" style="border-left-color:#9a7aff">
+      <div class="hd"><h4>P6 · strategic inversion — the fix guts AttestMesh's reason to exist</h4><span class="sev strat">Strategic</span></div>
+      <div class="story">Adopting dstack's model makes <code>DstackFacet</code> ≈ <code>DstackApp.isAppAllowed</code> + a pubkey registry, and the fatal adopter question — "why not just deploy DstackApp + a messaging contract?" — has no answer. §1's "attestation chain the cluster contract verifies," the Join invariant, and §10's "verifier as facet" all become false. The project demos but can't sell; adopters fork the two dstack primitives and route around it. The thesis dies from redundancy, not a bug.</div>
+      <div class="lbl">Underlying assumption</div><div class="assume">AttestMesh's value is the messaging/mesh surface, so the verification layer can be swapped for a trusted-KMS gate.</div>
+      <div class="lbl">Early warning signs</div><div class="warn">The spec's own Open Question 2 + Non-Requirements punt independent verification; a reviewer diffs <code>dstack_register</code> against <code>DstackApp.sol</code> and sees the same gate + registry.</div>
+    </div>
+
+  </div>
+
+  <footer>
+    Premortem of the fix · 2026-06-03 · target: <b>docs/specs/dstack-registration-rework.md</b> · grounded in github.com/dstack-tee/dstack (kms contracts, kms/src/crypto.rs + main_service, guest-agent + ra-rpc, basefiles/attestation.md) · companion transcript: <code>premortem-transcript-1780453627.md</code>
+  </footer>
+</div>
+</body>
+</html>
