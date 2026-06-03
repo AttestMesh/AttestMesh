@@ -75,6 +75,7 @@ Canonical receipt: `contracts/script/deployments/8453.json` (written by `DeployI
 | MessageFacet | `0x996F442669236E6843B6Bf063f7704D4aDeDd8c4` |
 | NetworkFacet | `0x4eFf3b7A5b8b4888bf8C80855BCB1FaAa59D727F` |
 | DstackFacet | `0xA5a9346665339369Cb9D78C622176a5cD14dd445` |
+| **ClusterDiamond `attestmesh-1`** | **`0x624a5bcE50ffD6b950a2b03edee1a10E3DF0b712`** (owner=deployer; KMS root + compose hash seeded; allowAnyDevice; 10.13.0.0/16) |
 
 ## Status log
 
@@ -82,4 +83,5 @@ Canonical receipt: `contracts/script/deployments/8453.json` (written by `DeployI
 |---|---|---|
 | 2026-06-03 | recon + env bridge + preflight | ✔ key→deployer verified, chain 8453, balance OK |
 | 2026-06-03 | **A1 DeployInfra (Base mainnet)** | ✔ 9 contracts live (~0.00006 ETH); bytecode verified on-chain |
-| 2026-06-03 | next | A2 DeployCluster — seed allowlist (KMS root + compose hash), then Track B/C |
+| 2026-06-03 | **A2 DeployCluster** `attestmesh-1` | ✔ `0x624a…b712`; owner=deployer, allowedKmsRoots[real]=true, allowedComposeHashes[real]=true, allowAnyDevice, meshIp(1)=10.13.124.237 (matches sidecar vector) |
+| 2026-06-03 | next | Track B (gas-webhook: wrangler deploy + point the Alchemy policy at it), Track C (indexer) |
