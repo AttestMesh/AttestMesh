@@ -1,11 +1,13 @@
 # dstack Registration Rework (premortem fix #1)
 
-**Status:** DRAFT
+**Status:** SUPERSEDED — rejected by its own premortem (`docs/premortems/premortem-transcript-1780453627.md`, P1/P2/P6). Replaced by [`dstack-attested-quorum-membership.md`](./dstack-attested-quorum-membership.md).
 **Author:** LSDan
 **Created:** 2026-06-03
 **Last Updated:** 2026-06-03
 **Parent specs:** [`contracts.md`](./contracts.md) §6, [`sidecar.md`](./sidecar.md) §6/§8/§13, [`attestmesh-coordination-layer.md`](./attestmesh-coordination-layer.md) §4.2/§7.1
 **Premortem:** `docs/premortems/premortem-transcript-1780448684.md` (F1, F4)
+
+> **This spec was not implemented.** Its premortem found the "adopt dstack's allowlist-gate model + verify one KMS signature on chain" approach is insecure (composeHash self-asserted), infeasible (dstack won't issue keys for ad-hoc app_ids; per-app keys collide), and self-defeating (collapses to dstack's own gate). Kept as a record; the live design is `dstack-attested-quorum-membership.md`.
 
 ## Overview
 
