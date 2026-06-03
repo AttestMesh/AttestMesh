@@ -6,7 +6,6 @@
 use super::abi;
 use alloy::primitives::{keccak256, Address, Bytes, B256};
 use alloy::signers::k256::ecdsa::{RecoveryId, Signature as K256Sig, SigningKey, VerifyingKey};
-use alloy::signers::k256::elliptic_curve::sec1::ToEncodedPoint;
 use alloy::sol_types::{SolCall, SolValue};
 use anyhow::{ensure, Context, Result};
 
