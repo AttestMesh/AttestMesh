@@ -182,12 +182,16 @@ impl UnixSocketDstack {
 #[async_trait]
 impl DstackRuntime for UnixSocketDstack {
     async fn derive_key(&self, purpose: &str, subkey: &str) -> Result<Zeroizing<[u8; 32]>> {
+        // dstack 0.5.x exposes only /GetKey (the /DeriveKey endpoint was removed). It
+        // returns 32 bytes of HKDF-derived key material for (path, purpose) plus a KMS
+        // signature chain we ignore here — derive_key wants only the seed bytes.
         let body = serde_json::json!({ "path": purpose, "purpose": subkey });
-        let resp = self.request("/DeriveKey", &body).await?;
-        let key_hex = resp
-            .get("key")
-            .and_then(|v| v.as_str())
-            .context("missing key")?;
+        let resp = self.request("/GetKey", &body).await?;
+        // On the error path the response carries no key, so it is safe to log it verbatim
+        // to pinpoint a guest-agent/API mismatch on a live CVM (deploy logging directive).
+        let key_hex = resp.get("key").and_then(|v| v.as_str()).with_context(|| {
+            format!("/GetKey response missing 'key' (path={purpose}, purpose={subkey}): {resp}")
+        })?;
         let bytes = hex::decode(key_hex.trim_start_matches("0x"))?;
         let mut out = [0u8; 32];
         anyhow::ensure!(bytes.len() >= 32, "short key");
@@ -223,15 +227,20 @@ impl DstackRuntime for UnixSocketDstack {
     async fn get_key(&self, path: &str, purpose: &str) -> Result<DstackKey> {
         let body = serde_json::json!({ "path": path, "purpose": purpose });
         let resp = self.request("/GetKey", &body).await?;
-        let key_hex = resp
-            .get("key")
-            .and_then(|v| v.as_str())
-            .context("GetKey: missing key")?;
+        // Error path has no key → safe to log the whole response.
+        let key_hex = resp.get("key").and_then(|v| v.as_str()).with_context(|| {
+            format!("GetKey: missing 'key' (path={path}, purpose={purpose}): {resp}")
+        })?;
         let key = hex::decode(key_hex.trim_start_matches("0x")).context("GetKey: bad key hex")?;
+        // The key IS present here, so never log the full response — only its field names.
         let signature_chain = resp
             .get("signature_chain")
             .and_then(|v| v.as_array())
-            .context("GetKey: missing signature_chain")?
+            .with_context(|| {
+                let fields: Vec<&String> =
+                    resp.as_object().map(|o| o.keys().collect()).unwrap_or_default();
+                format!("GetKey: missing 'signature_chain'; response fields = {fields:?}")
+            })?
             .iter()
             .map(|s| {
                 let h = s.as_str().context("signature_chain entry not a string")?;
