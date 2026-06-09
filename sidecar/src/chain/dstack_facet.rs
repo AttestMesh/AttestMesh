@@ -130,6 +130,19 @@ pub fn eth_signed_message_hash(hash: B256) -> B256 {
     keccak256(v)
 }
 
+/// Normalize an ECDSA signature's recovery id to Ethereum's {27, 28}. Both dstack's KMS
+/// chain sigs and alloy's `sign_message` may emit a raw 0/1 y-parity, but every on-chain
+/// recovery the proof must pass — `DstackSigChain.verify` (app/kms/binding sigs) and
+/// `ClusterMember._recoverBindingSigner` (binding sig) — uses OZ `ECDSA.recover`, which
+/// rejects v < 27 (ecrecover returns address(0) → `ECDSAInvalidSignature`). 0→27 / 1→28
+/// preserves the recovered key (v only selects the y-parity branch).
+fn normalize_recovery_id(mut sig: Vec<u8>) -> Vec<u8> {
+    if sig.len() == 65 && sig[64] < 27 {
+        sig[64] += 27;
+    }
+    sig
+}
+
 /// Build the complete on-chain `DstackProof` the sidecar submits to register: assemble
 /// the KMS material (app pubkey recovery + codeId), pin the binding `messageHash` to
 /// (cluster, member, xPub, wgPub), and sign its EIP-191 message with the derived key.
@@ -149,8 +162,8 @@ pub async fn build_proof(
     let material = build_kms_material(
         app_id,
         derived_priv.as_slice(),
-        app_signature,
-        kms_signature,
+        normalize_recovery_id(app_signature),
+        normalize_recovery_id(kms_signature),
     )?;
     let message_hash = bind_hash(cluster, member, x_pub, wg_pub);
     // alloy `sign_message` applies the EIP-191 prefix, exactly as the contract recovers.
@@ -161,7 +174,7 @@ pub async fn build_proof(
     Ok(assemble_proof(
         material,
         message_hash,
-        sig.as_bytes().to_vec(),
+        normalize_recovery_id(sig.as_bytes().to_vec()),
     ))
 }
 
@@ -449,5 +462,32 @@ mod tests {
         // bindings.
         assert_eq!(&proof.codeId.0[..20], &[0xABu8; 20]);
         assert_eq!(proof.messageHash, bind_hash(cluster, member, x_pub, wg_pub));
+
+        // Every signature must carry an Ethereum recovery id (v in {27,28}): the on-chain
+        // OZ ECDSA.recover in DstackSigChain.verify and ClusterMember._recoverBindingSigner
+        // reverts (ECDSAInvalidSignature) on a raw 0/1 y-parity.
+        for (label, sig) in [
+            ("app", &proof.appSignature),
+            ("kms", &proof.kmsSignature),
+            ("binding", &proof.messageSignature),
+        ] {
+            assert_eq!(sig.len(), 65, "{label} signature must be 65 bytes");
+            assert!(sig[64] >= 27, "{label} signature v={} must be an eth recovery id", sig[64]);
+        }
+    }
+
+    #[test]
+    fn normalize_recovery_id_maps_parity_to_eth() {
+        let mut raw = vec![0xABu8; 65];
+        raw[64] = 0;
+        assert_eq!(normalize_recovery_id(raw.clone())[64], 27);
+        raw[64] = 1;
+        assert_eq!(normalize_recovery_id(raw.clone())[64], 28);
+        // Already-Ethereum ids and non-65-byte inputs are left untouched.
+        raw[64] = 27;
+        assert_eq!(normalize_recovery_id(raw.clone())[64], 27);
+        raw[64] = 28;
+        assert_eq!(normalize_recovery_id(raw)[64], 28);
+        assert_eq!(normalize_recovery_id(vec![1u8; 64]).len(), 64);
     }
 }
