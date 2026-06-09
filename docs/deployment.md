@@ -104,7 +104,12 @@ and orphaned on-chain.
 | 2026-06-03 | Phala auth | ⚠ not found: no `phala` on PATH, no `~/.phala*` store, no `PHALA_CLOUD_API_KEY` in env/`~/.teesql`; `npx phala` says "not authenticated". Needs `PHALA_CLOUD_API_KEY` exported (dstackgres CLI reads that env var) or `phala login`. Blocks only D5 (CVM boot). |
 | 2026-06-03 | **milestone-A code** | ✔ done + tested: cold-start deadlock fix; `DstackRuntime` `/GetKey`+`/Info`; `build_kms_material` (app-pubkey recovery) + `build_proof` — e2e test proves a sidecar-built proof passes the on-chain `DstackSigChain.verify` (37 sidecar tests). |
 | 2026-06-03 | **fixed-facet redeploy (final on-chain)** | ✔ infra+cluster redeployed with the deadlock fix; `0xA46273…ccFA`; **`isAppAllowed(allowlisted, unregistered app_id) = (true,"")` verified live** (cold-start works); webhook redeployed to the new factories, `/healthz`=200. |
-| 2026-06-03 | **remaining = Phala-gated only** | wire `build_proof` into `state::run()` + the live submit, then `phala deploy` a CVM (app_id = a member addr, owner-allowlisted via `addAllowedAppId`) → on-chain registration. All of it needs a live CVM/bundler to validate → needs `~/.teesql/phala-cloud-api.key`. |
+| 2026-06-03 | (was) remaining = Phala-gated | wire `build_proof` into `state::run()` + the live submit, then `phala deploy` a CVM. |
+| 2026-06-09 | **Phala auth ✔** | device-flow `phala login` succeeded (user authorized); `phala status` = logged in as `lsdan`. Track D unblocked. |
+| 2026-06-09 | **registration wired** | `state::run()` now derives keys → `build_proof_from_runtime` → sponsored bootstrap `dstack_register` UserOp, heavily logged (commit `3d275a3`). |
+| 2026-06-09 | **node-1 on-chain prep ✔** | ClusterMember `0x259a539cfD72cca658f23bc16afa43c4ada39410` deployed (= CVM app_id), owner-allowlisted (`allowedAppIds=true`). |
+| 2026-06-09 | **sidecar image** | building via GH Actions → `ghcr.io/attestmesh/cluster-mesh-agent:latest` (no docker locally). Compose `deploy/compose/node-1.yaml`, sealed env `/tmp/attestmesh-node-1.env`. |
+| 2026-06-09 | next | deploy: `phala deploy --kms base --custom-app-id <member> --nonce 0x0..0 --compose node-1.yaml -e env --private-key <k>` (dstackgres flags); use `--prepare-only` → get compose hash → `addComposeHash` → `--commit` → CVM boots → watch logs → verify `memberCount=1`. Registry visibility (ghcr private → public or pull-creds) TBD. |
 
 ## Milestone-A reference: the real dstack guest-agent API
 
