@@ -5,15 +5,20 @@
 
 pub mod gates;
 
-use crate::chain::ChainClient;
+use crate::chain::{bundler, dstack_facet, userop, ChainClient};
 use crate::config::Config;
+use crate::dstack::DstackRuntime;
 use crate::heartbeat::liveness::Liveness;
 use crate::keys::KeyMaterial;
 use crate::wg::peer::PeerTable;
 use crate::wg::{self, MeshControl};
-use alloy::primitives::{keccak256, Address};
+use alloy::primitives::{keccak256, Address, B256};
 use alloy::sol_types::SolValue;
-use anyhow::Result;
+use anyhow::{Context, Result};
+
+/// Canonical EIP-4337 v0.7 EntryPoint (identical on every chain).
+const ENTRY_POINT: Address =
+    alloy::primitives::address!("0000000071727De22E5E9d8BAf0edAc6f37da032");
 use gates::Gates;
 use std::sync::Arc;
 use tokio::sync::{broadcast, Mutex};
@@ -189,9 +194,74 @@ pub async fn run(config: Config) -> Result<()> {
         .ok();
 
     shared.set_phase(Phase::Registering).await;
-    // Registration, Indexer subscription, peer exchange, heartbeats, CSK, and the
-    // health server are spawned here in the full build. The integration harness
-    // (§16.2) drives them against anvil + a mock dstack + a mock Indexer.
+
+    // Track D — registration. Build the dstack KMS proof and submit a sponsored
+    // dstack_register UserOp. Logged verbosely so a live-CVM run pinpoints any failure
+    // (which dstack call, the bundler, or the on-chain gate). Indexer subscription, peer
+    // exchange, heartbeats, CSK, and wg config are the subsequent bring-up steps.
+    match register_on_chain(&config, dstack.as_ref(), &chain, cluster, &keys).await {
+        Ok(tx) if tx == B256::ZERO => tracing::info!("already registered on-chain; skipping"),
+        Ok(tx) => tracing::info!(tx = %tx, "✔ dstack_register landed on-chain"),
+        Err(e) => tracing::error!(error = ?e, "✗ registration failed"),
+    }
+
     crate::health::serve(shared.clone(), config.health_http_addr.clone()).await?;
     Ok(())
+}
+
+/// Build the dstack KMS proof from the runtime and submit a sponsored `dstack_register`
+/// UserOp (bootstrap flow: ClusterMember.validateUserOp recovers the binding key from the
+/// inner proof). Returns the tx hash, or `B256::ZERO` if the node is already a member.
+///
+/// NOTE: the registration signer is the `/GetKey`-derived key returned by
+/// `build_proof_from_runtime` (the one the KMS sig-chain attests), NOT
+/// `keys.binding_seed` (a separate `derive_key` value). The ClusterMember owner is set to
+/// this signer, so every later UserOp must use it too — unify on it as bring-up grows.
+async fn register_on_chain(
+    config: &Config,
+    dstack: &dyn DstackRuntime,
+    chain: &ChainClient,
+    cluster: Address,
+    keys: &KeyMaterial,
+) -> Result<B256> {
+    let member = config.member_contract;
+
+    // Restart-safe: skip if already registered.
+    if chain
+        .member_of(cluster)
+        .await
+        .context("read memberOf")?
+        .exists()
+    {
+        return Ok(B256::ZERO);
+    }
+
+    let x_pub = B256::from(keys.x_pub);
+    let wg_pub = B256::from(keys.wg_pub);
+    tracing::info!(%member, %cluster, %x_pub, %wg_pub,
+        "registration: building proof from dstack runtime (/Info + /GetKey)");
+
+    let (proof, binding_signer) =
+        dstack_facet::build_proof_from_runtime(dstack, cluster, member, x_pub, wg_pub)
+            .await
+            .context("build_proof_from_runtime (/Info + /GetKey -> DstackProof)")?;
+    tracing::info!(owner = %binding_signer.address(), code_id = %proof.codeId,
+        purpose = %proof.purpose, "registration: proof built; derived key is the member owner");
+
+    let inner = dstack_facet::build_register_calldata(proof, member, x_pub, wg_pub);
+    let outer = userop::wrap_execute(cluster, inner);
+    let op = userop::UserOperation::new(member, Default::default(), outer);
+
+    let bundler = bundler::BundlerClient::new(
+        config.bundler_url.clone(),
+        ENTRY_POINT,
+        config.chain_id,
+        config.gas_policy_id.clone(),
+    );
+    tracing::info!(policy = %config.gas_policy_id,
+        "registration: submitting sponsored dstack_register UserOp (bootstrap mode)");
+    bundler
+        .submit(&binding_signer, op)
+        .await
+        .context("bundler.submit(dstack_register)")
 }
