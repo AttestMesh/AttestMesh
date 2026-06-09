@@ -161,9 +161,16 @@ contract DstackFacet is IDstackFacet, IAppAuth, IAppAuthBasicManagement, Cluster
         bytes32 xPubKey,
         bytes32 wgPubKey
     ) external returns (bytes32 memberId) {
-        // 1. memberContract was deployed by our factory.
+        // 1. memberContract is one of ours: either factory-deployed (custom-app-id KMS
+        //    path), or an owner-allowlisted app_id (Path A: a dstack-provisioned DstackApp
+        //    upgraded to ClusterMember, whose address IS the attested app_id). Both anchors
+        //    are owner-controlled; step 2 pins the attested app_id to exactly this address
+        //    and step 3 binds the derived key to these keys, so neither can be spoofed.
         address factory = MemberStorage.layout().memberFactory;
-        if (!IClusterMemberFactory(factory).isOurMember(memberContract)) revert NotOurMember();
+        if (
+            !IClusterMemberFactory(factory).isOurMember(memberContract)
+                && !DstackStorage.layout().allowedAppIds[memberContract]
+        ) revert NotOurMember();
 
         // 2. The KMS-attested app_id (codeId) must be exactly this member contract.
         if (proof.codeId != bytes32(bytes20(memberContract))) revert CodeIdMismatch();

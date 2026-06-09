@@ -61,6 +61,20 @@ contract ClusterMember is
         ClusterMemberStorage.layout().cluster = cluster_;
     }
 
+    /// @notice Path A re-init. A dstack-provisioned stock `DstackApp` proxy (minted by
+    ///         `phala deploy`, so its `_initialized == 1`) is UUPS-upgraded to this
+    ///         implementation and bound to its cluster in the SAME `upgradeToAndCall`.
+    ///         `reinitializer(2)` seats the cluster and burns the v1 `initialize` slot so
+    ///         it can't be replayed on the migrated proxy. Authorization is the upgrade
+    ///         itself: the stock proxy's `_authorizeUpgrade` (its deployer/owner) gates the
+    ///         `upgradeToAndCall` that delegate-calls this. Owner lands later, during
+    ///         dstack_register, exactly as in the factory path. Used when the KMS will only
+    ///         mint an app_id it provisioned (dstack base KMS), so the member contract must
+    ///         BE that app_id rather than a factory-predicted address.
+    function reinitializeFromDstackApp(address cluster_) external reinitializer(2) {
+        ClusterMemberStorage.layout().cluster = cluster_;
+    }
+
     function cluster() external view returns (address) {
         return ClusterMemberStorage.layout().cluster;
     }

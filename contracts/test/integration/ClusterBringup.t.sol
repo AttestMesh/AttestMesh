@@ -20,13 +20,20 @@ import { IDstackFacet } from "../../src/interfaces/IDstackFacet.sol";
 import { IClusterMember } from "../../src/interfaces/IClusterMember.sol";
 
 import { MockKmsChain } from "../helpers/MockKmsChain.sol";
+import { MockStockApp } from "../helpers/MockStockApp.sol";
 import { DstackSigChain } from "../../src/libraries/DstackSigChain.sol";
+import { ERC1967Proxy } from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
+import {
+    UUPSUpgradeable
+} from "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
+import { Initializable } from "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
 import {
     NotClusterMember,
     AlreadyRegistered,
     DuplicateEnvelope,
     CodeIdMismatch,
-    BindingMismatch
+    BindingMismatch,
+    NotOurMember
 } from "../../src/errors/Errors.sol";
 
 contract ClusterBringupTest is Test {
@@ -333,6 +340,77 @@ contract ClusterBringupTest is Test {
             meshCidrPrefix: 16,
             memberFactory: address(memberFactory)
         });
+    }
+
+    // ── Path A: register a member the factory did NOT deploy, via app_id allowlist ─
+    // When the KMS only mints an app_id it provisioned (dstack base KMS), the member
+    // contract IS that app_id (a stock DstackApp upgraded to ClusterMember), so it is not
+    // in the factory's deployedMembers. dstack_register must accept it on the strength of
+    // the owner's app_id allowlist instead — codeId (step 2) and the binding sig (step 3)
+    // still pin identity, so the looser membership anchor can't be abused.
+
+    function test_pathA_allowlistedNonFactoryMemberRegisters() public {
+        // A ClusterMember proxy deployed OUTSIDE the factory (stands in for the upgraded
+        // DstackApp proxy); cluster() is seeded so __setOwnerFromCluster accepts the diamond.
+        address impl = address(new ClusterMember());
+        address m =
+            address(new ERC1967Proxy(impl, abi.encodeCall(ClusterMember.initialize, (cluster))));
+        assertFalse(memberFactory.isOurMember(m), "must not be a factory member");
+
+        IDstackFacet.DstackProof memory proof = kms.buildProof(
+            MockKmsChain.DerivedKey({ priv: 4, compressed: COMP4 }),
+            cluster,
+            m,
+            bytes32("xpub-pa"),
+            bytes32("wg-pa")
+        );
+
+        // Neither factory-deployed nor allowlisted → NotOurMember.
+        vm.expectRevert(NotOurMember.selector);
+        IDstackFacet(cluster).dstack_register(proof, m, bytes32("xpub-pa"), bytes32("wg-pa"));
+
+        // Owner allowlists the app_id (== member address) → registration succeeds (Path A).
+        DstackFacet(cluster).addAllowedAppId(m);
+        bytes32 memberId =
+            IDstackFacet(cluster).dstack_register(proof, m, bytes32("xpub-pa"), bytes32("wg-pa"));
+
+        assertEq(IClusterMember(m).owner(), vm.addr(4), "derived key installed as owner");
+        assertEq(IAttest(cluster).memberCount(), 1);
+        assertEq(IAttest(cluster).xPubKeyOf(memberId), bytes32("xpub-pa"));
+    }
+
+    // ── Path A: reinitializeFromDstackApp re-seats a stock proxy and burns initialize ──
+    // Models `phala deploy` (a stock DstackApp proxy: _initialized==1, owner==deployer)
+    // then our `upgradeToAndCall` to the ClusterMember impl that binds the cluster in the
+    // same call. reinitializer(2) must run once and then lock both re-entry points.
+
+    function test_pathA_reinitFromStockAppProxy() public {
+        address stockImpl = address(new MockStockApp());
+        MockStockApp proxy = MockStockApp(
+            address(
+                new ERC1967Proxy(
+                    stockImpl, abi.encodeCall(MockStockApp.initialize, (address(this)))
+                )
+            )
+        );
+        assertEq(proxy.owner(), address(this), "stock proxy owned by deployer");
+
+        // Upgrade the stock proxy to ClusterMember + seat the cluster atomically.
+        address memberImpl = address(new ClusterMember());
+        UUPSUpgradeable(address(proxy))
+            .upgradeToAndCall(
+                memberImpl, abi.encodeCall(ClusterMember.reinitializeFromDstackApp, (cluster))
+            );
+
+        // It is now a ClusterMember bound to our cluster; owner lands later at registration.
+        assertEq(IClusterMember(address(proxy)).cluster(), cluster, "cluster seated");
+        assertEq(IClusterMember(address(proxy)).owner(), address(0), "owner not yet seated");
+
+        // The v1 initialize slot is burned: neither reinit nor initialize can run again.
+        vm.expectRevert(Initializable.InvalidInitialization.selector);
+        ClusterMember(payable(address(proxy))).reinitializeFromDstackApp(address(0xBEEF));
+        vm.expectRevert(Initializable.InvalidInitialization.selector);
+        ClusterMember(payable(address(proxy))).initialize(address(0xBEEF));
     }
 
     // ── helpers ───────────────────────────────────────────────────────────────
