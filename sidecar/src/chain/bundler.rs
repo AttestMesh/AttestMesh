@@ -19,11 +19,14 @@ use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
 use std::time::Duration;
 
-/// A shape-valid dummy 65-byte secp256k1 signature used for gas/paymaster estimation
-/// before the real signature exists. r/s nonzero, v = 0x1c. ClusterMember.validateUserOp
-/// recovers a (wrong) address from it, which is fine for estimation — the bundler only
-/// needs realistic calldata size.
-const DUMMY_SIGNATURE: &str = "0xfffffffffffffffffffffffffffffff0000000000000000000000000000000007aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa1c";
+/// A valid 65-byte secp256k1 signature used for gas/paymaster estimation before the real
+/// signature exists. It must be (a) even-length hex — Alchemy's
+/// `alchemy_requestGasAndPaymasterAndData` rejects an odd-length `dummySignature` outright —
+/// and (b) actually recoverable with low-s, because ClusterMember.validateUserOp runs OZ
+/// `ECDSA.recover`, which reverts on an unrecoverable/high-s signature (which would fail
+/// estimation). So we use a real signature (over an arbitrary message by private key 0x1,
+/// recovers 0x7E5F…Bdf); the recovered address is irrelevant to estimation.
+const DUMMY_SIGNATURE: &str = "0x6f79009346b958973a8481f680a44b5075d56562b39aff2104395323b6bc666a2302f4e19a7da13bef02c866971d5b35ce8c0ad27542a1c476e103b99a7b6cd61b";
 
 pub struct BundlerClient {
     http: reqwest::Client,
