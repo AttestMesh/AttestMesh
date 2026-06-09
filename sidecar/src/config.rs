@@ -7,7 +7,10 @@ use anyhow::{Context, Result};
 
 #[derive(Debug, Clone)]
 pub struct Config {
-    pub member_contract: Address,
+    /// The ClusterMember contract address. `None` when unset in env: Path A (dstack base
+    /// KMS) mints the app_id at `phala deploy` time, so the member contract — which equals
+    /// that app_id — is unknown until the CVM reads its own `/Info` at runtime.
+    pub member_contract: Option<Address>,
     pub chain_id: u64,
     pub rpc_url: String,
     pub bundler_url: String,
@@ -32,7 +35,10 @@ fn opt(key: &str, default: &str) -> String {
 impl Config {
     pub fn from_env() -> Result<Self> {
         Ok(Self {
-            member_contract: req("MEMBER_CONTRACT")?.parse().context("MEMBER_CONTRACT")?,
+            member_contract: match std::env::var("MEMBER_CONTRACT") {
+                Ok(s) if !s.trim().is_empty() => Some(s.parse().context("MEMBER_CONTRACT")?),
+                _ => None,
+            },
             chain_id: req("CHAIN_ID")?.parse().context("CHAIN_ID")?,
             rpc_url: req("RPC_URL")?,
             bundler_url: req("BUNDLER_URL")?,

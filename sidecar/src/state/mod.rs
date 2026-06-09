@@ -19,6 +19,13 @@ use anyhow::{Context, Result};
 /// Canonical EIP-4337 v0.7 EntryPoint (identical on every chain).
 const ENTRY_POINT: Address =
     alloy::primitives::address!("0000000071727De22E5E9d8BAf0edAc6f37da032");
+
+/// Retry cadence for boot-time chain calls that depend on the operator finishing the
+/// Path A on-chain setup (upgrade the stock proxy, allowlist the app_id, add the compose
+/// hash) shortly after `phala deploy`. Also absorbs transient RPC/bundler lag.
+const RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(10);
+const CLUSTER_DISCOVERY_MAX_ATTEMPTS: u32 = 90; // ~15 min
+const REGISTRATION_MAX_ATTEMPTS: u32 = 60; // ~10 min
 use gates::Gates;
 use std::sync::Arc;
 use tokio::sync::{broadcast, Mutex};
@@ -163,24 +170,37 @@ pub async fn run(config: Config) -> Result<()> {
         "derived identity keys"
     );
 
-    let chain = ChainClient::new(
-        &config.rpc_url,
-        config.chain_id,
-        config.member_contract,
-        &keys,
-    )?;
-    let cluster = chain.cluster_of().await?;
+    // Path A (dstack base KMS): when MEMBER_CONTRACT is unset, the member contract IS this
+    // CVM's app_id (a stock DstackApp `phala deploy` minted, then upgraded to ClusterMember),
+    // learnable only at runtime from /Info.
+    let member = resolve_member_contract(&config, dstack.as_ref()).await?;
+    tracing::info!(%member, "resolved member contract");
+
+    let chain = ChainClient::new(&config.rpc_url, config.chain_id, member, &keys)?;
+
+    // The cluster binding lands when the operator upgrades the stock proxy to ClusterMember
+    // and reinitializes it; ClusterMember.cluster() reverts until then. Retry so the sidecar
+    // tolerates the upgrade landing after boot (Path A) and transient RPC lag (both paths).
+    let mut attempt = 0u32;
+    let cluster = loop {
+        match chain.cluster_of().await {
+            Ok(c) => break c,
+            Err(e) => {
+                attempt += 1;
+                if attempt >= CLUSTER_DISCOVERY_MAX_ATTEMPTS {
+                    return Err(e.context("discover cluster (ClusterMember.cluster())"));
+                }
+                tracing::warn!(attempt, max = CLUSTER_DISCOVERY_MAX_ATTEMPTS, error = ?e,
+                    delay_s = RETRY_DELAY.as_secs(),
+                    "cluster not resolvable yet (awaiting ClusterMember upgrade?); retrying");
+                tokio::time::sleep(RETRY_DELAY).await;
+            }
+        }
+    };
     tracing::info!(%cluster, "discovered cluster diamond");
 
     // Default CIDR for v1; a production build reads AttestFacet.meshCidr().
-    let shared = Shared::new(
-        keys.clone(),
-        config.member_contract,
-        cluster,
-        0x0a0d0000,
-        16,
-        51820,
-    );
+    let shared = Shared::new(keys.clone(), member, cluster, 0x0a0d0000, 16, 51820);
 
     let wg_ctl: Arc<dyn MeshControl> = Arc::new(wg::CommandWg);
     wg_ctl
@@ -197,16 +217,59 @@ pub async fn run(config: Config) -> Result<()> {
 
     // Track D — registration. Build the dstack KMS proof and submit a sponsored
     // dstack_register UserOp. Logged verbosely so a live-CVM run pinpoints any failure
-    // (which dstack call, the bundler, or the on-chain gate). Indexer subscription, peer
-    // exchange, heartbeats, CSK, and wg config are the subsequent bring-up steps.
-    match register_on_chain(&config, dstack.as_ref(), &chain, cluster, &keys).await {
-        Ok(tx) if tx == B256::ZERO => tracing::info!("already registered on-chain; skipping"),
-        Ok(tx) => tracing::info!(tx = %tx, "✔ dstack_register landed on-chain"),
-        Err(e) => tracing::error!(error = ?e, "✗ registration failed"),
+    // (which dstack call, the bundler, or the on-chain gate). Retried: in Path A the
+    // operator's allowlist + compose-hash writes may land just after boot, and the bundler
+    // can transiently reject. Indexer subscription, peer exchange, heartbeats, CSK, and wg
+    // config are the subsequent bring-up steps.
+    let mut reg_attempt = 0u32;
+    loop {
+        reg_attempt += 1;
+        match register_on_chain(&config, dstack.as_ref(), &chain, member, cluster, &keys).await {
+            Ok(tx) if tx == B256::ZERO => {
+                tracing::info!("already registered on-chain; skipping");
+                break;
+            }
+            Ok(tx) => {
+                tracing::info!(tx = %tx, "✔ dstack_register landed on-chain");
+                break;
+            }
+            Err(e) if reg_attempt < REGISTRATION_MAX_ATTEMPTS => {
+                tracing::warn!(attempt = reg_attempt, max = REGISTRATION_MAX_ATTEMPTS, error = ?e,
+                    delay_s = RETRY_DELAY.as_secs(),
+                    "registration failed; retrying (awaiting allowlist/compose-hash or bundler)");
+                tokio::time::sleep(RETRY_DELAY).await;
+            }
+            Err(e) => {
+                tracing::error!(error = ?e, "✗ registration failed permanently");
+                break;
+            }
+        }
     }
 
     crate::health::serve(shared.clone(), config.health_http_addr.clone()).await?;
     Ok(())
+}
+
+/// Resolve the ClusterMember contract address. Uses `MEMBER_CONTRACT` when set (factory /
+/// custom-app-id KMS path); otherwise self-discovers it from the dstack `/Info` app_id
+/// (Path A: the member contract IS this CVM's provisioned app_id, unknown until runtime).
+async fn resolve_member_contract(config: &Config, dstack: &dyn DstackRuntime) -> Result<Address> {
+    if let Some(m) = config.member_contract {
+        if m != Address::ZERO {
+            return Ok(m);
+        }
+    }
+    let info = dstack
+        .info()
+        .await
+        .context("dstack /Info for app_id self-discovery (MEMBER_CONTRACT unset)")?;
+    if info.app_id.len() != 20 {
+        anyhow::bail!("dstack app_id is {} bytes, expected a 20-byte address", info.app_id.len());
+    }
+    let member = Address::from_slice(&info.app_id);
+    tracing::info!(%member,
+        "MEMBER_CONTRACT unset; self-discovered member contract from dstack /Info app_id (Path A)");
+    Ok(member)
 }
 
 /// Build the dstack KMS proof from the runtime and submit a sponsored `dstack_register`
@@ -221,11 +284,10 @@ async fn register_on_chain(
     config: &Config,
     dstack: &dyn DstackRuntime,
     chain: &ChainClient,
+    member: Address,
     cluster: Address,
     keys: &KeyMaterial,
 ) -> Result<B256> {
-    let member = config.member_contract;
-
     // Restart-safe: skip if already registered.
     if chain
         .member_of(cluster)

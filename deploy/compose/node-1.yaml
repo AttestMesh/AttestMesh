@@ -1,5 +1,6 @@
-# AttestMesh node compose for a dstack CVM (Track D).
-# app_id = the ClusterMember address (0x259a539c…); set at `phala deploy --custom-app-id`.
+# AttestMesh node compose for a dstack CVM (Track D, Path A / dstack base KMS).
+# app_id is minted by `phala deploy` (a stock DstackApp the operator then upgrades to
+# ClusterMember); the sidecar self-discovers it from /Info, so MEMBER_CONTRACT is omitted.
 # Secrets (RPC_URL with the Alchemy key) are passed as sealed env via `phala deploy -e`,
 # referenced here as ${...}. Mounts the dstack guest-agent socket for /GetKey + /Info.
 services:
@@ -7,7 +8,7 @@ services:
     image: ghcr.io/attestmesh/cluster-mesh-agent:latest
     restart: unless-stopped
     environment:
-      - MEMBER_CONTRACT=${MEMBER_CONTRACT}
+      # MEMBER_CONTRACT intentionally unset — self-discovered from /Info app_id (Path A).
       - CHAIN_ID=${CHAIN_ID}
       - RPC_URL=${RPC_URL}
       - BUNDLER_URL=${BUNDLER_URL}
