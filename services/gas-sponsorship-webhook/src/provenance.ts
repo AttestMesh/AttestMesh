@@ -19,9 +19,15 @@
  */
 
 import {
+  BaseError,
+  ContractFunctionExecutionError,
   createPublicClient,
   getAddress,
   http,
+  HttpRequestError,
+  RpcRequestError,
+  TimeoutError,
+  zeroAddress,
   type Address,
   type PublicClient,
 } from "viem";
@@ -45,6 +51,30 @@ const IS_DEPLOYED_CLUSTER_ABI = [
     name: "isDeployedCluster",
     stateMutability: "view",
     inputs: [{ name: "account", type: "address" }],
+    outputs: [{ name: "", type: "bool" }],
+  },
+] as const;
+
+// Path A (dstack base KMS): the member contract is a dstack DstackApp upgraded to
+// ClusterMember, so it is NOT minted by our member factory. It exposes cluster() and the
+// cluster exposes allowedAppIds(appId); together with isDeployedCluster they prove the
+// sender is an owner-allowlisted app_id of one of our clusters.
+const CLUSTER_OF_ABI = [
+  {
+    type: "function",
+    name: "cluster",
+    stateMutability: "view",
+    inputs: [],
+    outputs: [{ name: "", type: "address" }],
+  },
+] as const;
+
+const ALLOWED_APP_ID_ABI = [
+  {
+    type: "function",
+    name: "allowedAppIds",
+    stateMutability: "view",
+    inputs: [{ name: "appId", type: "address" }],
     outputs: [{ name: "", type: "bool" }],
   },
 ] as const;
@@ -176,4 +206,105 @@ export async function isDeployedCluster(deps: ProvenanceDeps, target: Address): 
         args: [getAddress(target)],
       }) as Promise<boolean>,
   });
+}
+
+/** Sentinel for a `view` call that reverted or hit an absent function (vs. a real value). */
+const REVERTED = Symbol("reverted");
+
+/**
+ * True when the error chain shows a transport/RPC failure rather than a contract-level
+ * rejection. viem wraps BOTH a real revert AND a dead-RPC/timeout in
+ * `ContractFunctionExecutionError`, so the outer class is not decisive — we must walk the
+ * cause chain for a transport error. Non-viem errors are treated as transport (fail safe:
+ * retryable, never cached as a denial).
+ */
+function isTransportFailure(err: unknown): boolean {
+  if (!(err instanceof BaseError)) return true;
+  return (
+    err.walk(
+      (e) =>
+        e instanceof HttpRequestError ||
+        e instanceof TimeoutError ||
+        e instanceof RpcRequestError,
+    ) !== null
+  );
+}
+
+/**
+ * One `view` read returning its value, {@link REVERTED} (the function reverted or doesn't
+ * exist — e.g. `cluster()` on a not-yet-upgraded stock proxy), or throwing
+ * {@link RpcFailureError} for a transport failure. The split matters: a revert is cacheable
+ * as a definitive "no", a transport flake must NOT be cached (it would wrongly deny
+ * sponsorship for the whole negative-cache TTL — the sidecar retry would keep hitting it).
+ */
+async function readViewOrRevert<T>(args: {
+  client: PublicClient;
+  address: Address;
+  abi: readonly unknown[];
+  functionName: string;
+  functionArgs?: readonly unknown[];
+  label: string;
+  logger: Logger;
+}): Promise<T | typeof REVERTED> {
+  try {
+    return (await args.client.readContract({
+      address: getAddress(args.address),
+      abi: args.abi as never,
+      functionName: args.functionName as never,
+      args: (args.functionArgs ?? []) as never,
+    })) as T;
+  } catch (cause) {
+    if (cause instanceof ContractFunctionExecutionError && !isTransportFailure(cause)) {
+      return REVERTED; // definitive contract-level "no" (revert / absent selector)
+    }
+    args.logger.error("rpc-call-failed", {
+      label: args.label,
+      address: args.address,
+      error: String(cause),
+    });
+    throw new RpcFailureError(`${args.label}(${args.address}) eth_call failed`, { cause });
+  }
+}
+
+/**
+ * Path A membership: `sender` is a dstack app upgraded to ClusterMember. It is not a
+ * factory member (so {@link isOurMember} is false), but its cluster — which MUST be one of
+ * our deployed ClusterDiamonds — has owner-allowlisted its app_id. We read `sender.cluster()`,
+ * confirm it via {@link isDeployedCluster} (so a hostile sender can't name a contract it
+ * controls), then read `cluster.allowedAppIds(sender)`. Cached under a `pathA:` key so it
+ * never collides with the `isOurMember(sender)` entry in the same KV namespace.
+ */
+export async function isAllowlistedAppId(deps: ProvenanceDeps, sender: Address): Promise<boolean> {
+  const { config, logger } = deps;
+  const key = `pathA:${cacheKey(config.expectedChainId, sender)}`;
+
+  const cached = await readCache(deps.memberCache, key, logger);
+  if (cached !== undefined) return cached;
+
+  const client = deps.client ?? makeClient(config);
+
+  let allowed = false;
+  const cluster = await readViewOrRevert<Address>({
+    client,
+    address: sender,
+    abi: CLUSTER_OF_ABI,
+    functionName: "cluster",
+    label: "cluster",
+    logger,
+  });
+  if (cluster !== REVERTED && cluster !== zeroAddress && (await isDeployedCluster(deps, cluster))) {
+    const read = await readViewOrRevert<boolean>({
+      client,
+      address: cluster,
+      abi: ALLOWED_APP_ID_ABI,
+      functionName: "allowedAppIds",
+      functionArgs: [getAddress(sender)],
+      label: "allowedAppIds",
+      logger,
+    });
+    allowed = read === true;
+  }
+
+  await writeCache(deps.memberCache, key, allowed, config, logger);
+  return allowed;
 }

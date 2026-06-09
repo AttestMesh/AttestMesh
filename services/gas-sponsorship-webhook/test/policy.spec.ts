@@ -12,6 +12,7 @@ vi.mock("../src/provenance.js", () => {
     RpcFailureError,
     isOurMember: (...args: unknown[]) => memberImpl(...args),
     isDeployedCluster: (...args: unknown[]) => clusterImpl(...args),
+    isAllowlistedAppId: (...args: unknown[]) => appIdImpl(...args),
   };
 });
 
@@ -19,6 +20,8 @@ vi.mock("../src/provenance.js", () => {
 var memberImpl: (...args: unknown[]) => Promise<boolean>;
 // eslint-disable-next-line no-var
 var clusterImpl: (...args: unknown[]) => Promise<boolean>;
+// eslint-disable-next-line no-var
+var appIdImpl: (...args: unknown[]) => Promise<boolean>;
 
 import { evaluatePolicy, constantTimeEqual, type PolicyInput } from "../src/policy.js";
 import { RpcFailureError } from "../src/provenance.js";
@@ -81,9 +84,11 @@ function validInput(overrides: Partial<PolicyInput> = {}): PolicyInput {
 }
 
 beforeEach(() => {
-  // Default: both provenance checks pass.
+  // Default: factory membership + cluster provenance pass; Path A app_id check defaults
+  // off (it is only consulted when isOurMember is false).
   memberImpl = vi.fn(async () => true);
   clusterImpl = vi.fn(async () => true);
+  appIdImpl = vi.fn(async () => false);
 });
 
 describe("constantTimeEqual", () => {
@@ -137,6 +142,13 @@ describe("evaluatePolicy", () => {
     memberImpl = vi.fn(async () => false);
     const decision = await evaluatePolicy(validInput(), config, provenance);
     expect(decision).toEqual({ approved: false, reason: "not-cluster-member" });
+  });
+
+  it("approves a Path A member (not a factory member, but app_id allowlisted)", async () => {
+    memberImpl = vi.fn(async () => false); // not factory-minted
+    appIdImpl = vi.fn(async () => true); // but its cluster allowlisted the app_id
+    const decision = await evaluatePolicy(validInput(), config, provenance);
+    expect(decision).toEqual({ approved: true });
   });
 
   it("denies rpc-failure when sender lookup throws RpcFailureError", async () => {

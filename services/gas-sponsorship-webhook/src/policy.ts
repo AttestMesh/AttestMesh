@@ -15,6 +15,7 @@ import type { Config } from "./env.js";
 import { DecodeError, decodeExecute, type UserOperation } from "./decode.js";
 import { isAllowedInnerSelector } from "./selectors.js";
 import {
+  isAllowlistedAppId,
   isDeployedCluster,
   isOurMember,
   RpcFailureError,
@@ -99,9 +100,15 @@ export async function evaluatePolicy(
     return deny("chain-mismatch");
   }
 
-  // 3. Sender provenance (cached eth_call).
+  // 3. Sender provenance (cached eth_call). A sponsorable sender is either a factory-minted
+  //    ClusterMember, or a Path A member — a dstack app upgraded to ClusterMember whose
+  //    cluster has owner-allowlisted its app_id (isOurMember is false for those, since the
+  //    member contract is the dstack-provisioned app_id, not a factory deployment).
   try {
-    if (!(await isOurMember(provenance, input.userOperation.sender))) {
+    const sender = input.userOperation.sender;
+    const sponsorable =
+      (await isOurMember(provenance, sender)) || (await isAllowlistedAppId(provenance, sender));
+    if (!sponsorable) {
       return deny("not-cluster-member");
     }
   } catch (err) {

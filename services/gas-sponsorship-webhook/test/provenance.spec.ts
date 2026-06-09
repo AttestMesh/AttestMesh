@@ -1,9 +1,15 @@
 import { describe, it, expect, vi } from "vitest";
-import type { Address, PublicClient } from "viem";
+import {
+  ContractFunctionExecutionError,
+  HttpRequestError,
+  type Address,
+  type PublicClient,
+} from "viem";
 
 import {
   isOurMember,
   isDeployedCluster,
+  isAllowlistedAppId,
   RpcFailureError,
   type ProvenanceDeps,
 } from "../src/provenance.js";
@@ -153,5 +159,135 @@ describe("provenance caching", () => {
     // Pass an all-lowercase target; key should be the checksummed form.
     await isDeployedCluster(d, "0x00000000000000000000000000000000000000c1");
     expect(store.has("84532:0x00000000000000000000000000000000000000C1")).toBe(true);
+  });
+});
+
+const CLUSTER: Address = "0x00000000000000000000000000000000C1C1c1C1";
+
+/** Dispatching fake client: routes readContract by functionName (cluster / isDeployedCluster
+ *  / allowedAppIds). Missing routes throw, so a test asserts exactly which calls happen. */
+function routingClient(routes: {
+  cluster?: () => Promise<unknown>;
+  isDeployedCluster?: () => Promise<boolean>;
+  allowedAppIds?: () => Promise<boolean>;
+}): PublicClient {
+  return {
+    async readContract(args: { functionName: string }) {
+      const fn = routes[args.functionName as keyof typeof routes];
+      if (!fn) throw new Error(`unexpected readContract(${args.functionName})`);
+      return fn();
+    },
+  } as unknown as PublicClient;
+}
+
+/** An error that passes `instanceof ContractFunctionExecutionError` (a view revert). */
+function revert(): Error {
+  const e = new Error("execution reverted");
+  Object.setPrototypeOf(e, ContractFunctionExecutionError.prototype);
+  return e;
+}
+
+/** What viem actually throws when an eth_call fails at the transport layer: a
+ *  ContractFunctionExecutionError wrapping an HttpRequestError. This MUST be treated as a
+ *  transport failure (RpcFailureError), not a contract-level "no". */
+function transportWrapped(): Error {
+  const http = new Error("HTTP request failed");
+  Object.setPrototypeOf(http, HttpRequestError.prototype);
+  const outer = new Error("contract call failed");
+  Object.setPrototypeOf(outer, ContractFunctionExecutionError.prototype);
+  (outer as { cause?: unknown }).cause = http;
+  return outer;
+}
+
+describe("isAllowlistedAppId (Path A membership)", () => {
+  it("true when sender.cluster() is a deployed cluster that allowlisted the app_id", async () => {
+    const d = deps({
+      client: routingClient({
+        cluster: async () => CLUSTER,
+        isDeployedCluster: async () => true,
+        allowedAppIds: async () => true,
+      }),
+    });
+    expect(await isAllowlistedAppId(d, SENDER)).toBe(true);
+  });
+
+  it("fails closed when sender names a cluster we did NOT deploy (hostile cluster())", async () => {
+    // The sender controls cluster(); it points at a contract that would self-report allowed.
+    // isDeployedCluster=false must short-circuit before allowedAppIds is ever consulted.
+    const allowed = vi.fn(async () => true);
+    const d = deps({
+      client: routingClient({
+        cluster: async () => "0x00000000000000000000000000000000DeaDDEAd",
+        isDeployedCluster: async () => false,
+        allowedAppIds: allowed,
+      }),
+    });
+    expect(await isAllowlistedAppId(d, SENDER)).toBe(false);
+    expect(allowed).not.toHaveBeenCalled();
+  });
+
+  it("false when the deployed cluster has not allowlisted the app_id", async () => {
+    const d = deps({
+      client: routingClient({
+        cluster: async () => CLUSTER,
+        isDeployedCluster: async () => true,
+        allowedAppIds: async () => false,
+      }),
+    });
+    expect(await isAllowlistedAppId(d, SENDER)).toBe(false);
+  });
+
+  it("false (not rpc-failure) when sender.cluster() reverts — a not-yet-upgraded stock proxy", async () => {
+    const d = deps({
+      client: routingClient({
+        cluster: async () => {
+          throw revert();
+        },
+      }),
+    });
+    expect(await isAllowlistedAppId(d, SENDER)).toBe(false);
+  });
+
+  it("throws RpcFailureError on a transport failure (so it is not cached as a denial)", async () => {
+    const d = deps({
+      client: routingClient({
+        cluster: async () => {
+          throw new Error("ECONNREFUSED");
+        },
+      }),
+    });
+    await expect(isAllowlistedAppId(d, SENDER)).rejects.toBeInstanceOf(RpcFailureError);
+  });
+
+  it("treats a transport error wrapped in ContractFunctionExecutionError as rpc-failure", async () => {
+    // viem wraps a dead-RPC eth_call in ContractFunctionExecutionError; it must NOT be
+    // mistaken for a contract revert and cached as a denial.
+    const { kv, puts } = recordingKV();
+    const d = deps({
+      memberCache: kv,
+      client: routingClient({
+        cluster: async () => {
+          throw transportWrapped();
+        },
+      }),
+    });
+    await expect(isAllowlistedAppId(d, SENDER)).rejects.toBeInstanceOf(RpcFailureError);
+    expect(puts.find((p) => p.key.startsWith("pathA:"))).toBeUndefined();
+  });
+
+  it("caches a positive answer under a pathA: key with the full TTL", async () => {
+    const { kv, puts } = recordingKV();
+    const d = deps({
+      memberCache: kv,
+      client: routingClient({
+        cluster: async () => CLUSTER,
+        isDeployedCluster: async () => true,
+        allowedAppIds: async () => true,
+      }),
+    });
+    await isAllowlistedAppId(d, SENDER);
+    const put = puts.find((p) => p.key.startsWith("pathA:"));
+    expect(put?.value).toBe("1");
+    expect(put?.ttl).toBe(config.cacheTtlSeconds);
   });
 });
