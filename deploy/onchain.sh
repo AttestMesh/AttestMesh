@@ -54,11 +54,22 @@ seed_appid() {
   log "allowedAppIds[$member] = $(cast call "$cluster" 'allowedAppIds(address)(bool)' "$member" --rpc-url "$RPC_URL")"
 }
 
+# patha-upgrade <cluster>: diamond-cut the cluster's DstackFacet to the Path A build (dstack_register
+# accepts owner-allowlisted app_ids) + deploy the Path A ClusterMember impl (the UUPS upgrade target
+# for dstack-provisioned app proxies). One-time per cluster; needs the deployer to be the diamond's
+# solidstate owner (the script acceptsOwnership if it is the nominee). Prints the new facet + impl.
+patha_upgrade() {
+  local cluster="${1:?usage: onchain.sh patha-upgrade <cluster>}"
+  export CLUSTER="$cluster"
+  run_step "patha-upgrade-${cluster}" bash -c "cd '$ROOT/contracts' && forge script script/UpgradeDstackFacetPathA.s.sol:UpgradeDstackFacetPathA --rpc-url '$RPC_URL' --broadcast"
+}
+
 case "${1:-all}" in
   preflight) preflight ;;
   infra)     preflight; infra ;;
   cluster)   cluster "${2:-attestmesh-1}" ;;
+  patha-upgrade) patha_upgrade "$2" ;;
   seed-appid) seed_appid "$2" "$3" ;;
   all)       preflight; infra; cluster "${2:-attestmesh-1}" ;;
-  *) die "usage: onchain.sh {preflight|infra|cluster [name]|seed-appid <cluster> <member>|all}" ;;
+  *) die "usage: onchain.sh {preflight|infra|cluster [name]|patha-upgrade <cluster>|seed-appid <cluster> <member>|all}" ;;
 esac

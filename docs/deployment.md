@@ -53,23 +53,36 @@ D. Node (dstack CVM via Phala)   ── MILESTONE-A WORK ──►  needs A,B,C
 ## Standardized routines (smithers + logged bash)
 
 Standardized two layers deep:
-- **Logged bash routines** (`deploy/onchain.sh`, `deploy/node.sh`) hold the actual,
-  idempotent commands; every step tees to `deploy/logs/` via `deploy/lib.sh::run_step`,
-  so on a re-run you see exactly what failed. `onchain.sh infra` no-ops if already
-  deployed (`FORCE=1` to redeploy); `node.sh` is gated on `PHALA_CLOUD_API_KEY` and fails
-  loudly with the unblock instruction.
-- **A durable smithers workflow** (`deploy/workflows/deploy.tsx`) sequences those routines
-  as crash-recoverable, resumable compute steps: preflight → infra → cluster → node.
-  Validated with `smithers graph` (renders the ordered 4-task plan). `deploy/package.json`
-  pins `smithers-orchestrator@0.22.0` + `zod@^4` (needs Zod 4's `.clone()`).
+- **Logged bash routines** hold the actual, idempotent commands; every step tees to
+  `deploy/logs/` via `deploy/lib.sh::run_step`, so on a re-run you see exactly what failed:
+  - `deploy/onchain.sh` — `{preflight | infra | cluster | patha-upgrade <cluster> | seed-appid}`.
+    `infra` no-ops if already deployed (`FORCE=1` to redeploy); `patha-upgrade` diamond-cuts the
+    Path A DstackFacet + deploys the upgrade-target impl.
+  - `deploy/webhook.sh` — `{deploy | route}`. `wrangler deploy` + ensures the custom-domain
+    route `gas-webhook.teesql.com/*` points at the AttestMesh worker (a stale route → bundler 401).
+  - `deploy/node-pathA.sh <node>` — `{env-file | deploy | prime | upgrade | setup | verify | all}`.
+    The Path A node bring-up: builds the sealed env (ghcr pull-creds; MEMBER_CONTRACT omitted →
+    self-discovered), phala-deploys a stock DstackApp CVM, primes the cluster gate, upgrades the
+    proxy to ClusterMember, then polls for the sidecar's self-registration. Gated on a `phala
+    login` session; persists CVM_ID/app_id in a state file so every subcommand is re-entrant.
+  - `deploy/node.sh` — the legacy `--custom-app-id` flow (unsupported on base KMS; kept for
+    reference / a future custom-app-id KMS).
+- **A durable smithers workflow** (`deploy/workflows/deploy.tsx`) sequences those routines as
+  crash-recoverable, resumable compute steps:
+  `preflight → infra → cluster → pathaUpgrade → webhook → node{env-file → deploy → prime →
+  upgrade → verify}`. The node sub-steps are individually durable — a `verify` timeout (the
+  sponsored registration UserOp is slow) resumes from `verify` without re-deploying the CVM.
+  Validated with `smithers graph` (renders the ordered 10-task plan). `deploy/package.json`
+  pins `smithers-orchestrator@0.22.0` + `zod@^4`.
 
 Run:
 ```bash
 source deploy/env.sh                                   # load ~/.teesql creds
 ( cd deploy && bun install )                           # once — deduped smithers deps
-( cd deploy && bunx smithers-orchestrator up workflows/deploy.tsx --input '{"node":"node-1"}' )
+( cd deploy && bunx smithers-orchestrator up workflows/deploy.tsx --input '{"node":"attestmesh-node-1"}' )
 # resume from the failed step after fixing it:  … up workflows/deploy.tsx --run-id <id> --resume true
-# or a single routine directly:  deploy/onchain.sh all   /   deploy/node.sh node-1 all
+# or a single routine directly:  deploy/onchain.sh all  /  deploy/webhook.sh deploy  /
+#                                CLUSTER=… MEMBER_IMPL=… deploy/node-pathA.sh attestmesh-node-1 setup
 ```
 
 ## Deployed addresses — Base mainnet (8453)
@@ -100,7 +113,8 @@ Base KMS only mints app_ids it provisions, so a member cannot be a factory-predi
 |---|---|
 | DstackFacet (Path A, cut into the cluster) | `0xC631793fB80d3Bc18435aAD3788B8b31B44bE255` (`dstack_register` also accepts owner-allowlisted app_ids) |
 | ClusterMember impl (Path A upgrade target) | `0xBe579F0B8A971d0F8b083Eb3E8bB241985A3C5C4` (`reinitializeFromDstackApp`) |
-| Node app_id (X) | minted per `phala deploy`, upgraded to ClusterMember + reinit'd + allowlisted; current = `0x51bbc0d9c46693cab9141468a6eee53f9c161764` |
+| Node app_id (X) — **registered member** | `0x54e63929b4d8d09d3c9e3019d54bd20e289ed985` (memberId `0x6c576be9…`, owner = KMS-derived key `0x6EB37a6B…`; registered via sponsored tx `0x577cd15d…`) |
+| Sponsorship webhook custom domain | `https://gas-webhook.teesql.com/?token=<~/.teesql/attestmesh-webhook-token>` → CF worker route → `attestmesh-gas-sponsorship-webhook` |
 
 Procedure: `source deploy/env.sh && CLUSTER=… MEMBER_IMPL=… ENV_FILE=… COMPOSE=deploy/compose/node-1.yaml deploy/node-pathA.sh attestmesh-node-1 setup` (deploy stock CVM → prime gate → upgrade proxy), then `… verify`.
 
@@ -122,7 +136,8 @@ Procedure: `source deploy/env.sh && CLUSTER=… MEMBER_IMPL=… ENV_FILE=… COM
 | 2026-06-09 | **base KMS reality** | `--custom-app-id` is unsupported on base KMS (proved via a stock DstackApp control deploy); the member must BE a phala-minted app_id → **Path A**: upgrade the stock DstackApp proxy to ClusterMember. |
 | 2026-06-09 | **Path A contracts + webhook** | `ClusterMember.reinitializeFromDstackApp` + `dstack_register` accepts owner-allowlisted app_ids; **diamond-cut live** into `0xA46273…` (new DstackFacet `0xC631793f…`, impl `0xBe579F0B…`, 26 contract tests). Webhook gains a Path A branch (cluster-allowlisted app_ids, 73 tests) + Cloudflare redeploy (also fixed a stale factory var). |
 | 2026-06-09 | **live CVM bring-up** | `phala deploy` (base KMS, ghcr pull-creds in sealed env) → upgrade proxy → sidecar self-registers. Fixed 3 live-only bugs: `/DeriveKey`→`/GetKey` (dstack 0.5.x removed it), odd-length dummy sig (Alchemy rejected), proof sig recovery-ids 0/1→27/28 (OZ ECDSA reverts on v<27). Codified in `deploy/node-pathA.sh`. |
-| 2026-06-09 | **registration: 1 gap (B3)** | Verified live end-to-end: key derivation, app_id self-discovery, cluster discovery, valid proof, on-chain simulation, **webhook approves X with the correct token**. Blocked only on the Alchemy Gas Manager policy (`56444921…`) sending a token that mismatches the webhook secret. **Fix:** set the policy's custom webhook URL to `…workers.dev/?token=<~/.teesql/attestmesh-webhook-token>` (Admin API needs an account token, not the app key). Then the sidecar (or a fresh `node-pathA.sh` run) registers. |
+| 2026-06-09 | **webhook routing bug (B3 root cause)** | Alchemy calls the policy's webhook at the custom domain `gas-webhook.teesql.com`, whose Cloudflare worker route pointed at the OLD `teesql-gas-webhook-prod` worker (→ HTTP 401), not `attestmesh-gas-sponsorship-webhook`. Repointed the route via the CF API (zone `teesql.com`, route `69066fb7…`). The dummy `A 192.0.2.1` placeholder record is fine (proxied; the worker route does the routing). NB: this moved `gas-webhook.teesql.com` away from the dstackgres worker. |
+| 2026-06-09 | **✅ NODE REGISTERED (milestone)** | A real dstack CVM (Phala base-KMS prod5) self-registered: `phala deploy` → upgrade proxy → sidecar derived KMS keys, self-discovered app_id `0x54e63929…`, built proof, submitted a **sponsored** EIP-4337 `dstack_register` UserOp → tx `0x577cd15d…` (success). `memberCount=1`, `isClusterMember=true`, `member.owner()=0x6EB37a6B…` (KMS-derived key installed), gas paid by the paymaster. End-to-end Path A proven on Base mainnet. |
 
 ## Milestone-A reference: the real dstack guest-agent API
 

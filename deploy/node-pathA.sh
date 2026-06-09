@@ -18,18 +18,42 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$HERE/.." && pwd)"
 source "$HERE/lib.sh"
 : "${RPC_URL:?source deploy/env.sh first}"
-require PRIVATE_KEY RPC_URL CHAIN_ID DEPLOYER_ADDR KMS_CONTRACT CLUSTER MEMBER_IMPL ENV_FILE
+require PRIVATE_KEY RPC_URL CHAIN_ID DEPLOYER_ADDR KMS_CONTRACT CLUSTER MEMBER_IMPL
 # Phala auth is a stored `phala login` session (device-flow), not an env var.
 npx --yes phala status 2>&1 | grep -qiE "logged in" || die "phala not logged in (run: npx phala login)"
 
-NODE="${1:?usage: node-pathA.sh <node-name> [all|deploy|prime|upgrade|verify]}"
+NODE="${1:?usage: node-pathA.sh <node-name> [all|setup|deploy|prime|upgrade|verify|env-file]}"
 NODE_ID="${NODE_ID:-26}"
 COMPOSE="${COMPOSE:-$ROOT/deploy/compose/${NODE}.yaml}"
+# Sealed env (Alchemy + ghcr secrets) — never committed; auto-built by env-file/deploy if absent.
+ENV_FILE="${ENV_FILE:-/tmp/attestmesh-${NODE}.env}"
 STATE="$LOGDIR/node-pathA-${NODE}.state"   # persists CVM_ID / X across subcommands
 ZERO32=0x0000000000000000000000000000000000000000000000000000000000000000
 
 _save() { printf 'CVM_ID=%s\nX=%s\n' "$CVM_ID" "$X" > "$STATE"; }
 _load() { [ -f "$STATE" ] && source "$STATE" || true; }
+
+# Build the sealed env file phala encrypts (-e): node config + ghcr pull-creds (so dstack's
+# pre-launch can docker-login the private image). MEMBER_CONTRACT is intentionally omitted —
+# the sidecar self-discovers its app_id from /Info (Path A).
+_build_env_file() {
+  local indexer guser gtok
+  indexer=$(jq -r .indexerRegistry "$ROOT/contracts/script/deployments/${CHAIN_ID}.json")
+  guser=$(grep -E '^\s*username\s*=' "$HOME/.teesql/ghcr-pull.toml" | head -1 | sed -E 's/.*=\s*//' | tr -d "\"' ")
+  gtok=$(grep -E '^\s*token\s*=' "$HOME/.teesql/ghcr-pull.toml" | head -1 | sed -E 's/.*=\s*//' | tr -d "\"' ")
+  [ -n "$indexer" ] && [ -n "$gtok" ] || die "could not assemble sealed env (indexer/ghcr creds)"
+  cat > "$ENV_FILE" <<EOF
+CHAIN_ID=${CHAIN_ID}
+RPC_URL=${RPC_URL}
+BUNDLER_URL=${BUNDLER_URL:-$RPC_URL}
+GAS_POLICY_ID=${GAS_POLICY_ID:-}
+INDEXER_REGISTRY_ADDR=${indexer}
+DSTACK_DOCKER_REGISTRY=ghcr.io
+DSTACK_DOCKER_USERNAME=${guser}
+DSTACK_DOCKER_PASSWORD=${gtok}
+EOF
+  log "built sealed env → $ENV_FILE (keys: $(grep -oE '^[A-Z_]+' "$ENV_FILE" | tr '\n' ' '))"
+}
 
 # send_seq <label> <to> <sig> <args...> : cast send with an explicit, locally-incremented
 # nonce. Back-to-back sends otherwise race the RPC's lagging pending-nonce, yielding
@@ -46,6 +70,7 @@ send_seq() {
 
 # 1. Deploy a stock DstackApp CVM; phala mints the app_id (no --custom-app-id on base KMS).
 deploy_cvm() {
+  [ -f "$ENV_FILE" ] || _build_env_file
   local lf="$LOGDIR/pathA-deploy-${NODE}.$(ts).log"
   log "▶ phala deploy (base KMS, stock) node=$NODE compose=$COMPOSE node-id=$NODE_ID"
   npx --yes phala deploy --kms base --kms-contract "$KMS_CONTRACT" \
@@ -105,11 +130,12 @@ verify() {
 
 log "=== Path A node bring-up: $NODE ==="
 case "${2:-all}" in
+  env-file) _build_env_file ;;                         # build the sealed env (idempotent)
   deploy)  deploy_cvm ;;
   prime)   prime_gate ;;
   upgrade) upgrade_member ;;
   setup)   deploy_cvm; prime_gate; upgrade_member ;;  # fast on-chain path, no register wait
   verify)  verify ;;                                   # long poll; run separately/background
   all)     deploy_cvm; prime_gate; upgrade_member; verify ;;
-  *) die "usage: node-pathA.sh <node-name> [all|setup|deploy|prime|upgrade|verify]" ;;
+  *) die "usage: node-pathA.sh <node-name> [all|setup|deploy|prime|upgrade|verify|env-file]" ;;
 esac
