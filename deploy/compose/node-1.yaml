@@ -1,0 +1,27 @@
+# AttestMesh node compose for a dstack CVM (Track D).
+# app_id = the ClusterMember address (0x259a539c…); set at `phala deploy --custom-app-id`.
+# Secrets (RPC_URL with the Alchemy key) are passed as sealed env via `phala deploy -e`,
+# referenced here as ${...}. Mounts the dstack guest-agent socket for /GetKey + /Info.
+services:
+  sidecar:
+    image: ghcr.io/attestmesh/cluster-mesh-agent:latest
+    restart: unless-stopped
+    environment:
+      - MEMBER_CONTRACT=${MEMBER_CONTRACT}
+      - CHAIN_ID=${CHAIN_ID}
+      - RPC_URL=${RPC_URL}
+      - BUNDLER_URL=${BUNDLER_URL}
+      - GAS_POLICY_ID=${GAS_POLICY_ID}
+      - INDEXER_REGISTRY_ADDR=${INDEXER_REGISTRY_ADDR}
+      - DSTACK_SOCKET=/var/run/dstack.sock
+      - HEALTH_HTTP_ADDR=0.0.0.0:9090
+      - LOG_FORMAT=pretty
+      - LOG_LEVEL=info,cluster_mesh_agent=debug
+    volumes:
+      - /var/run/dstack.sock:/var/run/dstack.sock
+    ports:
+      - "9090:9090"
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun
