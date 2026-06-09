@@ -89,8 +89,20 @@ and orphaned on-chain.
 | AttestFacet | `0x10532164ca3BdaCf1dAd13Fb534262DEc5aAA9AA` |
 | MessageFacet | `0x0F67cd8c1D8A2F71d2bb8091B2eb166E6b6bB564` |
 | NetworkFacet | `0x6AB2b7D506c85C7A9eA22f2ECcE0cc9191006159` |
-| DstackFacet | `0xe9d463974c6E833DC38794d7f2DC5AB692352968` |
-| **ClusterDiamond `attestmesh-1`** | **`0xA46273adC86c772C7D8daE896a5fbfdDA2B6ccFA`** (owner=deployer; KMS root + compose hash seeded; allowAnyDevice; 10.13.0.0/16; **cold-start gate verified live**) |
+| DstackFacet (infra bundle) | `0xe9d463974c6E833DC38794d7f2DC5AB692352968` — superseded on the live cluster by the Path A cut below |
+| **ClusterDiamond `attestmesh-1`** | **`0xA46273adC86c772C7D8daE896a5fbfdDA2B6ccFA`** (owner=deployer; KMS root + compose hash seeded; allowAnyDevice; 10.13.0.0/16; **cold-start gate verified live**; DstackFacet diamond-cut to the Path A build) |
+
+### Path A (dstack base KMS) — live cluster overrides
+
+Base KMS only mints app_ids it provisions, so a member cannot be a factory-predicted address — it must BE the provisioned app_id. The cluster's DstackFacet was diamond-cut to a Path A build, and a dedicated ClusterMember impl is the UUPS upgrade target for the stock DstackApp proxy `phala deploy` mints.
+
+| Item | Address / value |
+|---|---|
+| DstackFacet (Path A, cut into the cluster) | `0xC631793fB80d3Bc18435aAD3788B8b31B44bE255` (`dstack_register` also accepts owner-allowlisted app_ids) |
+| ClusterMember impl (Path A upgrade target) | `0xBe579F0B8A971d0F8b083Eb3E8bB241985A3C5C4` (`reinitializeFromDstackApp`) |
+| Node app_id (X) | minted per `phala deploy`, upgraded to ClusterMember + reinit'd + allowlisted; current = `0x51bbc0d9c46693cab9141468a6eee53f9c161764` |
+
+Procedure: `source deploy/env.sh && CLUSTER=… MEMBER_IMPL=… ENV_FILE=… COMPOSE=deploy/compose/node-1.yaml deploy/node-pathA.sh attestmesh-node-1 setup` (deploy stock CVM → prime gate → upgrade proxy), then `… verify`.
 
 ## Status log
 
@@ -107,9 +119,10 @@ and orphaned on-chain.
 | 2026-06-03 | (was) remaining = Phala-gated | wire `build_proof` into `state::run()` + the live submit, then `phala deploy` a CVM. |
 | 2026-06-09 | **Phala auth ✔** | device-flow `phala login` succeeded (user authorized); `phala status` = logged in as `lsdan`. Track D unblocked. |
 | 2026-06-09 | **registration wired** | `state::run()` now derives keys → `build_proof_from_runtime` → sponsored bootstrap `dstack_register` UserOp, heavily logged (commit `3d275a3`). |
-| 2026-06-09 | **node-1 on-chain prep ✔** | ClusterMember `0x259a539cfD72cca658f23bc16afa43c4ada39410` deployed (= CVM app_id), owner-allowlisted (`allowedAppIds=true`). |
-| 2026-06-09 | **sidecar image** | building via GH Actions → `ghcr.io/attestmesh/cluster-mesh-agent:latest` (no docker locally). Compose `deploy/compose/node-1.yaml`, sealed env `/tmp/attestmesh-node-1.env`. |
-| 2026-06-09 | next | deploy: `phala deploy --kms base --custom-app-id <member> --nonce 0x0..0 --compose node-1.yaml -e env --private-key <k>` (dstackgres flags); use `--prepare-only` → get compose hash → `addComposeHash` → `--commit` → CVM boots → watch logs → verify `memberCount=1`. Registry visibility (ghcr private → public or pull-creds) TBD. |
+| 2026-06-09 | **base KMS reality** | `--custom-app-id` is unsupported on base KMS (proved via a stock DstackApp control deploy); the member must BE a phala-minted app_id → **Path A**: upgrade the stock DstackApp proxy to ClusterMember. |
+| 2026-06-09 | **Path A contracts + webhook** | `ClusterMember.reinitializeFromDstackApp` + `dstack_register` accepts owner-allowlisted app_ids; **diamond-cut live** into `0xA46273…` (new DstackFacet `0xC631793f…`, impl `0xBe579F0B…`, 26 contract tests). Webhook gains a Path A branch (cluster-allowlisted app_ids, 73 tests) + Cloudflare redeploy (also fixed a stale factory var). |
+| 2026-06-09 | **live CVM bring-up** | `phala deploy` (base KMS, ghcr pull-creds in sealed env) → upgrade proxy → sidecar self-registers. Fixed 3 live-only bugs: `/DeriveKey`→`/GetKey` (dstack 0.5.x removed it), odd-length dummy sig (Alchemy rejected), proof sig recovery-ids 0/1→27/28 (OZ ECDSA reverts on v<27). Codified in `deploy/node-pathA.sh`. |
+| 2026-06-09 | **registration: 1 gap (B3)** | Verified live end-to-end: key derivation, app_id self-discovery, cluster discovery, valid proof, on-chain simulation, **webhook approves X with the correct token**. Blocked only on the Alchemy Gas Manager policy (`56444921…`) sending a token that mismatches the webhook secret. **Fix:** set the policy's custom webhook URL to `…workers.dev/?token=<~/.teesql/attestmesh-webhook-token>` (Admin API needs an account token, not the app key). Then the sidecar (or a fresh `node-pathA.sh` run) registers. |
 
 ## Milestone-A reference: the real dstack guest-agent API
 
