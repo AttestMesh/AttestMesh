@@ -131,8 +131,11 @@ verify() {
 update_cvm() {
   _load; [ -n "${CVM_ID:-}" ] || die "no CVM state; run 'deploy' first"
   [ -f "$ENV_FILE" ] || _build_env_file
+  # The CLI registers the new compose hash on the indexer's own stock DstackApp
+  # contract (owner = deployer) — that's why it needs the key.
   run_step "indexer-update-${NAME}" npx --yes phala deploy \
-    --cvm-id "$CVM_ID" --compose "$COMPOSE" -e "$ENV_FILE"
+    --cvm-id "$CVM_ID" --compose "$COMPOSE" -e "$ENV_FILE" \
+    --private-key "$PRIVATE_KEY" --rpc-url "$RPC_URL"
   run_step "indexer-restart-${NAME}" npx --yes phala cvms restart "$CVM_ID"
 }
 
