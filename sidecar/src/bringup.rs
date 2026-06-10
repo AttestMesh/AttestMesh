@@ -373,12 +373,17 @@ async fn poll_envelopes(ctx: &Ctx, next_from_block: &mut Option<u64>) -> Result<
 /// CSK lifecycle (master spec §8): restart-unseal, originate (memberIds[0]) or
 /// pull from a live peer over the mesh, then hold for peer-pull serving.
 async fn csk_loop(ctx: Arc<Ctx>) {
-    // Restart path: the CSK survives in the dstack sealed store.
-    if let Ok(Some(c)) = csk::unseal_from_store(ctx.dstack.as_ref()).await {
-        *ctx.shared.csk.lock().await = Some(*c);
-        ctx.shared.gates.set_csk_acquired();
-        tracing::info!("CSK unsealed from store (restart path)");
-        return;
+    // Restart fast path: the CSK survives in the dstack sealed store.
+    match csk::unseal_from_store(ctx.dstack.as_ref()).await {
+        Ok(Some(c)) => {
+            *ctx.shared.csk.lock().await = Some(*c);
+            ctx.shared.gates.set_csk_acquired();
+            tracing::info!("CSK unsealed from store (restart path)");
+            return;
+        }
+        Ok(None) => {}
+        // Diagnostic, not fatal: the originator re-derives, onboardees re-pull.
+        Err(e) => tracing::warn!(error = ?e, "sealed-store unseal failed (guest agent /Unseal)"),
     }
 
     loop {
@@ -406,11 +411,33 @@ async fn csk_once(ctx: &Ctx) -> Result<()> {
         let inner =
             message_facet::build_set_csk_commitment_calldata(B256::from(csk::commitment(&c)));
         let tx = ctx.submit_op(inner).await.context("setCskCommitment")?;
-        csk::seal_to_store(ctx.dstack.as_ref(), &c).await?;
+        // Best-effort: the commitment is on-chain already, and the originator can
+        // always re-derive (deterministic KMS derivation), so a store failure
+        // must not fail the pass here.
+        if let Err(e) = csk::seal_to_store(ctx.dstack.as_ref(), &c).await {
+            tracing::warn!(error = ?e, "CSK seal_to_store failed (non-fatal)");
+        }
         *ctx.shared.csk.lock().await = Some(*c);
         ctx.shared.gates.set_csk_acquired();
         tracing::info!(tx = %tx, "CSK originated + commitment set on-chain");
         return Ok(());
+    }
+
+    // Originator restart path: the CSK is deterministically KMS-derived, so when
+    // the sealed store is lost the originator re-derives and verifies against the
+    // on-chain commitment. Without this, a restarted originator would join every
+    // other empty-handed node in the pull path and the cluster would deadlock
+    // (peer_grpc only serves a held CSK).
+    if let Ok(c) = csk::derive_originator(ctx.dstack.as_ref()).await {
+        if csk::commitment(&c) == commitment.0 {
+            if let Err(e) = csk::seal_to_store(ctx.dstack.as_ref(), &c).await {
+                tracing::warn!(error = ?e, "CSK seal_to_store failed (non-fatal)");
+            }
+            *ctx.shared.csk.lock().await = Some(*c);
+            ctx.shared.gates.set_csk_acquired();
+            tracing::info!("CSK re-derived + verified against on-chain commitment (originator restart)");
+            return Ok(());
+        }
     }
 
     // Onboardee: pull from any configured peer over the mesh.
