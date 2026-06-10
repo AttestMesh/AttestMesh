@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
-# Standardized node bring-up routine (Track D) — the most order-sensitive / repeated
-# routine (one run per node), so it is the prime smithers-orchestrated loop.
+# LEGACY — the custom-app-id node bring-up flow. UNSUPPORTED on the dstack base KMS:
+# it only mints app_ids it provisions, so a member cannot be a factory-predicted
+# address (proved live 2026-06-09; see docs/deployment.md). The LIVE flow is
+# deploy/node-pathA.sh, which upgrades a stock phala-deployed DstackApp proxy to
+# ClusterMember. Kept for reference / a future custom-app-id-capable KMS.
 # Order: predict member addr → owner seeds app_id → build/push sidecar image →
 #        phala deploy CVM (app_id = member addr) → wait boot → verify on-chain registration.
 #

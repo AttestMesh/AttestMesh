@@ -8,14 +8,15 @@
 //! originator and adding a fourth onboardee still succeeds; and killing the Indexer
 //! mid-flight keeps healthy sidecars healthy while a fresh one stalls at `subscribing`.
 //!
-//! It is `#[ignore]`d because it requires anvil + the deployed contracts + spawning
-//! multiple wireguard-capable processes — out of scope for the v1 unit suite, which
-//! covers the protocol logic (keys, cidr, sealed-box, heartbeat, liveness, CSK,
-//! userop, bind-hash, envelope-verify) inline. The component-level unit tests are the
-//! v1 deliverable; this end-to-end harness lands with the milestone-A demo build-out.
+//! It is `#[ignore]`d because it requires anvil + the deployed contracts + a mock
+//! dstack runtime + spawning multiple wireguard-capable processes — out of scope for
+//! the unit suite, which covers the protocol logic (keys, cidr, sealed-box,
+//! heartbeat, liveness, CSK, userop, bind-hash, envelope-verify) inline. The flow
+//! this harness would exercise has been validated live on Base mainnet
+//! (docs/deployment.md); building the local reproduction harness remains open.
 
 #[test]
-#[ignore = "requires anvil + deployed contracts + multi-process wireguard harness (milestone A)"]
+#[ignore = "needs anvil + mock-dstack + multi-process wireguard harness; the live flow was validated on Base mainnet (docs/deployment.md)"]
 fn three_node_bringup_end_to_end() {
     // See module docs for the full scenario this will assert.
 }

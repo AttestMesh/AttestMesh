@@ -16,6 +16,7 @@ Boots, derives attestation-bound identity keys (x25519 for sealed-box messaging,
 - `src/chain/` — alloy read provider, EIP-4337 UserOp construction/hashing, bundler client, facet calldata builders, binding-hash (cross-checked against Solidity).
 - `src/indexer_client.rs` — gRPC subscription + envelope-signature verification.
 - `src/agent_grpc.rs`, `src/peer_grpc.rs`, `src/health.rs`, `src/state/` — the app façade (UDS), CSK peer-control, healthcheck, and bring-up state machine.
+- `src/bringup.rs`, `src/transport/` — mesh bring-up orchestration (peers from chain, envelope exchange, heartbeats, CSK, gRPC servers) + the wireguard-over-TCP gateway transport.
 - `proto/` — `indexer.proto` (shared with the indexer), `agent.proto`, `peer.proto`.
 
 The `MeshControl` trait abstracts wireguard (command-based impl + mock) so the crate builds and unit-tests without a kernel; swap in a netlink impl for production.
@@ -24,7 +25,7 @@ The `MeshControl` trait abstracts wireguard (command-based impl + mock) so the c
 
 ```bash
 cargo build --release
-cargo test                    # 33 unit tests (bring-up wiring is milestone A — see docs/specs/sidecar.md §1.1)
+cargo test                    # 40 unit tests (live on Base mainnet — see docs/deployment.md + docs/specs/sidecar.md §1.1)
 cargo clippy -- -D warnings
 cargo fmt --check
 ```

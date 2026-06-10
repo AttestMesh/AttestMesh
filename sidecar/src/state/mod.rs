@@ -1,7 +1,9 @@
 //! Bring-up state machine + shared runtime state (sidecar spec §7).
 //!
 //! `Shared` is the cross-cutting state every subsystem (indexer client, heartbeat
-//! loops, gRPC servers, health) reads and updates. `run` drives the boot sequence.
+//! loops, gRPC servers, health) reads and updates. `run` drives the full boot
+//! sequence — keys → registration → `bringup::launch` — live-proven on Base
+//! mainnet (docs/deployment.md).
 
 pub mod gates;
 
@@ -154,9 +156,11 @@ impl Shared {
     }
 }
 
-/// Boot orchestration (sidecar spec §7.1). High-level wiring of the modules; the
-/// full end-to-end run additionally needs a live dstack runtime, bundler, Indexer,
-/// and peers (exercised by the §16.2 integration harness).
+/// Boot orchestration (sidecar spec §7.1): derive keys → resolve the member
+/// contract → discover the cluster → sponsored dstack_register → mesh bring-up
+/// (`bringup::launch`) → health server. Validated live on Base mainnet
+/// (docs/deployment.md); the §16.2 integration harness reproduces the flow
+/// locally against anvil + a mock dstack runtime.
 pub async fn run(config: Config) -> Result<()> {
     use crate::dstack::{DstackRuntime, UnixSocketDstack};
 
@@ -227,7 +231,7 @@ pub async fn run(config: Config) -> Result<()> {
     // (which dstack call, the bundler, or the on-chain gate). Retried: in Path A the
     // operator's allowlist + compose-hash writes may land just after boot, and the bundler
     // can transiently reject. Indexer subscription, peer exchange, heartbeats, CSK, and wg
-    // config are the subsequent bring-up steps.
+    // config follow via bringup::launch once registration lands.
     let mut reg_attempt = 0u32;
     let mut registered = false;
     loop {
@@ -256,8 +260,9 @@ pub async fn run(config: Config) -> Result<()> {
         }
     }
 
-    // Mesh bring-up (milestone B): peers from chain, wg over the gateway TCP leg,
-    // envelope exchange, heartbeats, CSK, gRPC servers. Spawns tasks and returns.
+    // Mesh bring-up: peers from chain, wg over the gateway TCP leg, envelope
+    // exchange, heartbeats, CSK, gRPC servers. Spawns tasks and returns. (The
+    // pure-UDP transport upgrade is the remaining deferred piece — see transport.)
     if registered {
         crate::bringup::launch(
             config.clone(),

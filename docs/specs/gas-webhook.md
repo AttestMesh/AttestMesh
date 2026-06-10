@@ -1,9 +1,9 @@
 # AttestMesh Gas Sponsorship Webhook — Component Spec
 
-**Status**: Implemented v1 (was Draft v0.1; 2026-06-02)
+**Status**: Implemented v1 — **live on Base mainnet (8453)** at `gas-webhook.teesql.com`; see [`docs/deployment.md`](../deployment.md)
 **Parent spec**: [`attestmesh-coordination-layer.md`](./attestmesh-coordination-layer.md) (especially §13 item 18)
 **Component**: `services/gas-sponsorship-webhook/`
-**Last updated**: 2026-06-03
+**Last updated**: 2026-06-10
 
 ---
 
@@ -60,7 +60,7 @@ services/gas-sponsorship-webhook/
 
 | Key | Required | Source | Meaning |
 |---|---|---|---|
-| `EXPECTED_CHAIN_ID` | yes | env (plaintext) | `84532` for v1 Sepolia; `8453` for milestone B mainnet |
+| `EXPECTED_CHAIN_ID` | yes | env (plaintext) | `8453` (Base mainnet — the live deployment) |
 | `CANONICAL_CLUSTER_FACTORY` | yes | env (plaintext) | hex address of the `ClusterDiamondFactory` deployed by `DeployInfra.s.sol` |
 | `CANONICAL_MEMBER_FACTORY` | yes | env (plaintext) | hex address of the `ClusterMemberFactory` deployed by `DeployInfra.s.sol` |
 | `RPC_URL` | yes | env (secret) | Alchemy or other EVM RPC for the `eth_call` lookups |
@@ -214,7 +214,7 @@ Negative answers (`false`) are cached with a shorter TTL (10 min) so a new clust
 
 - Unit: every policy rule with fixture UserOps that trigger each failure path.
 - Unit: `decode.ts` round-trip against ABI fixtures.
-- Integration: a local `wrangler dev` server fed real UserOps captured from a Sepolia run; assert approve/deny.
+- Integration: a local `wrangler dev` server fed real UserOps captured from a Base mainnet run; assert approve/deny.
 - No on-chain tests in this component; the on-chain side is exercised by `contracts/test/integration`.
 
 ---

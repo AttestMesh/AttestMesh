@@ -20,11 +20,11 @@ Dependencies are cloned into `lib/` (solidstate v0.0.61, OZ 5.1, account-abstrac
 
 ```bash
 forge build              # compile
-forge test -vvv          # run tests (22 passing)
+forge test -vvv          # run tests (26 passing)
 forge fmt --check        # lint
 ```
 
 ## Targets
 
-- v1: Base Sepolia
-- Milestone B: Base mainnet (behind a Safe)
+- v1: Base mainnet (chain id 8453) — **live**; addresses in [`docs/deployment.md`](../docs/deployment.md)
+- Milestone B: ownership transfer to a Safe

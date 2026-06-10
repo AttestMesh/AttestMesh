@@ -1,10 +1,10 @@
 # AttestMesh Sidecar — Component Spec
 
-**Status**: Modules implemented + unit-tested (v1); end-to-end bring-up wiring is **Milestone A** (see §1.1)
+**Status**: Implemented v1 — **live on Base mainnet (8453)**; see §1.1 and [`docs/deployment.md`](../deployment.md)
 **Parent spec**: [`attestmesh-coordination-layer.md`](./attestmesh-coordination-layer.md) (especially §7, §8)
 **Component**: `sidecar/`
 **Binary**: `cluster-mesh-agent`
-**Last updated**: 2026-06-03
+**Last updated**: 2026-06-10
 
 ---
 
@@ -14,7 +14,7 @@ The sidecar is the per-node process that turns "a CVM running in dstack" into "a
 
 ### 1.1 Implementation status (v1)
 
-The protocol **modules** are implemented and unit-tested (33 tests: keys, CIDR, sealed-box, heartbeat, liveness, CSK, userop, bind-hash, bundler/F2, facet calldata builders, envelope verify). What is **not yet wired** is the bring-up orchestration: `state::run()` is a stub that derives keys, discovers the cluster, sets `Phase::Registering`, and starts the health server — it does **not** yet drive registration, the bundler submit, Indexer subscription, peer exchange, heartbeats, or the gRPC servers. Those components exist and are tested in isolation, but nothing constructs them on the run path, so the binary cannot yet register a node end-to-end. Completing this is **Milestone A**, gated on one missing seam: the `DstackRuntime` trait (§6) has no KMS-sig-chain request method, so `dstack_register` proof material can't yet be sourced from the runtime, and the real dstack KMS-chain format must be confirmed against a live node. The end-to-end harness (§16.2, `tests/integration.rs`) is `#[ignore]`d for the same reason. **In short: module-complete and green, but not yet wired into a working binary.**
+**Complete and live-proven on Base mainnet (8453)** — see the status log in [`docs/deployment.md`](../deployment.md). `state::run()` drives the full boot sequence on a real dstack CVM: key derivation (the guest agent's `/GetKey` + `/Info`) → proof construction (`dstack_facet::build_proof_from_runtime` — the `DstackRuntime` trait sources the KMS sig chain from `/GetKey`, validated against the real on-chain `DstackSigChain.verify`) → sponsored `dstack_register` bootstrap UserOp → mesh bring-up via `bringup::launch`: wireguard over the gateway TCP leg (`transport` + `bringup` modules), `PeerEndpoint` envelopes via `MessageFacet.send` + `MessageSent` log polling, heartbeats, the CSK originate / re-derive / pull lifecycle, the peer-control + agent gRPC servers, and the Indexer subscription (§9). A two-node mesh registered, converged, distributed the CSK, and reported `healthy` on Base mainnet on 2026-06-10. The crate carries 40 unit tests; the end-to-end harness (§16.2, `tests/integration.rs`) remains `#[ignore]`d because it needs anvil + a mock dstack runtime locally — the flow it would exercise has been validated live.
 
 ---
 
@@ -31,12 +31,12 @@ The protocol **modules** are implemented and unit-tested (33 tests: keys, CIDR, 
 | `tokio` (full) | async runtime |
 | `tonic` + `prost` | gRPC client (Indexer) + servers (app facade over UDS, peer control over mesh) |
 | `alloy` (`alloy-primitives`, `alloy-provider`, `alloy-signer`, `alloy-sol-types`) | EVM RPC reads, signing, ABI binding |
-| `alloy-rpc-types-bundler` (or hand-rolled wrappers if upstream isn't ready) | EIP-4337 v0.7 bundler RPC (`eth_sendUserOperation`, `eth_estimateUserOperationGas`, `eth_getUserOperationReceipt`, `eth_getUserOperationNonce`) |
+| `alloy-rpc-types-bundler` (or hand-rolled wrappers if upstream isn't ready) | EIP-4337 v0.7 bundler RPC (`eth_sendUserOperation`, `eth_estimateUserOperationGas`, `eth_getUserOperationReceipt`; nonces come from `EntryPoint.getNonce` via `eth_call` — `eth_getUserOperationNonce` is not a real bundler method, see §8.2) |
 | `dalek-cryptography` family (`x25519-dalek`, `ed25519-dalek`) | Curve25519 ops |
 | `crypto_box` | NaCl sealed-box (x25519 + XSalsa20-Poly1305) |
 | `zeroize` | zero-on-drop key material |
 | `defguard_wireguard_rs` | userspace wireguard control via `WG_QUICK`-equivalent netlink |
-| `dstack-sdk` (vendored if not crates.io-published) | dstack runtime client (`derive_key`, `seal`, `get_quote`) |
+| `dstack-sdk` (vendored if not crates.io-published) | dstack runtime client (`/GetKey`, `/Info`, `/Seal` — dstack 0.5.x removed `/DeriveKey`) |
 | `tracing` + `tracing-subscriber` (json output) | structured logging |
 | `prometheus` + `axum` | metrics endpoint (milestone B; v1 wires the crate in but exposes minimal counters) |
 
@@ -119,25 +119,28 @@ All configuration is via environment variables (no config files). The sidecar fa
 
 | Env var | Required | Default | Meaning |
 |---|---|---|---|
-| `MEMBER_CONTRACT` | yes | — | hex address of this node's ClusterMember proxy |
-| `CHAIN_ID` | yes | — | EVM chain id (`84532` for Base Sepolia v1, `8453` for Base mainnet) |
+| `MEMBER_CONTRACT` | no | — | hex address of this node's ClusterMember proxy. Unset → self-discovered from the dstack `/Info` `app_id` at runtime (Path A: the member contract IS the phala-provisioned app_id, unknowable before `phala deploy`) |
+| `CHAIN_ID` | yes | — | EVM chain id (`8453` — Base mainnet, the v1 deployment) |
 | `RPC_URL` | yes | — | EVM RPC endpoint URL (read-only direct chain reads — §8.4) |
 | `BUNDLER_URL` | yes | — | EIP-4337 bundler RPC endpoint (Alchemy in v1). All state-mutating calls go through here. |
 | `GAS_POLICY_ID` | no | `` | Alchemy Gas Manager policy id for `alchemy_requestGasAndPaymasterAndData` (sponsored UserOps — §8.2). |
 | `INDEXER_REGISTRY_ADDR` | yes | — | hex address of the per-chain IndexerRegistry. (Hardcoded per chain id in v1 sidecar binary; env var allows overriding for tests.) |
+| `GATEWAY_DOMAIN` | no | — | dstack gateway base domain (live value: `dstack-base-prod5.phala.network`). Peer ingress hostnames are `<app_id>-<port>s.<domain>` (§10). Unset → mesh bring-up is skipped (registration-only mode). |
+| `WG_TCP_PORT` | no | `51900` | TCP port of the wg-over-TCP ingress, exposed through the gateway (§10) |
+| `WG_LISTEN_PORT` | no | `51821` | wireguard outer listen port. Distinct from the in-mesh heartbeat port `51820` (§11.1) because kernel wg owns its UDP socket — the two must not collide |
 | `DSTACK_SOCKET` | no | `/var/run/dstack.sock` | path to dstack guest-agent socket |
 | `AGENT_GRPC_SOCKET` | no | `/var/run/attestmesh/agent.sock` | path the app facade listens on |
 | `HEALTH_HTTP_ADDR` | no | `127.0.0.1:9090` | HTTP /healthz endpoint (for docker-compose healthcheck) |
 | `LOG_FORMAT` | no | `json` | `json` or `pretty` |
 | `LOG_LEVEL` | no | `info` | standard `tracing` filter |
 
-No secrets in env vars. All key material is derived from the attestation-bound seed provided by the node's attestation method at runtime (on dstack: `derive_key`).
+No secrets in env vars. All key material is derived from the attestation-bound seed provided by the node's attestation method at runtime (on dstack: the guest agent's `/GetKey`).
 
 ---
 
 ## 6. Key derivation
 
-All key material is provided by the node's attestation method (on dstack: `dstack.derive_key(purpose, algo)`) and never persisted in plaintext outside the sidecar's process memory + the dstack sealed store. (The master spec uses the same name; `derive_key` is the canonical dstack runtime API.)
+All key material is provided by the node's attestation method (on dstack: the guest agent's `/GetKey(path, purpose)` — dstack 0.5.x removed the older `/DeriveKey` endpoint; the master spec's `derive_key` maps to this call) and never persisted in plaintext outside the sidecar's process memory + the dstack sealed store.
 
 | Purpose string | Algo | Used for |
 |---|---|---|
@@ -187,7 +190,7 @@ The 12 numbered steps from master spec §7.1 map onto modules as follows. This i
 |---|---|---|
 | 1 Discover cluster | `chain::attest::cluster_of` | reads `member.cluster()` via RPC |
 | 2 Derive keys | `keys::derive_all` | + `csk` originator path uses `csk::derive` later |
-| 3 Construct proof | `dstack::request_kms_chain` + sign binding | builds `DstackProof` (contracts spec §6.3) |
+| 3 Construct proof | `dstack_facet::build_proof_from_runtime` (`/Info` + `/GetKey`) | builds `DstackProof` (contracts spec §6.3); the binding signer is the `/GetKey`-derived key |
 | 4 Register or recognize | `state::check_existing_member` | branches on `AttestFacet.memberOf` |
 | 4a Determine CSK role | `state::determine_role` | reads `AttestFacet.memberCount()` post-register |
 | 5 Publish wireguard | `chain::network_facet::publish` | one tx; idempotent (no-op if value unchanged) |
@@ -225,7 +228,7 @@ The sidecar never submits raw transactions to the chain. Every state-mutating ca
 For every outbound call (`dstack_register`, `publishWgKey`, `send`, etc.):
 
 1. **Wrap as execute calldata.** The actual selector + args (e.g. `dstack_register(...)`) is encoded as `data`, then wrapped as `ClusterMember.execute(target=clusterDiamond, value=0, data=...)` to match the gas-webhook policy (gas-webhook spec §6 step 4).
-2. **Construct PackedUserOperation v0.7.** Sender = our ClusterMember address. Nonce = next from `eth_getUserOperationNonce(memberAddr, key=0)` (we use a single nonce key for v1; 2D nonces remain available for future use).
+2. **Construct PackedUserOperation v0.7.** Sender = our ClusterMember address. Nonce = `EntryPoint.getNonce(memberAddr, key=0)` via `eth_call` (we use a single nonce key for v1; 2D nonces remain available for future use). Live finding: `eth_getUserOperationNonce` is **not** a real bundler method — relying on it silently replayed nonce 0 and every post-registration op was rejected with `AA25`.
 3. **Request sponsorship + gas (before signing).** Call `alchemy_requestGasAndPaymasterAndData` (Gas Manager policy `GAS_POLICY_ID`) with the partial UserOp and a dummy signature. The Alchemy Gas Manager calls the AttestMesh gas-sponsorship webhook to approve, then returns the gas limits **and** the paymaster fields (`paymaster`, `paymasterData`, paymaster gas limits), scoped to this exact op.
 4. **Populate the op.** Apply the returned gas limits and paymaster fields to the UserOperation. The op is now final.
 5. **Sign userOpHash (sponsor-then-sign).** Compute the v0.7 userOpHash over the now-final op — the hash commits to `paymasterAndData` — and sign with the binding key. **Ordering is mandatory:** signing before the paymaster fields are populated produces a hash that differs from the one the EntryPoint recomputes, so `validateUserOp` recovers the wrong signer and the op is rejected with `AA24` (premortem F2).
@@ -316,15 +319,19 @@ The proto file itself is canonical for codegen; both this spec and indexer.md mu
 - On stream drop: exponential backoff `min(2^n s, 30s)` reconnect; resume from last-acked cursor. Re-read `IndexerRegistry.current()` on each retry in case the Indexer pubkey rotated.
 - Sampling spot-check: every Nth push (configurable, default disabled in v1, off-by-design opt-in), execute `rpc_repro` against `RPC_URL` and compare. Mismatch → log loudly, do not abort.
 
+As wired in v1 (live): `bringup::indexer_loop` + `indexer_client.rs` implement exactly this — endpoint + pubkey discovered from `IndexerRegistry`, every push Ed25519-verified, reconnect with backoff (re-reading the registry each time). A verified push **wakes the chain-read reconcile pass** (§10/§7 peer reconciler) — pushed payloads are never the data source, only the latency cut; the periodic RPC poll remains the fallback, and an empty registry leaves the sidecar in poll-only mode (re-checked every 5 minutes). One gateway quirk: the dstack gateway's TLS-passthrough route does proxy gRPC/h2, but answers ALPN with `http/1.1`, so the tonic client must set `ClientTlsConfig::assume_http2(true)`.
+
 ---
 
 ## 10. Wireguard management
+
+> **v1 transport reality (live).** This spec originally assumed direct UDP wireguard endpoints; dstack CVMs have **no inbound UDP**, so the v1 mesh bootstraps as **wireguard over length-prefixed UDP-over-TCP** through the dstack gateway's TLS-passthrough route (`<app_id>-<port>s.<GATEWAY_DOMAIN>`). The `transport` module bridges a loopback UDP socket per peer (which kernel wg uses as that peer's endpoint) to the peer's gateway ingress; `bringup` derives every peer's hostname from chain state + `GATEWAY_DOMAIN` — no off-chain config. The TLS on that leg is a throwaway self-signed cert (the gateway routes on SNI only); wireguard itself, with on-chain-pinned peer keys, remains the security layer. Two-sided simultaneous UDP hole-punching was live-verified on the prod5 fleet (including hairpin), so upgrading established links to pure punched UDP is deferred work, not a research risk.
 
 ### 10.1 Interface lifecycle
 
 - Interface name: `attestmesh0` (single mesh per node in v1).
 - Created at boot via netlink (`defguard_wireguard_rs`).
-- Listen port: random ephemeral, exposed in PeerEndpoint.
+- Listen port: `WG_LISTEN_PORT` (default `51821` — the outer wg port; see §11.1 for why it differs from the heartbeat port). The endpoint peers actually dial is the gateway ingress hostname, advertised via PeerEndpoint.
 - Self IP: derived per §7.3 from own `memberId` + cluster CIDR.
 - MTU: 1420 (standard wg overhead on 1500 underlay).
 
@@ -347,7 +354,7 @@ v1 has no on-chain eviction → no peer drop. Heartbeat-based liveness marks a p
 
 ### 11.1 Wire format
 
-UDP packet over the wg interface, port `51820` (cluster-wide convention; configurable in milestone B).
+UDP packet over the wg interface, port `51820` (cluster-wide convention; configurable in milestone B). Note this is the **in-mesh** heartbeat port, distinct from the wireguard **outer** listen port (`WG_LISTEN_PORT`, default `51821`): kernel wg owns its UDP socket, so the two cannot share a port.
 
 ```
 struct Heartbeat {
@@ -465,7 +472,7 @@ message ClusterSharedKey { bytes key = 1; }   // 32 bytes
 
 ### 12.3 Semantics
 
-- `SendMessage`: sidecar encrypts payload with sealed-box to `recipient_member_id`'s `xPubKey` (read from local cache → fallback `AttestFacet.xPubKeyOf` via RPC), submits `MessageFacet.send(recipient, envelope_id, ciphertext)`. Returns when the tx is mined (12s on Sepolia worst case). On revert (`DuplicateEnvelope`, `RecipientNotMember`), returns `FailedPrecondition` with a descriptive message.
+- `SendMessage`: sidecar encrypts payload with sealed-box to `recipient_member_id`'s `xPubKey` (read from local cache → fallback `AttestFacet.xPubKeyOf` via RPC), submits `MessageFacet.send(recipient, envelope_id, ciphertext)`. Returns when the tx is mined (Base ≈ 2s blocks; a few seconds typical). On revert (`DuplicateEnvelope`, `RecipientNotMember`), returns `FailedPrecondition` with a descriptive message.
 - `SubscribeMessages`: stream every successfully-decrypted incoming message whose recipient is self and whose kind is *not* the sidecar-internal type `peer-endpoint.v1`. Failed decryptions are silently dropped. Catchup behavior: streams everything the sidecar has accumulated since startup; the app is expected to handle dedup if it restarts.
 - `SubscribePeerEvents`: stream `PeerJoined` (on MemberRegistered + endpoint) and `PeerLiveness` (on heartbeat status changes).
 - `GetClusterSharedKey`: returns the 32-byte CSK. Returns `Unavailable` before acquisition.
@@ -509,6 +516,8 @@ Per master spec §8.
   3. On a `SealedCsk { sealed_csk }` response: sealed-box open with this node's x25519 private key → verify `keccak256(csk) == AttestFacet.cskCommitment()` (a direct on-chain view read, like the `memberCount()` read in §8.4). On mismatch, discard and try another connected peer.
   4. On success: `dstack.seal("attestmesh.csk.v1", csk)`, cache in process memory, mark `csk_acquired = true`.
 - **Restart path** (§7.1 step 4): `dstack.unseal("attestmesh.csk.v1") → csk` → cache → mark `csk_acquired = true`.
+
+  **Live caveat:** dstack `/Seal` data did **not** survive container recreation on the live fleet, so the sealed store cannot be relied on across restarts. As wired: the **originator** re-derives the CSK deterministically (it is a KMS-derived key) and verifies it against the on-chain `cskCommitment` before falling back to the peer-pull path; **onboardees** simply re-pull over the mesh on every restart (fine while ≥1 originator-derivable node is up). Store writes are best-effort.
 - **Serving a peer's pull** (steady-state, master spec §8.2): a member that already holds the CSK answers `PeerControl.RequestClusterSharedKey` from a peer over the mesh:
   1. Verify the requester is a current cluster member — its `xPubKey` exists in `AttestFacet` for `requester_member_id`.
   2. Sealed-box-encrypt the CSK to that `xPubKey` and return it as `SealedCsk { sealed_csk }`. No `MessageFacet.send`, no on-chain transaction, no `[0,500]ms` backoff, no `DuplicateEnvelope` handling.
@@ -538,7 +547,7 @@ Phases reported (`MeshStatus.phase`):
 ## 15. Failure handling
 
 - **Registration revert** (any reason except `AlreadyRegistered` — see §7.1 step 4): exit non-zero. docker-compose restart policy applies; if the cause is allowlist-related, the loop continues until ops intervenes.
-- **Indexer down**: exponential backoff reconnect. Healthcheck phase stuck at `subscribing` for joiners; healthy nodes stay healthy (first-converged gate fires once).
+- **Indexer down**: exponential backoff reconnect. Bring-up does not block: the chain-read reconcile poll (§9, as-wired note) keeps delivering membership + envelopes over RPC, so joiners still progress; healthy nodes stay healthy (first-converged gate fires once).
 - **CSK pull fails (no reachable peer holds it)**: phase stuck at `pulling-csk` (onboardees). Operational fix required.
 - **Convergence never reached**: phase stuck at `heartbeating`. Same.
 - **wg netlink errors**: log at error, retry. Persistent failure → exit non-zero (capability issue or kernel mismatch).

@@ -1,9 +1,9 @@
 # AttestMesh Contracts — Component Spec
 
-**Status**: Implemented v1 (was Draft v0.1; 2026-06-02)
+**Status**: Implemented v1 — **live on Base mainnet (8453)**; see [`docs/deployment.md`](../deployment.md)
 **Parent spec**: [`attestmesh-coordination-layer.md`](./attestmesh-coordination-layer.md)
 **Component**: `contracts/`
-**Last updated**: 2026-06-03
+**Last updated**: 2026-06-10
 
 ---
 
@@ -25,8 +25,7 @@ Code generation works from this spec. The parent spec defines *what* the system 
   - `eth-infinitism/account-abstraction` — EIP-4337 v0.7 interfaces (`IAccount`, `PackedUserOperation`, `IEntryPoint`).
 - **EntryPoint v0.7** (canonical, identical address on every supported chain): `0x0000000071727De22E5E9d8BAf0edAc6f37da032`. Hardcoded into `ClusterMember` as a `constant`; not deployed by us.
 - **Targets**:
-  - v1: Base Sepolia (chain id 84532).
-  - Milestone B: Base mainnet (chain id 8453).
+  - v1: Base mainnet (chain id 8453) — **live**. Deployed addresses are tracked in [`docs/deployment.md`](../deployment.md) (canonical receipt: `contracts/script/deployments/8453.json`); this spec does not duplicate them. Base Sepolia is no longer in scope — the real dstack base KMS lives on mainnet.
 
 ---
 
@@ -684,7 +683,7 @@ contract ClusterDiamondFactory {
 
 `factoryOwner` controls only future factory upgrades (e.g. swapping in a new default facet set). It does **not** retain any authority over already-deployed clusters — each cluster is independently owned by its own Safe after `transferOwnership` lands.
 
-For v1, one ClusterDiamondFactory is deployed per chain (Sepolia for v1, mainnet for milestone B). The address is hardcoded into the gas webhook's env config and the sidecar binary (via the IndexerRegistry pattern — see §11).
+For v1, one ClusterDiamondFactory is deployed per chain (Base mainnet for v1). The address is hardcoded into the gas webhook's env config and the sidecar binary (via the IndexerRegistry pattern — see §11).
 
 ---
 
@@ -710,7 +709,7 @@ contract IndexerRegistry {
 }
 ```
 
-One deployed instance per chain (on Sepolia for v1; on Base mainnet for milestone B). Address is hard-coded into the sidecar binary per chain id, so it doesn't need any other discovery.
+One deployed instance per chain (Base mainnet for v1). Address is hard-coded into the sidecar binary per chain id, so it doesn't need any other discovery.
 
 A future v2 may key the registry by chain id and expose `indexerOf(uint256 chainId)`. v1 is single-record.
 

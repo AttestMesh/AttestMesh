@@ -19,4 +19,4 @@ cargo clippy -- -D warnings
 
 ## v1 deployment
 
-Single CVM instance on Base Sepolia, registered in the IndexerRegistry contract for chain id 84532. HA shape is a milestone B concern.
+Single CVM instance **live on Base mainnet**, registered in the IndexerRegistry contract for chain id 8453 (see [`docs/deployment.md`](../docs/deployment.md)). It is shared infrastructure: one instance serves every cluster on the chains it watches — never per-cluster. HA shape is a milestone B concern.

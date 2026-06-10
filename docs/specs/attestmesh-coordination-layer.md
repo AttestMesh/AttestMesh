@@ -1,8 +1,8 @@
 # AttestMesh — Coordination Layer Master Spec
 
-**Status**: Implemented v1 (was Draft v0.4; 2026-06-02)
+**Status**: Implemented v1 — **fully live on Base mainnet (8453)**; see §11 and [`docs/deployment.md`](../deployment.md)
 **Authors**: LSDan
-**Last updated**: 2026-06-02
+**Last updated**: 2026-06-10
 
 ---
 
@@ -255,7 +255,7 @@ A member sidecar may sample pushes — issuing the repro stub against an indepen
 
 ### 6.3 Discovery
 
-A member sidecar discovers the Indexer at startup by reading a known **IndexerRegistry** contract — a tiny on-chain registry mapping `chainId → (indexerEndpoint, indexerCodeId, indexerPubKey)`. The registry is owned by the AttestMesh org Safe and exists per chain we deploy on (Base Sepolia for v1, Base mainnet for milestone B).
+A member sidecar discovers the Indexer at startup by reading a known **IndexerRegistry** contract — a tiny on-chain registry mapping `chainId → (indexerEndpoint, indexerCodeId, indexerPubKey)`. The registry is owned by the AttestMesh org Safe and exists per chain we deploy on (Base mainnet for v1).
 
 The node sidecar reads the IndexerRegistry directly via RPC at startup — this is one of the only direct RPC reads the sidecar does. After Indexer subscription is established, all subsequent event ingestion goes through the Indexer.
 
@@ -275,7 +275,7 @@ Subscriptions are stateful: the Indexer remembers per-member delivery cursors so
 
 ### 6.5 Indexer infrastructure (v1)
 
-For v1 the Indexer ships as a single node image, run by AttestMesh org. Whether milestone B's HA Indexer eats its own dog food (Indexer replicas as members of an AttestMesh cluster, coordinating cursor leadership via MessageFacet) or runs as a standalone primitive is deferred — both are open; dog-fooding is the preferred direction but neither shape is committed. v1's single-instance Indexer is built to be portable into either model.
+For v1 the Indexer ships as a single node image, run by AttestMesh org. It is **shared infrastructure: one Indexer instance serves every cluster on the chains it watches** — an Indexer is chain-scoped, never deployed per-cluster. Whether milestone B's HA Indexer eats its own dog food (Indexer replicas as members of an AttestMesh cluster, coordinating cursor leadership via MessageFacet) or runs as a standalone primitive is deferred — both are open; dog-fooding is the preferred direction but neither shape is committed. v1's single-instance Indexer is built to be portable into either model.
 
 ---
 
@@ -284,6 +284,8 @@ For v1 the Indexer ships as a single node image, run by AttestMesh org. Whether 
 A Rust binary (target: `cluster-mesh-agent`) shipped as an OCI image and included in node `docker-compose` files. Runs as a sidecar with elevated privileges (needs to configure wireguard) and a healthcheck that the application's main container can depend on.
 
 ### 7.1 Boot sequence
+
+> **v1 as built (live on Base mainnet):** dstack CVMs have no inbound UDP, so the mesh transport bootstraps as **wireguard over length-prefixed UDP-over-TCP** through the dstack gateway's TLS-passthrough route (`<app_id>-<port>s.<GATEWAY_DOMAIN>`); peer ingress hostnames are derived from chain state + `GATEWAY_DOMAIN`, keeping the chain the sole coordination layer. Two-sided simultaneous UDP hole-punching was verified live (including hairpin), so upgrading established links to pure punched UDP is deferred work, not a research risk. The Indexer subscription (step 6) is wired as a latency optimization that wakes a chain-read reconcile pass — the sidecar also polls `MessageSent` logs directly over RPC, so the mesh comes up even with no Indexer registered. See sidecar spec §9–§10 and `docs/deployment.md`.
 
 1. **Discover cluster address.** The sidecar reads its own member contract address from a `MEMBER_CONTRACT` env var or a file mounted from the dstack runtime. It calls `member.cluster()` to get the ClusterDiamond address.
 2. **Derive identity keys.** Using the attestation-bound seed, produce a single Curve25519 root from a known purpose string (e.g. `attestmesh.identity.v1`), then derive:
@@ -321,7 +323,7 @@ A Rust binary (target: `cluster-mesh-agent`) shipped as an OCI image and include
 ### 7.2 Failure modes
 
 - **Pattern revoked mid-flight.** If the cluster owner removes the attestation pattern between step 4 and the application coming up, no member already registered is forcibly removed (no on-chain eviction in v1); but new joiners cannot register, and a future re-register attempt (e.g. after a CVM restart) will fail. v1 punts cluster-driven eviction to a later spec.
-- **Indexer down.** If the Indexer is unreachable at boot, the sidecar stays in step 6 and reports unhealthy. The application container does not start. There is no v1 fallback to direct chain polling — operationally, the Indexer's HA shape is what guarantees liveness.
+- **Indexer down.** The sidecar reconnects with backoff; as built, the chain-read reconcile poll keeps bring-up and steady-state progressing in the meantime (the sidecar polls `MessageSent` logs directly over RPC, with Indexer pushes as the latency cut), so boot does not block on the Indexer.
 - **Indexer signature/attestation mismatch.** Treated as adversarial: the sidecar tears down the subscription, re-reads IndexerRegistry, and retries. If the pubkey on chain has been rotated (legitimate operator action), the new subscription succeeds. If not, the sidecar fails closed and stays unhealthy.
 - **Message channel poisoned.** A malicious member could spam another member's channel with garbage. Decryption failures are silently dropped; the sidecar logs at debug only. Rate-limiting is not enforced on chain in v1.
 - **First-convergence deadlock.** If the network is partitioned at startup such that no convergence is possible, a *joining* sidecar stays unhealthy indefinitely. This is intentional — degraded boot of an unmeshed mesh is worse than visible failure. Already-healthy sidecars elsewhere in the cluster are unaffected; the gate fires once per process.
@@ -400,6 +402,8 @@ Available only after CSK acquisition; before then, the call returns `Unavailable
 - **At rest** sealed via `dstack.seal("attestmesh.csk.v1", csk_bytes)`. Unsealed at boot.
 - **Never** on disk in plaintext, never in a shared tmpfs volume, never exposed to the application except through the sidecar gRPC.
 
+**Live caveat:** dstack `/Seal` data did not survive container recreation on the live fleet, so the sealed store is treated as best-effort. On restart the **originator** re-derives the CSK deterministically (it is a KMS-derived key) and verifies it against the on-chain `cskCommitment` before falling back to peer pull; **onboardees** re-pull over the mesh — fine while ≥1 originator-derivable node is up.
+
 ### 8.6 Failure modes
 
 - **Originator dies before onboarding any other member.** The CSK is lost forever (only the originator's TEE could re-derive it). The cluster cannot bootstrap. This is accepted: a cluster that never starts up is never used. v1 and milestone B both ship this behavior. Out-of-scope mitigations (key escrow, quorum recovery) are not on the roadmap.
@@ -443,30 +447,31 @@ dstackgres is the codebase AttestMesh is being extracted from. The differences:
 
 ## 11. v1 scope
 
-v1 targets a **working three-node demo on Base Sepolia** (milestone "A"). The goal is to prove out the protocol end-to-end with the smallest possible surface — production hardening, second attestor facets, and security review are deferred to milestone "B".
+v1 targeted a **working multi-node demo** (milestone "A"); it shipped as a **live two-node mesh on Base mainnet (8453)** — mainnet rather than Sepolia because the real dstack base KMS the nodes must boot against lives there. The goal was to prove out the protocol end-to-end with the smallest possible surface — production hardening, second attestor facets, and security review are deferred to milestone "B".
 
-> **Current state (2026-06-03):** all four components (contracts, sidecar, indexer, gas-webhook) are **implemented and unit-tested** — 155 tests green — but the demo below is **not yet wired end-to-end**. The sidecar's bring-up state machine (`state::run`) is a stub: the registration/messaging/submit modules exist and are tested in isolation but aren't driven by the binary yet, and the `DstackRuntime` trait still lacks a KMS-sig-chain request method. The list below is therefore the milestone-A **target**, not a description of a running system. See `docs/specs/sidecar.md §1.1`.
+> **Current state (2026-06-10): v1 is fully live on Base mainnet.** All four components are deployed and verified end-to-end — contracts (infra + cluster `attestmesh-1`), the gas-sponsorship webhook, a registered shared Indexer, and two real dstack CVMs that self-registered via sponsored UserOps, converged their wireguard mesh over the gateway TCP leg, originated + distributed the CSK, and hold open verified Indexer subscriptions while `phase=healthy`. The chain remained the sole coordination layer throughout. The day-by-day record (addresses, procedures, live-only bug fixes) is `docs/deployment.md`.
 
-**In v1 (milestone-A target):**
+**In v1 (milestone-A scope — delivered):**
 
 - DstackFacet only (no second attestation method).
-- A single ClusterDiamond deployed on Base Sepolia.
-- Three dstack CVMs registering, publishing wg pubkeys, exchanging endpoints via MessageFacet, and converging the wireguard mesh.
-- A single-instance Indexer (one node, no HA) watching that one cluster and pushing events to the three members.
-- IndexerRegistry contract deployed on Sepolia with the v1 Indexer's endpoint and pubkey.
+- A single ClusterDiamond deployed on Base mainnet.
+- dstack CVMs (two live) registering, publishing wg pubkeys, exchanging endpoints via MessageFacet, and converging the wireguard mesh.
+- A single-instance Indexer (one node, no HA) watching every cluster on the chain and pushing events to subscribed members.
+- IndexerRegistry contract deployed on Base mainnet with the v1 Indexer's endpoint and pubkey.
 - One end-to-end test sealed-box message exchanged between two members.
 - Liveness gate working: the application container does not start until the mesh is converged.
 
 **Deferred to milestone B (production-shaped single-method release):**
 
-- Deployment to Base mainnet behind a Safe.
+- Ownership transfer to a Safe (the contracts are live on Base mainnet, owned by the deployer for bring-up).
+- Pure punched-UDP mesh transport (v1 bootstraps wireguard over the gateway TCP leg; two-sided UDP hole-punching was live-verified, the upgrade is wiring work).
 - HA Indexer (multiple replicas, load balancer, monitoring).
 - Production sidecar packaging (signed OCI images, dstack runtime integration).
 - Formal threat model review.
 - Member-side sampling cadence policy (v1 default: always trust the Indexer signature; the repro stub is always generated so sampling is *available*, just not exercised by default).
 - Indexer-side attestation cache TTL (v1 re-verifies on every reconnect; B introduces a cache).
 - Member factory shape settles in milestone B if per-method impls force a different shape; v1 ships a singleton per-chain `ClusterMemberFactory` (contracts spec §9.2) shared across every cluster on the chain.
-- Reorg handling policy (v1 treats Sepolia confirmations as final; B picks a finality depth).
+- Reorg handling policy (v1 treats Base confirmations as final; B picks a finality depth).
 
 **Deferred indefinitely (not on the B path):**
 
@@ -491,7 +496,7 @@ No remaining open questions block v1. (Component-level specs may surface new one
 1. **Heartbeat transport: UDP-over-wireguard, gossip-computed convergence** (not on chain via MessageFacet). Cheap, fast, no per-heartbeat gas. Off-chain observers wanting "is the mesh healthy" must consume from a member.
 2. **Curve25519 for the node's operational key path** (sealed-box on x25519 for messaging, Ed25519 for heartbeat signatures). The per-CVM secp256k1 key the dstack KMS derives is used both for the registration binding signature AND, after the diamond callback installs it as the ClusterMember's owner, for signing every subsequent EIP-4337 UserOpHash (item 18). One key, two recoverable signing surfaces. Future methods that expose raw attestation quotes can use the user-data slot for the *attestation* binding, but still need a signing key for paymaster-sponsored UserOps (unless an alternative gas-sponsorship integration removes that requirement).
 3. **Attestation-method support = installed facet.** Each attestation method is a facet on the diamond. Clusters install whichever attestor facets they want to admit; the core facets (Attest / Message / Network) are attestation-method-agnostic and never need to change as new attestation methods ship.
-4. **Target chain: Base** (Sepolia for v1, mainnet for milestone B and beyond). Same EVM family as dstackgres. Chain-agnosticism is a milestone-C+ concern; v1 deployment scripts, the IndexerRegistry instance, and the org Safe-owned addresses are all Base-specific.
+4. **Target chain: Base mainnet** (chain id 8453) — v1 deployed there directly because the live dstack base KMS the nodes boot against lives on mainnet, so Sepolia fell out of scope. Same EVM family as dstackgres. Chain-agnosticism is a milestone-C+ concern; v1 deployment scripts, the IndexerRegistry instance, and the org Safe-owned addresses are all Base-specific.
 5. **Event delivery via a shared attested Indexer**, not direct chain polling from each node. Members trust the Indexer for liveness and completeness only; each push carries an RPC repro stub so correctness is independently verifiable per event. Follows the dstackgres monitoring-hub pattern.
 6. **Monorepo.** Contracts, node sidecar, and Indexer service all live in `AttestMesh/AttestMesh`. The protocol and its reference implementations evolve together; the spec in this repo is authoritative for the deployed Indexer it ships alongside.
 7. **No dstackgres compatibility, Postgres deferred.** AttestMesh is the generic mesh primitive. The existing TeeSQL Postgres-as-a-Service product is on hold and the existing dstackgres deployments on Base mainnet are not migration targets. dstackgres is referenced in §10 strictly as the *extraction source* — useful for understanding which moving parts were ripped out and why — not as a system we owe ABI compatibility to. A future Postgres application on top of AttestMesh is plausible but explicitly out of scope for v1.
