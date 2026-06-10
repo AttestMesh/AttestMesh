@@ -237,8 +237,10 @@ impl DstackRuntime for UnixSocketDstack {
             .get("signature_chain")
             .and_then(|v| v.as_array())
             .with_context(|| {
-                let fields: Vec<&String> =
-                    resp.as_object().map(|o| o.keys().collect()).unwrap_or_default();
+                let fields: Vec<&String> = resp
+                    .as_object()
+                    .map(|o| o.keys().collect())
+                    .unwrap_or_default();
                 format!("GetKey: missing 'signature_chain'; response fields = {fields:?}")
             })?
             .iter()

@@ -71,8 +71,8 @@ pub async fn connect_and_run(
     // Explicit TLS config for https endpoints (the gateway-terminated route).
     // assume_http2: the dstack gateway serves gRPC/h2 but may answer ALPN with
     // http/1.1 — gRPC requires h2, so trust the verified reality over ALPN.
-    let mut ep = tonic::transport::Channel::from_shared(endpoint.clone())
-        .context("indexer endpoint URI")?;
+    let mut ep =
+        tonic::transport::Channel::from_shared(endpoint.clone()).context("indexer endpoint URI")?;
     if endpoint.starts_with("https://") {
         let tls = tonic::transport::ClientTlsConfig::new()
             .with_native_roots()
@@ -108,7 +108,10 @@ pub async fn connect_and_run(
         // WgKeyPublished) is fully recoverable from chain reads, so a verified push
         // wakes the reconcile pass (which re-reads membership + polls MessageSent
         // logs) instead of double-implementing event decoding here.
-        tracing::debug!(block = env.block_number, "verified indexer push; waking reconcile");
+        tracing::debug!(
+            block = env.block_number,
+            "verified indexer push; waking reconcile"
+        );
         let _ = wake.try_send(());
     }
     Ok(())
