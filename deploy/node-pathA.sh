@@ -113,6 +113,51 @@ upgrade_member() {
   log "X.cluster()=$c (expect $CLUSTER)"
 }
 
+# Roll a new compose/env onto a LIVE member CVM. Order matters (proven 2026-06-10):
+# the boot gate checks the compose hash on the cluster, so allowlist FIRST, then a
+# plain update (state-only verification passes once the hash is on-chain). The
+# `--prepare-only/--commit` token flow is broken (token/CVM-id mismatch) — prepare is
+# used here ONLY to learn the new compose hash without touching the CVM.
+update_member() {
+  _load; [ -n "${CVM_ID:-}" ] || die "no CVM state; run 'deploy' first"
+  _build_env_file
+  local lf="$LOGDIR/pathA-prepare-${NODE}.$(ts).log"
+  npx --yes phala deploy --cvm-id "$CVM_ID" --compose "$COMPOSE" -e "$ENV_FILE" \
+    --prepare-only 2>&1 | tee "$lf" >/dev/null
+  local hash; hash=$(grep -iE 'Compose Hash:' "$lf" | grep -oE '0x[0-9a-fA-F]{64}' | head -1)
+  [ -n "$hash" ] || die "could not learn new compose hash (see $lf)"
+  local allowed; allowed=$(cast call "$CLUSTER" "allowedComposeHashes(bytes32)(bool)" "$hash" --rpc-url "$RPC_URL" 2>/dev/null)
+  if [ "$allowed" = "true" ]; then
+    log "compose hash $hash already allowlisted"
+  else
+    send_seq "addComposeHash-update-${NODE}" "$CLUSTER" "addComposeHash(bytes32)" "$hash"
+  fi
+  run_step "update-${NODE}" npx --yes phala deploy --cvm-id "$CVM_ID" --compose "$COMPOSE" -e "$ENV_FILE"
+}
+
+# Restart the CVM (re-pulls :latest — the path for image-only rolls).
+restart_cvm() {
+  _load; [ -n "${CVM_ID:-}" ] || die "no CVM state; run 'deploy' first"
+  run_step "restart-${NODE}" npx --yes phala cvms restart "$CVM_ID"
+}
+
+# Poll the node's health endpoint (via the gateway) until the mesh is fully healthy:
+# phase=healthy ⇒ live_peers>0 (multi-node), first_converged, csk_acquired.
+mesh_verify() {
+  _load; [ -n "${X:-}" ] || die "no app_id state; run 'deploy' first"
+  local gw="${GATEWAY_DOMAIN:-dstack-base-prod5.phala.network}" i body
+  for i in $(seq 1 45); do
+    body=$(curl -sm 8 "https://${X#0x}-9090.${gw}/healthz" 2>/dev/null)
+    if echo "$body" | grep -q '"phase":"healthy"'; then
+      log "✔ node $NODE mesh healthy: $body"
+      return 0
+    fi
+    log "… not healthy yet (attempt $i/45): ${body:-<unreachable>}"
+    sleep 20
+  done
+  die "node $NODE never reached phase=healthy — check: phala cvms logs $CVM_ID"
+}
+
 # 4. Poll the chain for the in-CVM sidecar's self-registration.
 verify() {
   _load; [ -n "${X:-}" ] || die "no app_id state; run 'deploy' first"
@@ -137,6 +182,9 @@ case "${2:-all}" in
   upgrade) upgrade_member ;;
   setup)   deploy_cvm; prime_gate; upgrade_member ;;  # fast on-chain path, no register wait
   verify)  verify ;;                                   # long poll; run separately/background
+  update)  update_member ;;                            # roll new compose/env onto a live CVM
+  restart) restart_cvm ;;                              # re-pull :latest (image-only roll)
+  mesh-verify) mesh_verify ;;                          # poll healthz for phase=healthy
   all)     deploy_cvm; prime_gate; upgrade_member; verify ;;
-  *) die "usage: node-pathA.sh <node-name> [all|setup|deploy|prime|upgrade|verify|env-file]" ;;
+  *) die "usage: node-pathA.sh <node-name> [all|setup|deploy|prime|upgrade|verify|update|restart|mesh-verify|env-file]" ;;
 esac

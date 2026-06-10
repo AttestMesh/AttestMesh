@@ -110,12 +110,16 @@ impl UnixSocketDstack {
 #[async_trait]
 impl DstackRuntime for UnixSocketDstack {
     async fn derive_key(&self, purpose: &str, subkey: &str) -> Result<Zeroizing<[u8; 32]>> {
+        // dstack 0.5.x exposes only /GetKey (the /DeriveKey endpoint was removed) —
+        // same live-only fix as the sidecar's dstack client. The KMS signature chain
+        // in the response is ignored here; derive_key wants only the seed bytes.
         let body = serde_json::json!({ "path": purpose, "purpose": subkey });
-        let resp = self.request("/DeriveKey", &body).await?;
-        let key_hex = resp
-            .get("key")
-            .and_then(|v| v.as_str())
-            .context("missing key")?;
+        let resp = self.request("/GetKey", &body).await?;
+        // On the error path the response carries no key, so it is safe to log it
+        // verbatim to pinpoint a guest-agent/API mismatch on a live CVM.
+        let key_hex = resp.get("key").and_then(|v| v.as_str()).with_context(|| {
+            format!("/GetKey response missing 'key' (path={purpose}, purpose={subkey}): {resp}")
+        })?;
         let bytes = hex::decode(key_hex.trim_start_matches("0x"))?;
         anyhow::ensure!(bytes.len() >= 32, "short key");
         let mut out = [0u8; 32];
