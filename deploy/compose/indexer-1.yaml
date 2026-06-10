@@ -1,0 +1,30 @@
+# AttestMesh indexer compose for a dstack CVM. The indexer is an attested service —
+# NOT a cluster member: no Path A upgrade, no on-chain registration of the app itself.
+# Its Ed25519 signing pubkey (derived from the dstack seed, logged at boot) is what the
+# operator registers in IndexerRegistry.setIndexer alongside the public endpoint.
+# Secrets (RPC_URL with the Alchemy key) come in as sealed env via `phala deploy -e`.
+services:
+  indexer:
+    image: ghcr.io/attestmesh/attestmesh-indexer:latest
+    restart: unless-stopped
+    environment:
+      - CHAIN_ID=${CHAIN_ID}
+      - RPC_URL=${RPC_URL}
+      - INDEXER_REGISTRY_ADDR=${INDEXER_REGISTRY_ADDR}
+      - CLUSTER_DIAMOND_FACTORY_ADDR=${CLUSTER_DIAMOND_FACTORY_ADDR}
+      - INDEXER_CODE_ID=${INDEXER_CODE_ID}
+      - INDEXER_GRPC_ADDR=0.0.0.0:50051
+      - HEALTH_HTTP_ADDR=0.0.0.0:9090
+      - DSTACK_SOCKET=/var/run/dstack.sock
+      - STATE_DIR=/data/indexer-state
+      - LOG_FORMAT=pretty
+      - LOG_LEVEL=info,attestmesh_indexer=debug
+    volumes:
+      - /var/run/dstack.sock:/var/run/dstack.sock
+      - indexer-state:/data/indexer-state
+    ports:
+      - "50051:50051"
+      - "9090:9090"
+
+volumes:
+  indexer-state:
