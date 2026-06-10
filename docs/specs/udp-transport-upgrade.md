@@ -1,6 +1,6 @@
 # Pure-UDP Hole-Punched Mesh Transport
 
-**Status:** APPROVED
+**Status:** IMPLEMENTING
 **Author:** LSDan
 **Created:** 2026-06-10
 **Last Updated:** 2026-06-10
