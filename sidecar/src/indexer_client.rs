@@ -68,9 +68,19 @@ pub async fn connect_and_run(
     indexer_pubkey: [u8; 32],
     wake: mpsc::Sender<()>,
 ) -> Result<()> {
-    let mut client = IndexerClient::connect(endpoint)
-        .await
-        .context("connect indexer")?;
+    // Explicit TLS config for https endpoints (the gateway-terminated route).
+    // assume_http2: the dstack gateway serves gRPC/h2 but may answer ALPN with
+    // http/1.1 — gRPC requires h2, so trust the verified reality over ALPN.
+    let mut ep = tonic::transport::Channel::from_shared(endpoint.clone())
+        .context("indexer endpoint URI")?;
+    if endpoint.starts_with("https://") {
+        let tls = tonic::transport::ClientTlsConfig::new()
+            .with_native_roots()
+            .assume_http2(true);
+        ep = ep.tls_config(tls).context("indexer TLS config")?;
+    }
+    let channel = ep.connect().await.context("connect indexer")?;
+    let mut client = IndexerClient::new(channel);
 
     let (tx, rx) = mpsc::channel::<SubscribeMessage>(64);
     let hello = SubscribeMessage {
