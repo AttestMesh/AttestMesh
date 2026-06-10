@@ -60,20 +60,31 @@ Standardized two layers deep:
     Path A DstackFacet + deploys the upgrade-target impl.
   - `deploy/webhook.sh` — `{deploy | route}`. `wrangler deploy` + ensures the custom-domain
     route `gas-webhook.teesql.com/*` points at the AttestMesh worker (a stale route → bundler 401).
-  - `deploy/node-pathA.sh <node>` — `{env-file | deploy | prime | upgrade | setup | verify | all}`.
+  - `deploy/node-pathA.sh <node>` — `{env-file | deploy | prime | upgrade | setup | verify |
+    update | restart | mesh-verify | all}`.
     The Path A node bring-up: builds the sealed env (ghcr pull-creds; MEMBER_CONTRACT omitted →
     self-discovered), phala-deploys a stock DstackApp CVM, primes the cluster gate, upgrades the
-    proxy to ClusterMember, then polls for the sidecar's self-registration. Gated on a `phala
-    login` session; persists CVM_ID/app_id in a state file so every subcommand is re-entrant.
+    proxy to ClusterMember, then polls for the sidecar's self-registration. Day-2: `update` rolls
+    a new compose/env onto the live CVM (learns the new compose hash via `--prepare-only`,
+    allowlists it on the cluster FIRST, then plain-updates — the prepare/commit token flow is
+    broken); `restart` re-pulls `:latest` (image-only roll); `mesh-verify` polls the gateway
+    healthz for `phase=healthy`. Gated on a `phala login` session; persists CVM_ID/app_id in a
+    state file so every subcommand is re-entrant.
+  - `deploy/indexer.sh <name>` — `{ensure | env-file | deploy | register | verify | update}`.
+    The **shared** indexer (ONE instance serves every cluster + the networks it watches — never
+    per-cluster): a stock dstack app (no Path A upgrade, no cluster gating). `register` scrapes
+    the boot-derived Ed25519 pubkey from the CVM logs + the compose hash and calls
+    `IndexerRegistry.setIndexer`; `ensure` no-ops when the registry already has an endpoint —
+    that is the per-cluster workflow entry.
   - `deploy/node.sh` — the legacy `--custom-app-id` flow (unsupported on base KMS; kept for
     reference / a future custom-app-id KMS).
-- **A durable smithers workflow** (`deploy/workflows/deploy.tsx`) sequences those routines as
-  crash-recoverable, resumable compute steps:
-  `preflight → infra → cluster → pathaUpgrade → webhook → node{env-file → deploy → prime →
-  upgrade → verify}`. The node sub-steps are individually durable — a `verify` timeout (the
-  sponsored registration UserOp is slow) resumes from `verify` without re-deploying the CVM.
-  Validated with `smithers graph` (renders the ordered 10-task plan). `deploy/package.json`
-  pins `smithers-orchestrator@0.22.0` + `zod@^4`.
+- **A durable smithers workflow** (`deploy/workflows/deploy.tsx`, `attestmesh-deploy-full`)
+  sequences those routines as crash-recoverable, resumable compute steps:
+  `preflight → infra → cluster → pathaUpgrade → webhook → indexerEnsure → node-1{env-file →
+  deploy → prime → upgrade → verify} → node-2{…} → meshVerify`. The node sub-steps are
+  individually durable — a `verify` timeout (the sponsored registration UserOp is slow) resumes
+  from `verify` without re-deploying the CVM. Validated with `smithers graph` (renders the
+  ordered 17-task plan). `deploy/package.json` pins `smithers-orchestrator@0.22.0` + `zod@^4`.
 
 Run:
 ```bash
@@ -147,6 +158,9 @@ Procedure: `source deploy/env.sh && CLUSTER=… MEMBER_IMPL=… ENV_FILE=… COM
 | 2026-06-10 | **✅ MESH CONNECTED (milestone-B core)** | Both nodes formed the wireguard mesh over the gateway TCP leg: sponsored PeerEndpoint envelopes landed (`0x4da2ac5c…`, `0xb1dc6b22…`), Ed25519 keys absorbed from `MessageSent` logs, verified heartbeats → `live_peers=1` on both; node-1 (memberIds[0]) **originated the CSK + set the on-chain commitment** (`0xabf10640…`); node-2 **pulled the CSK over the mesh** (`http://10.13.46.241:50051` — node-1's mesh IP through the tunnel) and verified it against the commitment. |
 | 2026-06-10 | **bug 6: CSK restart deadlock** | After a CVM restart the guest-agent `/Seal` data did not survive container recreation; with the commitment already on-chain, the originator joined the pull path and all nodes waited on each other (`pulling-csk` deadlock). Fixed (`b9ba052`): the originator's CSK is deterministically KMS-derived, so on restart it re-derives and verifies against the on-chain commitment before falling back to peer pull; store writes best-effort. **Caveat: dstack `/Seal`/`/Unseal` persistence is unverified — onboardees re-pull on every restart (fine while ≥1 originator-derivable node is up).** |
 | 2026-06-10 | **✅ MESH HEALTHY (milestone-B complete)** | Both nodes `GET /healthz` → **200** `{phase:"healthy", live_peers:1, first_converged:true, csk_acquired:true}`. Restart-resilient: node-1 re-derived CSK (log: "CSK re-derived + verified against on-chain commitment"), node-2 re-pulled over the mesh, convergence latched on both. Chain remained the sole coordination layer end-to-end: membership + wg keys + mesh IPs from facet reads, endpoints derived from app_id + `GATEWAY_DOMAIN`, envelopes via `MessageFacet`. **No STUN, no Indexer, no off-chain config.** |
+| 2026-06-10 | **indexer deployed (shared infra)** | `attestmesh-indexer-1` (CVM `bb97eedf…`, app `7917d8ec…`) — stock dstack app (NOT a member; ONE indexer serves every cluster + network). 3 more live-only bugs en route: (7) `/DeriveKey`→`/GetKey` (same dstack 0.5.x drift as the sidecar — crash-loop); (8) boot catch-up scanned from genesis (~47M Base blocks; health/gRPC start only after catch-up → never up). Fixed with `INDEXER_START_BLOCK` floor = factory deploy block (computed by `deploy/indexer.sh` via getCode binary search) + chunked discovery → **catch-up in 23s**; (9) pubkey scrape needed ANSI stripping. Registered: `setIndexer(https://7917d8ec…-50051.dstack-base-prod5.phala.network, codeId=compose hash, pubKey=0xa44ecf22…)`. |
+| 2026-06-10 | **gateway gRPC reality** | The gateway-terminated route DOES proxy gRPC/h2 (verified via grpcurl: full Subscribe replay with signed envelopes + TDX attestation quote), but answers ALPN with http/1.1 → tonic needs `ClientTlsConfig::assume_http2(true)` (bug 10, `c240d16`). |
+| 2026-06-10 | **✅ FULL SYSTEM LIVE** | All four components deployed + working on Base mainnet: contracts, gas webhook, **indexer** (registered, bounded catch-up, signed+attested pushes), and both nodes **subscribed** (`indexer subscription open` on both) while `phase=healthy` — 9 verified pushes absorbed on node-1; pushes wake the chain-read reconcile pass (poll fallback stays). Day-0 bring-up + day-2 ops fully codified in `deploy/{onchain,webhook,indexer,node-pathA}.sh` + the 17-task `attestmesh-deploy-full` smithers workflow. |
 
 ## Milestone-A reference: the real dstack guest-agent API
 
