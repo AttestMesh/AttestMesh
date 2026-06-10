@@ -36,7 +36,7 @@ use tokio::sync::Mutex;
 const ENTRY_POINT: Address =
     alloy::primitives::address!("0000000071727De22E5E9d8BAf0edAc6f37da032");
 
-const PEER_GRPC_PORT: u16 = 50051;
+pub const PEER_GRPC_PORT: u16 = 50051;
 const RECONCILE_INTERVAL: Duration = Duration::from_secs(15);
 const CSK_RETRY: Duration = Duration::from_secs(10);
 /// Re-send our PeerEndpoint envelope while a peer's Ed25519 key is still unknown
@@ -57,6 +57,9 @@ struct Ctx {
     submit_lock: Mutex<()>,
     /// Our own gateway ingress hostname (SNI), advertised in PeerEndpoint.
     self_sni: String,
+    /// UDP punch upgrader (None when WG_UDP_PUNCH=false). Mesh bring-up and
+    /// health never depend on it.
+    puncher: Option<Arc<transport::punch::Puncher>>,
 }
 
 fn now_ms() -> u64 {
@@ -68,7 +71,12 @@ fn now_ms() -> u64 {
 
 fn sni_for(member_contract: Address, tcp_port: u16, gw_domain: &str) -> String {
     // TLS-passthrough route: `<app_id>-<port>s.<gateway-domain>`.
-    format!("{}-{}s.{}", hex::encode(member_contract.as_slice()), tcp_port, gw_domain)
+    format!(
+        "{}-{}s.{}",
+        hex::encode(member_contract.as_slice()),
+        tcp_port,
+        gw_domain
+    )
 }
 
 impl Ctx {
@@ -111,6 +119,26 @@ pub async fn launch(
     ));
 
     let self_sni = sni_for(shared.member_contract, config.wg_tcp_port, &gw_domain);
+
+    // UDP punch upgrader (udp-transport-upgrade spec). Gateway TCP stays the
+    // bootstrap path and permanent fallback; this only upgrades live links.
+    let puncher = if config.wg_udp_punch {
+        Some(transport::punch::Puncher::new(
+            shared.clone(),
+            wg.clone(),
+            transport::punch::PunchConfig {
+                enabled: true,
+                timeout: Duration::from_secs(config.punch_timeout_secs),
+                backoff_initial_secs: config.punch_retry_backoff_secs,
+                wg_listen_port: shared.wg_listen_port,
+            },
+            Arc::new(transport::punch::DnsEgress::new(gw_domain.clone())),
+        ))
+    } else {
+        tracing::info!("WG_UDP_PUNCH=false — links stay on gateway TCP");
+        None
+    };
+
     let ctx = Arc::new(Ctx {
         config: config.clone(),
         dstack,
@@ -121,6 +149,7 @@ pub async fn launch(
         owner_signer,
         submit_lock: Mutex::new(()),
         self_sni,
+        puncher: puncher.clone(),
     });
 
     // 1. wg-over-TCP ingress (peers reach us through the gateway).
@@ -131,6 +160,12 @@ pub async fn launch(
                 tracing::error!(error = %e, "wg-tcp ingress exited");
             }
         });
+    }
+
+    // 1b. punch scheduler + UDP-path watchdog (no-ops while no link qualifies).
+    if let Some(p) = &puncher {
+        tokio::spawn(p.clone().run_initiator());
+        tokio::spawn(p.clone().run_watchdog());
     }
 
     // 2. heartbeats (verification activates per-peer once its Ed25519 key arrives).
@@ -165,7 +200,8 @@ pub async fn launch(
     {
         let shared = shared.clone();
         let chain = chain.clone();
-        tokio::spawn(async move { serve_peer_grpc(shared, chain).await });
+        let puncher = puncher.clone();
+        tokio::spawn(async move { serve_peer_grpc(shared, chain, puncher).await });
     }
 
     // 6. app-facing agent gRPC on the unix socket.
@@ -273,11 +309,17 @@ async fn reconcile_once(
 
         if !configured {
             ctx.shared.set_phase(Phase::WgConfiguring).await;
-            let rec = ctx.chain.member_by_id(cluster, B256::from(*member_id)).await?;
+            let rec = ctx
+                .chain
+                .member_by_id(cluster, B256::from(*member_id))
+                .await?;
             if !rec.exists() {
                 continue;
             }
-            let mesh_ip = ctx.chain.mesh_ip_of(cluster, B256::from(*member_id)).await?;
+            let mesh_ip = ctx
+                .chain
+                .mesh_ip_of(cluster, B256::from(*member_id))
+                .await?;
             let sni = sni_for(rec.member_contract, ctx.config.wg_tcp_port, gw_domain);
             let endpoint =
                 transport::spawn_peer_bridge(sni.clone(), 443, ctx.shared.wg_listen_port)
@@ -296,6 +338,9 @@ async fn reconcile_once(
                 let mut peers = ctx.shared.peers.lock().await;
                 peers.ensure_chain(*member_id, mesh_ip, rec.wg_pubkey.0);
                 peers.set_endpoint(member_id, sni.clone());
+                // The bridge address is the punch-upgrade revert target; the
+                // bridge task itself stays alive even while the link rides UDP.
+                peers.set_bridge_addr(member_id, endpoint);
                 peers.mark_configured(member_id);
             }
             let _ = ctx.shared.peer_event_tx.send(AppPeerEvent::Joined {
@@ -323,7 +368,9 @@ async fn reconcile_once(
         let now = now_ms();
         let due = match last_sent.get(member_id) {
             None => true,
-            Some(at) => !peer_ed_known && now.saturating_sub(*at) > ENVELOPE_RESEND.as_millis() as u64,
+            Some(at) => {
+                !peer_ed_known && now.saturating_sub(*at) > ENVELOPE_RESEND.as_millis() as u64
+            }
         };
         if due {
             match send_peer_endpoint(ctx, *member_id).await {
@@ -361,13 +408,21 @@ async fn send_peer_endpoint(ctx: &Ctx, peer_id: [u8; 32]) -> Result<B256> {
     if xpub == B256::ZERO {
         anyhow::bail!("peer has no x25519 key on chain");
     }
-    let pe = PeerEndpoint::new(
+    let mut pe = PeerEndpoint::new(
         ctx.shared.self_member_id,
         ctx.self_sni.clone(),
         443,
         ctx.shared.keys.wg_pub,
         ctx.shared.keys.ed25519_pub,
     );
+    // Should-Have (udp-transport-upgrade spec): advertise our UDP candidate to
+    // cut one negotiation round trip. Optional CBOR fields — old peers ignore.
+    if let Some(p) = &ctx.puncher {
+        if let Some((ip, port)) = p.advertised_udp_candidate().await {
+            pe.udp_ip = Some(ip);
+            pe.udp_port = Some(port);
+        }
+    }
     let ct = envelopes::seal(&xpub.0, &pe.encode()?)?;
     let mut salt = Vec::with_capacity(72);
     salt.extend_from_slice(&envelopes::peer_endpoint_envelope_id());
@@ -424,6 +479,9 @@ async fn poll_envelopes(ctx: &Ctx, next_from_block: &mut Option<u64>) -> Result<
         if peers.set_ed25519(&sender, pe.ed25519_pub) {
             tracing::info!(peer = %hex::encode(sender), host = %pe.host,
                 "PeerEndpoint envelope absorbed (Ed25519 key learned)");
+        }
+        if let Some(udp) = pe.udp_addr() {
+            peers.set_advertised_udp(&sender, Some(udp));
         }
     }
     Ok(())
@@ -494,7 +552,9 @@ async fn csk_once(ctx: &Ctx) -> Result<()> {
             }
             *ctx.shared.csk.lock().await = Some(*c);
             ctx.shared.gates.set_csk_acquired();
-            tracing::info!("CSK re-derived + verified against on-chain commitment (originator restart)");
+            tracing::info!(
+                "CSK re-derived + verified against on-chain commitment (originator restart)"
+            );
             return Ok(());
         }
     }
@@ -503,7 +563,11 @@ async fn csk_once(ctx: &Ctx) -> Result<()> {
     ctx.shared.set_phase(Phase::PullingCsk).await;
     let targets: Vec<u32> = {
         let peers = ctx.shared.peers.lock().await;
-        peers.all().filter(|p| p.configured).map(|p| p.mesh_ip).collect()
+        peers
+            .all()
+            .filter(|p| p.configured)
+            .map(|p| p.mesh_ip)
+            .collect()
     };
     for ip in targets {
         let url = format!("http://{}:{}", cidr::fmt_ipv4(ip), PEER_GRPC_PORT);
@@ -535,13 +599,21 @@ async fn csk_once(ctx: &Ctx) -> Result<()> {
     anyhow::bail!("no peer served the CSK yet")
 }
 
-async fn serve_peer_grpc(shared: Arc<Shared>, chain: Arc<ChainClient>) {
+async fn serve_peer_grpc(
+    shared: Arc<Shared>,
+    chain: Arc<ChainClient>,
+    puncher: Option<Arc<transport::punch::Puncher>>,
+) {
     let addr = SocketAddr::V4(SocketAddrV4::new(
         Ipv4Addr::from(shared.self_mesh_ip),
         PEER_GRPC_PORT,
     ));
     loop {
-        let svc = crate::peer_grpc::PeerControlService::new(shared.clone(), chain.clone());
+        let svc = crate::peer_grpc::PeerControlService::new(
+            shared.clone(),
+            chain.clone(),
+            puncher.clone(),
+        );
         match tonic::transport::Server::builder()
             .add_service(svc.into_server())
             .serve(addr)
@@ -615,7 +687,11 @@ mod tests {
             salt.extend_from_slice(&ms.to_le_bytes());
             keccak256(&salt)
         };
-        assert_ne!(id_at(1), id_at(2), "different send instants → different ids");
+        assert_ne!(
+            id_at(1),
+            id_at(2),
+            "different send instants → different ids"
+        );
         assert_ne!(id_at(1).0, base, "salted id differs from the bare kind id");
     }
 }

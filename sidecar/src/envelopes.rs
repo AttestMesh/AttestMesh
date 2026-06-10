@@ -70,7 +70,11 @@ pub fn open(
 }
 
 /// The sidecar-internal peer-endpoint payload exchanged over MessageFacet
-/// (master spec §7.1 step 7). Carries the peer's wireguard endpoint + Ed25519 key.
+/// (master spec §7.1 step 7). Carries the peer's wireguard endpoint + Ed25519 key,
+/// plus an optional self-advertised UDP candidate for the punch upgrade
+/// (udp-transport-upgrade spec, Should-Have). The UDP fields are optional CBOR
+/// map entries — absent on old senders, ignored by old receivers — so the
+/// envelope stays compatible in both directions.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PeerEndpoint {
     /// keccak256("attestmesh.peer-endpoint.v1") — demux discriminator.
@@ -80,6 +84,11 @@ pub struct PeerEndpoint {
     pub port: u16,
     pub wg_pub: [u8; 32],
     pub ed25519_pub: [u8; 32],
+    /// Advertised UDP candidate (egress IP guess) — cuts one punch round trip.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub udp_ip: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub udp_port: Option<u16>,
 }
 
 impl PeerEndpoint {
@@ -97,7 +106,19 @@ impl PeerEndpoint {
             port,
             wg_pub,
             ed25519_pub,
+            udp_ip: None,
+            udp_port: None,
         }
+    }
+
+    /// The advertised UDP candidate as a socket address, if present and sane.
+    pub fn udp_addr(&self) -> Option<std::net::SocketAddr> {
+        let ip: std::net::IpAddr = self.udp_ip.as_deref()?.parse().ok()?;
+        let port = self.udp_port?;
+        if port == 0 {
+            return None;
+        }
+        Some(std::net::SocketAddr::new(ip, port))
     }
 
     pub fn is_peer_endpoint(&self) -> bool {
@@ -149,6 +170,69 @@ mod tests {
         let bytes = pe.encode().unwrap();
         let back = PeerEndpoint::decode(&bytes).unwrap();
         assert_eq!(pe, back);
+    }
+
+    /// Wire-compat both directions for the optional UDP-candidate fields
+    /// (udp-transport-upgrade spec): an old sidecar's encoding (no UDP keys)
+    /// decodes with `None`, and a new encoding with the keys present decodes
+    /// fine on an old sidecar (unknown CBOR map entries are ignored).
+    #[test]
+    fn peer_endpoint_udp_fields_are_backward_and_forward_compatible() {
+        /// The pre-upgrade wire shape, byte-for-byte.
+        #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+        struct LegacyPeerEndpoint {
+            kind: [u8; 32],
+            member_id: [u8; 32],
+            host: String,
+            port: u16,
+            wg_pub: [u8; 32],
+            ed25519_pub: [u8; 32],
+        }
+
+        // old bytes -> new struct: UDP fields default to None
+        let legacy = LegacyPeerEndpoint {
+            kind: peer_endpoint_envelope_id(),
+            member_id: [7u8; 32],
+            host: "h-51900s.gw".into(),
+            port: 443,
+            wg_pub: [9u8; 32],
+            ed25519_pub: [3u8; 32],
+        };
+        let mut old_bytes = Vec::new();
+        ciborium::into_writer(&legacy, &mut old_bytes).unwrap();
+        let pe = PeerEndpoint::decode(&old_bytes).unwrap();
+        assert!(pe.is_peer_endpoint());
+        assert_eq!(pe.udp_ip, None);
+        assert_eq!(pe.udp_addr(), None);
+
+        // new bytes (with UDP candidate) -> old struct: unknown keys ignored
+        let mut pe = PeerEndpoint::new([7u8; 32], "h-51900s.gw".into(), 443, [9u8; 32], [3u8; 32]);
+        pe.udp_ip = Some("203.0.113.7".into());
+        pe.udp_port = Some(51821);
+        assert_eq!(pe.udp_addr(), Some("203.0.113.7:51821".parse().unwrap()));
+        let new_bytes = pe.encode().unwrap();
+        let back: LegacyPeerEndpoint = ciborium::from_reader(new_bytes.as_slice()).unwrap();
+        assert_eq!(back, legacy);
+
+        // a None-UDP new encoding is byte-identical to the legacy encoding
+        let plain = PeerEndpoint::new([7u8; 32], "h-51900s.gw".into(), 443, [9u8; 32], [3u8; 32]);
+        assert_eq!(plain.encode().unwrap(), old_bytes);
+    }
+
+    /// Garbage advertised candidates must not become punch targets.
+    #[test]
+    fn peer_endpoint_udp_addr_rejects_garbage() {
+        let mut pe = PeerEndpoint::new([1u8; 32], "h".into(), 443, [2u8; 32], [4u8; 32]);
+        pe.udp_ip = Some("not-an-ip".into());
+        pe.udp_port = Some(51821);
+        assert_eq!(pe.udp_addr(), None);
+
+        pe.udp_ip = Some("203.0.113.7".into());
+        pe.udp_port = Some(0);
+        assert_eq!(pe.udp_addr(), None);
+
+        pe.udp_port = None;
+        assert_eq!(pe.udp_addr(), None);
     }
 
     #[test]

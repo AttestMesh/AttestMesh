@@ -76,6 +76,27 @@ pub enum AppPeerEvent {
     Liveness { member_id: [u8; 32], up: bool },
 }
 
+/// Punch-upgrade counters (udp-transport-upgrade spec, Interfaces): exposed on
+/// the health endpoint and `/metrics`. Purely observational — mesh health never
+/// depends on punch outcomes.
+#[derive(Default)]
+pub struct PunchMetrics {
+    pub attempts_total: std::sync::atomic::AtomicU64,
+    pub success_total: std::sync::atomic::AtomicU64,
+    pub udp_reverts_total: std::sync::atomic::AtomicU64,
+}
+
+impl PunchMetrics {
+    pub fn snapshot(&self) -> (u64, u64, u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        (
+            self.attempts_total.load(Relaxed),
+            self.success_total.load(Relaxed),
+            self.udp_reverts_total.load(Relaxed),
+        )
+    }
+}
+
 pub struct Shared {
     pub keys: Arc<KeyMaterial>,
     pub member_contract: Address,
@@ -91,6 +112,7 @@ pub struct Shared {
     pub csk: Mutex<Option<[u8; 32]>>,
     pub phase: Mutex<Phase>,
     pub gates: Gates,
+    pub punch_metrics: PunchMetrics,
 
     pub incoming_tx: broadcast::Sender<AppIncoming>,
     pub peer_event_tx: broadcast::Sender<AppPeerEvent>,
@@ -130,6 +152,7 @@ impl Shared {
             csk: Mutex::new(None),
             phase: Mutex::new(Phase::Booting),
             gates: Gates::new(),
+            punch_metrics: PunchMetrics::default(),
             incoming_tx,
             peer_event_tx,
         })
@@ -292,7 +315,10 @@ async fn resolve_member_contract(config: &Config, dstack: &dyn DstackRuntime) ->
         .await
         .context("dstack /Info for app_id self-discovery (MEMBER_CONTRACT unset)")?;
     if info.app_id.len() != 20 {
-        anyhow::bail!("dstack app_id is {} bytes, expected a 20-byte address", info.app_id.len());
+        anyhow::bail!(
+            "dstack app_id is {} bytes, expected a 20-byte address",
+            info.app_id.len()
+        );
     }
     let member = Address::from_slice(&info.app_id);
     tracing::info!(%member,
