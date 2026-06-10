@@ -94,8 +94,12 @@ register() {
   _load; [ -n "${CVM_ID:-}" ] && [ -n "${APP_ID:-}" ] || die "no CVM state; run 'deploy' first"
   local pubkey="" i
   for i in $(seq 1 40); do
+    # Strip ANSI color codes first — the pretty-format log line interleaves
+    # escape sequences (which contain digits) between "pubkey" and the hex.
     pubkey=$(npx --yes phala cvms logs "$CVM_ID" 2>/dev/null \
-      | grep -oE 'pubkey[^0-9a-fx]*0x[0-9a-fA-F]{64}' | grep -oE '0x[0-9a-fA-F]{64}' | head -1)
+      | sed 's/\x1b\[[0-9;]*m//g' \
+      | grep -E 'derived indexer signing identity' \
+      | grep -oE '0x[0-9a-fA-F]{64}' | tail -1)
     [ -n "$pubkey" ] && break
     log "… waiting for indexer boot to log its signing pubkey (attempt $i/40)"
     sleep 10

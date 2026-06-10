@@ -25,7 +25,9 @@ require() {
 run_step() {
   local name="$1"; shift
   local lf="$LOGDIR/${name}.$(ts).log"
-  log "▶ ${name}: $*"
+  # Redact key material from the echoed command line (full output still goes to
+  # the per-step logfile, which is gitignored — but the console echo travels).
+  log "▶ ${name}: $(printf '%s ' "$@" | sed -E 's/(--private-key|--api-key|--token)[= ]+[^ ]+/\1 <redacted>/g')"
   log "  └ log: $lf"
   if "$@" >"$lf" 2>&1; then
     log "✔ ${name}"
