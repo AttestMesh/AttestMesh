@@ -136,11 +136,23 @@ pub async fn launch(
     // 2. heartbeats (verification activates per-peer once its Ed25519 key arrives).
     crate::heartbeat::spawn(shared.clone());
 
+    // Indexer pushes wake the reconcile pass early; polling remains the fallback.
+    let (wake_tx, wake_rx) = tokio::sync::mpsc::channel::<()>(8);
+
     // 3. peer reconciler: chain → bridges → wg peers → envelope exchange.
     {
         let ctx = ctx.clone();
         let gw = gw_domain.clone();
-        tokio::spawn(async move { reconcile_loop(ctx, gw).await });
+        tokio::spawn(async move { reconcile_loop(ctx, gw, wake_rx).await });
+    }
+
+    // 3b. Indexer subscription (sidecar spec §9): discover via IndexerRegistry,
+    // verify every push, reconnect with backoff. Absent registration → poll-only.
+    {
+        let shared = shared.clone();
+        let chain = chain.clone();
+        let registry = config.indexer_registry_addr;
+        tokio::spawn(async move { indexer_loop(shared, chain, registry, wake_tx).await });
     }
 
     // 4. CSK originate-or-pull.
@@ -170,7 +182,11 @@ pub async fn launch(
 /// One pass + steady-state loop: enumerate members from chain, configure any new
 /// peer (bridge + wg), send our PeerEndpoint envelope, and poll MessageSent logs
 /// for inbound envelopes (peers' Ed25519 keys).
-async fn reconcile_loop(ctx: Arc<Ctx>, gw_domain: String) {
+async fn reconcile_loop(
+    ctx: Arc<Ctx>,
+    gw_domain: String,
+    mut wake: tokio::sync::mpsc::Receiver<()>,
+) {
     let mut last_sent: HashMap<[u8; 32], u64> = HashMap::new();
     let mut next_from_block: Option<u64> = None;
 
@@ -179,7 +195,50 @@ async fn reconcile_loop(ctx: Arc<Ctx>, gw_domain: String) {
         {
             tracing::warn!(error = ?e, "peer reconcile pass failed; retrying");
         }
-        tokio::time::sleep(RECONCILE_INTERVAL).await;
+        // Indexer pushes cut the latency; the interval is the poll fallback.
+        tokio::select! {
+            _ = tokio::time::sleep(RECONCILE_INTERVAL) => {}
+            _ = wake.recv() => {}
+        }
+    }
+}
+
+/// Discover the Indexer from the on-chain registry and hold the subscription open,
+/// re-discovering + reconnecting with backoff (spec §9.2). An empty registry means
+/// no indexer is operated yet — the reconcile poll remains the only event source.
+async fn indexer_loop(
+    shared: Arc<Shared>,
+    chain: Arc<ChainClient>,
+    registry: Address,
+    wake: tokio::sync::mpsc::Sender<()>,
+) {
+    loop {
+        let info = match crate::chain::registry::read_indexer(chain.provider(), registry).await {
+            Ok(i) => i,
+            Err(e) => {
+                tracing::warn!(error = ?e, "IndexerRegistry read failed; retrying");
+                tokio::time::sleep(Duration::from_secs(60)).await;
+                continue;
+            }
+        };
+        if info.endpoint.is_empty() {
+            tracing::info!("no indexer registered; staying in poll-only mode");
+            tokio::time::sleep(Duration::from_secs(300)).await;
+            continue;
+        }
+        tracing::info!(endpoint = %info.endpoint, "subscribing to indexer");
+        match crate::indexer_client::connect_and_run(
+            shared.clone(),
+            info.endpoint.clone(),
+            info.pubkey.0,
+            wake.clone(),
+        )
+        .await
+        {
+            Ok(()) => tracing::info!("indexer stream ended; re-discovering"),
+            Err(e) => tracing::warn!(error = ?e, "indexer subscription failed; re-discovering"),
+        }
+        tokio::time::sleep(Duration::from_secs(15)).await;
     }
 }
 

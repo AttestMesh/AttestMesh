@@ -16,7 +16,9 @@ path = "src/main.rs"
 [dependencies]
 tokio = { version = "1", features = ["full"] }
 tokio-stream = { version = "0.1", features = ["net"] }
-tonic = "0.12"
+# tls-native-roots: the indexer endpoint from IndexerRegistry is an https URL
+# behind the dstack gateway's (valid) wildcard cert.
+tonic = { version = "0.12", features = ["tls", "tls-native-roots"] }
 prost = "0.13"
 prost-types = "0.13"
 

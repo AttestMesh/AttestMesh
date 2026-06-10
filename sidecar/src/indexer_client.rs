@@ -58,10 +58,15 @@ pub fn verify_envelope(env: &PushEnvelope, pubkey: &[u8; 32]) -> bool {
 
 /// Open the subscription and process pushes until the stream drops. Caller handles
 /// reconnect/backoff (sidecar spec §9.2).
+///
+/// Each verified push fires `wake`: the envelope carries an RPC-repro stub by design
+/// (spec §8.1 — members re-verify against their own RPC), so dispatch is "wake the
+/// chain-read reconcile pass now" rather than trusting the pushed payload as data.
 pub async fn connect_and_run(
     shared: Arc<Shared>,
     endpoint: String,
     indexer_pubkey: [u8; 32],
+    wake: mpsc::Sender<()>,
 ) -> Result<()> {
     let mut client = IndexerClient::connect(endpoint)
         .await
@@ -84,15 +89,17 @@ pub async fn connect_and_run(
         .context("subscribe")?;
     let mut inbound = resp.into_inner();
 
+    tracing::info!(cluster = %shared.cluster, "indexer subscription open");
     while let Some(env) = inbound.message().await.context("indexer stream")? {
         if !verify_envelope(&env, &indexer_pubkey) {
             anyhow::bail!("indexer signature mismatch — tearing down subscription");
         }
-        // Event dispatch (MessageSent → decrypt/peer-endpoint, MemberRegistered →
-        // peer-join, WgKeyPublished → key refresh) decodes the RLP event_data and is
-        // driven from here; the §16.2 harness exercises the full path against anvil.
-        tracing::debug!(block = env.block_number, "verified indexer push");
-        let _ = &shared;
+        // Dispatch: every event we subscribe to (MessageSent / MemberRegistered /
+        // WgKeyPublished) is fully recoverable from chain reads, so a verified push
+        // wakes the reconcile pass (which re-reads membership + polls MessageSent
+        // logs) instead of double-implementing event decoding here.
+        tracing::debug!(block = env.block_number, "verified indexer push; waking reconcile");
+        let _ = wake.try_send(());
     }
     Ok(())
 }
