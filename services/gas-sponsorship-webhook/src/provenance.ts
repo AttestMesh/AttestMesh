@@ -191,20 +191,30 @@ export async function isOurMember(deps: ProvenanceDeps, sender: Address): Promis
   });
 }
 
-/** `ClusterDiamondFactory.isDeployedCluster(target)` with caching (spec §6 step 7). */
+/**
+ * `isDeployedCluster(target)` against the v1 factory OR the v2 factory when one
+ * is configured (multi-attestor spec: the factories coexist; v1 clusters keep
+ * working untouched, new deploys come from v2), with caching (spec §6 step 7).
+ */
 export async function isDeployedCluster(deps: ProvenanceDeps, target: Address): Promise<boolean> {
+  const ask = (client: PublicClient, factory: Address) =>
+    client.readContract({
+      address: factory,
+      abi: IS_DEPLOYED_CLUSTER_ABI,
+      functionName: "isDeployedCluster",
+      args: [getAddress(target)],
+    }) as Promise<boolean>;
+
   return cachedBoolCall({
     deps,
     kv: deps.factoryCache,
     address: target,
     label: "isDeployedCluster",
-    call: (client) =>
-      client.readContract({
-        address: deps.config.canonicalClusterFactory,
-        abi: IS_DEPLOYED_CLUSTER_ABI,
-        functionName: "isDeployedCluster",
-        args: [getAddress(target)],
-      }) as Promise<boolean>,
+    call: async (client) => {
+      if (await ask(client, deps.config.canonicalClusterFactory)) return true;
+      const v2 = deps.config.canonicalClusterFactoryV2;
+      return v2 !== undefined && (await ask(client, v2));
+    },
   });
 }
 

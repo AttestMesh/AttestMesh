@@ -19,7 +19,19 @@ export interface Env {
   // Plaintext vars.
   EXPECTED_CHAIN_ID: string;
   CANONICAL_CLUSTER_FACTORY: string;
+  /**
+   * Optional second cluster factory (ClusterDiamondFactoryV2, multi-attestor
+   * spec). v1 and v2 factories coexist on chain; `isDeployedCluster` trusts
+   * either. Unset → v1-only (pre-v2 deployments keep working unchanged).
+   */
+  CANONICAL_CLUSTER_FACTORY_V2?: string;
   CANONICAL_MEMBER_FACTORY: string;
+  /**
+   * Sponsor OperatorFacet traffic (`operator_register` + signer admin)?
+   * Default false: operator-method members are vouched for by a key, not
+   * hardware attestation, so paying their gas is an explicit opt-in.
+   */
+  SPONSOR_OPERATOR_METHOD?: string;
   CACHE_TTL_SECONDS?: string;
   LOG_LEVEL?: string;
 
@@ -32,7 +44,11 @@ export interface Env {
 export interface Config {
   expectedChainId: number;
   canonicalClusterFactory: Address;
+  /** v2 factory; undefined when not yet deployed/configured. */
+  canonicalClusterFactoryV2: Address | undefined;
   canonicalMemberFactory: Address;
+  /** Gate for the OPERATOR_SELECTORS set (default false — explicit opt-in). */
+  sponsorOperatorMethod: boolean;
   rpcUrl: string;
   alchemyWebhookToken: string;
   cacheTtlSeconds: number;
@@ -106,10 +122,25 @@ export function parseEnv(env: Env): Config {
     cacheTtl = parsed;
   }
 
+  let sponsorOperatorMethod = false;
+  if (env.SPONSOR_OPERATOR_METHOD !== undefined && env.SPONSOR_OPERATOR_METHOD !== "") {
+    if (env.SPONSOR_OPERATOR_METHOD !== "true" && env.SPONSOR_OPERATOR_METHOD !== "false") {
+      throw new EnvError(
+        `SPONSOR_OPERATOR_METHOD must be "true" or "false", got "${env.SPONSOR_OPERATOR_METHOD}"`,
+      );
+    }
+    sponsorOperatorMethod = env.SPONSOR_OPERATOR_METHOD === "true";
+  }
+
   return {
     expectedChainId: chainId,
     canonicalClusterFactory: parseAddressVar("CANONICAL_CLUSTER_FACTORY", env.CANONICAL_CLUSTER_FACTORY),
+    canonicalClusterFactoryV2:
+      env.CANONICAL_CLUSTER_FACTORY_V2 === undefined || env.CANONICAL_CLUSTER_FACTORY_V2 === ""
+        ? undefined
+        : parseAddressVar("CANONICAL_CLUSTER_FACTORY_V2", env.CANONICAL_CLUSTER_FACTORY_V2),
     canonicalMemberFactory: parseAddressVar("CANONICAL_MEMBER_FACTORY", env.CANONICAL_MEMBER_FACTORY),
+    sponsorOperatorMethod,
     rpcUrl: env.RPC_URL,
     alchemyWebhookToken: env.ALCHEMY_WEBHOOK_TOKEN,
     cacheTtlSeconds: cacheTtl,

@@ -19,7 +19,9 @@ import { createLogger } from "../src/log.js";
 const config: Config = {
   expectedChainId: 84532,
   canonicalClusterFactory: "0x000000000000000000000000000000000000Face",
+  canonicalClusterFactoryV2: undefined,
   canonicalMemberFactory: "0x000000000000000000000000000000000000bEEF",
+  sponsorOperatorMethod: false,
   rpcUrl: "https://rpc.test.invalid",
   alchemyWebhookToken: "tok",
   cacheTtlSeconds: 86_400,
@@ -159,6 +161,46 @@ describe("provenance caching", () => {
     // Pass an all-lowercase target; key should be the checksummed form.
     await isDeployedCluster(d, "0x00000000000000000000000000000000000000c1");
     expect(store.has("84532:0x00000000000000000000000000000000000000C1")).toBe(true);
+  });
+
+  // Multi-attestor spec: v1 and v2 factories coexist; the webhook trusts either.
+  describe("isDeployedCluster across both factories", () => {
+    const V2_FACTORY: Address = "0x000000000000000000000000000000000000Fad2";
+    const v2Config: Config = { ...config, canonicalClusterFactoryV2: V2_FACTORY };
+
+    /** Route the read by factory address: v1 says `v1`, v2 says `v2`. */
+    function dualFactoryClient(v1: boolean, v2: boolean) {
+      return fakeClient(async (args: unknown) => {
+        const { address } = args as { address: Address };
+        return address.toLowerCase() === V2_FACTORY.toLowerCase() ? v2 : v1;
+      });
+    }
+
+    it("true when only the v1 factory knows the cluster", async () => {
+      const d = deps({ config: v2Config, client: dualFactoryClient(true, false) });
+      expect(await isDeployedCluster(d, TARGET)).toBe(true);
+    });
+
+    it("true when only the v2 factory knows the cluster", async () => {
+      const d = deps({ config: v2Config, client: dualFactoryClient(false, true) });
+      expect(await isDeployedCluster(d, TARGET)).toBe(true);
+    });
+
+    it("false when neither factory knows the cluster", async () => {
+      const d = deps({ config: v2Config, client: dualFactoryClient(false, false) });
+      expect(await isDeployedCluster(d, TARGET)).toBe(false);
+    });
+
+    it("does not consult v2 when unset (v1-only deployments unchanged)", async () => {
+      const readContract = vi.fn(async (args: unknown) => {
+        const { address } = args as { address: Address };
+        expect(address.toLowerCase()).toBe(config.canonicalClusterFactory.toLowerCase());
+        return false;
+      });
+      const d = deps({ client: fakeClient(readContract) });
+      expect(await isDeployedCluster(d, TARGET)).toBe(false);
+      expect(readContract).toHaveBeenCalledTimes(1);
+    });
   });
 });
 

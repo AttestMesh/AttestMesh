@@ -134,8 +134,13 @@ export async function evaluatePolicy(
     return deny("value-nonzero");
   }
 
-  // 6. Inner selector in allowlist.
-  if (!isAllowedInnerSelector(decoded.innerSelector)) {
+  // 6. Inner selector in allowlist (the operator-method set is gated by
+  //    SPONSOR_OPERATOR_METHOD — multi-attestor spec).
+  if (
+    !isAllowedInnerSelector(decoded.innerSelector, {
+      sponsorOperatorMethod: config.sponsorOperatorMethod,
+    })
+  ) {
     return deny("inner-selector-not-allowed");
   }
 
