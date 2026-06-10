@@ -41,13 +41,16 @@ pub fn spawn(shared: Arc<Shared>) -> Vec<JoinHandle<()>> {
 async fn send_loop(shared: Arc<Shared>) -> anyhow::Result<()> {
     let sock = UdpSocket::bind(("0.0.0.0", 0)).await?;
     loop {
-        let (connected, targets) = {
+        let (mut connected, targets) = {
             let p = shared.peers.lock().await;
             (
                 p.connected_ids(),
                 p.all().map(|x| x.mesh_ip).collect::<Vec<_>>(),
             )
         };
+        // The connected view includes the sender itself (liveness convergence
+        // compares each node's view against the live set, which contains everyone).
+        connected.push(shared.self_member_id);
         let payload = packet::HeartbeatPayload {
             version: packet::HEARTBEAT_VERSION,
             sender_member_id: shared.self_member_id,
@@ -90,7 +93,8 @@ async fn recv_loop(shared: Arc<Shared>) -> anyhow::Result<()> {
         }
 
         let now = now_ms();
-        let connected = shared.peers.lock().await.connected_ids();
+        let mut connected = shared.peers.lock().await.connected_ids();
+        connected.push(shared.self_member_id); // self is part of our own view
         {
             let mut lv = shared.liveness.lock().await;
             lv.on_heartbeat(sender, &hb.payload.connected_member_ids, now);
