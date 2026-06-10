@@ -7,7 +7,7 @@ One Indexer instance serves many clusters. Members subscribe over gRPC bidirecti
 **Spec**: [`docs/specs/indexer.md`](../docs/specs/indexer.md)
 **Master spec**: [`docs/specs/attestmesh-coordination-layer.md`](../docs/specs/attestmesh-coordination-layer.md)
 
-Code lands here when the indexer spec is generated.
+Implemented: block-watcher (`eth_getLogs` polling + per-member relevance filtering), sled-backed per-member delivery cursors, signed-envelope gRPC with RPC repro stubs, identity derivation, and a health endpoint (42 unit tests).
 
 ## Quick reference
 
@@ -19,4 +19,4 @@ cargo clippy -- -D warnings
 
 ## v1 deployment
 
-Single CVM instance on Base Sepolia, registered in the IndexerRegistry contract for chain id 84532. HA shape is a milestone B concern.
+Single CVM instance **live on Base mainnet**, registered in the IndexerRegistry contract for chain id 8453 (see [`docs/deployment.md`](../docs/deployment.md)). It is shared infrastructure: one instance serves every cluster on the chains it watches — never per-cluster. HA shape is a milestone B concern.

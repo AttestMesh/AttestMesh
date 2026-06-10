@@ -1,0 +1,18 @@
+syntax = "proto3";
+
+// Peer-control service (sidecar spec §12.5). A second tonic server bound to the
+// node's mesh IP on the attestmesh0 wireguard interface — the only callers are
+// other cluster members reachable over the encrypted mesh. Carries the CSK pull.
+package attestmesh.peer.v1;
+
+service PeerControl {
+  rpc RequestClusterSharedKey(CskRequest) returns (SealedCsk);
+}
+
+message CskRequest {
+  bytes requester_member_id = 1; // 32 bytes
+}
+
+message SealedCsk {
+  bytes sealed_csk = 1; // CSK sealed-boxed (x25519) to the requester's on-chain xPubKey
+}

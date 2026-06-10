@@ -1,0 +1,16 @@
+AttestMesh ERC-7201 storage namespaces.
+
+Each 32-byte slot is computed per ERC-7201:
+
+    slot = keccak256(abi.encode(uint256(keccak256("<source string>")) - 1)) & ~bytes32(uint256(0xff))
+
+| Layout struct            | Source string                  | Owner facet      |
+|--------------------------|--------------------------------|------------------|
+| MemberStorage.Layout     | attestmesh.storage.Member      | AttestFacet      |
+| MessageStorage.Layout    | attestmesh.storage.Message     | MessageFacet     |
+| NetworkStorage.Layout    | attestmesh.storage.Network     | NetworkFacet     |
+| DstackStorage.Layout     | attestmesh.storage.Dstack      | DstackFacet      |
+| ClusterMemberStorage     | attestmesh.storage.ClusterMember | ClusterMember  |
+
+The precomputed slot constants are asserted in test/unit/Namespaces.t.sol so a
+drift between the source string and the hard-coded constant fails the build.

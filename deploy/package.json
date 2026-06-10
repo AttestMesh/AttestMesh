@@ -1,0 +1,14 @@
+{
+  "name": "attestmesh-deploy",
+  "private": true,
+  "type": "module",
+  "description": "Durable deploy workflows (smithers) + standardized routines for AttestMesh.",
+  "scripts": {
+    "graph": "smithers-orchestrator graph workflows/deploy.tsx",
+    "up": "smithers-orchestrator up workflows/deploy.tsx"
+  },
+  "devDependencies": {
+    "smithers-orchestrator": "0.22.0",
+    "zod": "^4.0.0"
+  }
+}

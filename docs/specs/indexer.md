@@ -1,10 +1,10 @@
 # AttestMesh Indexer — Component Spec
 
-**Status**: Draft v0.1
+**Status**: Implemented v1 — **live on Base mainnet (8453)**, deployed + registered; see [`docs/deployment.md`](../deployment.md)
 **Parent spec**: [`attestmesh-coordination-layer.md`](./attestmesh-coordination-layer.md) (especially §6)
 **Component**: `indexer/`
 **Binary**: `attestmesh-indexer`
-**Last updated**: 2026-05-30
+**Last updated**: 2026-06-10
 
 ---
 
@@ -31,7 +31,7 @@ Each push is signed by the Indexer's attestation-bound key and paired with an `e
 | `alloy` (`alloy-primitives`, `alloy-provider`, `alloy-sol-types`, `alloy-rpc-types-eth`) | EVM RPC: `eth_getLogs`, `eth_blockNumber`, `eth_chainId`, ABI decoding |
 | `ed25519-dalek` | signs every push envelope |
 | `zeroize` | zero-on-drop key material |
-| `dstack-sdk` (vendored) | dstack runtime client (`derive_key`, `seal`, `get_quote`) |
+| `dstack-sdk` (vendored) | dstack runtime client (`/GetKey`, `/Info`, `get_quote` — dstack 0.5.x removed `/DeriveKey`) |
 | `sled` or `rocksdb` | local persistent store for per-member cursors |
 | `tracing` + `tracing-subscriber` (json) | structured logging |
 | `prometheus` + `axum` | metrics endpoint (counters per cluster/per member; gauge of subscriber count + chain head lag) |
@@ -45,7 +45,7 @@ Each push is signed by the Indexer's attestation-bound key and paired with an `e
 
 ## 3. Process model
 
-A single process runs inside a dstack CVM. v1 ships **one instance** per chain (Sepolia for v1; Base mainnet for milestone B); HA is deferred. Master spec §13 item 5 captures the operational shape — multi-replica + dog-fooded-on-AttestMesh shapes remain open but are explicitly deferred.
+A single process runs inside a dstack CVM. v1 ships **one shared instance** that serves **every cluster on the chains it watches** (live: Base mainnet `8453`) — the Indexer is chain-scoped infrastructure and is never deployed per-cluster; HA is deferred. Master spec §13 item 5 captures the operational shape — multi-replica + dog-fooded-on-AttestMesh shapes remain open but are explicitly deferred.
 
 Runtime requirements:
 
@@ -105,7 +105,7 @@ Env vars only.
 
 | Env var | Required | Default | Meaning |
 |---|---|---|---|
-| `CHAIN_ID` | yes | — | `84532` (Sepolia v1) or `8453` (mainnet B) |
+| `CHAIN_ID` | yes | — | `8453` (Base mainnet — the v1 deployment) |
 | `RPC_URL` | yes | — | EVM RPC endpoint (Alchemy in v1) |
 | `INDEXER_REGISTRY_ADDR` | yes | — | per-chain IndexerRegistry contract address |
 | `CLUSTER_DIAMOND_FACTORY_ADDR` | yes | — | per-chain ClusterDiamondFactory address (used to discover which clusters exist) |
@@ -114,7 +114,8 @@ Env vars only.
 | `DSTACK_SOCKET` | no | `/var/run/dstack.sock` | dstack guest-agent socket |
 | `STATE_DIR` | no | `/var/lib/attestmesh-indexer` | sled/rocksdb data dir (mounted as a persistent volume) |
 | `BLOCK_POLL_INTERVAL_MS` | no | `2000` | how often to call `eth_blockNumber` |
-| `BLOCK_BATCH_SIZE` | no | `200` | max blocks per `eth_getLogs` request when catching up |
+| `BLOCK_BATCH_SIZE` | no | `200` | max blocks per `eth_getLogs` request when catching up (the live deployment runs `2000`) |
+| `INDEXER_START_BLOCK` | no | `0` | floor for the boot catch-up scan — the factory's deploy block (no clusters can exist before it). `0` means genesis, which on a mainnet is effectively unbootable (~47M Base blocks of paged `eth_getLogs`); `deploy/indexer.sh` computes the floor via a `getCode` binary search (live value: `46868742`) |
 | `LOG_LEVEL` | no | `info` | `tracing` filter |
 | `LOG_FORMAT` | no | `json` | `json` or `pretty` |
 
@@ -131,7 +132,7 @@ The Indexer's identity is derived from its TEE seed at boot, the same way sideca
 | `attestmesh.indexer.signing.v1` | ed25519 | signing every push envelope. Pubkey is what IndexerRegistry's `pubKey` field points to. |
 | `attestmesh.indexer.tls.v1` | ed25519 | TLS server certificate for the gRPC listener (milestone B; v1 terminates TLS at a load balancer). |
 
-The signing key is stable across restarts (deterministic from the TEE seed). It is NOT sealed-stored — it's re-derived every boot from `dstack.derive_key`.
+The signing key is stable across restarts (deterministic from the TEE seed). It is NOT sealed-stored — it's re-derived every boot from the guest agent's `/GetKey`.
 
 ### 6.1 Attestation request
 
@@ -182,7 +183,7 @@ Filter shape: every log whose `address` is in the set of known cluster diamonds 
 
 `BLOCK_BATCH_SIZE` bounds a single `eth_getLogs` call so we don't blow past RPC provider limits. If `latest - last_indexed > BLOCK_BATCH_SIZE`, we paginate.
 
-Catchup on startup: the Indexer reads `last_indexed` from persistent state, and the chain head from RPC, and pages forward `BLOCK_BATCH_SIZE` blocks at a time until caught up. Then it transitions to the steady-state poll.
+Catchup on startup: the Indexer reads `last_indexed` from persistent state, floors it at `INDEXER_START_BLOCK` (the factory deploy block — scanning from genesis is unbootable on a mainnet), runs cluster discovery over the factory's `ClusterDeployed` logs in 10k-block chunks, and pages the watcher forward `BLOCK_BATCH_SIZE` blocks at a time until caught up (live: 23s from the factory deploy block). Then it transitions to the steady-state poll.
 
 ### 7.2 Cluster-discovery loop
 
@@ -403,7 +404,7 @@ HTTP at `HEALTH_HTTP_ADDR`:
 
 - **RPC down**: block-watcher loop retries with exponential backoff. `/healthz` flips to 503 after one missed poll. Existing subscriptions stay open (no new events to push); reconnecting subscribers can still verify membership cache, get the indexer attestation, and wait.
 - **RPC behind** (chain reorg, provider lag): tolerated. Events from the original chain head are re-emitted when the new head exceeds the old. Subscribers dedup off `(block_number, log_index)`.
-- **Reorgs ≤ shallow finality**: v1 treats Sepolia/Base confirmations as final. If a deep reorg removes events the Indexer already pushed, subscribers see the original push as Ack'd; the chain no longer reflects it. v1 logs at error but does not re-emit corrections. This is the same posture as master spec §13 item 4 — Sepolia is finality-on-confirmation for v1.
+- **Reorgs ≤ shallow finality**: v1 treats Base confirmations as final. If a deep reorg removes events the Indexer already pushed, subscribers see the original push as Ack'd; the chain no longer reflects it. v1 logs at error but does not re-emit corrections. This is the same posture as master spec §13 item 4 — Base is finality-on-confirmation for v1.
 - **Out-of-disk on cursor store**: writes start failing. `/healthz` flips to 503. Operator must add disk capacity.
 - **gRPC stream errors mid-session**: individual subscriptions terminate; subscribers reconnect; cursor is durable. No global impact.
 - **Crash and restart**: state restored from sled. Subscribers reconnect after their stream-drop detection (couple seconds). Continuity gap of ~seconds, no event loss.

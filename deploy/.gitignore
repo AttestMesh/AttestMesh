@@ -1,0 +1,8 @@
+# never commit secrets or runtime state
+env.local.sh
+*.env
+.smithers/
+logs/
+node_modules/
+bun.lock
+smithers.db*

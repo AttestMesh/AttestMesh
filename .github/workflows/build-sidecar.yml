@@ -1,0 +1,42 @@
+name: build-sidecar
+
+# Builds the AttestMesh sidecar OCI image and publishes it to ghcr.io so dstack CVMs
+# can pull it. Runs here because the deploy environment has no docker daemon.
+on:
+  push:
+    paths:
+      - "sidecar/**"
+      - ".github/workflows/build-sidecar.yml"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # docker-container driver supports gha cache export (default driver does not).
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to ghcr.io
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: ./sidecar
+          file: ./sidecar/Dockerfile
+          push: true
+          tags: |
+            ghcr.io/attestmesh/cluster-mesh-agent:latest
+            ghcr.io/attestmesh/cluster-mesh-agent:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

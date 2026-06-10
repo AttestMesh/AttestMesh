@@ -1,0 +1,74 @@
+syntax = "proto3";
+
+// App-facing gRPC façade (sidecar spec §12.1). Served over a unix domain socket;
+// the trust domain is the node, so there is no transport-level auth.
+package attestmesh.agent.v1;
+
+service Agent {
+  rpc GetMeshStatus(Empty) returns (MeshStatus);
+  rpc ListPeers(Empty) returns (PeerList);
+  rpc SendMessage(SendRequest) returns (SendResponse);
+  rpc SubscribeMessages(Empty) returns (stream IncomingMessage);
+  rpc SubscribePeerEvents(Empty) returns (stream PeerEvent);
+  rpc GetClusterSharedKey(Empty) returns (ClusterSharedKey);
+  rpc GetSelf(Empty) returns (SelfInfo);
+}
+
+message Empty {}
+
+message MeshStatus {
+  string phase = 1; // "booting" | "registering" | ... | "healthy"
+  bool first_converged = 2;
+  bool csk_acquired = 3;
+  uint32 live_peer_count = 4;
+}
+
+message SelfInfo {
+  bytes member_id = 1;       // 32 bytes
+  bytes member_contract = 2; // 20-byte address
+  uint32 mesh_ip = 3;        // derived per master spec §7.3
+}
+
+message PeerList {
+  repeated PeerInfo peers = 1;
+}
+message PeerInfo {
+  bytes member_id = 1; // 32 bytes
+  uint32 mesh_ip = 2;
+  bool live = 3;
+}
+
+message SendRequest {
+  bytes recipient_member_id = 1; // 32 bytes
+  bytes payload = 2;             // app-defined; sidecar sealed-boxes to recipient
+  bytes envelope_id = 3;         // optional; if empty, sidecar hashes the payload
+}
+message SendResponse {
+  bytes envelope_id = 1; // 32 bytes
+  bytes tx_hash = 2;     // 32 bytes
+}
+
+message IncomingMessage {
+  bytes sender_member_id = 1; // 32 bytes
+  bytes payload = 2;          // decrypted
+  uint64 block_number = 3;
+}
+
+message PeerEvent {
+  oneof kind {
+    PeerJoined joined = 1;
+    PeerLiveness liveness = 2;
+  }
+}
+message PeerJoined {
+  bytes member_id = 1; // 32 bytes
+  uint32 mesh_ip = 2;
+}
+message PeerLiveness {
+  bytes member_id = 1; // 32 bytes
+  bool up = 2;
+}
+
+message ClusterSharedKey {
+  bytes key = 1; // 32 bytes
+}

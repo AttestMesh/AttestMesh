@@ -1,0 +1,61 @@
+syntax = "proto3";
+
+// Canonical Indexer subscription envelope (sidecar spec §9.1, indexer spec §8.1).
+// This file is owned by the sidecar component; the indexer build references it.
+//
+// NB: the specs write `bytes32` illustratively; proto3 has no fixed-width bytes,
+// so hashes/ids are `bytes` with documented fixed lengths (addr = 20, id/hash = 32).
+package attestmesh.indexer.v1;
+
+service Indexer {
+  rpc Subscribe(stream SubscribeMessage) returns (stream PushEnvelope);
+}
+
+message SubscribeMessage {
+  oneof inner {
+    Hello hello = 1; // initial handshake
+    Ack ack = 2;     // delivery acknowledgement
+  }
+}
+
+message Hello {
+  bytes cluster_addr = 1; // 20-byte ClusterDiamond address
+  bytes member_id = 2;    // 32-byte memberId
+  bytes attestation = 3;  // reserved for milestone B re-verification; v1 indexer ignores
+  uint64 from_block = 4;  // resume cursor; 0 means "from this member's MemberRegistered"
+}
+
+message Ack {
+  uint64 block_number = 1;
+  uint64 log_index = 2;
+}
+
+message PushEnvelope {
+  bytes event_data = 1;          // RLP-encoded log topics + data (verifiable against the chain)
+  bytes cluster_addr = 2;        // 20-byte ClusterDiamond address
+  uint64 block_number = 3;
+  bytes tx_hash = 4;             // 32 bytes
+  uint64 log_index = 5;
+  RpcReproStub rpc_repro = 6;
+  bytes indexer_signature = 7;   // Ed25519 over the envelope-signing view (see below)
+  IndexerAttestation indexer_attestation = 8; // present on first push of a session only
+}
+
+message RpcReproStub {
+  string method = 1;       // "eth_getLogs"
+  string params_json = 2;  // exact params to reproduce
+}
+
+message IndexerAttestation {
+  bytes quote = 1;            // TEE quote with report_data binding to the indexer signing pubkey
+  bytes expected_code_id = 2; // 32 bytes
+  bytes expected_pubkey = 3;  // 32-byte ed25519 signing key
+}
+
+// ── Envelope signing convention (MUST match on both ends) ────────────────────
+// signing_input = keccak256( b"attestmesh.indexer.envelope.v1" || canonical_cbor )
+// where canonical_cbor is the deterministic CBOR encoding of the tuple:
+//   (event_data, cluster_addr, block_number, tx_hash, log_index,
+//    rpc_repro.method, rpc_repro.params_json)
+// i.e. the envelope fields EXCLUDING indexer_signature and indexer_attestation.
+// The signature is Ed25519 over signing_input, verified against IndexerRegistry.pubKey.

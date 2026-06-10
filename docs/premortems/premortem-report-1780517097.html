@@ -1,0 +1,191 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Premortem — Deploying the dstack auth extraction</title>
+<style>
+  :root{
+    --bg:#0a0e1a; --panel:#121826; --panel2:#0f1422; --ink:#e8edf6; --muted:#94a3b8;
+    --line:#1f2a3d; --accent:#6ea8fe; --crit:#ff5d6c; --high:#ff9f43; --med:#ffd166;
+    --good:#4ade80; --chip:#1b2438;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);
+    font:15px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif}
+  .wrap{max-width:1080px;margin:0 auto;padding:40px 22px 80px}
+  header h1{font-size:30px;margin:0 0 6px;letter-spacing:-.3px}
+  header .sub{color:var(--muted);font-size:15px}
+  header .meta{color:var(--muted);font-size:12.5px;margin-top:10px;border-top:1px solid var(--line);padding-top:10px}
+  code{background:#0b1020;border:1px solid var(--line);border-radius:5px;padding:1px 5px;font-size:12.5px;color:#cfe0ff}
+  h2.section{font-size:13px;text-transform:uppercase;letter-spacing:.14em;color:var(--accent);
+    margin:38px 0 14px;border-bottom:1px solid var(--line);padding-bottom:8px}
+  .syn{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:18px 20px}
+  .card.full{grid-column:1/-1}
+  .card h3{margin:0 0 8px;font-size:16px}
+  .card p{margin:8px 0;color:#d6deec}
+  .tag{display:inline-block;font-size:11px;font-weight:700;letter-spacing:.04em;text-transform:uppercase;
+    padding:3px 9px;border-radius:999px;margin-right:6px;vertical-align:middle}
+  .t-crit{background:rgba(255,93,108,.16);color:var(--crit);border:1px solid rgba(255,93,108,.4)}
+  .t-high{background:rgba(255,159,67,.15);color:var(--high);border:1px solid rgba(255,159,67,.4)}
+  .t-med{background:rgba(255,209,102,.13);color:var(--med);border:1px solid rgba(255,209,102,.4)}
+  .lead{border-left:3px solid var(--accent);padding-left:14px}
+  ol,ul{margin:8px 0 8px;padding-left:20px}
+  ol li,ul li{margin:7px 0;color:#d6deec}
+  .check li{list-style:none;position:relative;padding-left:26px}
+  .check li:before{content:"☐";position:absolute;left:0;color:var(--accent);font-size:16px}
+  .grid{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin:6px 0 4px}
+  .mini{background:var(--panel2);border:1px solid var(--line);border-radius:10px;padding:12px}
+  .mini .k{font-weight:800;font-size:13px}
+  .mini .d{color:var(--muted);font-size:11.5px;margin-top:3px}
+  .dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:6px;vertical-align:middle}
+  .d-crit{background:var(--crit)} .d-high{background:var(--high)} .d-med{background:var(--med)}
+  .fail{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:18px 20px;margin:14px 0}
+  .fail h3{margin:0 0 10px;font-size:17px;display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+  .fail .label{font-size:12px;color:var(--muted);margin:12px 0 2px;text-transform:uppercase;letter-spacing:.08em}
+  .fail .assume{background:#0b1020;border:1px solid var(--line);border-radius:8px;padding:10px 12px;color:#cfe0ff;font-style:italic}
+  .warn{color:#ffd9a6}
+  .precedent{background:rgba(255,93,108,.08);border:1px dashed rgba(255,93,108,.45);border-radius:8px;padding:10px 12px;margin-top:10px;font-size:13.5px}
+  footer{color:var(--muted);font-size:12px;margin-top:46px;border-top:1px solid var(--line);padding-top:14px}
+  @media(max-width:760px){.syn{grid-template-columns:1fr}.grid{grid-template-columns:repeat(2,1fr)}}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>Premortem — Deploying the dstack auth extraction</h1>
+    <div class="sub">It is 3 months from now. We deployed the real KMS-chain verification preimages + the F2 sponsor-then-sign fix to a real owner-gated dstack cluster — and it failed. Working backward to find out why.</div>
+    <div class="meta">8 parallel investigators · target: <code>dstack-auth-extraction</code> (commits 1217c8c / c8635c7 / f316480 / 58fe26f) · 2026-06-03</div>
+  </header>
+
+  <h2 class="section">Synthesis — read this first</h2>
+  <div class="syn">
+    <div class="card">
+      <h3><span class="dot d-high"></span>Most likely failure</h3>
+      <p><b>The cluster never reaches one member.</b> Bring-up dies at first boot on the confirmed <code>isAppAllowed</code> deadlock; and patched past it, the never-validated <code>codeId</code> / preimage / KMS-signer assumptions revert registration next.</p>
+      <p>Every one is near-certain — not because they're bugs, but because they're <i>untested interfaces</i>. Nothing was ever run against a real KMS.</p>
+    </div>
+    <div class="card">
+      <h3><span class="dot d-crit"></span>Most dangerous failure</h3>
+      <p><b>Silent admission of unattested software.</b> Compose-hash enforcement was removed from registration and moved to a gate that is deadlocked and absent from the signed proof.</p>
+      <p>The operator who flips <code>allowAnyDevice</code> to escape the bring-up deadlock removes the last on-chain binding of "approved image" → "member." CI stays green; the attestation guarantee is void.</p>
+    </div>
+    <div class="card full lead">
+      <h3>The hidden assumption — named by nearly every investigator</h3>
+      <p><b>Internal self-consistency was mistaken for external truth.</b> The proof producer (<code>MockKmsChain</code>) and the verifier (<code>DstackSigChain</code>) are built from the same ported source, so "22+33+65 green" proves only that the implementation agrees with <i>itself</i> — not that it conforms to a real dstack KMS, a real <code>app_id</code>, a real bundler, or a real boot gate. <b>No byte ever crossed the trust boundary.</b></p>
+      <div class="precedent">⚠ <b>Not hypothetical.</b> Investigator C found the source project hit this exact error: the dstackgres tree carries a corrective Safe bundle <code>monitor-kms-fix-root-signer.safe.json</code> — they shipped the wrong <code>allowedKmsRoots</code> address (<code>0x7b7d98a9…</code> vs the real <code>0x52d3CF51…</code>), <b>bricked CVM boot</b>, and needed an on-chain fix + a <code>recover_root</code> CLI. AttestMesh inherited the math, not the scar tissue.</p>
+      </div>
+    </div>
+    <div class="card full">
+      <h3>The revised plan</h3>
+      <ol>
+        <li><b>Capture one real proof first — it adjudicates A, B, and C at once.</b> Stand up a single real dstack CVM on testnet; capture its KMS sig-chain material, real <code>app_id</code>, and real KMS root pubkey; check it in as a fixture; add a test that runs <i>that</i> fixture through <code>DstackSigChain.verify</code>. Until it passes, treat the verifier as unverified.</li>
+        <li><b>Fix the <code>isAppAllowed</code> deadlock now, not as a follow-up.</b> Check an owner-seeded <code>allowedAppIds</code> (the operator's flow step 1) or <code>isOurMember(appId)</code> instead of prior registration. Add a positive-path test: gate returns <code>(true,"")</code> for an allowlisted-but-unregistered appId.</li>
+        <li><b>Wire the bundler into <code>run()</code> and land one real sponsored <code>dstack_register</code> on testnet</b> (real Alchemy policy, real <code>ClusterMember</code> dummy-sig, real response parsing). One included UserOp with no AA24 is the only thing that validates F2.</li>
+        <li><b>Add a cross-language ABI conformance test.</b> Emit the sidecar's actual calldata (alloy 0.8), assert the selector <code>== 0x537d491c</code> in Rust, and decode those exact bytes back into the same proof in Solidity.</li>
+        <li><b>Settle the compose-hash trust model explicitly.</b> Either re-add an on-chain compose binding at registration, or document the <i>observed</i> KMS behaviour that makes gate-only enforcement safe — never an unobserved assumption. Decide the <code>allowAnyDevice</code> posture.</li>
+      </ol>
+    </div>
+    <div class="card full">
+      <h3>Pre-launch checklist</h3>
+      <ul class="check">
+        <li>A <b>real captured</b> dstack proof fixture verifies through <code>DstackSigChain.verify</code> in CI (not a synthesized one).</li>
+        <li><code>isAppAllowed</code> returns <code>(true,"")</code> for an allowlisted, not-yet-registered appId — and a real CVM boots past the gate on a cold cluster.</li>
+        <li>One real sponsored <code>dstack_register</code> UserOp is included on testnet (no AA24), with <code>BundlerClient</code> wired into <code>run()</code>.</li>
+        <li>The sidecar-emitted selector is asserted <code>== 0x537d491c</code> in Rust and round-trip-decoded in Solidity.</li>
+        <li>Documented + observed proof that an unapproved compose hash cannot obtain a KMS-issued key for the <code>codeId</code> — or registration re-adds a compose binding. <code>allowAnyDevice</code> posture defined.</li>
+      </ul>
+    </div>
+  </div>
+
+  <h2 class="section">The 8 investigators</h2>
+  <div class="grid">
+    <div class="mini"><div class="k"><span class="dot d-high"></span>A · Preimages</div><div class="d">Ported, not canonical → InvalidSigChain</div></div>
+    <div class="mini"><div class="k"><span class="dot d-high"></span>B · app_id</div><div class="d">≠ member addr → CodeIdMismatch</div></div>
+    <div class="mini"><div class="k"><span class="dot d-high"></span>C · KMS signer</div><div class="d">Wrong root (real precedent)</div></div>
+    <div class="mini"><div class="k"><span class="dot d-crit"></span>D · Boot deadlock</div><div class="d">Gate needs prior registration</div></div>
+    <div class="mini"><div class="k"><span class="dot d-crit"></span>E · Compose regress</div><div class="d">Unapproved image registers</div></div>
+    <div class="mini"><div class="k"><span class="dot d-high"></span>F · F2 unwired</div><div class="d">Bundler is dead code</div></div>
+    <div class="mini"><div class="k"><span class="dot d-med"></span>G · ABI drift</div><div class="d">alloy0.8 ↔ solc ↔ viem</div></div>
+    <div class="mini"><div class="k"><span class="dot d-high"></span>H · False confidence</div><div class="d">"green" ≠ deploy-ready</div></div>
+  </div>
+
+  <div class="fail">
+    <h3><span class="tag t-high">High</span>A — Non-canonical preimages (closed loop relocated, not eliminated)</h3>
+    <p>The three preimages <code>DstackSigChain.verify</code> reconstructs were transcribed from <code>TeeSQL/dstackgres</code>, a Postgres-fused third-party adaptation — not canonical upstream dstack. A real CVM's KMS signed over a different domain/field layout (and the derived key over a different <code>purpose</code> than the placeholder <code>"app-key"</code>), so <code>ECDSA.recover</code> returned an address matching neither the allowlisted root nor the app pubkey. Every node reverted <code>InvalidSigChain</code>; zero members registered. CI was green because <code>MockKmsChain.buildProof</code> builds its preimages with the exact bytes <code>verify</code> checks — it even imports the library's own <code>bytesToHex</code>. The "literal drift guard" pins the implementation to itself.</p>
+    <div class="label">Underlying assumption</div>
+    <div class="assume">A test suite whose proof producer and verifier derive from the same source can validate conformance to an external signing format neither was checked against.</div>
+    <div class="label">Early warning signs</div>
+    <p class="warn">No proof fixture captured from a real KMS exists — every vector is <code>vm.sign</code> over in-repo preimages, and <code>purpose</code> is still <code>"app-key"</code>. The cited source of truth is <code>/tmp/dstackgres</code>.</p>
+  </div>
+
+  <div class="fail">
+    <h3><span class="tag t-high">High</span>B — app_id ≠ member contract address (CodeIdMismatch)</h3>
+    <p>The operator deploys a <code>ClusterMember</code> at <code>0xMEMBER</code> and provisions a CVM "with the member address as its app ID." But dstack <i>assigns</i> <code>app_id</code> at app-registration (a function of the compose hash and the registration tx) — it isn't operator-dictated. The CVM's <code>derive_key</code> returns a <code>codeId</code> that is never <code>bytes20(0xMEMBER)</code>, so <code>dstack_register</code> reverts <code>CodeIdMismatch</code> — every node, every time. The mock hid it by setting <code>proof.codeId = bytes32(bytes20(memberContract))</code> by construction. dstackgres's <code>DstackMember</code> <i>is</i> the AppAuth contract dstack knows — a topology where codeId-equals-contract can hold — but AttestMesh's EIP-4337 <code>ClusterMember</code> is a different contract. No operator knob fixes it; app_id is bound upstream.</p>
+    <div class="label">Underlying assumption</div>
+    <div class="assume">A dstack CVM's <code>app_id</code> is an operator-chosen value settable equal to the ClusterMember address, rather than an identifier dstack derives at app-registration time.</div>
+    <div class="label">Early warning signs</div>
+    <p class="warn">The dstack app-registration step (or first <code>derive_key</code>) returns a <code>codeId</code> ≠ <code>bytes20(memberContract)</code>. A fixture that <i>defines</i> the property under test is the smell that no captured proof exists.</p>
+  </div>
+
+  <div class="fail">
+    <h3><span class="tag t-high">High</span>C — KMS signer never matches the allowlisted root <span style="font-size:12px;color:var(--crit)">· real precedent</span></h3>
+    <p>The operator seeds <code>allowedKmsRoots</code> from the published KMS pubkey; a real CVM boots and <code>dstack_register</code> reverts <code>InvalidSigChain</code> — the recovered signer isn't in the set. <b>This already happened in the source project:</b> <code>monitor-kms-fix-root-signer.safe.json</code> records a wrong root (<code>0x7b7d98a9…</code> vs <code>0x52d3CF51…</code>), bricked boot, and a corrective tx + <code>recover_root</code> CLI. The silent branch is worse: an operator who "fixes" the revert by allowlisting whatever address the first proof recovers anchors trust to an unverified key. If the signer is app-scoped/intermediate or rotates, it becomes a recurring cluster-wide outage with no off-chain recovery (the chain is the sole source of membership).</p>
+    <div class="label">Underlying assumption</div>
+    <div class="assume">The address <code>ecrecover</code> yields from a live KMS signature is a single, static, correctly-derivable value the operator can allowlist in advance.</div>
+    <div class="label">Early warning signs</div>
+    <p class="warn">A real CVM's first registration reverts <code>InvalidSigChain</code> while <code>forge test</code> is green. The runbook has a manual "derive the KMS root from the pubkey" step with no on-chain assertion that derived == recovered.</p>
+  </div>
+
+  <div class="fail">
+    <h3><span class="tag t-crit">Critical</span>D — isAppAllowed boot deadlock bricks bring-up</h3>
+    <p>The KMS queries <code>isAppAllowed</code> at boot; compose and device pass, then <code>memberIdOf[appId] == 0</code> → <code>(false, "appId not a cluster member")</code>. The KMS withholds the derived key; <code>derive_all</code> blocks, never builds a proof, never registers — so the next boot fails identically. The cluster never reaches one member. CI was green because the suite encodes the deadlock as expected: <code>dstack_register</code> is called directly (bypassing the gate), and the gate tests use a phantom <code>appId</code> (<code>0xBEEF</code>) that only exercises the compose branch (checked first). <code>test_removeComposeHashBlocksBootGate</code> asserts only that the reason is <i>not</i> "compose hash not allowed" — it never asserts the gate returns <code>true</code>, because with an unregistered appId it never can.</p>
+    <div class="label">Underlying assumption</div>
+    <div class="assume"><code>isAppAllowed</code>'s green tests meant the gate worked — but they only ever asserted rejection, never the cold-start accept path a real first node must traverse.</div>
+    <div class="label">Early warning signs</div>
+    <p class="warn">No test asserts <code>isAppAllowed(...) == (true,"")</code> for a not-yet-registered appId. The first real CVM's KMS log shows <code>isAppAllowed → false: "appId not a cluster member"</code> while <code>memberIdOf[appId]</code> reads zero — visible before any tx.</p>
+  </div>
+
+  <div class="fail">
+    <h3><span class="tag t-crit">Critical</span>E — Compose-hash enforcement regression (silent security failure)</h3>
+    <p><code>DstackProof</code> carries no <code>composeHash</code>/<code>deviceId</code>/<code>tcbStatus</code> field — registration is <i>structurally</i> incapable of constraining which image ran. <code>verify</code> checks only that an allowlisted root signed <code>"dstack-kms-issued:" ‖ codeId ‖ appPubkey</code>, that the app key authorised a derived key, and that the derived key signed the binding. A KMS root issues keys under a <code>codeId</code>; it does not, in the signed material, attest the compose hash. An attacker (or an operator running a patched build, or one who flipped <code>allowAnyDevice</code> to escape the deadlock) boots a tampered image under the same <code>codeId</code>, gets a normally KMS-issued derived key, registers — joins, pulls the CSK, receives plaintext peer traffic. The gate meant to bind compose-to-boot is a separate, deadlocked view never invoked at registration.</p>
+    <div class="label">Underlying assumption</div>
+    <div class="assume">An allowlisted KMS root having issued a key under a <code>codeId</code> cryptographically implies the approved compose hash booted — when the signed chain binds neither.</div>
+    <div class="label">Early warning signs</div>
+    <p class="warn">A live member's running image hash matches no <code>allowedComposeHashes</code> entry, yet its <code>memberId</code> is live. <code>isAppAllowed</code> observed false at real boot while registrations still succeed.</p>
+  </div>
+
+  <div class="fail">
+    <h3><span class="tag t-high">High</span>F — F2 fix unwired + untested against a live bundler</h3>
+    <p>F2 shipped green — but only against a hand-written <code>sample_sponsorship()</code> JSON the author also wrote. <b><code>BundlerClient::new</code> is invoked nowhere in the tree</b>, and its only consumer (<code>AgentService::new</code>) is itself never called. <code>state::run()</code> derives keys, discovers the cluster, sets <code>Phase::Registering</code>, then serves health and returns — <code>build_register_calldata</code> is dead. A real zero-ETH node sat in "registering" forever. Hand-wired to debug, the live Alchemy path broke as suspected: modelled on dstackgres's LightAccount v2, but AttestMesh's <code>ClusterMember</code> has a different <code>validateUserOp</code>; the hardcoded dummy sig mismatched verification gas, response field names didn't match the exact-key parser (which <code>bail!</code>s on any missing key), and <code>GAS_POLICY_ID</code> empty-by-default sent <code>policyId: ""</code>.</p>
+    <div class="label">Underlying assumption</div>
+    <div class="assume">A unit test passing on self-authored fixture JSON proves an integration works, and code that compiles is code that runs in the bring-up path.</div>
+    <div class="label">Early warning signs</div>
+    <p class="warn">A node logs <code>phase=registering</code> indefinitely with no <code>eth_sendUserOperation</code> leaving the box. <code>BundlerClient::new</code> / <code>build_register_calldata</code> have zero call sites reachable from <code>run()</code>.</p>
+  </div>
+
+  <div class="fail">
+    <h3><span class="tag t-med">Medium</span>G — Cross-language ABI / selector drift</h3>
+    <p>Three independent <code>DstackProof</code> ABIs shipped green: the webhook hard-codes <code>0x537d491c</code> (viem), the contract's selector came from solc, the sidecar's from alloy 0.8's <code>sol!</code> — none compared byte-for-byte. The sidecar's only relevant test asserts <code>bind_hash</code> (a keccak over static params), nothing about the selector or proof calldata. The trap sprang at first real registration because the encoders are unwired, so no encode→decode ever ran. With five dynamic <code>bytes</code> + a trailing <code>string</code>, an off-by-32 head offset or differing field order yields a 4-byte prefix the webhook never allowlisted (sponsorship silently denied) — or, selector matching but tail differing, the facet decodes garbage and reverts inside <code>verify</code> after the node paid gas.</p>
+    <div class="label">Underlying assumption</div>
+    <div class="assume">Three per-language suites each passing in isolation proves the three ABIs agree — when no test compares one component's actual bytes/selector against another's.</div>
+    <div class="label">Early warning signs</div>
+    <p class="warn"><code>0x537d491c</code> appears only in webhook code; grep returns zero hits in <code>sidecar/</code> and <code>contracts/</code>. The encoders have no caller reachable from <code>run()</code>.</p>
+  </div>
+
+  <div class="fail">
+    <h3><span class="tag t-high">High</span>H — "IMPLEMENTED + green" mistaken for deploy-ready</h3>
+    <p>The status line — "IMPLEMENTED, 22+33+65 tests green, fmt/clippy clean" — is what traveled to standup, the demo, the partner deck. Nobody re-read the Open Questions three scrolls down, where the spec itself confessed no captured proof, no confirmed <code>purpose</code>, and no working boot gate existed. The deferred items lived in prose; the checkmarks lived in the status line, and stakeholders read the status line. First boot bricked on the deadlock; patching it open then surfaced the never-captured-proof and placeholder-<code>purpose</code> risks. These were never code bugs found late — they were the actual gating work, mislabeled as follow-ups.</p>
+    <div class="label">Underlying assumption</div>
+    <div class="assume">"All tests pass" measures real-world readiness — when the tests only verified the system against a mock the team authored, and the spec had already named the three unknowns it couldn't cover.</div>
+    <div class="label">Early warning signs</div>
+    <p class="warn">The "IMPLEMENTED" status and the Open Questions contradict each other in the same document, and no issue/gate/checklist tracks the deferrals. Zero CI artifacts reference a real KMS, a testnet CVM, or a live Alchemy call.</p>
+  </div>
+
+  <footer>
+    Premortem generated 2026-06-03 (ts 1780517097) · 8 parallel investigators (Gary Klein prospective-hindsight method) · target: the <code>dstack-auth-extraction</code> deployment. Transcript: <code>premortem-transcript-1780517097.md</code>.
+  </footer>
+</div>
+</body>
+</html>

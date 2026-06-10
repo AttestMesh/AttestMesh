@@ -1,0 +1,4 @@
+{ "clusterOwner": "0x60b174704AdAf2b0BF87B426B364D6EbD81818E1", "kmsRootSigner": "0x52d3cf51c8a37a2ccfc79bbb98c7810d7dd4ce51",
+  "initialComposeHashes": ["0x206a322e7ad0cfec0a2080822a4dfef10c4240a33e1dc553dd9e76b606b8ed0f"], "initialDeviceIds": [],
+  "allowAnyDevice": true, "requireTcbUpToDate": false,
+  "meshCidrIp": 168624128, "meshCidrPrefix": 16, "salt": "0xddb1e4fd5d6737ce564803e9dc5edc17f24fc480c38ccfbcfd4362a2d50b9395" }

@@ -1,9 +1,9 @@
 # AttestMesh Gas Sponsorship Webhook — Component Spec
 
-**Status**: Draft v0.1
+**Status**: Implemented v1 — **live on Base mainnet (8453)** at `gas-webhook.teesql.com`; see [`docs/deployment.md`](../deployment.md)
 **Parent spec**: [`attestmesh-coordination-layer.md`](./attestmesh-coordination-layer.md) (especially §13 item 18)
 **Component**: `services/gas-sponsorship-webhook/`
-**Last updated**: 2026-05-30
+**Last updated**: 2026-06-10
 
 ---
 
@@ -60,7 +60,7 @@ services/gas-sponsorship-webhook/
 
 | Key | Required | Source | Meaning |
 |---|---|---|---|
-| `EXPECTED_CHAIN_ID` | yes | env (plaintext) | `84532` for v1 Sepolia; `8453` for milestone B mainnet |
+| `EXPECTED_CHAIN_ID` | yes | env (plaintext) | `8453` (Base mainnet — the live deployment) |
 | `CANONICAL_CLUSTER_FACTORY` | yes | env (plaintext) | hex address of the `ClusterDiamondFactory` deployed by `DeployInfra.s.sol` |
 | `CANONICAL_MEMBER_FACTORY` | yes | env (plaintext) | hex address of the `ClusterMemberFactory` deployed by `DeployInfra.s.sol` |
 | `RPC_URL` | yes | env (secret) | Alchemy or other EVM RPC for the `eth_call` lookups |
@@ -160,7 +160,8 @@ The inner-selector allowlist is the *exact set* of cluster operations the operat
 ```typescript
 export const ALLOWED_SELECTORS = [
   // Member-driven operations:
-  selectorOf("dstack_register(DstackProof,address,bytes32,bytes32)"),
+  // NB: the selector is over the EXPANDED DstackProof tuple, not the struct name → 0x537d491c
+  selectorOf("dstack_register((bytes32,bytes32,bytes,bytes,bytes,bytes,bytes,string),address,bytes32,bytes32)"),
   selectorOf("publishWgKey(bytes32)"),
   selectorOf("send(bytes32,bytes32,bytes)"),
   selectorOf("setCskCommitment(bytes32)"),         // originator publishes keccak256(CSK) once (master §8.1)
@@ -213,7 +214,7 @@ Negative answers (`false`) are cached with a shorter TTL (10 min) so a new clust
 
 - Unit: every policy rule with fixture UserOps that trigger each failure path.
 - Unit: `decode.ts` round-trip against ABI fixtures.
-- Integration: a local `wrangler dev` server fed real UserOps captured from a Sepolia run; assert approve/deny.
+- Integration: a local `wrangler dev` server fed real UserOps captured from a Base mainnet run; assert approve/deny.
 - No on-chain tests in this component; the on-chain side is exercised by `contracts/test/integration`.
 
 ---

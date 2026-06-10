@@ -1,0 +1,137 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Premortem — the EXTRACTION/PORT (dstack-auth-extraction)</title>
+<style>
+  :root{--bg:#0a0e1a;--panel:#121829;--panel2:#0e1422;--ink:#e8ecf6;--muted:#97a2c0;--line:#222c44;--accent:#7aa2ff;--danger:#ff5d6c;--warn:#ffb454;--ok:#54d6a0}
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif}
+  .wrap{max-width:1080px;margin:0 auto;padding:40px 22px 80px}
+  h1{font-size:26px;margin:0 0 6px;letter-spacing:-.3px}
+  .sub{color:var(--muted);margin:0 0 4px}
+  .kill{display:block;margin:16px 0 4px;padding:12px 16px;border-radius:12px;background:rgba(255,93,108,.13);color:#ffb9c0;border:1px solid rgba(255,93,108,.45);font-weight:600;font-size:14px}
+  .conv{display:block;margin:10px 0 4px;padding:14px 18px;border-radius:12px;background:rgba(84,214,160,.1);color:#bdf0db;border:1px solid rgba(84,214,160,.4);font-size:14px}
+  h2{font-size:13px;text-transform:uppercase;letter-spacing:1.4px;color:var(--muted);margin:34px 0 14px;border-bottom:1px solid var(--line);padding-bottom:8px}
+  .syn{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:20px 22px;margin:12px 0}
+  .syn h3{margin:0 0 6px;font-size:16px}
+  .tag{font-size:11px;text-transform:uppercase;letter-spacing:1px;font-weight:700}
+  .t-likely{color:var(--warn)}.t-danger{color:var(--danger)}.t-hidden{color:var(--accent)}.t-fix{color:var(--ok)}
+  ol,ul{margin:8px 0 0;padding-left:20px}li{margin:6px 0}
+  code{background:var(--panel2);border:1px solid var(--line);border-radius:5px;padding:1px 5px;font-size:12px;color:#cdd7f5}
+  .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(330px,1fr));gap:16px;margin-top:14px}
+  .card{background:var(--panel);border:1px solid var(--line);border-left-width:4px;border-radius:12px;padding:16px 17px;display:flex;flex-direction:column}
+  .card .hd{display:flex;justify-content:space-between;align-items:flex-start;gap:8px;margin-bottom:8px}
+  .card h4{margin:0;font-size:14.5px;line-height:1.35}
+  .sev{flex:none;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.6px;padding:3px 7px;border-radius:6px;white-space:nowrap}
+  .sev.cert{background:rgba(255,93,108,.15);color:var(--danger);border:1px solid rgba(255,93,108,.35)}
+  .sev.high{background:rgba(255,180,84,.13);color:var(--warn);border:1px solid rgba(255,180,84,.32)}
+  .lbl{font-size:10.5px;text-transform:uppercase;letter-spacing:.8px;color:var(--muted);margin:11px 0 3px;font-weight:700}
+  .story{color:#d4dbf0;font-size:13.5px}.assume{color:#f0d9b0;font-size:13px;font-style:italic}.warn{color:#bfe9d6;font-size:13px}
+  footer{margin-top:46px;color:var(--muted);font-size:12px;border-top:1px solid var(--line);padding-top:16px}
+  .scope{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:12px;margin-top:6px}
+  .scope div{background:var(--panel2);border:1px solid var(--line);border-radius:10px;padding:12px 14px}
+  .scope .k{font-size:10.5px;text-transform:uppercase;letter-spacing:.8px;color:var(--muted)}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Premortem — the EXTRACTION / PORT (<code>dstack-auth-extraction</code>)</h1>
+  <p class="sub">We ported dstackgres as specced. Frame: months from now, it failed — not the design (it's proven), but the <em>port</em>.</p>
+  <div class="kill">Third fix attempt, third strong negative — verified in code with hard numbers: dstackgres's data-sidecar is <b>35,323 lines / 46 modules, 12× v1's sidecar</b>; the CSK struct's wire fields are <code>pg_replication_password</code>/<code>control_plane_key_hex</code>; the two diamonds' pinned slot assertions detonate on contact; alloy <b>0.8 vs 1</b> is a major-version wall; and the mock hides the wrong verification preimages.</div>
+  <div class="conv"><b>But this one converges the whole thread.</b> Across all three fix premortems, the surviving answer is the same: keep v1's working scaffolding and <b>surgically extract only the verification primitive</b> (the ~200-line <code>DstackSigChain</code> + real preimages) — don't port the 35k-line system, and don't reinvent. See "the convergent fix" below.</div>
+
+  <div class="scope">
+    <div><div class="k">What</div>Port dstackgres's auth code (teesql-group-auth + sqlx-ra-tls + data-sidecar + gas-payment) into AttestMesh, rebranded, dropping Postgres/control-plane/leader.</div>
+    <div><div class="k">Who</div>The team doing the port; everyone downstream of a working dstack integration.</div>
+    <div><div class="k">Success</div>A clean, finished port that passes against a real dstack proof and brings up a mesh.</div>
+    <div><div class="k">Method</div>6 parallel investigators grounded in the spec + AttestMesh code + the dstackgres source. 2026-06-03.</div>
+  </div>
+
+  <h2>Synthesis — read this first</h2>
+
+  <div class="syn">
+    <span class="tag t-likely">Most likely / most immediate</span>
+    <h3>E6 + E2 — the wholesale port can't even build.</h3>
+    <p>dstackgres's data-sidecar is <b>35,323 lines / 46 modules (12×</b> v1's 2,777); contracts 3,885 vs 1,556. The two diamonds are mutually exclusive: <code>attestmesh.storage.Member</code> (rich record, <code>memberId=keccak256(abi.encode(cluster,member,attestorId))</code>, EIP-4337 <code>ClusterMember</code>) vs <code>teesql.storage.Member</code> (just <code>address cluster</code>, <code>memberId=keccak256(derivedPubkey)</code>, a UUPS-forwarder <code>DstackMember</code>). <code>Namespaces.t.sol</code>'s slot assertions detonate; the two memberId formulas orphan every "surviving" lookup; first <code>cargo build</code> fails on alloy 0.8-vs-1 + missing workspace crates. Six weeks → a chimera that doesn't run, v1's tests now red.</p>
+  </div>
+
+  <div class="syn">
+    <span class="tag t-danger">Most dangerous</span>
+    <h3>E3 — the rebrand silently breaks (or weakens) verification, and the mock hides it.</h3>
+    <p>v1's facet already recovers over the <em>wrong</em> preimage (<code>abi.encode("dstack.app",…)</code>) vs dstack's real <code>abi.encodePacked("dstack-kms-issued:", bytes20(codeId), appCompressedPubkey)</code>, and <code>MockKmsChain</code> was built to match the wrong facet — a closed loop where any preimage round-trips. A port that fixes the facet but not the mock passes CI and rejects every real proof; a <code>Proof</code> field-reorder maps bytes into <code>kmsSignature</code>/<code>appCompressedPubkey</code> and can recover <em>attacker-chosen</em> addresses while the mock still passes. <code>"dstack-kms-issued:"</code> has zero test coverage.</p>
+  </div>
+
+  <div class="syn">
+    <span class="tag t-hidden">The hidden assumption</span>
+    <h3>That dstackgres's auth is a separable, finished module you copy-and-rebrand.</h3>
+    <p>It's a tightly-coupled subset of a system several times AttestMesh's size, fused to Postgres (the CSK <code>ClusterSecrets</code> carries <code>pg_replication_password</code>; <code>cold_start_election</code> takes <code>&PgManager</code> + reads WAL LSNs), on a different diamond, memberId algebra, member ABI, mesh/IP scheme (<code>10.42.0.0/24</code> octet table vs <code>10.13.0.0/16</code> keccak), and toolchain (alloy 1).</p>
+  </div>
+
+  <div class="syn">
+    <span class="tag t-fix">The convergent fix (all three premortems)</span>
+    <h3>Surgical extraction — not wholesale port, not reinvention.</h3>
+    <ol>
+      <li><b>Port ONLY the verification primitive:</b> <code>DstackSigChain</code> (real <code>"dstack-kms-issued:"</code> preimages + <code>recover</code>/<code>compressedToAddress</code>) — the ~200-line crown jewel v1 got wrong and dstackgres got right, self-contained. Replace v1's invented one + the <code>dstack_register</code> preimages.</li>
+      <li><b>Fix the mock + add a real fixture:</b> rewrite <code>MockKmsChain</code> to produce real-format proofs; check in a captured real dstack proof; test the literal <code>"dstack-kms-issued:"</code>. Kills E3's closed loop.</li>
+      <li><b>Fix F2 in v1's own <code>bundler.rs</code></b> (sponsor-then-sign), using dstackgres's <code>gas_payment/alchemy.rs</code> as a <em>read-only reference</em> — don't port across alloy 0.8→1 (avoids E4).</li>
+      <li><b>Fix v1's remaining gaps AttestMesh-native</b> (CSK→LUKS data disk; originator selection; encrypted-endpoint rendezvous over <code>MessageFacet</code>), <em>informed by</em> dstackgres but not importing its 35k-line modules (avoids E1/E5/E6).</li>
+      <li><b>Do NOT graft two diamonds or port the data-sidecar wholesale</b> (avoids E2/E6's chimera). Keep v1's diamond/<code>MessageFacet</code>/heartbeat/mesh-IP — they pass tests.</li>
+      <li><b>Narrow the spec</b> from "port 8 facets + a crate + 15 modules" to "extract the verification primitive + reference the rest."</li>
+    </ol>
+  </div>
+
+  <h2>The six failure modes</h2>
+  <div class="grid">
+
+    <div class="card" style="border-left-color:#ff5d6c">
+      <div class="hd"><h4>E1 · The extraction boundary isn't clean</h4><span class="sev high">High</span></div>
+      <div class="story">The CSK (<code>ClusterSecrets</code>) <em>is</em> the Postgres envelope (<code>pg_replication_password</code>, <code>backup_encryption_key_hex</code>, <code>control_plane_key_hex</code>); <code>group_auth</code>/<code>onboarding</code> re-export it. <code>cold_start_election</code> takes <code>&PgManager</code>, reads WAL LSNs, calls <code>leader_lease()</code> — "election" = "elect the PG primary + claim the lease." On-chain <code>CoreFacet</code> shares <code>CoreStorage</code> across register/onboard/<code>claimLeader</code>. Drop the Postgres parts and the auth code stops working.</div>
+      <div class="lbl">Underlying assumption</div><div class="assume">"auth/CSK/election" and "Postgres/leader/control-plane" are separable — they're the same code through shared structs.</div>
+      <div class="lbl">Early warning signs</div><div class="warn">First port forces a yes/no on <code>pg_replication_password</code> in the CSK wire format; <code>cargo build</code> demands <code>PgManager</code>/<code>wal_bearer_writer</code>/<code>boot_restore</code>.</div>
+    </div>
+
+    <div class="card" style="border-left-color:#ff7a45">
+      <div class="hd"><h4>E2 · Two incompatible diamonds collide</h4><span class="sev cert">Certain</span></div>
+      <div class="story">Disjoint ERC-7201 regimes: <code>attestmesh.storage.Member</code> (full record) vs <code>teesql.storage.Member</code> (just <code>address cluster</code>); two memberId formulas; an EIP-4337 <code>ClusterMember</code> vs a UUPS-forwarder <code>DstackMember</code> with no 4337. "Keep base, replace core" assumed they compose — a diamond's real interface is its storage map + memberId algebra + member ABI, and on all three they're mutually exclusive.</div>
+      <div class="lbl">Underlying assumption</div><div class="assume">A shared SolidStateDiamond base means two diamonds are compositionally compatible.</div>
+      <div class="lbl">Early warning signs</div><div class="warn"><code>Namespaces.t.sol</code> slot assertions fail when a rebranded <code>teesql.storage.Member</code> lands; a ported member looked up by surviving code returns the zero record.</div>
+    </div>
+
+    <div class="card" style="border-left-color:#e85d9c">
+      <div class="hd"><h4>E3 · Rebrand silently breaks/weakens verification</h4><span class="sev cert">Certain</span></div>
+      <div class="story">v1 recovers over <code>abi.encode("dstack.app",…)</code>; dstack's real preimage is <code>abi.encodePacked("dstack-kms-issued:", bytes20(codeId), appCompressedPubkey)</code>. <code>MockKmsChain</code> mirrors the wrong facet → closed loop, any preimage round-trips. Fix the facet but not the mock → green CI, rejects every real proof. Reorder the <code>Proof</code> struct → recover attacker-chosen addresses while the mock passes. <code>"dstack-kms-issued:"</code> has zero coverage.</div>
+      <div class="lbl">Underlying assumption</div><div class="assume">A green suite proves the verifier correct — it only proves it agrees with a mock built to mirror the wrong code.</div>
+      <div class="lbl">Early warning signs</div><div class="warn">The "port DstackSigChain" PR leaves the mock/tests untouched; no test references <code>"dstack-kms-issued:"</code>; <code>abi.encode(</code>/<code>"dstack.app"</code> still in the post-port verifier.</div>
+    </div>
+
+    <div class="card" style="border-left-color:#ffb454">
+      <div class="hd"><h4>E4 · "Proven" hides version skew + TODOs + dead upstream</h4><span class="sev high">High</span></div>
+      <div class="story">alloy <b>0.8 vs 1</b> — a major signer/provider break; the ported <code>gas_payment</code>/<code>dstack.rs</code> won't compile or silently shift the userOpHash (reopening F2). Inherited <code>TODO(future-kms-dispatch)</code> hardcodes a single KMS adapter — fine in dstackgres, but it contradicts AttestMesh's pluggable-attestor "agnostic core" directive. TeeSQL's product is on hold → a frozen upstream, bugs and all.</div>
+      <div class="lbl">Underlying assumption</div><div class="assume">"Proven in dstackgres" = "correct in isolation" — it meant "correct given its versions, context, and tolerated TODOs."</div>
+      <div class="lbl">Early warning signs</div><div class="warn">First build fails on alloy 0.8-vs-1 trait mismatches; <code>grep "TODO(future-kms-dispatch)"</code> returns dstackgres markers verbatim in the ported tree.</div>
+    </div>
+
+    <div class="card" style="border-left-color:#7aa2ff">
+      <div class="hd"><h4>E5 · Kept AttestMesh glue doesn't fit the ported mesh</h4><span class="sev high">High</span></div>
+      <div class="story">Two endpoint protocols, two wg-pubkey publishers (<code>NetworkFacet.publishWgKey</code> self-asserted vs <code>WgMeshFacet.setMemberWgPubkeyAttested</code> quote-derived) that disagree → handshake never completes. Two subnets (<code>10.13/16</code> keccak vs <code>10.42/24</code> octet table) → heartbeats land nowhere. Two liveness models (first-convergence vs <code>fence_watchdog</code>/<code>degraded_mode</code> assuming a leader v1 dropped) → neither reaches healthy.</div>
+      <div class="lbl">Underlying assumption</div><div class="assume">Endpoint exchange, wg-pubkey publication, and liveness are mix-and-match — they're one coupled contract.</div>
+      <div class="lbl">Early warning signs</div><div class="warn">Two CIDRs live in one tree; two wg-pubkey writers compile side by side and <code>PeerEndpoint.wg_pub</code> matches neither's on-chain value.</div>
+    </div>
+
+    <div class="card" style="border-left-color:#9a7aff">
+      <div class="hd"><h4>E6 · "Extraction" undersells a re-architecture that stalls</h4><span class="sev cert">Certain</span></div>
+      <div class="story">35,323 lines / 46 modules — 12× v1; "drop Postgres" = surgery on every file (<code>group_auth</code> 170 refs, <code>onboarding</code> 216, <code>cold_start_election</code> 89). The sidecar won't build (missing <code>teesql-common</code>); the diamonds never reconcile; alloy unhandled; two mesh models unwired. Six weeks → a chimera that doesn't run, v1's tests red, sunk cost keeping it limping.</div>
+      <div class="lbl">Underlying assumption</div><div class="assume">dstackgres's auth is a separable finished module you copy and rename.</div>
+      <div class="lbl">Early warning signs</div><div class="warn">First <code>cargo build</code> after copying a module fails on missing workspace crates + the alloy mismatch; the tree accumulates half-rebranded <code>teesql_*</code> beside <code>attestmesh_*</code>.</div>
+    </div>
+
+  </div>
+
+  <footer>
+    Premortem of the extraction/port · 2026-06-03 · target: <b>docs/specs/dstack-auth-extraction.md</b> · grounded in the AttestMesh code + the dstackgres source · companion transcript: <code>premortem-transcript-1780498753.md</code>
+  </footer>
+</div>
+</body>
+</html>
