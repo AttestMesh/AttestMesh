@@ -22,6 +22,7 @@ pub mod proto {
 }
 
 pub mod agent_grpc;
+pub mod bringup;
 pub mod chain;
 pub mod config;
 pub mod csk;
@@ -33,6 +34,7 @@ pub mod indexer_client;
 pub mod keys;
 pub mod peer_grpc;
 pub mod state;
+pub mod transport;
 pub mod wg;
 
 /// Binary entrypoint: load config, init logging, run the bring-up state machine.

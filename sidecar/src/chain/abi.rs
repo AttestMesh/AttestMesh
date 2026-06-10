@@ -17,6 +17,7 @@ sol! {
             uint64 registeredAt;
         }
         function memberOf(address account) external view returns (MemberRecord memory);
+        function memberById(bytes32 memberId) external view returns (MemberRecord memory);
         function memberIdOf(address account) external view returns (bytes32);
         function memberCount() external view returns (uint256);
         function cskCommitment() external view returns (bytes32);
@@ -28,6 +29,18 @@ sol! {
     #[sol(rpc)]
     interface IClusterMemberView {
         function cluster() external view returns (address);
+    }
+
+    // MessageFacet event, decoded from `eth_getLogs` during mesh bring-up.
+    #[sol(rpc)]
+    #[derive(Debug)]
+    interface IMessageEvents {
+        event MessageSent(
+            bytes32 indexed senderMemberId,
+            bytes32 indexed recipientMemberId,
+            bytes32 indexed envelopeId,
+            bytes ciphertext
+        );
     }
 
     #[sol(rpc)]

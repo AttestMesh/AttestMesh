@@ -178,6 +178,14 @@ pub async fn build_proof(
     ))
 }
 
+/// Re-derive the registration signer (the ClusterMember `owner` installed by
+/// `dstack_register`) for post-registration UserOps. Same `/GetKey` path+purpose
+/// as `build_proof_from_runtime`, so it is bit-identical across calls.
+pub async fn derive_owner_signer(dstack: &dyn DstackRuntime) -> Result<PrivateKeySigner> {
+    let dk = dstack.get_key(KEY_PATH, KEY_PURPOSE).await?;
+    PrivateKeySigner::from_slice(&dk.key).context("derived owner key from dstack")
+}
+
 /// End-to-end: pull the KMS chain from the dstack runtime (`/Info` + `/GetKey`) and
 /// assemble the full registration proof the sidecar submits. Returns the proof and the
 /// derived signer (which becomes the ClusterMember's EIP-4337 owner). The proof satisfies

@@ -200,7 +200,14 @@ pub async fn run(config: Config) -> Result<()> {
     tracing::info!(%cluster, "discovered cluster diamond");
 
     // Default CIDR for v1; a production build reads AttestFacet.meshCidr().
-    let shared = Shared::new(keys.clone(), member, cluster, 0x0a0d0000, 16, 51820);
+    let shared = Shared::new(
+        keys.clone(),
+        member,
+        cluster,
+        0x0a0d0000,
+        16,
+        config.wg_listen_port,
+    );
 
     let wg_ctl: Arc<dyn MeshControl> = Arc::new(wg::CommandWg);
     wg_ctl
@@ -222,15 +229,18 @@ pub async fn run(config: Config) -> Result<()> {
     // can transiently reject. Indexer subscription, peer exchange, heartbeats, CSK, and wg
     // config are the subsequent bring-up steps.
     let mut reg_attempt = 0u32;
+    let mut registered = false;
     loop {
         reg_attempt += 1;
         match register_on_chain(&config, dstack.as_ref(), &chain, member, cluster, &keys).await {
             Ok(tx) if tx == B256::ZERO => {
                 tracing::info!("already registered on-chain; skipping");
+                registered = true;
                 break;
             }
             Ok(tx) => {
                 tracing::info!(tx = %tx, "✔ dstack_register landed on-chain");
+                registered = true;
                 break;
             }
             Err(e) if reg_attempt < REGISTRATION_MAX_ATTEMPTS => {
@@ -244,6 +254,19 @@ pub async fn run(config: Config) -> Result<()> {
                 break;
             }
         }
+    }
+
+    // Mesh bring-up (milestone B): peers from chain, wg over the gateway TCP leg,
+    // envelope exchange, heartbeats, CSK, gRPC servers. Spawns tasks and returns.
+    if registered {
+        crate::bringup::launch(
+            config.clone(),
+            dstack.clone(),
+            Arc::new(chain),
+            shared.clone(),
+            wg_ctl.clone(),
+        )
+        .await?;
     }
 
     crate::health::serve(shared.clone(), config.health_http_addr.clone()).await?;

@@ -59,6 +59,39 @@ impl PeerTable {
         e.endpoint = Some(endpoint);
     }
 
+    /// Insert/refresh a peer from chain enumeration alone (no Ed25519/endpoint yet —
+    /// those arrive via the PeerEndpoint envelope; existing values are preserved).
+    pub fn ensure_chain(&mut self, member_id: MemberId, mesh_ip: u32, wg_pub: [u8; 32]) {
+        let e = self.peers.entry(member_id).or_insert_with(|| PeerInfo {
+            member_id,
+            mesh_ip,
+            wg_pub,
+            ed25519_pub: None,
+            endpoint: None,
+            configured: false,
+            live: false,
+        });
+        e.mesh_ip = mesh_ip;
+        e.wg_pub = wg_pub;
+    }
+
+    /// Record a peer's Ed25519 heartbeat key. Returns true if it was newly set/changed.
+    pub fn set_ed25519(&mut self, member_id: &MemberId, ed: [u8; 32]) -> bool {
+        match self.peers.get_mut(member_id) {
+            Some(p) if p.ed25519_pub != Some(ed) => {
+                p.ed25519_pub = Some(ed);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    pub fn set_endpoint(&mut self, member_id: &MemberId, endpoint: String) {
+        if let Some(p) = self.peers.get_mut(member_id) {
+            p.endpoint = Some(endpoint);
+        }
+    }
+
     pub fn mark_configured(&mut self, member_id: &MemberId) {
         if let Some(p) = self.peers.get_mut(member_id) {
             p.configured = true;

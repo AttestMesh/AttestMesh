@@ -17,6 +17,15 @@ pub struct Config {
     /// Alchemy Gas Manager policy id for sponsored UserOps (sidecar spec §8.2).
     pub gas_policy_id: String,
     pub indexer_registry_addr: Address,
+    /// dstack gateway base domain (e.g. `dstack-base-prod5.phala.network`). Peer
+    /// ingress hostnames are `<app_id>-<port>s.<domain>`. Unset → mesh bring-up
+    /// is skipped (registration-only mode).
+    pub gateway_domain: Option<String>,
+    /// TCP port of the wg-over-TCP ingress (exposed through the gateway).
+    pub wg_tcp_port: u16,
+    /// Wireguard outer listen port. Distinct from the in-mesh heartbeat port
+    /// (51820): kernel wg owns its UDP socket, so they must not collide.
+    pub wg_listen_port: u16,
     pub dstack_socket: String,
     pub agent_grpc_socket: String,
     pub health_http_addr: String,
@@ -46,6 +55,14 @@ impl Config {
             indexer_registry_addr: req("INDEXER_REGISTRY_ADDR")?
                 .parse()
                 .context("INDEXER_REGISTRY_ADDR")?,
+            gateway_domain: match std::env::var("GATEWAY_DOMAIN") {
+                Ok(s) if !s.trim().is_empty() => Some(s.trim().to_string()),
+                _ => None,
+            },
+            wg_tcp_port: opt("WG_TCP_PORT", "51900").parse().context("WG_TCP_PORT")?,
+            wg_listen_port: opt("WG_LISTEN_PORT", "51821")
+                .parse()
+                .context("WG_LISTEN_PORT")?,
             dstack_socket: opt("DSTACK_SOCKET", "/var/run/dstack.sock"),
             agent_grpc_socket: opt("AGENT_GRPC_SOCKET", "/var/run/attestmesh/agent.sock"),
             health_http_addr: opt("HEALTH_HTTP_ADDR", "127.0.0.1:9090"),

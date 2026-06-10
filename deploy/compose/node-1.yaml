@@ -14,6 +14,9 @@ services:
       - BUNDLER_URL=${BUNDLER_URL}
       - GAS_POLICY_ID=${GAS_POLICY_ID}
       - INDEXER_REGISTRY_ADDR=${INDEXER_REGISTRY_ADDR}
+      # Mesh bring-up: peers' wg-over-TCP ingresses are reached via the dstack
+      # gateway (`<app_id>-51900s.<GATEWAY_DOMAIN>`); ours is exposed below.
+      - GATEWAY_DOMAIN=${GATEWAY_DOMAIN}
       - DSTACK_SOCKET=/var/run/dstack.sock
       - HEALTH_HTTP_ADDR=0.0.0.0:9090
       - LOG_FORMAT=pretty
@@ -22,6 +25,7 @@ services:
       - /var/run/dstack.sock:/var/run/dstack.sock
     ports:
       - "9090:9090"
+      - "51900:51900"
     cap_add:
       - NET_ADMIN
     devices:

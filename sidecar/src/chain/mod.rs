@@ -116,6 +116,34 @@ impl ChainClient {
             ._0)
     }
 
+    /// `AttestFacet.memberById(memberId)` — peer enumeration during mesh bring-up.
+    pub async fn member_by_id(&self, cluster: Address, member_id: B256) -> Result<MemberRecord> {
+        let a = abi::IAttest::new(cluster, &self.provider);
+        let r = a
+            .memberById(member_id)
+            .call()
+            .await
+            .context("read memberById")?
+            ._0;
+        Ok(MemberRecord {
+            attestor_id: r.attestorId,
+            member_contract: r.memberContract,
+            x_pubkey: r.xPubKey,
+            wg_pubkey: r.wgPubKey,
+            registered_at: r.registeredAt,
+        })
+    }
+
+    /// `AttestFacet.meshIpOf(memberId)` — the peer's derived mesh /32.
+    pub async fn mesh_ip_of(&self, cluster: Address, member_id: B256) -> Result<u32> {
+        let a = abi::IAttest::new(cluster, &self.provider);
+        Ok(a.meshIpOf(member_id)
+            .call()
+            .await
+            .context("read meshIpOf")?
+            ._0)
+    }
+
     pub async fn member_id_of(&self, cluster: Address, who: Address) -> Result<B256> {
         let a = abi::IAttest::new(cluster, &self.provider);
         Ok(a.memberIdOf(who)
