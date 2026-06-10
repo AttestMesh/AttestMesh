@@ -2,6 +2,7 @@
 pragma solidity 0.8.24;
 
 import { IDstackFacet } from "../../interfaces/IDstackFacet.sol";
+import { IAttestorFacet } from "../../interfaces/IAttestorFacet.sol";
 import { IAppAuth } from "../../interfaces/IAppAuth.sol";
 import { IAppAuthBasicManagement } from "../../interfaces/IAppAuthBasicManagement.sol";
 import { IAttest } from "../../interfaces/IAttest.sol";
@@ -14,7 +15,12 @@ import { DstackStorage } from "../../storage/DstackStorage.sol";
 import { ClusterAccess } from "../../access/ClusterAccess.sol";
 import { DstackSigChain } from "../../libraries/DstackSigChain.sol";
 
-import { NotOurMember, CodeIdMismatch, BindingMismatch } from "../../errors/Errors.sol";
+import {
+    NotOurMember,
+    CodeIdMismatch,
+    BindingMismatch,
+    NotDiamondContext
+} from "../../errors/Errors.sol";
 
 /// @title DstackFacet — the dstack attestor facet (contracts spec §6).
 /// @notice Verifies the dstack KMS signature chain (KMS root -> app key -> derived
@@ -24,9 +30,77 @@ import { NotOurMember, CodeIdMismatch, BindingMismatch } from "../../errors/Erro
 ///         IAppAuthBasicManagement allowlist surface so existing dstack tooling works
 ///         unchanged — the allowlist is the boot-gate policy the KMS enforces, not a
 ///         registration-time self-assertion.
-contract DstackFacet is IDstackFacet, IAppAuth, IAppAuthBasicManagement, ClusterAccess {
+contract DstackFacet is
+    IDstackFacet,
+    IAttestorFacet,
+    IAppAuth,
+    IAppAuthBasicManagement,
+    ClusterAccess
+{
     bytes32 public constant DSTACK_ATTESTOR_ID = keccak256("attestmesh.attestor.dstack");
     string internal constant BIND_DOMAIN = "attestmesh.bind.v1";
+
+    // ── IAttestorFacet (multi-attestor spec) ──────────────────────────────────
+
+    /// @notice The dstack init blob DiamondInitV2 delegatecalls into `initAttestor`:
+    ///         exactly the dstack-shaped fields that left DiamondInit v1's InitArgs.
+    struct DstackInitArgs {
+        address kmsRootSigner;
+        bytes32[] initialComposeHashes;
+        bytes32[] initialDeviceIds;
+        bool allowAnyDevice;
+        bool requireTcbUpToDate;
+    }
+
+    function attestorId() external pure returns (bytes32) {
+        return DSTACK_ATTESTOR_ID;
+    }
+
+    /// @notice Exactly the v1 hardcoded cut (ClusterCut's original `_dstackSelectors`
+    ///         list, pinned bit-for-bit by `AttestorManifest.t.sol`). `owner()` is
+    ///         intentionally absent — the diamond's SafeOwnable serves it — as are
+    ///         the IAttestorFacet selectors themselves (impl-level only).
+    function selectorManifest() external pure returns (bytes4[] memory s) {
+        s = new bytes4[](19);
+        s[0] = IAppAuthBasicManagement.addComposeHash.selector;
+        s[1] = IAppAuthBasicManagement.removeComposeHash.selector;
+        s[2] = IAppAuthBasicManagement.addDevice.selector;
+        s[3] = IAppAuthBasicManagement.removeDevice.selector;
+        s[4] = IAppAuthBasicManagement.setAllowAnyDevice.selector;
+        s[5] = IAppAuthBasicManagement.setRequireTcbUpToDate.selector;
+        s[6] = IAppAuthBasicManagement.allowedComposeHashes.selector;
+        s[7] = IAppAuthBasicManagement.allowedDeviceIds.selector;
+        s[8] = IAppAuthBasicManagement.allowAnyDevice.selector;
+        s[9] = IAppAuthBasicManagement.requireTcbUpToDate.selector;
+        s[10] = IAppAuthBasicManagement.version.selector;
+        s[11] = IDstackFacet.addAllowedKmsRoot.selector;
+        s[12] = IDstackFacet.removeAllowedKmsRoot.selector;
+        s[13] = IDstackFacet.allowedKmsRoots.selector;
+        s[14] = IDstackFacet.dstack_register.selector;
+        s[15] = IAppAuth.isAppAllowed.selector;
+        s[16] = IDstackFacet.addAllowedAppId.selector;
+        s[17] = IDstackFacet.removeAllowedAppId.selector;
+        s[18] = IDstackFacet.allowedAppIds.selector;
+    }
+
+    /// @notice Seed DstackStorage from the v2 per-facet init blob. Delegatecall-only:
+    ///         core storage is seeded before any initAttestor runs (DiamondInitV2
+    ///         ordering; an owner diamondCut on a live cluster trivially satisfies it),
+    ///         so an unset clusterOwner means we are NOT in a diamond's context.
+    function initAttestor(bytes calldata initData) external {
+        if (MemberStorage.layout().clusterOwner == address(0)) revert NotDiamondContext();
+        DstackInitArgs memory args = abi.decode(initData, (DstackInitArgs));
+        DstackStorage.Layout storage d = DstackStorage.layout();
+        d.allowedKmsRoots[args.kmsRootSigner] = true;
+        for (uint256 i; i < args.initialComposeHashes.length; ++i) {
+            d.allowedComposeHashes[args.initialComposeHashes[i]] = true;
+        }
+        for (uint256 i; i < args.initialDeviceIds.length; ++i) {
+            d.allowedDeviceIds[args.initialDeviceIds[i]] = true;
+        }
+        d.allowAnyDevice = args.allowAnyDevice;
+        d.requireTcbUpToDate = args.requireTcbUpToDate;
+    }
 
     // ── IAppAuthBasicManagement: allowlist admin ──────────────────────────────
 

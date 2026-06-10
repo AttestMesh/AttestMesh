@@ -20,6 +20,9 @@ interface IOwnableTransfer {
 /// @notice Atomically deploys a ClusterDiamond + DiamondInit with the v1 default
 ///         facet cut. `isDeployedCluster` is the read the gas webhook uses to
 ///         validate UserOp targets.
+/// @dev DEPRECATED for new deploys — use ClusterDiamondFactoryV2 (multi-attestor
+///      spec). The deployed v1 instance and its clusters keep working unchanged;
+///      this source stays for verification of the live deployment.
 contract ClusterDiamondFactory {
     address public immutable factoryOwner; // AttestMesh org Safe — gates upgrades
     address public immutable diamondInitImpl;

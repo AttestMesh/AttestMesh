@@ -6,6 +6,7 @@ import { MemberStorage } from "../../src/storage/MemberStorage.sol";
 import { MessageStorage } from "../../src/storage/MessageStorage.sol";
 import { NetworkStorage } from "../../src/storage/NetworkStorage.sol";
 import { DstackStorage } from "../../src/storage/DstackStorage.sol";
+import { OperatorStorage } from "../../src/storage/OperatorStorage.sol";
 import { ClusterMemberStorage } from "../../src/storage/ClusterMemberStorage.sol";
 
 /// @notice Asserts each ERC-7201 slot constant matches the canonical formula so a
@@ -16,6 +17,7 @@ contract NamespacesTest is Test {
         assertEq(MessageStorage.SLOT, _erc7201("attestmesh.storage.Message"));
         assertEq(NetworkStorage.SLOT, _erc7201("attestmesh.storage.Network"));
         assertEq(DstackStorage.SLOT, _erc7201("attestmesh.storage.Dstack"));
+        assertEq(OperatorStorage.SLOT, _erc7201("attestmesh.storage.Operator"));
         assertEq(ClusterMemberStorage.SLOT, _erc7201("attestmesh.storage.ClusterMember"));
     }
 

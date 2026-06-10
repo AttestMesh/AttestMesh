@@ -7,6 +7,8 @@ import { MemberStorage } from "./storage/MemberStorage.sol";
 /// @title DiamondInit — one-shot atomic cluster initializer (contracts spec §8).
 /// @notice delegatecall'd from ClusterDiamond's constructor; runs in the diamond's
 ///         storage context and seeds every facet's namespace in one transaction.
+/// @dev DEPRECATED for new deploys — use DiamondInitV2 (method-agnostic CoreInitArgs
+///      + per-attestor-facet init blobs). Kept for the deployed v1 factory lineage.
 contract DiamondInit {
     struct InitArgs {
         address clusterOwner; // Safe address — written into the cluster-owner slot

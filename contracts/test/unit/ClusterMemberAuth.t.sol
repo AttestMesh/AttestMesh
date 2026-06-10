@@ -10,10 +10,10 @@ import {
 import { ClusterMember } from "../../src/members/ClusterMember.sol";
 import { ClusterMemberFactory } from "../../src/members/ClusterMemberFactory.sol";
 import { IAppAuth } from "../../src/interfaces/IAppAuth.sol";
+import { IClusterMember } from "../../src/interfaces/IClusterMember.sol";
 import {
     OnlyEntryPoint,
     OnlyCluster,
-    OwnerAlreadySet,
     InvalidBootstrapCall,
     NotClusterOwner
 } from "../../src/errors/Errors.sol";
@@ -220,12 +220,16 @@ contract ClusterMemberAuthTest is Test {
         member.__setOwnerFromCluster(address(1));
     }
 
-    function test_setOwnerOnlyOnce() public {
+    /// Skip-if-set (multi-attestor spec): a second owner-set succeeds, keeps the
+    /// existing owner, and emits OwnerSetSkipped so the ignored key is observable.
+    function test_setOwnerSkipIfSet() public {
         vm.prank(address(clusterMock));
         member.__setOwnerFromCluster(address(1));
         vm.prank(address(clusterMock));
-        vm.expectRevert(OwnerAlreadySet.selector);
+        vm.expectEmit(true, true, true, true, address(member));
+        emit IClusterMember.OwnerSetSkipped(address(1), address(2));
         member.__setOwnerFromCluster(address(2));
+        assertEq(member.owner(), address(1), "existing owner must be untouched");
     }
 
     // ── IAppAuth / IAppAuthBasicManagement forwards ───────────────────────────
