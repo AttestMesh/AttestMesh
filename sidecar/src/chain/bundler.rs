@@ -73,7 +73,7 @@ impl BundlerClient {
 
     /// Build, sponsor, sign, submit, and await inclusion. Returns the underlying tx hash.
     pub async fn submit(&self, signer: &PrivateKeySigner, mut op: UserOperation) -> Result<B256> {
-        op.nonce = self.get_nonce(op.sender).await.unwrap_or(U256::ZERO);
+        op.nonce = self.get_nonce(op.sender).await.context("EntryPoint.getNonce")?;
 
         // F2: request gas + paymaster sponsorship and populate the op BEFORE signing.
         self.apply_sponsorship(&mut op).await?;
@@ -122,11 +122,23 @@ impl BundlerClient {
         apply_sponsorship_response(op, &resp)
     }
 
+    /// EIP-4337 account nonce: `EntryPoint.getNonce(sender, key=0)` via `eth_call`
+    /// (there is no bundler RPC for this; the Alchemy endpoint serves both APIs).
     async fn get_nonce(&self, sender: Address) -> Result<U256> {
+        // getNonce(address,uint192) selector = 0x35567e1a; args are 32-byte padded.
+        let data = format!(
+            "0x35567e1a{:0>64}{:0>64}",
+            hex::encode(sender.as_slice()),
+            "0"
+        );
         let r = self
-            .rpc("eth_getUserOperationNonce", json!([sender, "0x0"]))
+            .rpc(
+                "eth_call",
+                json!([{"to": self.entry_point, "data": data}, "latest"]),
+            )
             .await?;
-        Ok(serde_json::from_value(r).unwrap_or(U256::ZERO))
+        let s: String = serde_json::from_value(r).context("eth_call getNonce result")?;
+        U256::from_str_radix(s.trim_start_matches("0x"), 16).context("parse getNonce hex")
     }
 
     /// Poll `eth_getUserOperationReceipt` up to 60s (sidecar spec §8.2 step 7).
