@@ -61,3 +61,55 @@ impl PeerControl for PeerControlService {
         Ok(Response::new(SealedCsk { sealed_csk: sealed }))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::dstack::MockDstack;
+    use crate::state::Shared;
+    use alloy::primitives::Address;
+    use std::sync::Arc;
+
+    async fn service() -> PeerControlService {
+        let dstack = MockDstack::from_label("peer-grpc-test");
+        let keys = Arc::new(crate::keys::derive_all(&dstack).await.unwrap());
+        let shared = Shared::new(
+            keys.clone(),
+            Address::repeat_byte(0x11),
+            Address::repeat_byte(0x22),
+            0x0a0d0000,
+            16,
+            51821,
+        );
+        // Never dialed in these tests — both paths below return before any RPC.
+        let chain = Arc::new(
+            ChainClient::new("http://127.0.0.1:1", 8453, Address::repeat_byte(0x11), &keys)
+                .unwrap(),
+        );
+        PeerControlService::new(shared, chain)
+    }
+
+    #[tokio::test]
+    async fn refuses_when_csk_not_held() {
+        // The exact shape of the live pulling-csk deadlock: an empty-handed node
+        // must answer `unavailable` (so the requester tries another peer), never
+        // hang or fabricate.
+        let svc = service().await;
+        let req = Request::new(CskRequest {
+            requester_member_id: vec![9u8; 32],
+        });
+        let err = svc.request_cluster_shared_key(req).await.unwrap_err();
+        assert_eq!(err.code(), tonic::Code::Unavailable);
+    }
+
+    #[tokio::test]
+    async fn rejects_malformed_member_id() {
+        let svc = service().await;
+        *svc.shared.csk.lock().await = Some([5u8; 32]);
+        let req = Request::new(CskRequest {
+            requester_member_id: vec![9u8; 7], // not 32 bytes
+        });
+        let err = svc.request_cluster_shared_key(req).await.unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    }
+}

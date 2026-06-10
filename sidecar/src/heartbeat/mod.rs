@@ -38,19 +38,26 @@ pub fn spawn(shared: Arc<Shared>) -> Vec<JoinHandle<()>> {
     vec![send, recv]
 }
 
+/// The connected view a node reports (and records for itself): its configured
+/// peers PLUS itself. Liveness convergence compares each node's view against the
+/// live set — which contains everyone — so omitting self makes convergence
+/// unsatisfiable (live-found bug: a 2-node mesh could never converge).
+pub fn connected_view(peers: &crate::wg::peer::PeerTable, self_id: [u8; 32]) -> Vec<[u8; 32]> {
+    let mut connected = peers.connected_ids();
+    connected.push(self_id);
+    connected
+}
+
 async fn send_loop(shared: Arc<Shared>) -> anyhow::Result<()> {
     let sock = UdpSocket::bind(("0.0.0.0", 0)).await?;
     loop {
-        let (mut connected, targets) = {
+        let (connected, targets) = {
             let p = shared.peers.lock().await;
             (
-                p.connected_ids(),
+                connected_view(&p, shared.self_member_id),
                 p.all().map(|x| x.mesh_ip).collect::<Vec<_>>(),
             )
         };
-        // The connected view includes the sender itself (liveness convergence
-        // compares each node's view against the live set, which contains everyone).
-        connected.push(shared.self_member_id);
         let payload = packet::HeartbeatPayload {
             version: packet::HEARTBEAT_VERSION,
             sender_member_id: shared.self_member_id,
@@ -93,8 +100,7 @@ async fn recv_loop(shared: Arc<Shared>) -> anyhow::Result<()> {
         }
 
         let now = now_ms();
-        let mut connected = shared.peers.lock().await.connected_ids();
-        connected.push(shared.self_member_id); // self is part of our own view
+        let connected = connected_view(&*shared.peers.lock().await, shared.self_member_id);
         {
             let mut lv = shared.liveness.lock().await;
             lv.on_heartbeat(sender, &hb.payload.connected_member_ids, now);
@@ -113,5 +119,58 @@ async fn recv_loop(shared: Arc<Shared>) -> anyhow::Result<()> {
         if shared.gates.healthy() {
             shared.set_phase(Phase::Healthy).await;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::wg::peer::PeerTable;
+
+    fn id(n: u8) -> [u8; 32] {
+        let mut b = [0u8; 32];
+        b[31] = n;
+        b
+    }
+
+    /// Regression (live bug 5 in docs/deployment.md): the reported view must
+    /// include the sender itself, or `view == live_set` can never hold and
+    /// first-convergence never latches on a real mesh.
+    #[test]
+    fn connected_view_includes_self_and_configured_peers() {
+        let me = id(1);
+        let mut peers = PeerTable::new();
+        peers.ensure_chain(id(2), 0x0a0d0002, [2u8; 32]);
+        peers.mark_configured(&id(2));
+        peers.ensure_chain(id(3), 0x0a0d0003, [3u8; 32]); // known but NOT configured
+
+        let view = connected_view(&peers, me);
+        assert!(view.contains(&me), "self must be in the reported view");
+        assert!(view.contains(&id(2)), "configured peers are in the view");
+        assert!(!view.contains(&id(3)), "unconfigured peers are not");
+        assert_eq!(view.len(), 2);
+    }
+
+    /// The exact two-node shape that deadlocked live: each node's view (peer +
+    /// self) must satisfy the liveness convergence check.
+    #[test]
+    fn two_node_views_converge() {
+        use crate::heartbeat::liveness::Liveness;
+        let (a, b) = (id(1), id(2));
+
+        let mut peers_a = PeerTable::new();
+        peers_a.ensure_chain(b, 2, [2u8; 32]);
+        peers_a.mark_configured(&b);
+        let view_a = connected_view(&peers_a, a);
+
+        let mut peers_b = PeerTable::new();
+        peers_b.ensure_chain(a, 1, [1u8; 32]);
+        peers_b.mark_configured(&a);
+        let view_b = connected_view(&peers_b, b);
+
+        let mut lv = Liveness::with_params(a, 1000, 3);
+        lv.record_self_view(&view_a, 1000);
+        lv.on_heartbeat(b, &view_b, 1000);
+        assert!(lv.is_converged(1000), "peer+self views must converge");
     }
 }

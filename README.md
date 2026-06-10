@@ -27,7 +27,7 @@ See [`docs/specs/attestmesh-coordination-layer.md`](docs/specs/attestmesh-coordi
 
 ## Status
 
-**Live on Base mainnet (chain id 8453).** All four components — contracts, sidecar, indexer, and gas-webhook — are deployed and verified working end-to-end: real dstack CVMs self-register through sponsored UserOperations, form a wireguard mesh through the dstack gateway, exchange encrypted endpoint envelopes, distribute the CSK peer-to-peer, and hold verified subscriptions to the attested indexer. 174 tests green across the four suites.
+**Live on Base mainnet (chain id 8453).** All four components — contracts, sidecar, indexer, and gas-webhook — are deployed and verified working end-to-end: real dstack CVMs self-register through sponsored UserOperations, form a wireguard mesh through the dstack gateway, exchange encrypted endpoint envelopes, distribute the CSK peer-to-peer, and hold verified subscriptions to the attested indexer. 222 tests green across the four suites (contracts at 94% line / 76% branch coverage).
 
 - Live addresses: [`contracts/script/deployments/8453.json`](contracts/script/deployments/8453.json) (reference cluster `0xA46273adC86c772C7D8daE896a5fbfdDA2B6ccFA`)
 - Deployment runbook + status log: [`docs/deployment.md`](docs/deployment.md)
@@ -65,9 +65,9 @@ Container images for the sidecar and indexer are built and published to ghcr.io 
 ## Test
 
 ```bash
-( cd contracts && forge test -vvv )                       # 26 tests
-( cd sidecar  && cargo test )                             # 40 tests
-( cd indexer  && cargo test )                             # 35 tests
+( cd contracts && forge test -vvv )                       # 57 tests
+( cd sidecar  && cargo test )                             # 50 tests
+( cd indexer  && cargo test )                             # 42 tests
 ( cd services/gas-sponsorship-webhook && npm test )       # 73 tests
 ```
 

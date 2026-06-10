@@ -583,3 +583,39 @@ async fn serve_agent_grpc(
         tracing::error!(error = %e, "agent gRPC exited");
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The peer ingress hostname derives purely from chain state + config — the
+    /// gateway's TLS-passthrough route needs the `s` suffix (a plain route is
+    /// HTTP-parsed and drops raw TCP; verified live).
+    #[test]
+    fn sni_for_builds_the_passthrough_hostname() {
+        let member: Address = "0xa87128971070f41c26871ce361d3eded7ecf909b"
+            .parse()
+            .unwrap();
+        assert_eq!(
+            sni_for(member, 51900, "dstack-base-prod5.phala.network"),
+            "a87128971070f41c26871ce361d3eded7ecf909b-51900s.dstack-base-prod5.phala.network"
+        );
+    }
+
+    /// MessageFacet dedups (recipient, envelopeId) on chain, so resends must salt
+    /// the id; receivers demux on the `kind` INSIDE the ciphertext instead.
+    #[test]
+    fn envelope_ids_are_salted_per_send() {
+        let base = envelopes::peer_endpoint_envelope_id();
+        let self_id = [7u8; 32];
+        let id_at = |ms: u64| {
+            let mut salt = Vec::with_capacity(72);
+            salt.extend_from_slice(&base);
+            salt.extend_from_slice(&self_id);
+            salt.extend_from_slice(&ms.to_le_bytes());
+            keccak256(&salt)
+        };
+        assert_ne!(id_at(1), id_at(2), "different send instants → different ids");
+        assert_ne!(id_at(1).0, base, "salted id differs from the bare kind id");
+    }
+}

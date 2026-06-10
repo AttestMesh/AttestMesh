@@ -19,6 +19,33 @@ use alloy::primitives::Address;
 use std::sync::Arc;
 use std::time::Duration;
 
+/// getLogs chunk for cluster discovery (providers cap ranges; Alchemy ~10k blocks).
+const DISCOVERY_CHUNK: u64 = 10_000;
+
+/// The inclusive `(from, to)` getLogs ranges covering `[start, head]` in `chunk`-sized
+/// pages. Pure so the catch-up bounds are unit-tested: the live-found failure mode was
+/// an unbounded genesis scan (~47M blocks on Base) that kept the health/gRPC listeners
+/// from ever starting.
+fn scan_ranges(start: u64, head: u64, chunk: u64) -> impl Iterator<Item = (u64, u64)> {
+    let chunk = chunk.max(1);
+    let mut from = start;
+    std::iter::from_fn(move || {
+        if from > head {
+            return None;
+        }
+        let to = (from + chunk - 1).min(head);
+        let range = (from, to);
+        from = to + 1;
+        Some(range)
+    })
+}
+
+/// Where the event catch-up starts: just past the persisted cursor, but never below
+/// the configured floor (the factory deploy block — nothing exists before it).
+fn events_scan_start(last_indexed: u64, floor: u64) -> u64 {
+    last_indexed.saturating_add(1).max(floor)
+}
+
 /// Shared handles passed to the loops.
 #[derive(Clone)]
 pub struct Runtime {
@@ -42,11 +69,8 @@ impl Runtime {
         // genesis scan on a mainnet never finishes. Chunked: providers cap getLogs
         // ranges (Alchemy ~10k blocks).
         let floor = self.config.start_block;
-        const DISCOVERY_CHUNK: u64 = 10_000;
-        let mut from = floor;
         tracing::info!(floor, head, "boot catch-up: discovering clusters");
-        while from <= head {
-            let to = (from + DISCOVERY_CHUNK - 1).min(head);
+        for (from, to) in scan_ranges(floor, head, DISCOVERY_CHUNK) {
             let new = watcher::poll_new_clusters(
                 &self.provider,
                 self.config.cluster_diamond_factory_addr,
@@ -57,7 +81,6 @@ impl Runtime {
             for c in new {
                 self.state.add_cluster(c).await;
             }
-            from = to + 1;
         }
         self.state.set_last_factory_block(head).await;
         self.metrics
@@ -66,23 +89,18 @@ impl Runtime {
 
         // Page cluster events forward BLOCK_BATCH_SIZE at a time until caught up.
         let clusters = self.state.known_clusters().await;
-        let mut from = self
-            .state
-            .last_indexed_block()
-            .await
-            .saturating_add(1)
-            .max(floor);
+        let start = events_scan_start(self.state.last_indexed_block().await, floor);
         let batch = self.config.block_batch_size.max(1);
-        tracing::info!(clusters = clusters.len(), from, head, "boot catch-up: paging cluster events");
+        tracing::info!(clusters = clusters.len(), start, head, "boot catch-up: paging cluster events");
         let mut batches = 0u64;
-        while from <= head && !clusters.is_empty() {
-            let to = (from + batch - 1).min(head);
-            let logs = watcher::poll_cluster_logs(&self.provider, &clusters, from, to).await?;
-            self.ingest_for_cache(&logs).await;
-            from = to + 1;
-            batches += 1;
-            if batches % 100 == 0 {
-                tracing::info!(from, head, "boot catch-up progress");
+        if !clusters.is_empty() {
+            for (from, to) in scan_ranges(start, head, batch) {
+                let logs = watcher::poll_cluster_logs(&self.provider, &clusters, from, to).await?;
+                self.ingest_for_cache(&logs).await;
+                batches += 1;
+                if batches % 100 == 0 {
+                    tracing::info!(from, head, "boot catch-up progress");
+                }
             }
         }
         self.state.set_last_indexed_block(head).await;
@@ -252,4 +270,48 @@ pub fn ack_cursor(
     c: Cursor,
 ) {
     let _ = state.cursors().advance(cluster, member, c);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scan_ranges_cover_exactly_once_with_partial_tail() {
+        let ranges: Vec<_> = scan_ranges(100, 125, 10).collect();
+        assert_eq!(ranges, vec![(100, 109), (110, 119), (120, 125)]);
+    }
+
+    #[test]
+    fn scan_ranges_single_block_and_empty() {
+        assert_eq!(scan_ranges(5, 5, 10).collect::<Vec<_>>(), vec![(5, 5)]);
+        assert_eq!(scan_ranges(6, 5, 10).count(), 0, "start past head scans nothing");
+    }
+
+    #[test]
+    fn scan_ranges_tolerate_zero_chunk() {
+        // A misconfigured chunk must not loop forever on the same block.
+        assert_eq!(scan_ranges(1, 3, 0).collect::<Vec<_>>(), vec![(1, 1), (2, 2), (3, 3)]);
+    }
+
+    /// Regression (live bug 8 in docs/deployment.md): with the factory-deploy floor
+    /// applied, the catch-up workload is proportional to the factory's age — not the
+    /// chain's. The live numbers: floor 46_868_742 on a ~47.1M head needed ~134
+    /// batches at 2000; from genesis it would have been ~23.6k ranges of 2000.
+    #[test]
+    fn floor_bounds_the_catchup_workload() {
+        let head = 47_136_575;
+        let floor = 46_868_742;
+        let floored = scan_ranges(events_scan_start(0, floor), head, 2_000).count();
+        let genesis = scan_ranges(events_scan_start(0, 0), head, 2_000).count();
+        assert_eq!(floored, 134);
+        assert!(genesis > 23_000);
+    }
+
+    #[test]
+    fn events_scan_start_resumes_past_cursor_but_not_below_floor() {
+        assert_eq!(events_scan_start(0, 500), 500, "fresh store starts at the floor");
+        assert_eq!(events_scan_start(700, 500), 701, "persisted cursor wins past the floor");
+        assert_eq!(events_scan_start(u64::MAX, 0), u64::MAX, "no overflow");
+    }
 }

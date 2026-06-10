@@ -4,9 +4,7 @@ pragma solidity 0.8.24;
 import { Script } from "forge-std/Script.sol";
 import { console2 } from "forge-std/console2.sol";
 
-import {
-    IERC2535DiamondCut
-} from "@solidstate/contracts/interfaces/IERC2535DiamondCut.sol";
+import { IERC2535DiamondCut } from "@solidstate/contracts/interfaces/IERC2535DiamondCut.sol";
 import {
     IERC2535DiamondCutInternal
 } from "@solidstate/contracts/interfaces/IERC2535DiamondCutInternal.sol";

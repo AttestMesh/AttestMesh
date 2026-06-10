@@ -125,16 +125,10 @@ impl BundlerClient {
     /// EIP-4337 account nonce: `EntryPoint.getNonce(sender, key=0)` via `eth_call`
     /// (there is no bundler RPC for this; the Alchemy endpoint serves both APIs).
     async fn get_nonce(&self, sender: Address) -> Result<U256> {
-        // getNonce(address,uint192) selector = 0x35567e1a; args are 32-byte padded.
-        let data = format!(
-            "0x35567e1a{:0>64}{:0>64}",
-            hex::encode(sender.as_slice()),
-            "0"
-        );
         let r = self
             .rpc(
                 "eth_call",
-                json!([{"to": self.entry_point, "data": data}, "latest"]),
+                json!([{"to": self.entry_point, "data": get_nonce_calldata(sender)}, "latest"]),
             )
             .await?;
         let s: String = serde_json::from_value(r).context("eth_call getNonce result")?;
@@ -154,6 +148,14 @@ impl BundlerClient {
         }
         bail!("userOp not included within 60s: {user_op_hash}")
     }
+}
+
+/// `EntryPoint.getNonce(address,uint192)` calldata: selector `0x35567e1a` plus the
+/// two 32-byte-padded args (key fixed to 0). Pure so the encoding is pinned by a
+/// unit test — the live-found failure mode here was silent (a wrong nonce source
+/// fell back to 0 and every post-registration UserOp died with AA25).
+fn get_nonce_calldata(sender: Address) -> String {
+    format!("0x35567e1a{:0>64}{:0>64}", hex::encode(sender.as_slice()), "0")
 }
 
 /// Populate `op`'s gas + paymaster fields from an `alchemy_requestGasAndPaymasterAndData`
@@ -282,5 +284,30 @@ mod tests {
             without, with_hash,
             "paymasterAndData must change the userOpHash; sign AFTER sponsorship (F2)"
         );
+    }
+}
+
+#[cfg(test)]
+mod nonce_tests {
+    use super::*;
+
+    /// Regression (live bug 4 in docs/deployment.md): the nonce MUST come from
+    /// `EntryPoint.getNonce` via eth_call. Pin the exact calldata encoding so a
+    /// drift in selector or padding fails here instead of as a live AA25.
+    #[test]
+    fn get_nonce_calldata_is_pinned() {
+        let sender: Address = "0x54e63929b4d8d09d3c9e3019d54bd20e289ed985"
+            .parse()
+            .unwrap();
+        let data = get_nonce_calldata(sender);
+        // selector = first 4 bytes of keccak("getNonce(address,uint192)")
+        assert!(data.starts_with("0x35567e1a"));
+        // 4-byte selector + 2 × 32-byte args = 2 + 8 + 64 + 64 hex chars
+        assert_eq!(data.len(), 2 + 8 + 64 + 64);
+        // address left-padded to 32 bytes
+        assert!(data[10..74].starts_with("000000000000000000000000"));
+        assert!(data[10..74].ends_with("54e63929b4d8d09d3c9e3019d54bd20e289ed985"));
+        // key = 0
+        assert_eq!(&data[74..], "0".repeat(64));
     }
 }

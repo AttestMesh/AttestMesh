@@ -71,3 +71,79 @@ impl Config {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    // Env vars are process-global; serialize the tests that touch them.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    fn set_required() {
+        std::env::set_var("CHAIN_ID", "8453");
+        std::env::set_var("RPC_URL", "http://rpc.example");
+        std::env::set_var("BUNDLER_URL", "http://bundler.example");
+        std::env::set_var("INDEXER_REGISTRY_ADDR", "0xbC003686943fB957100E517D3CEf66c52B5CDdBf");
+    }
+
+    fn clear_optional() {
+        for k in [
+            "MEMBER_CONTRACT",
+            "GAS_POLICY_ID",
+            "GATEWAY_DOMAIN",
+            "WG_TCP_PORT",
+            "WG_LISTEN_PORT",
+            "DSTACK_SOCKET",
+            "AGENT_GRPC_SOCKET",
+            "HEALTH_HTTP_ADDR",
+            "LOG_FORMAT",
+            "LOG_LEVEL",
+        ] {
+            std::env::remove_var(k);
+        }
+    }
+
+    #[test]
+    fn defaults_and_required_parse() {
+        let _g = ENV_LOCK.lock().unwrap();
+        set_required();
+        clear_optional();
+
+        let c = Config::from_env().expect("required set");
+        assert_eq!(c.chain_id, 8453);
+        assert_eq!(c.member_contract, None, "Path A: self-discovered at runtime");
+        assert_eq!(c.gateway_domain, None, "unset → registration-only mode");
+        assert_eq!(c.wg_tcp_port, 51900);
+        assert_eq!(
+            c.wg_listen_port, 51821,
+            "outer wg port must differ from the in-mesh heartbeat port 51820"
+        );
+        assert_eq!(c.dstack_socket, "/var/run/dstack.sock");
+        assert_eq!(c.health_http_addr, "127.0.0.1:9090");
+    }
+
+    #[test]
+    fn gateway_domain_blank_is_none() {
+        let _g = ENV_LOCK.lock().unwrap();
+        set_required();
+        clear_optional();
+        std::env::set_var("GATEWAY_DOMAIN", "   ");
+        let c = Config::from_env().unwrap();
+        assert_eq!(c.gateway_domain, None, "whitespace-only counts as unset");
+
+        std::env::set_var("GATEWAY_DOMAIN", "dstack-base-prod5.phala.network");
+        let c = Config::from_env().unwrap();
+        assert_eq!(c.gateway_domain.as_deref(), Some("dstack-base-prod5.phala.network"));
+        std::env::remove_var("GATEWAY_DOMAIN");
+    }
+
+    #[test]
+    fn missing_required_fails() {
+        let _g = ENV_LOCK.lock().unwrap();
+        set_required();
+        std::env::remove_var("RPC_URL");
+        assert!(Config::from_env().is_err());
+        set_required(); // restore for whoever runs next
+    }
+}
