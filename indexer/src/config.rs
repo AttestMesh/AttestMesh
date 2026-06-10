@@ -18,6 +18,11 @@ pub struct Config {
     pub state_dir: String,
     pub block_poll_interval: Duration,
     pub block_batch_size: u64,
+    /// Lower bound for the boot catch-up scan — the factory's deploy block (no
+    /// clusters can exist before it). 0 (the default) means genesis, which on a
+    /// mainnet is effectively unbootable (~hundreds of thousands of getLogs calls);
+    /// the deploy routine computes this via a getCode binary search.
+    pub start_block: u64,
     pub log_level: String,
     pub log_format: LogFormat,
 }
@@ -58,6 +63,9 @@ impl Config {
             block_batch_size: opt("BLOCK_BATCH_SIZE", "200")
                 .parse()
                 .context("BLOCK_BATCH_SIZE")?,
+            start_block: opt("INDEXER_START_BLOCK", "0")
+                .parse()
+                .context("INDEXER_START_BLOCK")?,
             log_level: opt("LOG_LEVEL", "info"),
             log_format: match opt("LOG_FORMAT", "json").as_str() {
                 "pretty" => LogFormat::Pretty,

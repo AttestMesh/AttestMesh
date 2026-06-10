@@ -13,6 +13,10 @@ services:
       - INDEXER_REGISTRY_ADDR=${INDEXER_REGISTRY_ADDR}
       - CLUSTER_DIAMOND_FACTORY_ADDR=${CLUSTER_DIAMOND_FACTORY_ADDR}
       - INDEXER_CODE_ID=${INDEXER_CODE_ID}
+      # Catch-up floor: the factory deploy block (computed by deploy/indexer.sh via a
+      # getCode binary search) — a genesis scan on a mainnet never finishes.
+      - INDEXER_START_BLOCK=${INDEXER_START_BLOCK}
+      - BLOCK_BATCH_SIZE=2000
       - INDEXER_GRPC_ADDR=0.0.0.0:50051
       - HEALTH_HTTP_ADDR=0.0.0.0:9090
       - DSTACK_SOCKET=/var/run/dstack.sock

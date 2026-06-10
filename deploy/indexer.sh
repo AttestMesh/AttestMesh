@@ -39,17 +39,33 @@ FACTORY=$(jq -r .clusterDiamondFactory "$ROOT/contracts/script/deployments/${CHA
 _save() { printf 'CVM_ID=%s\nAPP_ID=%s\n' "$CVM_ID" "$APP_ID" > "$STATE"; }
 _load() { [ -f "$STATE" ] && source "$STATE" || true; }
 
+# The catch-up floor: the factory's deploy block (no clusters exist before it).
+# Binary search getCode over [0, head] — ~26 RPC round-trips.
+_factory_deploy_block() {
+  local lo=0 hi mid code
+  hi=$(cast block-number --rpc-url "$RPC_URL") || die "cast block-number failed"
+  while [ "$lo" -lt "$hi" ]; do
+    mid=$(( (lo + hi) / 2 ))
+    code=$(cast code "$FACTORY" --block "$mid" --rpc-url "$RPC_URL" 2>/dev/null)
+    if [ -n "$code" ] && [ "$code" != "0x" ]; then hi=$mid; else lo=$((mid + 1)); fi
+  done
+  echo "$lo"
+}
+
 _build_env_file() {
-  local guser gtok
+  local guser gtok start
   guser=$(grep -E '^\s*username\s*=' "$HOME/.teesql/ghcr-pull.toml" | head -1 | sed -E 's/.*=\s*//' | tr -d "\"' ")
   gtok=$(grep -E '^\s*token\s*=' "$HOME/.teesql/ghcr-pull.toml" | head -1 | sed -E 's/.*=\s*//' | tr -d "\"' ")
   [ -n "$REGISTRY" ] && [ -n "$FACTORY" ] && [ -n "$gtok" ] || die "could not assemble sealed env (registry/factory/ghcr creds)"
+  start="${INDEXER_START_BLOCK:-$(_factory_deploy_block)}"
+  log "catch-up floor (factory deploy block): $start"
   cat > "$ENV_FILE" <<EOF
 CHAIN_ID=${CHAIN_ID}
 RPC_URL=${RPC_URL}
 INDEXER_REGISTRY_ADDR=${REGISTRY}
 CLUSTER_DIAMOND_FACTORY_ADDR=${FACTORY}
 INDEXER_CODE_ID=
+INDEXER_START_BLOCK=${start}
 DSTACK_DOCKER_REGISTRY=ghcr.io
 DSTACK_DOCKER_USERNAME=${guser}
 DSTACK_DOCKER_PASSWORD=${gtok}

@@ -37,16 +37,27 @@ impl Runtime {
         let head = chain::block_number(&self.provider).await?;
         self.health.set_rpc_reachable(true);
 
-        // Discover all clusters from genesis of the factory's history.
-        let new = watcher::poll_new_clusters(
-            &self.provider,
-            self.config.cluster_diamond_factory_addr,
-            0,
-            head,
-        )
-        .await?;
-        for c in new {
-            self.state.add_cluster(c).await;
+        // Discover all clusters from the factory's history. INDEXER_START_BLOCK (the
+        // factory deploy block) bounds the scan — nothing exists before it, and a
+        // genesis scan on a mainnet never finishes. Chunked: providers cap getLogs
+        // ranges (Alchemy ~10k blocks).
+        let floor = self.config.start_block;
+        const DISCOVERY_CHUNK: u64 = 10_000;
+        let mut from = floor;
+        tracing::info!(floor, head, "boot catch-up: discovering clusters");
+        while from <= head {
+            let to = (from + DISCOVERY_CHUNK - 1).min(head);
+            let new = watcher::poll_new_clusters(
+                &self.provider,
+                self.config.cluster_diamond_factory_addr,
+                from,
+                to,
+            )
+            .await?;
+            for c in new {
+                self.state.add_cluster(c).await;
+            }
+            from = to + 1;
         }
         self.state.set_last_factory_block(head).await;
         self.metrics
@@ -55,16 +66,28 @@ impl Runtime {
 
         // Page cluster events forward BLOCK_BATCH_SIZE at a time until caught up.
         let clusters = self.state.known_clusters().await;
-        let mut from = self.state.last_indexed_block().await.saturating_add(1);
+        let mut from = self
+            .state
+            .last_indexed_block()
+            .await
+            .saturating_add(1)
+            .max(floor);
         let batch = self.config.block_batch_size.max(1);
+        tracing::info!(clusters = clusters.len(), from, head, "boot catch-up: paging cluster events");
+        let mut batches = 0u64;
         while from <= head && !clusters.is_empty() {
             let to = (from + batch - 1).min(head);
             let logs = watcher::poll_cluster_logs(&self.provider, &clusters, from, to).await?;
             self.ingest_for_cache(&logs).await;
             from = to + 1;
+            batches += 1;
+            if batches % 100 == 0 {
+                tracing::info!(from, head, "boot catch-up progress");
+            }
         }
         self.state.set_last_indexed_block(head).await;
         self.health.set_head_lag(0);
+        tracing::info!(head, "boot catch-up complete");
         Ok(())
     }
 
