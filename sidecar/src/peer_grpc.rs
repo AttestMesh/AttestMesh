@@ -80,11 +80,17 @@ mod tests {
             0x0a0d0000,
             16,
             51821,
+            alloy::primitives::keccak256(crate::state::DSTACK_ATTESTOR_ID).0,
         );
         // Never dialed in these tests — both paths below return before any RPC.
         let chain = Arc::new(
-            ChainClient::new("http://127.0.0.1:1", 8453, Address::repeat_byte(0x11), &keys)
-                .unwrap(),
+            ChainClient::new(
+                "http://127.0.0.1:1",
+                8453,
+                Address::repeat_byte(0x11),
+                &keys,
+            )
+            .unwrap(),
         );
         PeerControlService::new(shared, chain)
     }

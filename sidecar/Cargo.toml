@@ -13,6 +13,12 @@ path = "src/lib.rs"
 name = "cluster-mesh-agent"
 path = "src/main.rs"
 
+# Operator-method provisioning helper: mints the node seed + OperatorProof voucher
+# together (multi-attestor spec). NOT hardware attestation — see attestor::operator.
+[[bin]]
+name = "mesh-voucher"
+path = "src/bin/mesh_voucher.rs"
+
 [dependencies]
 tokio = { version = "1", features = ["full"] }
 tokio-stream = { version = "0.1", features = ["net"] }

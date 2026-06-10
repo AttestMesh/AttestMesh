@@ -22,6 +22,7 @@ pub mod proto {
 }
 
 pub mod agent_grpc;
+pub mod attestor;
 pub mod bringup;
 pub mod chain;
 pub mod config;

@@ -74,6 +74,25 @@ sol! {
         bytes32 wgPubKey
     ) external returns (bytes32);
 
+    // Operator-signature attestor voucher (multi-attestor spec). Field order MUST
+    // match contracts' IOperatorFacet.OperatorProof exactly (ABI + selector).
+    // TRUST NOTE: an operator_register member is vouched for by an allowlisted
+    // operator key, not hardware attestation.
+    #[derive(Debug)]
+    struct OperatorProof {
+        address signer;
+        address ownerKey;
+        uint64 expiry;
+        bytes signature;
+    }
+
+    function operator_register(
+        OperatorProof proof,
+        address memberContract,
+        bytes32 xPubKey,
+        bytes32 wgPubKey
+    ) external returns (bytes32);
+
     function publishWgKey(bytes32 wgPubKey) external;
     function send(bytes32 recipientMemberId, bytes32 envelopeId, bytes ciphertext) external;
     function setCskCommitment(bytes32 commitment) external;
@@ -96,5 +115,12 @@ mod tests {
     #[test]
     fn dstack_register_selector_is_pinned() {
         assert_eq!(dstack_registerCall::SELECTOR, [0x53, 0x7d, 0x49, 0x1c]);
+    }
+
+    /// Same cross-language guard for the operator method:
+    /// operator_register((address,address,uint64,bytes),address,bytes32,bytes32).
+    #[test]
+    fn operator_register_selector_is_pinned() {
+        assert_eq!(operator_registerCall::SELECTOR, [0x57, 0x97, 0x7c, 0x40]);
     }
 }

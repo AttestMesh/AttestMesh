@@ -42,9 +42,19 @@ pub async fn derive_all(dstack: &dyn DstackRuntime) -> Result<KeyMaterial> {
     let identity_seed = dstack.derive_key(PURPOSE_IDENTITY, "").await?;
     let wg_seed = dstack.derive_key(PURPOSE_WIREGUARD, "").await?;
     let binding_seed = dstack.derive_key(PURPOSE_BINDING, "").await?;
+    Ok(from_seeds(&identity_seed, &wg_seed, &binding_seed))
+}
 
+/// Assemble the key set from per-purpose 32-byte seeds. The purpose strings above
+/// are AttestMesh-scoped, not dstack-scoped: every attestation provider derives the
+/// same key shapes from its own seed source (dstack KMS, operator seed file, ...).
+pub fn from_seeds(
+    identity_seed: &[u8; 32],
+    wg_seed: &[u8; 32],
+    binding_seed: &[u8; 32],
+) -> KeyMaterial {
     // Ed25519 signing key from the identity seed.
-    let ed_signing = SigningKey::from_bytes(&identity_seed);
+    let ed_signing = SigningKey::from_bytes(identity_seed);
     let ed_verifying: VerifyingKey = ed_signing.verifying_key();
 
     // x25519 sealed-box key from the SAME identity seed (one stored secret).
@@ -55,7 +65,7 @@ pub async fn derive_all(dstack: &dyn DstackRuntime) -> Result<KeyMaterial> {
     let wg_secret = XSecretKey::from(*wg_seed);
     let wg_pub = wg_secret.public_key();
 
-    Ok(KeyMaterial {
+    KeyMaterial {
         x_pub: *x_pub.as_bytes(),
         ed25519_pub: ed_verifying.to_bytes(),
         wg_pub: *wg_pub.as_bytes(),
@@ -63,7 +73,7 @@ pub async fn derive_all(dstack: &dyn DstackRuntime) -> Result<KeyMaterial> {
         ed_signing,
         wg_secret,
         binding_seed: Zeroizing::new(*binding_seed),
-    })
+    }
 }
 
 #[cfg(test)]
