@@ -37,6 +37,10 @@ MESH_CIDR_IP="${MESH_CIDR_IP:-168951808}"          # 10.18.0.0/16 — pick a UNI
 MESH_CIDR_PREFIX="${MESH_CIDR_PREFIX:-16}"
 export BOX_VCPU="${BOX_VCPU:-4}" BOX_MEM="${BOX_MEM:-8192}" BOX_DISK="${BOX_DISK:-60}"
 export BOX_PORTS="${BOX_PORTS:-[\"tcp:127.0.0.1:8080:80\",\"tcp:127.0.0.1:9091:9090\"]}"  # no host port >20000
+# Health-check host ports derived from BOX_PORTS, so multiple nodes can coexist on one box.
+_hostport() { echo "$BOX_PORTS" | tr ',[]' ' ' | tr -d '"' | tr ' ' '\n' | awk -F: -v vm="$1" '$4==vm{print $3; exit}'; }
+NGINX_PORT="$(_hostport 80)";     NGINX_PORT="${NGINX_PORT:-8080}"
+SIDECAR_PORT="$(_hostport 9090)"; SIDECAR_PORT="${SIDECAR_PORT:-9091}"
 GW_DOMAIN="${GATEWAY_DOMAIN:-gateway.attestmesh.xyz}"
 RECEIPT="$ROOT/contracts/script/deployments/${CHAIN_ID}.json"
 STATE="$LOGDIR/matrix-node-${NODE}.state"
@@ -77,7 +81,7 @@ _box_run() {
 _wait_synapse() {
   local i body
   for i in $(seq 1 60); do
-    body=$(ssh_box 'curl -s --max-time 6 http://127.0.0.1:8080/_matrix/client/versions' 2>/dev/null)
+    body=$(ssh_box "curl -s --max-time 6 http://127.0.0.1:${NGINX_PORT}/_matrix/client/versions" 2>/dev/null)
     echo "$body" | grep -q '"versions"' && { log "✔ synapse live (/_matrix/client/versions)"; return 0; }
     log "… synapse not ready ($i/60)"; sleep 12
   done
@@ -165,8 +169,8 @@ verify() {
     id=$(cast call "$CLUSTER" "memberIdOf(address)(bytes32)" "$X" --rpc-url "$RPC_URL" 2>/dev/null)
     if [ -n "$id" ] && [ "$id" != "$ZERO32" ]; then
       log "✔ $NODE registered: memberId=$id memberCount=$(cast call "$CLUSTER" 'memberCount()(uint256)' --rpc-url "$RPC_URL")"
-      log "  sidecar: $(ssh_box 'curl -s --max-time 6 http://127.0.0.1:9091/healthz' 2>/dev/null)"
-      log "  matrix:  $(ssh_box 'curl -s --max-time 6 http://127.0.0.1:8080/.well-known/matrix/server' 2>/dev/null)"
+      log "  sidecar: $(ssh_box "curl -s --max-time 6 http://127.0.0.1:${SIDECAR_PORT}/healthz" 2>/dev/null)"
+      log "  matrix:  $(ssh_box "curl -s --max-time 6 http://127.0.0.1:${NGINX_PORT}/.well-known/matrix/server" 2>/dev/null)"
       local xb="${X#0x}"; log "  url:     https://${xb,,}.${GW_DOMAIN}/_matrix/client/versions"
       return 0
     fi
