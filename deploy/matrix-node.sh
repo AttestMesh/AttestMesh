@@ -54,12 +54,15 @@ _load() { [ -f "$STATE" ] && source "$STATE" || true; }
 ssh_box() { ssh -o BatchMode=yes -o ConnectTimeout=8 "$BOX_HOST" "$@"; }
 _vmm() { ssh_box "curl -s --max-time 30 http://127.0.0.1:9080/prpc/$1?json -H 'content-type: application/json' -d '$2'"; }
 
-NEXT_NONCE=""
-send_seq() {  # nonce-safe back-to-back cast send (AttestMesh deployer, this machine)
+send_seq() {  # cast send with a FRESHLY-fetched nonce + one retry — handles RPC nonce lag right
+              # after forge scripts (DeployCluster/patha) where `cast nonce` can read stale.
   local label="$1"; shift
-  [ -n "$NEXT_NONCE" ] || NEXT_NONCE=$(cast nonce "$DEPLOYER_ADDR" --rpc-url "$RPC_URL")
-  run_step "$label" cast send "$@" --nonce "$NEXT_NONCE" --rpc-url "$RPC_URL" --private-key "$PRIVATE_KEY" \
-    && NEXT_NONCE=$((NEXT_NONCE + 1))
+  local nonce
+  nonce=$(cast nonce "$DEPLOYER_ADDR" --rpc-url "$RPC_URL")
+  run_step "$label" cast send "$@" --nonce "$nonce" --rpc-url "$RPC_URL" --private-key "$PRIVATE_KEY" && return 0
+  log "↻ $label: refetching nonce + retrying (likely RPC nonce lag after a forge script)"
+  sleep 4; nonce=$(cast nonce "$DEPLOYER_ADDR" --rpc-url "$RPC_URL")
+  run_step "${label}-retry" cast send "$@" --nonce "$nonce" --rpc-url "$RPC_URL" --private-key "$PRIVATE_KEY"
 }
 
 # Run the box-side helper (matrix-node-box.py) with the sealed secret env passed over SSH (in-memory,

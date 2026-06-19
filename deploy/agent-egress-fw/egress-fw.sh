@@ -24,7 +24,9 @@
 #     agent simply loses LLM egress (it never gains open egress).
 set -eu
 
-host_of() { printf '%s' "$1" | sed -E 's#^[a-z]+://##; s#[:/].*$##'; }
+host_of() {  # strip scheme then :port//path — POSIX param expansion (busybox-safe, no sed)
+  h="${1#*://}"; printf '%s' "${h%%[:/]*}"
+}
 
 LLM_HOST="$(host_of "${LLM_BASE_URL:-}")"      # empty allowed → fail closed (no LLM allow)
 LLM_PORT="${LLM_PORT:-443}"
