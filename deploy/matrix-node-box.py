@@ -33,7 +33,7 @@ ENV_KEYS = ["RPC_URL", "BUNDLER_URL", "GAS_POLICY_ID", "POSTGRES_PASSWORD", "TS_
             # matrix-admin-agent (docs/specs/matrix-admin-agent.md §5); key NAMES are
             # measured into compose_hash, VALUES sealed. Optional ones may be empty.
             "BOT_USERNAME", "BOT_PASSWORD", "MATRIX_ADMIN_MXIDS", "MATRIX_ADMIN_SENDERS",
-            "INITIAL_ADMIN", "LLM_BASE_URL", "LLM_MODEL", "LLM_API_KEY"]
+            "INITIAL_ADMIN", "INITIAL_ADMIN_PASSWORD", "LLM_BASE_URL", "LLM_MODEL", "LLM_API_KEY"]
 
 
 def build_env():
