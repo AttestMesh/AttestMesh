@@ -22,11 +22,11 @@ import { IAppAuthBasicManagement } from "../interfaces/IAppAuthBasicManagement.s
 import { IClusterMember } from "../interfaces/IClusterMember.sol";
 import { IAttest } from "../interfaces/IAttest.sol";
 import { IDstackFacet } from "../interfaces/IDstackFacet.sol";
+import { IOperatorFacet } from "../interfaces/IOperatorFacet.sol";
 import { ClusterMemberStorage } from "../storage/ClusterMemberStorage.sol";
 import {
     OnlyEntryPoint,
     OnlyCluster,
-    OwnerAlreadySet,
     InvalidBootstrapCall,
     NotClusterOwner
 } from "../errors/Errors.sol";
@@ -50,6 +50,7 @@ contract ClusterMember is
 
     bytes4 internal constant EXECUTE_SELECTOR = bytes4(keccak256("execute(address,uint256,bytes)"));
     bytes4 internal constant DSTACK_REGISTER_SELECTOR = IDstackFacet.dstack_register.selector;
+    bytes4 internal constant OPERATOR_REGISTER_SELECTOR = IOperatorFacet.operator_register.selector;
     string internal constant BIND_DOMAIN = "attestmesh.bind.v1";
 
     constructor() {
@@ -108,9 +109,10 @@ contract ClusterMember is
         } else {
             address ownerAddr = ClusterMemberStorage.layout().owner;
             if (ownerAddr == address(0)) {
-                // Bootstrap: must be the registration call; userOp signer must equal
-                // the binding signer inside the inner dstack_register calldata.
-                address bindSigner = _recoverBindingSigner(userOp.callData);
+                // Bootstrap: must be a registration call; userOp signer must equal
+                // that method's bootstrap signer (dstack: the binding signer recovered
+                // from the inner proof; operator: the ownerKey the voucher names).
+                address bindSigner = _bootstrapSigner(userOp.callData);
                 validationData = (recovered == bindSigner && recovered != address(0))
                     ? SIG_VALIDATION_SUCCESS
                     : SIG_VALIDATION_FAILED;
@@ -137,10 +139,14 @@ contract ClusterMember is
         }
     }
 
-    /// @notice Parse `execute(cluster, 0, dstack_register(...))` and recover the
-    ///         binding signer from the inner proof's bindingSig. Reverts on any
-    ///         structural deviation from the expected bootstrap shape.
-    function _recoverBindingSigner(bytes calldata callData) internal view returns (address) {
+    /// @notice Parse `execute(cluster, 0, <method>_register(...))` and return the
+    ///         method's bootstrap signer (multi-attestor spec): for dstack_register,
+    ///         the binding signer recovered from the inner proof's messageSignature;
+    ///         for operator_register, the ownerKey named inside the signed
+    ///         OperatorProof (the voucher itself is verified by the facet on
+    ///         execution). Reverts on any structural deviation from the expected
+    ///         bootstrap shape.
+    function _bootstrapSigner(bytes calldata callData) internal view returns (address) {
         if (callData.length < 100 || bytes4(callData[0:4]) != EXECUTE_SELECTOR) {
             revert InvalidBootstrapCall();
         }
@@ -154,29 +160,47 @@ contract ClusterMember is
         uint256 dataLen = uint256(bytes32(callData[dataOffset:dataOffset + 32]));
         bytes calldata inner = callData[dataOffset + 32:dataOffset + 32 + dataLen];
 
-        if (inner.length < 4 || bytes4(inner[0:4]) != DSTACK_REGISTER_SELECTOR) {
-            revert InvalidBootstrapCall();
-        }
-        (
-            IDstackFacet.DstackProof memory proof,
-            address memberContract,
-            bytes32 xPubKey,
-            bytes32 wgPubKey
-        ) = abi.decode(inner[4:], (IDstackFacet.DstackProof, address, bytes32, bytes32));
-        if (memberContract != address(this)) revert InvalidBootstrapCall();
+        if (inner.length < 4) revert InvalidBootstrapCall();
+        bytes4 innerSelector = bytes4(inner[0:4]);
 
-        bytes32 bindHash = keccak256(
-                abi.encode(BIND_DOMAIN, clusterAddr, address(this), xPubKey, wgPubKey)
-            ).toEthSignedMessageHash();
-        return ECDSA.recover(bindHash, proof.messageSignature);
+        if (innerSelector == DSTACK_REGISTER_SELECTOR) {
+            (
+                IDstackFacet.DstackProof memory proof,
+                address memberContract,
+                bytes32 xPubKey,
+                bytes32 wgPubKey
+            ) = abi.decode(inner[4:], (IDstackFacet.DstackProof, address, bytes32, bytes32));
+            if (memberContract != address(this)) revert InvalidBootstrapCall();
+
+            bytes32 bindHash = keccak256(
+                    abi.encode(BIND_DOMAIN, clusterAddr, address(this), xPubKey, wgPubKey)
+                ).toEthSignedMessageHash();
+            return ECDSA.recover(bindHash, proof.messageSignature);
+        }
+
+        if (innerSelector == OPERATOR_REGISTER_SELECTOR) {
+            (IOperatorFacet.OperatorProof memory proof, address memberContract,,) =
+                abi.decode(inner[4:], (IOperatorFacet.OperatorProof, address, bytes32, bytes32));
+            if (memberContract != address(this)) revert InvalidBootstrapCall();
+            return proof.ownerKey;
+        }
+
+        revert InvalidBootstrapCall();
     }
 
     // ── Cluster-mediated owner setting (contracts spec §9.1.3) ────────────────
 
+    /// @dev Skip-if-set (multi-attestor spec): a registration via a second attestor
+    ///      method must succeed without disturbing the existing owner — the node
+    ///      already controls its wallet; the second method only adds an admission
+    ///      record. The skip is emitted so an ignored ownerKey stays observable.
     function __setOwnerFromCluster(address newOwner) external {
         ClusterMemberStorage.Layout storage l = ClusterMemberStorage.layout();
         if (msg.sender != l.cluster) revert OnlyCluster();
-        if (l.owner != address(0)) revert OwnerAlreadySet();
+        if (l.owner != address(0)) {
+            emit OwnerSetSkipped(l.owner, newOwner);
+            return;
+        }
         l.owner = newOwner;
     }
 

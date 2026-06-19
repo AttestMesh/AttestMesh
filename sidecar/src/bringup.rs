@@ -12,9 +12,9 @@
 //! envelope exchange), heartbeat send/recv, CSK originate-or-pull, the peer-control
 //! gRPC server (mesh-only), and the app-facing agent gRPC server (UDS).
 
-use crate::chain::{bundler::BundlerClient, dstack_facet, message_facet, userop, ChainClient};
+use crate::attestor::AttestationProvider;
+use crate::chain::{bundler::BundlerClient, message_facet, userop, ChainClient};
 use crate::config::Config;
-use crate::dstack::DstackRuntime;
 use crate::envelopes::{self, PeerEndpoint};
 use crate::proto::peer::peer_control_client::PeerControlClient;
 use crate::proto::peer::CskRequest;
@@ -47,7 +47,7 @@ const LOG_LOOKBACK_BLOCKS: u64 = 4000;
 
 struct Ctx {
     config: Config,
-    dstack: Arc<dyn DstackRuntime>,
+    provider: Arc<dyn AttestationProvider>,
     chain: Arc<ChainClient>,
     shared: Arc<Shared>,
     wg: Arc<dyn MeshControl>,
@@ -68,7 +68,12 @@ fn now_ms() -> u64 {
 
 fn sni_for(member_contract: Address, tcp_port: u16, gw_domain: &str) -> String {
     // TLS-passthrough route: `<app_id>-<port>s.<gateway-domain>`.
-    format!("{}-{}s.{}", hex::encode(member_contract.as_slice()), tcp_port, gw_domain)
+    format!(
+        "{}-{}s.{}",
+        hex::encode(member_contract.as_slice()),
+        tcp_port,
+        gw_domain
+    )
 }
 
 impl Ctx {
@@ -85,7 +90,7 @@ impl Ctx {
 /// Spawn all mesh bring-up tasks. Returns once spawned (health::serve blocks after).
 pub async fn launch(
     config: Config,
-    dstack: Arc<dyn DstackRuntime>,
+    provider: Arc<dyn AttestationProvider>,
     chain: Arc<ChainClient>,
     shared: Arc<Shared>,
     wg: Arc<dyn MeshControl>,
@@ -97,9 +102,11 @@ pub async fn launch(
 
     shared.set_phase(Phase::Subscribing).await;
 
-    // The owner key: the same /GetKey-derived signer registration installed as the
-    // ClusterMember owner; every post-registration UserOp must be signed by it.
-    let owner_signer = dstack_facet::derive_owner_signer(dstack.as_ref())
+    // The owner key: the same signer registration installed as the ClusterMember
+    // owner; every post-registration UserOp must be signed by it. Method-specific
+    // derivation lives in the provider (dstack: /GetKey; operator: seed file).
+    let owner_signer = provider
+        .owner_signer()
         .await
         .context("derive owner signer for post-registration UserOps")?;
 
@@ -113,7 +120,7 @@ pub async fn launch(
     let self_sni = sni_for(shared.member_contract, config.wg_tcp_port, &gw_domain);
     let ctx = Arc::new(Ctx {
         config: config.clone(),
-        dstack,
+        provider,
         chain: chain.clone(),
         shared: shared.clone(),
         wg,
@@ -273,11 +280,17 @@ async fn reconcile_once(
 
         if !configured {
             ctx.shared.set_phase(Phase::WgConfiguring).await;
-            let rec = ctx.chain.member_by_id(cluster, B256::from(*member_id)).await?;
+            let rec = ctx
+                .chain
+                .member_by_id(cluster, B256::from(*member_id))
+                .await?;
             if !rec.exists() {
                 continue;
             }
-            let mesh_ip = ctx.chain.mesh_ip_of(cluster, B256::from(*member_id)).await?;
+            let mesh_ip = ctx
+                .chain
+                .mesh_ip_of(cluster, B256::from(*member_id))
+                .await?;
             let sni = sni_for(rec.member_contract, ctx.config.wg_tcp_port, gw_domain);
             let endpoint =
                 transport::spawn_peer_bridge(sni.clone(), 443, ctx.shared.wg_listen_port)
@@ -323,7 +336,9 @@ async fn reconcile_once(
         let now = now_ms();
         let due = match last_sent.get(member_id) {
             None => true,
-            Some(at) => !peer_ed_known && now.saturating_sub(*at) > ENVELOPE_RESEND.as_millis() as u64,
+            Some(at) => {
+                !peer_ed_known && now.saturating_sub(*at) > ENVELOPE_RESEND.as_millis() as u64
+            }
         };
         if due {
             match send_peer_endpoint(ctx, *member_id).await {
@@ -431,9 +446,13 @@ async fn poll_envelopes(ctx: &Ctx, next_from_block: &mut Option<u64>) -> Result<
 
 /// CSK lifecycle (master spec §8): restart-unseal, originate (memberIds[0]) or
 /// pull from a live peer over the mesh, then hold for peer-pull serving.
+/// Origination is gated to providers that support it (dstack only in v1 — the CSK
+/// is KMS-derived; an operator-admitted node is onboardee-only per the spec's CSK
+/// note, since the P2P pull is method-agnostic).
 async fn csk_loop(ctx: Arc<Ctx>) {
-    // Restart fast path: the CSK survives in the dstack sealed store.
-    match csk::unseal_from_store(ctx.dstack.as_ref()).await {
+    // Restart fast path: the CSK survives in the provider's store (dstack sealed
+    // store; the operator method has none and re-pulls).
+    match ctx.provider.csk_unseal().await {
         Ok(Some(c)) => {
             *ctx.shared.csk.lock().await = Some(*c);
             ctx.shared.gates.set_csk_acquired();
@@ -466,15 +485,25 @@ async fn csk_once(ctx: &Ctx) -> Result<()> {
         if members.first().map(|m| m.0) != Some(ctx.shared.self_member_id) {
             return Ok(()); // originator hasn't committed yet; keep waiting
         }
-        let c = csk::derive_originator(ctx.dstack.as_ref()).await?;
+        if !ctx.provider.supports_csk_origination() {
+            // First registrant, but the method can't originate (operator method,
+            // v1). The cluster needs a dstack node to register first / originate.
+            tracing::warn!(
+                "this node is memberIds[0] but its attestation method cannot \
+                 originate the CSK (non-TEE); waiting for a dstack member to exist \
+                 before the cluster can converge"
+            );
+            return Ok(());
+        }
+        let c = ctx.provider.derive_csk_originator().await?;
         let inner =
             message_facet::build_set_csk_commitment_calldata(B256::from(csk::commitment(&c)));
         let tx = ctx.submit_op(inner).await.context("setCskCommitment")?;
         // Best-effort: the commitment is on-chain already, and the originator can
         // always re-derive (deterministic KMS derivation), so a store failure
         // must not fail the pass here.
-        if let Err(e) = csk::seal_to_store(ctx.dstack.as_ref(), &c).await {
-            tracing::warn!(error = ?e, "CSK seal_to_store failed (non-fatal)");
+        if let Err(e) = ctx.provider.csk_seal(&c).await {
+            tracing::warn!(error = ?e, "CSK seal failed (non-fatal)");
         }
         *ctx.shared.csk.lock().await = Some(*c);
         ctx.shared.gates.set_csk_acquired();
@@ -486,16 +515,20 @@ async fn csk_once(ctx: &Ctx) -> Result<()> {
     // the sealed store is lost the originator re-derives and verifies against the
     // on-chain commitment. Without this, a restarted originator would join every
     // other empty-handed node in the pull path and the cluster would deadlock
-    // (peer_grpc only serves a held CSK).
-    if let Ok(c) = csk::derive_originator(ctx.dstack.as_ref()).await {
-        if csk::commitment(&c) == commitment.0 {
-            if let Err(e) = csk::seal_to_store(ctx.dstack.as_ref(), &c).await {
-                tracing::warn!(error = ?e, "CSK seal_to_store failed (non-fatal)");
+    // (peer_grpc only serves a held CSK). Gated like origination.
+    if ctx.provider.supports_csk_origination() {
+        if let Ok(c) = ctx.provider.derive_csk_originator().await {
+            if csk::commitment(&c) == commitment.0 {
+                if let Err(e) = ctx.provider.csk_seal(&c).await {
+                    tracing::warn!(error = ?e, "CSK seal failed (non-fatal)");
+                }
+                *ctx.shared.csk.lock().await = Some(*c);
+                ctx.shared.gates.set_csk_acquired();
+                tracing::info!(
+                    "CSK re-derived + verified against on-chain commitment (originator restart)"
+                );
+                return Ok(());
             }
-            *ctx.shared.csk.lock().await = Some(*c);
-            ctx.shared.gates.set_csk_acquired();
-            tracing::info!("CSK re-derived + verified against on-chain commitment (originator restart)");
-            return Ok(());
         }
     }
 
@@ -503,7 +536,11 @@ async fn csk_once(ctx: &Ctx) -> Result<()> {
     ctx.shared.set_phase(Phase::PullingCsk).await;
     let targets: Vec<u32> = {
         let peers = ctx.shared.peers.lock().await;
-        peers.all().filter(|p| p.configured).map(|p| p.mesh_ip).collect()
+        peers
+            .all()
+            .filter(|p| p.configured)
+            .map(|p| p.mesh_ip)
+            .collect()
     };
     for ip in targets {
         let url = format!("http://{}:{}", cidr::fmt_ipv4(ip), PEER_GRPC_PORT);
@@ -523,7 +560,7 @@ async fn csk_once(ctx: &Ctx) -> Result<()> {
             &commitment.0,
         ) {
             Ok(c) => {
-                csk::seal_to_store(ctx.dstack.as_ref(), &c).await?;
+                ctx.provider.csk_seal(&c).await?;
                 *ctx.shared.csk.lock().await = Some(*c);
                 ctx.shared.gates.set_csk_acquired();
                 tracing::info!(from = %url, "CSK pulled + verified against on-chain commitment");
@@ -615,7 +652,11 @@ mod tests {
             salt.extend_from_slice(&ms.to_le_bytes());
             keccak256(&salt)
         };
-        assert_ne!(id_at(1), id_at(2), "different send instants → different ids");
+        assert_ne!(
+            id_at(1),
+            id_at(2),
+            "different send instants → different ids"
+        );
         assert_ne!(id_at(1).0, base, "salted id differs from the bare kind id");
     }
 }

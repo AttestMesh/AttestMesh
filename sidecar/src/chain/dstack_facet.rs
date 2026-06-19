@@ -480,7 +480,11 @@ mod tests {
             ("binding", &proof.messageSignature),
         ] {
             assert_eq!(sig.len(), 65, "{label} signature must be 65 bytes");
-            assert!(sig[64] >= 27, "{label} signature v={} must be an eth recovery id", sig[64]);
+            assert!(
+                sig[64] >= 27,
+                "{label} signature v={} must be an eth recovery id",
+                sig[64]
+            );
         }
     }
 

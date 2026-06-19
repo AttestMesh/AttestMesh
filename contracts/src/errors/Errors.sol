@@ -17,6 +17,18 @@ error NotClusterMember();
 error CodeIdMismatch(); // proof.codeId != bytes20(memberContract)
 error BindingMismatch(); // proof.messageHash != keccak256(bind domain, cluster, member, xPub, wgPub)
 
+// ── Operator registration ───────────────────────────────────────────────────
+// OperatorFacet admits members on an allowlisted operator's signature, not hardware
+// attestation; these guard the voucher. BindingMismatch is shared with dstack for
+// the signature-vs-preimage check.
+error OperatorSignerNotAllowed(); // proof.signer not in OperatorStorage.signers
+error VoucherExpired(); // block.timestamp > proof.expiry
+
+// ── Multi-attestor framework ────────────────────────────────────────────────
+error AttestorNotApproved(); // factory v2: facet not in the approved-attestor set
+error NotDiamondContext(); // initAttestor called outside an initialized diamond
+error NotFactoryOwner();
+
 // ── Messaging ───────────────────────────────────────────────────────────────
 error DuplicateEnvelope();
 error RecipientNotMember();
@@ -32,6 +44,6 @@ error ClusterDestroyed(); // reserved for milestone B; not used in v1
 // ── Member contract / EIP-4337 ──────────────────────────────────────────────
 error OnlyEntryPoint();
 error OnlyCluster();
-error OwnerAlreadySet();
+error OwnerAlreadySet(); // unused since the multi-attestor skip-if-set change; kept for ABI tooling
 error InvalidBootstrapCall();
 error NotInternalCall();

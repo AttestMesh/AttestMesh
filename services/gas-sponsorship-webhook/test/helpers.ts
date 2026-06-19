@@ -50,6 +50,10 @@ export interface TestEnvOptions {
   memberCache?: KVNamespace;
   token?: string;
   chainId?: number;
+  /** SPONSOR_OPERATOR_METHOD value; omitted (default-off) when undefined. */
+  sponsorOperatorMethod?: "true" | "false";
+  /** CANONICAL_CLUSTER_FACTORY_V2; omitted (v1-only) when undefined. */
+  clusterFactoryV2?: string;
 }
 
 export function makeEnv(opts: TestEnvOptions = {}): Env {
@@ -58,7 +62,13 @@ export function makeEnv(opts: TestEnvOptions = {}): Env {
     MEMBER_PROVENANCE_CACHE: opts.memberCache ?? fakeKV(),
     EXPECTED_CHAIN_ID: String(opts.chainId ?? 84532),
     CANONICAL_CLUSTER_FACTORY: "0x000000000000000000000000000000000000FacE",
+    ...(opts.clusterFactoryV2 !== undefined && {
+      CANONICAL_CLUSTER_FACTORY_V2: opts.clusterFactoryV2,
+    }),
     CANONICAL_MEMBER_FACTORY: "0x000000000000000000000000000000000000BeeF",
+    ...(opts.sponsorOperatorMethod !== undefined && {
+      SPONSOR_OPERATOR_METHOD: opts.sponsorOperatorMethod,
+    }),
     CACHE_TTL_SECONDS: "86400",
     LOG_LEVEL: "error",
     RPC_URL: "https://rpc.test.invalid",

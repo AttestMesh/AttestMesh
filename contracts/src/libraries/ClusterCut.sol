@@ -11,10 +11,15 @@ import { INetwork } from "../interfaces/INetwork.sol";
 import { IDstackFacet } from "../interfaces/IDstackFacet.sol";
 import { IAppAuth } from "../interfaces/IAppAuth.sol";
 import { IAppAuthBasicManagement } from "../interfaces/IAppAuthBasicManagement.sol";
+import { IAttestorFacet, AttestorConfig } from "../interfaces/IAttestorFacet.sol";
 
-/// @title ClusterCut — builds the canonical v1 FacetCut array (contracts spec §10).
+/// @title ClusterCut — builds the canonical FacetCut arrays (contracts spec §10).
 /// @notice Centralizes the diamond's selector set so the factory and the deploy
-///         script can never drift. Two selectors are resolved against clashes:
+///         script can never drift. v1 (`buildFacetCuts`) keeps the hand-maintained
+///         dstack selector list for the deployed v1 factory lineage; v2 splits into
+///         fixed core cuts (`buildCoreCuts`) + self-describing attestor cuts
+///         (`buildAttestorCuts`, selectors staticcalled from each facet's own
+///         `selectorManifest()`). Two selectors are resolved against clashes:
 ///         - `wgPubKeyOf(bytes32)` is registered on NetworkFacet only (AttestFacet
 ///           also implements it as a mirror, but the diamond serves the canonical
 ///           NetworkStorage value).
@@ -22,6 +27,49 @@ import { IAppAuthBasicManagement } from "../interfaces/IAppAuthBasicManagement.s
 ///           `owner()` (the solidstate owner) serves it — equal to the cluster owner
 ///           in the common single-Safe case.
 library ClusterCut {
+    /// @notice v2 core cuts: the fixed attestation-method-agnostic facet set.
+    function buildCoreCuts(address attestFacet, address messageFacet, address networkFacet)
+        internal
+        pure
+        returns (IERC2535DiamondCutInternal.FacetCut[] memory cuts)
+    {
+        cuts = new IERC2535DiamondCutInternal.FacetCut[](3);
+        cuts[0] = IERC2535DiamondCutInternal.FacetCut({
+            target: attestFacet,
+            action: IERC2535DiamondCutInternal.FacetCutAction.ADD,
+            selectors: _attestSelectors()
+        });
+        cuts[1] = IERC2535DiamondCutInternal.FacetCut({
+            target: messageFacet,
+            action: IERC2535DiamondCutInternal.FacetCutAction.ADD,
+            selectors: _messageSelectors()
+        });
+        cuts[2] = IERC2535DiamondCutInternal.FacetCut({
+            target: networkFacet,
+            action: IERC2535DiamondCutInternal.FacetCutAction.ADD,
+            selectors: _networkSelectors()
+        });
+    }
+
+    /// @notice v2 attestor cuts, built dynamically from each configured facet's own
+    ///         `selectorManifest()` (a staticcall against the implementation address,
+    ///         not the diamond) — manifest/cut drift is impossible by construction.
+    ///         Overlapping manifests revert inside `_diamondCut` (selector collision).
+    function buildAttestorCuts(AttestorConfig[] memory attestors)
+        internal
+        view // staticcalls each facet's selectorManifest() (pure on the impl)
+        returns (IERC2535DiamondCutInternal.FacetCut[] memory cuts)
+    {
+        cuts = new IERC2535DiamondCutInternal.FacetCut[](attestors.length);
+        for (uint256 i; i < attestors.length; ++i) {
+            cuts[i] = IERC2535DiamondCutInternal.FacetCut({
+                target: attestors[i].facet,
+                action: IERC2535DiamondCutInternal.FacetCutAction.ADD,
+                selectors: IAttestorFacet(attestors[i].facet).selectorManifest()
+            });
+        }
+    }
+
     function buildFacetCuts(
         address attestFacet,
         address messageFacet,

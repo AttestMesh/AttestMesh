@@ -38,7 +38,9 @@ const WG_KEY: Hex = `0x${"cd".repeat(32)}`;
 const config: Config = {
   expectedChainId: 84532,
   canonicalClusterFactory: "0x000000000000000000000000000000000000FacE",
+  canonicalClusterFactoryV2: undefined,
   canonicalMemberFactory: "0x000000000000000000000000000000000000BeeF",
+  sponsorOperatorMethod: false,
   rpcUrl: "https://rpc.invalid",
   alchemyWebhookToken: TOKEN,
   cacheTtlSeconds: 86_400,
@@ -245,6 +247,85 @@ describe("evaluatePolicy", () => {
     await evaluatePolicy(validInput({ token: "wrong" }), config, provenance);
     expect(memberSpy).not.toHaveBeenCalled();
     expect(clusterSpy).not.toHaveBeenCalled();
+  });
+
+  // 6b. operator-method gate (multi-attestor spec): operator_register and the
+  // OperatorFacet admin selectors sponsor only under SPONSOR_OPERATOR_METHOD=true.
+  // Trust note: operator-admitted members are key-vouched, not hardware-attested,
+  // so paying their gas is an explicit operator opt-in.
+  function operatorRegisterInner(): Hex {
+    return encodeFunctionData({
+      abi: [
+        {
+          type: "function",
+          name: "operator_register",
+          stateMutability: "nonpayable",
+          inputs: [
+            {
+              name: "proof",
+              type: "tuple",
+              components: [
+                { name: "signer", type: "address" },
+                { name: "ownerKey", type: "address" },
+                { name: "expiry", type: "uint64" },
+                { name: "signature", type: "bytes" },
+              ],
+            },
+            { name: "memberContract", type: "address" },
+            { name: "xPubKey", type: "bytes32" },
+            { name: "wgPubKey", type: "bytes32" },
+          ],
+          outputs: [{ name: "", type: "bytes32" }],
+        },
+      ] as const,
+      functionName: "operator_register",
+      args: [
+        {
+          signer: SENDER,
+          ownerKey: SENDER,
+          expiry: 4_000_000_000n,
+          signature: `0x${"ab".repeat(65)}`,
+        },
+        SENDER,
+        `0x${"11".repeat(32)}`,
+        `0x${"22".repeat(32)}`,
+      ],
+    });
+  }
+
+  it("denies operator_register when SPONSOR_OPERATOR_METHOD is off (default)", async () => {
+    const decision = await evaluatePolicy(
+      validInput({
+        userOperation: {
+          sender: SENDER,
+          callData: encodeExecute(CLUSTER, 0n, operatorRegisterInner()),
+        },
+      }),
+      config,
+      provenance,
+    );
+    expect(decision).toEqual({ approved: false, reason: "inner-selector-not-allowed" });
+  });
+
+  it("approves operator_register when SPONSOR_OPERATOR_METHOD is on", async () => {
+    const optIn: Config = { ...config, sponsorOperatorMethod: true };
+    const decision = await evaluatePolicy(
+      validInput({
+        userOperation: {
+          sender: SENDER,
+          callData: encodeExecute(CLUSTER, 0n, operatorRegisterInner()),
+        },
+      }),
+      optIn,
+      provenance,
+    );
+    expect(decision).toEqual({ approved: true });
+  });
+
+  it("the operator gate does not affect core traffic", async () => {
+    const optOut: Config = { ...config, sponsorOperatorMethod: false };
+    const decision = await evaluatePolicy(validInput(), optOut, provenance);
+    expect(decision).toEqual({ approved: true });
   });
 
   // Accept a different allowlisted selector (setCskCommitment) end-to-end.

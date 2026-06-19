@@ -7,9 +7,9 @@
 
 pub mod gates;
 
-use crate::chain::{bundler, dstack_facet, userop, ChainClient};
+use crate::attestor::AttestationProvider;
+use crate::chain::{bundler, userop, ChainClient};
 use crate::config::Config;
-use crate::dstack::DstackRuntime;
 use crate::heartbeat::liveness::Liveness;
 use crate::keys::KeyMaterial;
 use crate::wg::peer::PeerTable;
@@ -96,10 +96,16 @@ pub struct Shared {
     pub peer_event_tx: broadcast::Sender<AppPeerEvent>,
 }
 
-/// memberId = keccak256(abi.encode(cluster, memberContract, keccak256(attestorId))).
+/// memberId = keccak256(abi.encode(cluster, memberContract, keccak256(attestorId))),
+/// for the dstack method. Kept for callers/tests that predate the provider seam.
 pub fn compute_member_id(cluster: Address, member: Address) -> [u8; 32] {
-    let attestor_id = keccak256(DSTACK_ATTESTOR_ID);
-    let enc = (cluster, member, attestor_id).abi_encode_params();
+    compute_member_id_for(cluster, member, keccak256(DSTACK_ATTESTOR_ID).0)
+}
+
+/// memberId = keccak256(abi.encode(cluster, memberContract, attestorId)) — the
+/// method-agnostic form (`attestorId` comes from the provider).
+pub fn compute_member_id_for(cluster: Address, member: Address, attestor_id: [u8; 32]) -> [u8; 32] {
+    let enc = (cluster, member, B256::from(attestor_id)).abi_encode_params();
     keccak256(enc).0
 }
 
@@ -111,8 +117,9 @@ impl Shared {
         mesh_cidr_ip: u32,
         mesh_cidr_prefix: u8,
         wg_listen_port: u16,
+        attestor_id: [u8; 32],
     ) -> Arc<Self> {
-        let self_member_id = compute_member_id(cluster, member_contract);
+        let self_member_id = compute_member_id_for(cluster, member_contract, attestor_id);
         let self_mesh_ip = wg::cidr::derive_ip(&self_member_id, mesh_cidr_ip, mesh_cidr_prefix);
         let (incoming_tx, _) = broadcast::channel(1024);
         let (peer_event_tx, _) = broadcast::channel(1024);
@@ -157,16 +164,13 @@ impl Shared {
 }
 
 /// Boot orchestration (sidecar spec §7.1): derive keys → resolve the member
-/// contract → discover the cluster → sponsored dstack_register → mesh bring-up
-/// (`bringup::launch`) → health server. Validated live on Base mainnet
-/// (docs/deployment.md); the §16.2 integration harness reproduces the flow
-/// locally against anvil + a mock dstack runtime.
+/// contract → discover the cluster → sponsored register UserOp → mesh bring-up
+/// (`bringup::launch`) → health server. All attestation-method detail lives behind
+/// the provider (`ATTESTOR=dstack|operator`); the dstack flow is validated live on
+/// Base mainnet (docs/deployment.md).
 pub async fn run(config: Config) -> Result<()> {
-    use crate::dstack::{DstackRuntime, UnixSocketDstack};
-
-    let dstack: Arc<dyn DstackRuntime> =
-        Arc::new(UnixSocketDstack::new(config.dstack_socket.clone()));
-    let keys = Arc::new(crate::keys::derive_all(dstack.as_ref()).await?);
+    let provider = crate::attestor::make_provider(&config)?;
+    let keys = Arc::new(provider.derive_keys().await?);
     tracing::info!(
         x_pub = %hex::encode(keys.x_pub),
         ed25519_pub = %hex::encode(keys.ed25519_pub),
@@ -176,8 +180,8 @@ pub async fn run(config: Config) -> Result<()> {
 
     // Path A (dstack base KMS): when MEMBER_CONTRACT is unset, the member contract IS this
     // CVM's app_id (a stock DstackApp `phala deploy` minted, then upgraded to ClusterMember),
-    // learnable only at runtime from /Info.
-    let member = resolve_member_contract(&config, dstack.as_ref()).await?;
+    // learnable only at runtime from /Info. Other methods require MEMBER_CONTRACT.
+    let member = resolve_member_contract(&config, provider.as_ref()).await?;
     tracing::info!(%member, "resolved member contract");
 
     let chain = ChainClient::new(&config.rpc_url, config.chain_id, member, &keys)?;
@@ -211,6 +215,7 @@ pub async fn run(config: Config) -> Result<()> {
         0x0a0d0000,
         16,
         config.wg_listen_port,
+        provider.attestor_id(),
     );
 
     let wg_ctl: Arc<dyn MeshControl> = Arc::new(wg::CommandWg);
@@ -226,24 +231,24 @@ pub async fn run(config: Config) -> Result<()> {
 
     shared.set_phase(Phase::Registering).await;
 
-    // Track D — registration. Build the dstack KMS proof and submit a sponsored
-    // dstack_register UserOp. Logged verbosely so a live-CVM run pinpoints any failure
-    // (which dstack call, the bundler, or the on-chain gate). Retried: in Path A the
-    // operator's allowlist + compose-hash writes may land just after boot, and the bundler
-    // can transiently reject. Indexer subscription, peer exchange, heartbeats, CSK, and wg
-    // config follow via bringup::launch once registration lands.
+    // Track D — registration. Build this method's register call via the provider and
+    // submit it as a sponsored UserOp. Logged verbosely so a live run pinpoints any
+    // failure (the provider, the bundler, or the on-chain gate). Retried: the
+    // operator-side on-chain prep (allowlists, compose hashes, signer set) may land
+    // just after boot, and the bundler can transiently reject. Indexer subscription,
+    // peer exchange, heartbeats, CSK, and wg config follow via bringup::launch.
     let mut reg_attempt = 0u32;
     let mut registered = false;
     loop {
         reg_attempt += 1;
-        match register_on_chain(&config, dstack.as_ref(), &chain, member, cluster, &keys).await {
+        match register_on_chain(&config, provider.as_ref(), &chain, member, cluster, &keys).await {
             Ok(tx) if tx == B256::ZERO => {
                 tracing::info!("already registered on-chain; skipping");
                 registered = true;
                 break;
             }
             Ok(tx) => {
-                tracing::info!(tx = %tx, "✔ dstack_register landed on-chain");
+                tracing::info!(tx = %tx, "✔ registration landed on-chain");
                 registered = true;
                 break;
             }
@@ -266,7 +271,7 @@ pub async fn run(config: Config) -> Result<()> {
     if registered {
         crate::bringup::launch(
             config.clone(),
-            dstack.clone(),
+            provider.clone(),
             Arc::new(chain),
             shared.clone(),
             wg_ctl.clone(),
@@ -279,38 +284,34 @@ pub async fn run(config: Config) -> Result<()> {
 }
 
 /// Resolve the ClusterMember contract address. Uses `MEMBER_CONTRACT` when set (factory /
-/// custom-app-id KMS path); otherwise self-discovers it from the dstack `/Info` app_id
-/// (Path A: the member contract IS this CVM's provisioned app_id, unknown until runtime).
-async fn resolve_member_contract(config: &Config, dstack: &dyn DstackRuntime) -> Result<Address> {
+/// custom-app-id KMS path); otherwise asks the provider to self-discover it (dstack
+/// Path A reads its `/Info` app_id; methods without self-discovery fail fast).
+async fn resolve_member_contract(
+    config: &Config,
+    provider: &dyn AttestationProvider,
+) -> Result<Address> {
     if let Some(m) = config.member_contract {
         if m != Address::ZERO {
             return Ok(m);
         }
     }
-    let info = dstack
-        .info()
-        .await
-        .context("dstack /Info for app_id self-discovery (MEMBER_CONTRACT unset)")?;
-    if info.app_id.len() != 20 {
-        anyhow::bail!("dstack app_id is {} bytes, expected a 20-byte address", info.app_id.len());
-    }
-    let member = Address::from_slice(&info.app_id);
-    tracing::info!(%member,
-        "MEMBER_CONTRACT unset; self-discovered member contract from dstack /Info app_id (Path A)");
+    let member = provider.self_member_contract().await?;
+    tracing::info!(%member, "MEMBER_CONTRACT unset; provider self-discovered the member contract");
     Ok(member)
 }
 
-/// Build the dstack KMS proof from the runtime and submit a sponsored `dstack_register`
-/// UserOp (bootstrap flow: ClusterMember.validateUserOp recovers the binding key from the
-/// inner proof). Returns the tx hash, or `B256::ZERO` if the node is already a member.
+/// Build this method's register call via the provider and submit it as a sponsored
+/// UserOp (bootstrap flow: ClusterMember.validateUserOp checks the userOp signer
+/// against the method's bootstrap signer inside the inner calldata). Returns the tx
+/// hash, or `B256::ZERO` if the node is already a member.
 ///
-/// NOTE: the registration signer is the `/GetKey`-derived key returned by
-/// `build_proof_from_runtime` (the one the KMS sig-chain attests), NOT
-/// `keys.binding_seed` (a separate `derive_key` value). The ClusterMember owner is set to
-/// this signer, so every later UserOp must use it too — unify on it as bring-up grows.
+/// NOTE (dstack): the registration signer is the `/GetKey`-derived key the KMS
+/// sig-chain attests, NOT `keys.binding_seed` (a separate `derive_key` value). The
+/// ClusterMember owner is set to the provider's signer, so every later UserOp must
+/// use it too (`AttestationProvider::owner_signer`).
 async fn register_on_chain(
     config: &Config,
-    dstack: &dyn DstackRuntime,
+    provider: &dyn AttestationProvider,
     chain: &ChainClient,
     member: Address,
     cluster: Address,
@@ -329,17 +330,13 @@ async fn register_on_chain(
     let x_pub = B256::from(keys.x_pub);
     let wg_pub = B256::from(keys.wg_pub);
     tracing::info!(%member, %cluster, %x_pub, %wg_pub,
-        "registration: building proof from dstack runtime (/Info + /GetKey)");
+        "registration: building register call via the attestation provider");
 
-    let (proof, binding_signer) =
-        dstack_facet::build_proof_from_runtime(dstack, cluster, member, x_pub, wg_pub)
-            .await
-            .context("build_proof_from_runtime (/Info + /GetKey -> DstackProof)")?;
-    tracing::info!(owner = %binding_signer.address(), code_id = %proof.codeId,
-        purpose = %proof.purpose, "registration: proof built; derived key is the member owner");
-
-    let inner = dstack_facet::build_register_calldata(proof, member, x_pub, wg_pub);
-    let outer = userop::wrap_execute(cluster, inner);
+    let reg = provider
+        .build_register_call(cluster, member, keys.x_pub, keys.wg_pub)
+        .await
+        .context("provider.build_register_call")?;
+    let outer = userop::wrap_execute(cluster, reg.calldata);
     let op = userop::UserOperation::new(member, Default::default(), outer);
 
     let bundler = bundler::BundlerClient::new(
@@ -349,9 +346,9 @@ async fn register_on_chain(
         config.gas_policy_id.clone(),
     );
     tracing::info!(policy = %config.gas_policy_id,
-        "registration: submitting sponsored dstack_register UserOp (bootstrap mode)");
+        "registration: submitting sponsored register UserOp (bootstrap mode)");
     bundler
-        .submit(&binding_signer, op)
+        .submit(&reg.signer, op)
         .await
-        .context("bundler.submit(dstack_register)")
+        .context("bundler.submit(register)")
 }

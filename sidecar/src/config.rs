@@ -3,10 +3,29 @@
 //! derived from the attestation-bound seed at runtime.
 
 use alloy::primitives::Address;
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
+
+/// Which attestation method this node registers with (`ATTESTOR`, multi-attestor
+/// spec). Exactly one per node; a cluster may mix methods across nodes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AttestorMethod {
+    #[default]
+    Dstack,
+    /// Operator-signature method: the node is vouched for by an allowlisted
+    /// operator key, NOT hardware attestation (see attestor::operator).
+    Operator,
+}
 
 #[derive(Debug, Clone)]
 pub struct Config {
+    /// Attestation method selection (`ATTESTOR=dstack|operator`, default dstack).
+    pub attestor: AttestorMethod,
+    /// Operator method only: the pre-signed registration voucher minted by
+    /// `mesh-voucher` (hex CBOR or JSON). Not secret — useless without the seed.
+    pub operator_voucher: Option<String>,
+    /// Operator method only: path of the node's local key seed file (generated on
+    /// first boot, mode 0600). Explicitly weaker than TEE-derived keys.
+    pub attestor_seed_path: String,
     /// The ClusterMember contract address. `None` when unset in env: Path A (dstack base
     /// KMS) mints the app_id at `phala deploy` time, so the member contract — which equals
     /// that app_id — is unknown until the CVM reads its own `/Info` at runtime.
@@ -44,6 +63,16 @@ fn opt(key: &str, default: &str) -> String {
 impl Config {
     pub fn from_env() -> Result<Self> {
         Ok(Self {
+            attestor: match opt("ATTESTOR", "dstack").trim() {
+                "dstack" => AttestorMethod::Dstack,
+                "operator" => AttestorMethod::Operator,
+                other => bail!("ATTESTOR must be dstack|operator, got {other:?}"),
+            },
+            operator_voucher: match std::env::var("OPERATOR_VOUCHER") {
+                Ok(s) if !s.trim().is_empty() => Some(s.trim().to_string()),
+                _ => None,
+            },
+            attestor_seed_path: opt("ATTESTOR_SEED_PATH", "/var/lib/attestmesh/attestor-seed"),
             member_contract: match std::env::var("MEMBER_CONTRACT") {
                 Ok(s) if !s.trim().is_empty() => Some(s.parse().context("MEMBER_CONTRACT")?),
                 _ => None,
@@ -84,11 +113,17 @@ mod tests {
         std::env::set_var("CHAIN_ID", "8453");
         std::env::set_var("RPC_URL", "http://rpc.example");
         std::env::set_var("BUNDLER_URL", "http://bundler.example");
-        std::env::set_var("INDEXER_REGISTRY_ADDR", "0xbC003686943fB957100E517D3CEf66c52B5CDdBf");
+        std::env::set_var(
+            "INDEXER_REGISTRY_ADDR",
+            "0xbC003686943fB957100E517D3CEf66c52B5CDdBf",
+        );
     }
 
     fn clear_optional() {
         for k in [
+            "ATTESTOR",
+            "OPERATOR_VOUCHER",
+            "ATTESTOR_SEED_PATH",
             "MEMBER_CONTRACT",
             "GAS_POLICY_ID",
             "GATEWAY_DOMAIN",
@@ -112,7 +147,17 @@ mod tests {
 
         let c = Config::from_env().expect("required set");
         assert_eq!(c.chain_id, 8453);
-        assert_eq!(c.member_contract, None, "Path A: self-discovered at runtime");
+        assert_eq!(
+            c.attestor,
+            AttestorMethod::Dstack,
+            "default method is dstack"
+        );
+        assert_eq!(c.operator_voucher, None);
+        assert_eq!(c.attestor_seed_path, "/var/lib/attestmesh/attestor-seed");
+        assert_eq!(
+            c.member_contract, None,
+            "Path A: self-discovered at runtime"
+        );
         assert_eq!(c.gateway_domain, None, "unset → registration-only mode");
         assert_eq!(c.wg_tcp_port, 51900);
         assert_eq!(
@@ -134,8 +179,26 @@ mod tests {
 
         std::env::set_var("GATEWAY_DOMAIN", "dstack-base-prod5.phala.network");
         let c = Config::from_env().unwrap();
-        assert_eq!(c.gateway_domain.as_deref(), Some("dstack-base-prod5.phala.network"));
+        assert_eq!(
+            c.gateway_domain.as_deref(),
+            Some("dstack-base-prod5.phala.network")
+        );
         std::env::remove_var("GATEWAY_DOMAIN");
+    }
+
+    #[test]
+    fn attestor_selection_parses() {
+        let _g = ENV_LOCK.lock().unwrap();
+        set_required();
+        clear_optional();
+
+        std::env::set_var("ATTESTOR", "operator");
+        let c = Config::from_env().unwrap();
+        assert_eq!(c.attestor, AttestorMethod::Operator);
+
+        std::env::set_var("ATTESTOR", "tdx-direct");
+        assert!(Config::from_env().is_err(), "unknown method must fail fast");
+        std::env::remove_var("ATTESTOR");
     }
 
     #[test]

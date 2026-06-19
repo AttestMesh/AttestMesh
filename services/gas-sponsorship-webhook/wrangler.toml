@@ -18,6 +18,13 @@ EXPECTED_CHAIN_ID = "8453"
 CANONICAL_CLUSTER_FACTORY = "0xf6E85fD138E3208d3AAE63ce4E2A33f20e82b9fb"
 # ClusterMemberFactory address deployed by DeployInfra.s.sol on Base mainnet (fixed-facet redeploy).
 CANONICAL_MEMBER_FACTORY = "0xFf9f438EFdAa197f4ae59D1d711C4f09640b8417"
+# Multi-attestor (multi-attestor spec): set once ClusterDiamondFactoryV2 is deployed —
+# v1 and v2 coexist and isDeployedCluster trusts either. Unset = v1-only.
+# CANONICAL_CLUSTER_FACTORY_V2 = "0x..."
+# Sponsor OperatorFacet traffic (operator_register + signer admin)? Default false.
+# TRUST NOTE: operator-method members are vouched for by a key, not hardware
+# attestation — enabling sponsorship for them is an explicit opt-in.
+# SPONSOR_OPERATOR_METHOD = "false"
 CACHE_TTL_SECONDS = "86400"
 LOG_LEVEL = "info"
 
