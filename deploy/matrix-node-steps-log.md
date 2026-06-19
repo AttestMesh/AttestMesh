@@ -128,7 +128,14 @@ Clusters **C `0x342b676…`** (orphan dead originator `0xbEBBB…` + member Z `0
 **C2 `0xdf5eb5a…`** (member W `0xD6aa247…`, media_store crash). Intermediate registered apps
 `0x783f…,0xdd69…,0x53e2…,0x6363…`.
 
-## 5. The repeatable flow (BUILT — Smithers, graph-validated)
+## 5. The repeatable flow (BUILT + END-TO-END VALIDATED — Smithers)
+
+> **Validated 2026-06-19**: a full `smithers up` run (throwaway node `matrix-node-test` on box ports
+> 8082/9093, alongside the live node) completed all 6 steps in **2m19s** — deploy → cluster
+> (`0x0717E5C1…`) → patha → prime → bind → verify — with the node registered as sole member#0 / CSK
+> originator (`csk_acquired:true`, `waiting-peers`) and Matrix well-known live. Test CVM removed after;
+> the throwaway cluster/app remain abandoned on-chain (no `removeMember`).
+
 
 Distilled into a durable, resumable Smithers workflow (mirrors `deploy/workflows/deploy.tsx`):
 
