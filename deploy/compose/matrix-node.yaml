@@ -1,0 +1,297 @@
+# AttestMesh node + Matrix homeserver — ONE sealed dstack CVM on the self-hosted
+# on-chain box (attestmesh.xyz), deployed via the patched mcp__dstack__deploy_app(env=...).
+#
+# Secrets are injected as dstack encrypted_env (allowed_envs = their KEYS, measured into
+# compose_hash; VALUES sealed to the app's X25519 key, decrypted only in the TEE). The
+# sealed set passed at deploy time: RPC_URL, BUNDLER_URL, GAS_POLICY_ID, POSTGRES_PASSWORD,
+# TS_AUTHKEY  (+ APP_ID auto-injected by the tool if available; else resolved from /Info).
+#
+# Matrix server_name = <app_id>.gateway.attestmesh.xyz — the app_id is unknown until the
+# deploy registers the on-chain app, so `synapse-init` resolves it AT BOOT (from $APP_ID if
+# the tool injected it, else by querying the dstack guest socket) and self-writes the config.
+#
+# Single-node mesh never reaches phase=healthy (no peers to converge with), so Matrix is
+# intentionally NOT gated on the sidecar's health — they run independently.
+
+services:
+
+  # ── AttestMesh node sidecar (cluster-mesh-agent): registers this CVM into the cluster ──
+  sidecar:
+    image: ghcr.io/attestmesh/cluster-mesh-agent:latest
+    restart: unless-stopped
+    environment:
+      - CHAIN_ID=8453
+      - INDEXER_REGISTRY_ADDR=0xbC003686943fB957100E517D3CEf66c52B5CDdBf
+      - GATEWAY_DOMAIN=gateway.attestmesh.xyz
+      - RPC_URL=${RPC_URL}
+      - BUNDLER_URL=${BUNDLER_URL}
+      - GAS_POLICY_ID=${GAS_POLICY_ID}
+      - DSTACK_SOCKET=/var/run/dstack.sock
+      - HEALTH_HTTP_ADDR=0.0.0.0:9090
+      - LOG_FORMAT=pretty
+      - LOG_LEVEL=info,cluster_mesh_agent=debug
+    volumes:
+      - /var/run/dstack.sock:/var/run/dstack.sock
+    ports:
+      - "9090:9090"
+      - "51900:51900"
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun
+
+  # ── Postgres for Synapse ────────────────────────────────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      - POSTGRES_USER=synapse
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+      - POSTGRES_DB=synapse
+      - POSTGRES_INITDB_ARGS=--encoding=UTF8 --locale=C
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U synapse -d synapse"]
+      interval: 10s
+      timeout: 5s
+      retries: 18
+
+  # ── One-shot init: resolve app_id → server_name, generate Synapse config/keys + well-known ──
+  # All logic is in Python (no shell $-vars) to sidestep docker-compose ${} interpolation.
+  synapse-init:
+    image: ghcr.io/element-hq/synapse:latest
+    restart: "no"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+      - APP_ID=${APP_ID}
+    volumes:
+      - synapse-data:/data
+      - wellknown:/wellknown
+      - /var/run/dstack.sock:/var/run/dstack.sock:ro
+    entrypoint:
+      - /bin/bash
+      - -c
+      - |
+        cat > /tmp/init.py <<'PYEOF'
+        import os, sys, json, socket, subprocess, secrets, time
+
+        DATA = "/data"; WK = "/wellknown"
+        hs = os.path.join(DATA, "homeserver.yaml")
+        if os.path.exists(hs):
+            print("homeserver.yaml exists; init skipped"); sys.exit(0)
+
+        def via_socket(path, method):
+            # dstack guest agent speaks prpc over the unix socket; try a few shapes.
+            s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM); s.settimeout(5)
+            s.connect(path)
+            req = "GET /prpc/%s?json HTTP/1.1\r\nHost: dstack\r\nConnection: close\r\n\r\n" % method
+            s.sendall(req.encode()); buf = b""
+            while True:
+                try: chunk = s.recv(4096)
+                except Exception: break
+                if not chunk: break
+                buf += chunk
+            s.close()
+            body = buf.split(b"\r\n\r\n", 1)[1] if b"\r\n\r\n" in buf else buf
+            return json.loads(body.decode("utf-8", "replace"))
+
+        def find_app_id(obj):
+            if isinstance(obj, dict):
+                for k, v in obj.items():
+                    if k.lower() in ("app_id", "appid") and isinstance(v, str) and len(v.replace("0x","")) == 40:
+                        return v
+                    r = find_app_id(v)
+                    if r: return r
+            elif isinstance(obj, list):
+                for v in obj:
+                    r = find_app_id(v)
+                    if r: return r
+            return None
+
+        appid = (os.environ.get("APP_ID") or "").strip()
+        if not appid:
+            sock = os.environ.get("DSTACK_SOCKET", "/var/run/dstack.sock")
+            for method in ("Info", "GetInfo", "Worker.Info", "Tappd.Info", "Guest.Info"):
+                for attempt in range(30):
+                    try:
+                        appid = find_app_id(via_socket(sock, method)) or ""
+                    except Exception:
+                        appid = ""
+                    if appid: break
+                    time.sleep(2)
+                if appid: break
+        if not appid:
+            sys.exit("FATAL: could not resolve app_id (set APP_ID env or check dstack socket)")
+
+        appid = appid.lower().replace("0x", "")
+        sn = appid + ".gateway.attestmesh.xyz"
+        print("resolved server_name =", sn, flush=True)
+
+        subprocess.run(["python", "-m", "synapse._scripts.generate_signing_key", "-o", os.path.join(DATA, "signing.key")], check=True)
+        reg = secrets.token_urlsafe(48); mac = secrets.token_urlsafe(48); form = secrets.token_urlsafe(48)
+        pw = os.environ["POSTGRES_PASSWORD"]
+
+        cfg = """server_name: "{sn}"
+        pid_file: /data/homeserver.pid
+        signing_key_path: /data/signing.key
+        media_store_path: /data/media_store
+        report_stats: false
+        public_baseurl: "https://{sn}/"
+        listeners:
+          - port: 8008
+            tls: false
+            type: http
+            x_forwarded: true
+            bind_addresses: ['0.0.0.0']
+            resources:
+              - names: [client, federation]
+                compress: false
+        database:
+          name: psycopg2
+          args:
+            user: synapse
+            password: "{pw}"
+            database: synapse
+            host: postgres
+            cp_min: 5
+            cp_max: 10
+        registration_shared_secret: "{reg}"
+        macaroon_secret_key: "{mac}"
+        form_secret: "{form}"
+        enable_registration: false
+        url_preview_enabled: false
+        suppress_key_server_warning: true
+        trusted_key_servers:
+          - server_name: "matrix.org"
+        """.replace("\n        ", "\n").format(sn=sn, pw=pw, reg=reg, mac=mac, form=form)
+        with open(hs, "w") as f: f.write(cfg)
+
+        wkd = os.path.join(WK, ".well-known", "matrix"); os.makedirs(wkd, exist_ok=True)
+        with open(os.path.join(wkd, "server"), "w") as f:
+            f.write(json.dumps({"m.server": sn + ":443"}))
+        with open(os.path.join(wkd, "client"), "w") as f:
+            f.write(json.dumps({"m.homeserver": {"base_url": "https://" + sn + "/"}}))
+
+        # Synapse runs as uid 991 in this image.
+        for root, dirs, files in os.walk(DATA):
+            for n in dirs + files:
+                try: os.chown(os.path.join(root, n), 991, 991)
+                except Exception: pass
+        try: os.chown(DATA, 991, 991)
+        except Exception: pass
+        print("synapse-init: config + signing key + well-known written", flush=True)
+        PYEOF
+        python3 /tmp/init.py
+
+  # ── Synapse homeserver ──────────────────────────────────────────────────────
+  synapse:
+    image: ghcr.io/element-hq/synapse:latest
+    restart: unless-stopped
+    depends_on:
+      synapse-init:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+    environment:
+      - SYNAPSE_CONFIG_PATH=/data/homeserver.yaml
+    volumes:
+      - synapse-data:/data
+
+  # ── Reverse proxy: well-known delegation + /_matrix|/_synapse → synapse ──────
+  # config written at runtime (avoids needing a build context / BuildKit heredoc).
+  nginx:
+    image: nginx:alpine
+    restart: unless-stopped
+    depends_on:
+      - synapse
+    ports:
+      - "80:80"
+    volumes:
+      - wellknown:/usr/share/nginx/wellknown:ro
+    command:
+      - /bin/sh
+      - -c
+      - |
+        cat > /etc/nginx/conf.d/default.conf <<'NGINX'
+        server {
+          listen 80 default_server;
+          server_name _;
+          client_max_body_size 50M;
+
+          location /.well-known/matrix/ {
+            root /usr/share/nginx/wellknown;
+            default_type application/json;
+            add_header Access-Control-Allow-Origin *;
+          }
+
+          location ~ ^(/_matrix|/_synapse/client) {
+            proxy_pass http://synapse:8008;
+            proxy_set_header X-Forwarded-For $$remote_addr;
+            proxy_set_header X-Forwarded-Proto https;
+            proxy_set_header Host $$host;
+            proxy_http_version 1.1;
+          }
+
+          location = / {
+            default_type text/plain;
+            return 200 "AttestMesh Matrix node — Synapse homeserver. Use a Matrix client against this domain.\n";
+          }
+        }
+        NGINX
+        exec nginx -g 'daemon off;'
+
+  # ── Tailscale: joins the tailnet sharing nginx's netns, so the node + Matrix are
+  #     reachable over the tailnet at http://<ts-hostname>:80 (tailnet is encrypted). ──
+  tailscale:
+    image: tailscale/tailscale:latest
+    restart: unless-stopped
+    network_mode: service:nginx
+    environment:
+      - TS_AUTHKEY=${TS_AUTHKEY}
+      - TS_HOSTNAME=matrix-attestmesh
+      - TS_STATE_DIR=/var/lib/tailscale
+      - TS_USERSPACE=false
+      - TS_EXTRA_ARGS=--netfilter-mode=off
+    volumes:
+      - tailscale-state:/var/lib/tailscale
+    cap_add:
+      - NET_ADMIN
+      - SYS_MODULE
+    devices:
+      - /dev/net/tun
+
+  # ── Tailnet firewall: only Matrix (nginx:80) is reachable over the tailscale interface.
+  #     Shares nginx's netns (where tailscale0 lives). Tailscale runs --netfilter-mode=off so
+  #     these rules are authoritative. Re-applied every 30s (idempotent) to survive churn. ──
+  ts-firewall:
+    image: alpine:3.20
+    restart: unless-stopped
+    network_mode: service:nginx
+    depends_on:
+      - tailscale
+    cap_add:
+      - NET_ADMIN
+    command:
+      - /bin/sh
+      - -c
+      - |
+        apk add --no-cache iptables >/dev/null 2>&1 || apk add --no-cache iptables >/dev/null 2>&1
+        while ! [ -d /sys/class/net/tailscale0 ]; do sleep 2; done
+        while true; do
+          iptables -C INPUT -i tailscale0 -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || iptables -A INPUT -i tailscale0 -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+          iptables -C INPUT -i tailscale0 -p tcp --dport 80 -j ACCEPT 2>/dev/null || iptables -A INPUT -i tailscale0 -p tcp --dport 80 -j ACCEPT
+          iptables -C INPUT -i tailscale0 -p icmp -j ACCEPT 2>/dev/null || iptables -A INPUT -i tailscale0 -p icmp -j ACCEPT
+          iptables -C INPUT -i tailscale0 -j DROP 2>/dev/null || iptables -A INPUT -i tailscale0 -j DROP
+          iptables -C FORWARD -i tailscale0 -j DROP 2>/dev/null || iptables -A FORWARD -i tailscale0 -j DROP
+          sleep 30
+        done
+
+volumes:
+  pgdata:
+  synapse-data:
+  wellknown:
+  tailscale-state:
