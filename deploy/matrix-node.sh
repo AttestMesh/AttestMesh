@@ -47,8 +47,8 @@ RECEIPT="$ROOT/contracts/script/deployments/${CHAIN_ID}.json"
 STATE="$LOGDIR/matrix-node-${NODE}.state"
 ZERO32=0x0000000000000000000000000000000000000000000000000000000000000000
 
-_save() { printf 'X=%s\nH=%s\nVM_ID=%s\nCLUSTER=%s\nMEMBER_IMPL=%s\nPGPW=%s\n' \
-  "${X:-}" "${H:-}" "${VM_ID:-}" "${CLUSTER:-}" "${MEMBER_IMPL:-}" "${PGPW:-}" > "$STATE"; }
+_save() { printf 'X=%s\nH=%s\nVM_ID=%s\nCLUSTER=%s\nMEMBER_IMPL=%s\nPGPW=%s\nIAPW=%s\n' \
+  "${X:-}" "${H:-}" "${VM_ID:-}" "${CLUSTER:-}" "${MEMBER_IMPL:-}" "${PGPW:-}" "${IAPW:-}" > "$STATE"; }
 _load() { [ -f "$STATE" ] && source "$STATE" || true; }
 
 ssh_box() { ssh -o BatchMode=yes -o ConnectTimeout=8 "$BOX_HOST" "$@"; }
@@ -76,7 +76,8 @@ _box_run() {
     E_RPC_URL='$RPC_URL' E_BUNDLER_URL='${BUNDLER_URL:-$RPC_URL}' E_GAS_POLICY_ID='${GAS_POLICY_ID:-}' \
     E_POSTGRES_PASSWORD='$PGPW' E_TS_AUTHKEY='$TS_AUTHKEY' E_DSTACK_DOCKER_USERNAME='${guser:-dmvt}' E_DSTACK_DOCKER_PASSWORD='$gtok' \
     E_BOT_USERNAME='${BOT_USERNAME:-admin-agent}' E_BOT_PASSWORD='${BOT_PASSWORD:-}' \
-    E_MATRIX_ADMIN_MXIDS='${MATRIX_ADMIN_MXIDS:-}' E_MATRIX_ADMIN_SENDERS='${MATRIX_ADMIN_SENDERS:-}' E_INITIAL_ADMIN='${INITIAL_ADMIN:-}' \
+    E_MATRIX_ADMIN_MXIDS='${MATRIX_ADMIN_MXIDS:-}' E_MATRIX_ADMIN_SENDERS='${MATRIX_ADMIN_SENDERS:-}' \
+    E_INITIAL_ADMIN='${INITIAL_ADMIN:-}' E_INITIAL_ADMIN_PASSWORD='${INITIAL_ADMIN_PASSWORD:-}' \
     E_LLM_BASE_URL='${LLM_BASE_URL:-}' E_LLM_MODEL='${LLM_MODEL:-}' E_LLM_API_KEY='${LLM_API_KEY:-}' \
     $BOX_PY /tmp/matrix-node-box.py $mode $app_id"
 }
@@ -89,6 +90,15 @@ _require_agent_env() {
     [ -n "${!v:-}" ] || missing="$missing $v"
   done
   [ -z "$missing" ] || die "missing required matrix-admin-agent env:$missing  (pass them in the invocation, e.g. BOT_PASSWORD=… LLM_API_KEY=…)"
+}
+
+# Stable initial-admin password: generated ONCE (if INITIAL_ADMIN is set and none was provided),
+# persisted in the state file, and reused across rolls so the operator's login doesn't change.
+_ensure_iapw() {
+  if [ -n "${INITIAL_ADMIN:-}" ] && [ -z "${INITIAL_ADMIN_PASSWORD:-}" ]; then
+    INITIAL_ADMIN_PASSWORD="${IAPW:-$(openssl rand -base64 24 | tr -dc 'A-Za-z0-9' | head -c 28)}"
+  fi
+  IAPW="${INITIAL_ADMIN_PASSWORD:-}"; export INITIAL_ADMIN_PASSWORD
 }
 
 # Poll the box loopback (8080 → nginx → Matrix) for synapse readiness.
@@ -104,7 +114,7 @@ _wait_synapse() {
 
 # 1. Register stock DstackApp + CreateVm via the box, then wait for Matrix to be live.
 deploy_cvm() {
-  _load; _require_agent_env
+  _load; _require_agent_env; _ensure_iapw
   PGPW="${PGPW:-$(openssl rand -hex 24)}"; _save
   log "▶ box deploy_app node=$NODE compose=$COMPOSE"
   local out; out=$(_box_run deploy) || die "box deploy failed"
@@ -218,7 +228,7 @@ verify_agent() {
 # originator). Allowlists the new hash FIRST, stops the old CVM, then CreateVm(app_id=X).
 update_member() {
   _load; [ -n "${X:-}" ] && [ -n "${CLUSTER:-}" ] || die "need X+cluster (do a full deploy first)"
-  _require_agent_env
+  _require_agent_env; _ensure_iapw
   PGPW="${PGPW:-$(openssl rand -hex 24)}"
   local nh; nh=$(_box_run hash | grep -oE '^[0-9a-f]{64}$' | tail -1)
   [ -n "$nh" ] || die "could not compute new compose_hash"
