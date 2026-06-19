@@ -188,3 +188,44 @@ mesh `/16` per cluster (`MESH_CIDR_IP`).
 - Revoke/rotate transcript-exposed secrets (old single-use TS key; GHCR pull token).
 - No Matrix users yet (`enable_registration:false`).
 - Reconcile `deploy/matrix-node-runbook.md` with this; commit working-tree changes if desired.
+
+## 7. matrix-admin-agent — on-chain + LLM admin control plane (BUILT 2026-06-19; deploy pending)
+
+Closes the §6 dead-end ("No Matrix users yet / enable_registration:false"): a co-located agent
+administers Synapse from (a) encrypted on-chain member commands via the sidecar app gRPC
+(deterministic, no LLM) and (b) an LLM bot in Matrix for allowlisted operators — full Synapse admin
+surface via a generic `synapse_request` verb + named convenience verbs. Spec:
+`docs/specs/matrix-admin-agent.md`. Agent repo: `AttestMesh/matrix-admin-agent` (Python 3.12).
+
+### What was built
+- **Sidecar (prereq):** `poll_envelopes` now FORWARDS every non-PeerEndpoint decrypted `MessageSent`
+  payload to the app via `SubscribeMessages` (it was silently dropped). `classify_internal()` + 2 tests;
+  clippy clean. Image `cluster-mesh-agent` (backward-compatible — existing nodes have no app consumer).
+- **Agent (own repo):** config/bootstrap/synapse_admin/commands/executor/ledger + sidecar & Matrix
+  adapters + a ~200-line LLM tool loop. ruff+mypy clean, 75 tests. Authz = sealed `MATRIX_ADMIN_SENDERS`
+  (on-chain memberIds) + `MATRIX_ADMIN_MXIDS` (humans). Dedup ledger in the node's Postgres.
+- **Egress firewall** (`deploy/agent-egress-fw/`, image `ghcr.io/attestmesh/agent-egress-fw`): shares the
+  agent netns, default-DROP OUTPUT, allows ONLY Synapse/Postgres/nginx (resolved IPs) + Docker DNS + the
+  pinned LLM host:443. Plain iptables (no ipset — `ip_set` module unproven on the box, same posture as
+  ts-firewall), fail-closed, re-resolves for DNS pinning.
+- **Egress self-check (KEY — §5b: "container logs unreachable from the box"):** the agent itself TCP-probes
+  a non-allowlisted canary at startup; if reachable → egress not locked → logs CRITICAL and EXITS (fail
+  closed). The result folds into `/healthz` (`egress_locked`), exposed on the box loopback (`9100→9102`)
+  like the sidecar — so one `verify-agent` curl confirms bootstrap AND egress lock without exec-ing the TEE.
+
+### Deploy wiring (this repo)
+- `deploy/compose/matrix-node.yaml`: `matrix-admin-agent` + `agent-egress-fw` services; shared `agent-sock`
+  UDS (sidecar↔agent) + `AGENT_GRPC_SOCKET` on the sidecar; `agent-secrets` volume (synapse-init writes
+  ONLY the registration secret there, 0444 — agent never sees the signing key); agent `/healthz` host-port.
+- `deploy/matrix-node-box.py`: 8 new `ENV_KEYS`; tolerant `build_env` (optional keys → "").
+- `deploy/matrix-node.sh`: `_require_agent_env` guard; `E_*` passthrough; `AGENT_PORT`; `verify-agent`
+  (polls `/healthz` for `"status":"ok"`); folded into `all` + `update`.
+- `deploy/workflows/matrix-node.tsx`: `deploy→cluster→patha→prime→bind→verify→agent`.
+
+### To deploy (pending operator creds)
+Sealed: `LLM_BASE_URL`/`LLM_MODEL`/`LLM_API_KEY` (redpill), `BOT_PASSWORD` (or generated),
+`MATRIX_ADMIN_MXIDS` (= `@<localpart>:<app_id>.gateway.attestmesh.xyz`); reuse the §6 TS key. Optional:
+`MATRIX_ADMIN_SENDERS`, `INITIAL_ADMIN`. Flow: throwaway test node (unique BOX_PORTS + mesh /16) → verify
+incl. egress → `matrix-node.sh <node> update` onto C3/W3 (resets the EMPTY Synapse DB; app_id reuse keeps
+membership + CSK originator). Three images must be CI-published first: `cluster-mesh-agent` (sidecar),
+`agent-egress-fw`, `matrix-admin-agent`.

@@ -27,11 +27,13 @@ services:
       - BUNDLER_URL=${BUNDLER_URL}
       - GAS_POLICY_ID=${GAS_POLICY_ID}
       - DSTACK_SOCKET=/var/run/dstack.sock
+      - AGENT_GRPC_SOCKET=/var/run/attestmesh/agent.sock
       - HEALTH_HTTP_ADDR=0.0.0.0:9090
       - LOG_FORMAT=pretty
       - LOG_LEVEL=info,cluster_mesh_agent=debug
     volumes:
       - /var/run/dstack.sock:/var/run/dstack.sock
+      - agent-sock:/var/run/attestmesh          # app-facing gRPC UDS, shared with matrix-admin-agent
     ports:
       - "9090:9090"
       - "51900:51900"
@@ -71,6 +73,7 @@ services:
     volumes:
       - synapse-data:/data
       - wellknown:/wellknown
+      - agent-secrets:/agent-secrets               # scoped registration-secret drop for matrix-admin-agent
       - /var/run/dstack.sock:/var/run/dstack.sock:ro
     entrypoint:
       - /bin/bash
@@ -170,6 +173,18 @@ services:
         """.replace("\n        ", "\n").format(sn=sn, pw=pw, reg=reg, mac=mac, form=form)
         with open(hs, "w") as f: f.write(cfg)
 
+        # Scoped copy of just the registration shared secret for the matrix-admin-agent,
+        # so it never needs the whole synapse-data volume (signing key, media, etc.).
+        # The agent-secrets volume is mounted ONLY into synapse-init (here) and the agent.
+        try:
+            os.makedirs("/agent-secrets", exist_ok=True)
+            ap = "/agent-secrets/registration_shared_secret"
+            with open(ap, "w") as f: f.write(reg)
+            os.chmod(ap, 0o444)
+            print("synapse-init: wrote scoped registration secret for matrix-admin-agent", flush=True)
+        except Exception as e:
+            print("synapse-init: WARN could not write agent-secrets:", e, flush=True)
+
         wkd = os.path.join(WK, ".well-known", "matrix"); os.makedirs(wkd, exist_ok=True)
         with open(os.path.join(wkd, "server"), "w") as f:
             f.write(json.dumps({"m.server": sn + ":443"}))
@@ -200,6 +215,61 @@ services:
       - SYNAPSE_CONFIG_PATH=/data/homeserver.yaml
     volumes:
       - synapse-data:/data
+
+  # ── Matrix admin agent: executes the full Synapse admin surface from (a) on-chain member
+  #     commands delivered by the sidecar app gRPC (deterministic, no LLM) and (b) an LLM bot
+  #     in Matrix for allowlisted operators. Egress is locked by agent-egress-fw (below) to
+  #     Synapse + Postgres + the one pinned LLM host. See docs/specs/matrix-admin-agent.md. ──
+  matrix-admin-agent:
+    image: ghcr.io/attestmesh/matrix-admin-agent:latest
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      synapse:
+        condition: service_started
+      sidecar:
+        condition: service_started
+    environment:
+      - SYNAPSE_URL=http://synapse:8008
+      - MATRIX_HOMESERVER_URL=http://nginx:80
+      - AGENT_GRPC_SOCKET=/var/run/attestmesh/agent.sock
+      - REG_SECRET_PATH=/agent-secrets/registration_shared_secret
+      - PG_DSN=postgresql://synapse:${POSTGRES_PASSWORD}@postgres:5432/synapse
+      - BOT_USERNAME=${BOT_USERNAME}
+      - BOT_PASSWORD=${BOT_PASSWORD}
+      - MATRIX_ADMIN_MXIDS=${MATRIX_ADMIN_MXIDS}
+      - MATRIX_ADMIN_SENDERS=${MATRIX_ADMIN_SENDERS}
+      - INITIAL_ADMIN=${INITIAL_ADMIN}
+      - LLM_BASE_URL=${LLM_BASE_URL}
+      - LLM_API_KEY=${LLM_API_KEY}
+      - LLM_MODEL=${LLM_MODEL}
+      - HEALTH_HTTP_ADDR=0.0.0.0:9100
+      - LOG_LEVEL=info
+    ports:
+      - "9100:9100"                                    # /healthz → CVM host (box maps to loopback for verify-agent); reports egress_locked
+    volumes:
+      - agent-sock:/var/run/attestmesh                 # sidecar app-facing gRPC UDS
+      - agent-secrets:/agent-secrets:ro                # scoped registration secret only
+
+  # ── Egress firewall for the agent: shares the agent's netns and sets default-DROP OUTPUT,
+  #     allowing ONLY loopback, established/related, Docker DNS, the compose bridge (Synapse +
+  #     Postgres), and the single pinned LLM host:443. Network-enforced exfiltration control —
+  #     the agent has no self-egress tool, and even a jailbroken LLM cannot reach the internet.
+  #     Logic lives in the image (auditable), not inline compose shell. ──
+  agent-egress-fw:
+    image: ghcr.io/attestmesh/agent-egress-fw:latest
+    restart: unless-stopped
+    network_mode: service:matrix-admin-agent
+    depends_on:
+      - matrix-admin-agent
+    environment:
+      - LLM_BASE_URL=${LLM_BASE_URL}                   # the ONE permitted external host (:443)
+      - INTERNAL_HOSTS=synapse postgres nginx          # internal services the agent may reach (by resolved IP)
+      - ALLOW_DNS=127.0.0.11                           # Docker embedded resolver
+      - RERESOLVE_SECONDS=30                            # re-resolve pinned + internal hosts (DNS pinning)
+    cap_add:
+      - NET_ADMIN
 
   # ── Reverse proxy: well-known delegation + /_matrix|/_synapse → synapse ──────
   # config written at runtime (avoids needing a build context / BuildKit heredoc).
@@ -295,3 +365,5 @@ volumes:
   synapse-data:
   wellknown:
   tailscale-state:
+  agent-sock:        # sidecar app-facing gRPC UDS, shared sidecar ↔ matrix-admin-agent
+  agent-secrets:     # scoped registration-secret drop, synapse-init → matrix-admin-agent

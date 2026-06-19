@@ -1,7 +1,12 @@
 /** @jsxImportSource smithers-orchestrator */
 // Matrix-node bring-up on the SELF-HOSTED on-chain dstack box — durable, ordered (smithers).
 //
-//   deploy → cluster → patha → prime → bind → verify
+//   deploy → cluster → patha → prime → bind → verify → agent
+//
+// `deploy` seals the matrix-admin-agent + its egress firewall into the CVM (the compose and
+// matrix-node.sh thread the sealed agent env); the `agent` step confirms the agent is healthy AND
+// its egress is LOCKED via /healthz (the CVM is a TEE, so the agent self-verifies egress). See
+// docs/specs/matrix-admin-agent.md.
 //
 // Each step shells out to deploy/matrix-node.sh (which tees per-step output to deploy/logs/ and
 // persists app_id/cluster/impl in a state file), so a failure is visible and the run RESUMES from
@@ -16,7 +21,10 @@
 //
 // Run from the repo root:
 //   source deploy/env.sh
-//   TS_AUTHKEY=tskey-… bunx smithers-orchestrator up deploy/workflows/matrix-node.tsx \
+//   # agent secrets/config are read from the env (inherited by the child), like TS_AUTHKEY:
+//   TS_AUTHKEY=tskey-… BOT_PASSWORD=… MATRIX_ADMIN_MXIDS=@you:<server> \
+//     LLM_BASE_URL=… LLM_MODEL=… LLM_API_KEY=… [MATRIX_ADMIN_SENDERS=… INITIAL_ADMIN=…] \
+//     bunx smithers-orchestrator up deploy/workflows/matrix-node.tsx \
 //     --input '{"node":"matrix-node","meshCidrIp":"168951808"}'
 //   # resume after fixing a failed step:
 //   bunx smithers-orchestrator up deploy/workflows/matrix-node.tsx --run-id <id> --resume true
@@ -36,6 +44,7 @@ const { Workflow, smithers, outputs } = createSmithers({
   prime: Step,
   bind: Step,
   verify: Step,
+  agent: Step,
 });
 
 // Repo root, from this file's location (deploy/workflows/ → ../..), so it runs from any cwd.
@@ -83,6 +92,9 @@ export default smithers((ctx) => {
         </Task>
         <Task id="verify" output={outputs.verify}>
           {() => run("verify", mn("verify"))}
+        </Task>
+        <Task id="agent" output={outputs.agent}>
+          {() => run("agent", mn("verify-agent"))}
         </Task>
       </Sequence>
     </Workflow>

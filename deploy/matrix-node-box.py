@@ -29,11 +29,16 @@ MEM = int(os.environ.get("BOX_MEM", "8192"))
 DISK = int(os.environ.get("BOX_DISK", "60"))
 PORTS = json.loads(os.environ.get("BOX_PORTS", '["tcp:127.0.0.1:8080:80","tcp:127.0.0.1:9091:9090"]'))
 ENV_KEYS = ["RPC_URL", "BUNDLER_URL", "GAS_POLICY_ID", "POSTGRES_PASSWORD", "TS_AUTHKEY",
-            "DSTACK_DOCKER_USERNAME", "DSTACK_DOCKER_PASSWORD"]
+            "DSTACK_DOCKER_USERNAME", "DSTACK_DOCKER_PASSWORD",
+            # matrix-admin-agent (docs/specs/matrix-admin-agent.md §5); key NAMES are
+            # measured into compose_hash, VALUES sealed. Optional ones may be empty.
+            "BOT_USERNAME", "BOT_PASSWORD", "MATRIX_ADMIN_MXIDS", "MATRIX_ADMIN_SENDERS",
+            "INITIAL_ADMIN", "LLM_BASE_URL", "LLM_MODEL", "LLM_API_KEY"]
 
 
 def build_env():
-    env = {k: os.environ["E_" + k] for k in ENV_KEYS}
+    # Optional keys (e.g. MATRIX_ADMIN_SENDERS, INITIAL_ADMIN) may be unset → "".
+    env = {k: os.environ.get("E_" + k, "") for k in ENV_KEYS}
     env["DSTACK_DOCKER_REGISTRY"] = os.environ.get("E_DSTACK_DOCKER_REGISTRY", "ghcr.io")
     return env
 

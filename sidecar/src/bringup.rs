@@ -402,6 +402,7 @@ async fn poll_envelopes(ctx: &Ctx, next_from_block: &mut Option<u64>) -> Result<
     *next_from_block = Some(head + 1);
 
     for log in logs {
+        let block_number = log.block_number.unwrap_or(0);
         let Ok(ev) = log.log_decode::<MessageSent>() else {
             continue;
         };
@@ -414,16 +415,41 @@ async fn poll_envelopes(ctx: &Ctx, next_from_block: &mut Option<u64>) -> Result<
         ) else {
             continue; // not for us / not openable — fine, other envelope kinds exist
         };
-        let Ok(pe) = PeerEndpoint::decode(&pt) else {
-            continue;
-        };
-        if !pe.is_peer_endpoint() || pe.member_id != sender {
-            continue;
-        }
-        let mut peers = ctx.shared.peers.lock().await;
-        if peers.set_ed25519(&sender, pe.ed25519_pub) {
-            tracing::info!(peer = %hex::encode(sender), host = %pe.host,
-                "PeerEndpoint envelope absorbed (Ed25519 key learned)");
+
+        // Demux on the inner `kind`: a well-formed PeerEndpoint carrying the reserved
+        // kind is sidecar-internal; every other decrypted payload is an opaque
+        // application message forwarded to the app via SubscribeMessages (master spec
+        // §7.1 step 7, sidecar spec §12.3). The sidecar never parses app protocols.
+        match envelopes::classify_internal(&pt) {
+            Some(pe) => {
+                if pe.member_id != sender {
+                    continue; // sender-binding mismatch on an internal envelope — drop
+                }
+                let mut peers = ctx.shared.peers.lock().await;
+                if peers.set_ed25519(&sender, pe.ed25519_pub) {
+                    tracing::info!(peer = %hex::encode(sender), host = %pe.host,
+                        "PeerEndpoint envelope absorbed (Ed25519 key learned)");
+                }
+            }
+            None => {
+                // Application message: forward verbatim to SubscribeMessages
+                // subscribers. send() errs only when there are no subscribers yet —
+                // not an error (same broadcast semantics as peer_event_tx).
+                let bytes = pt.len();
+                if ctx
+                    .shared
+                    .incoming_tx
+                    .send(crate::state::AppIncoming {
+                        sender_member_id: sender,
+                        payload: pt,
+                        block_number,
+                    })
+                    .is_ok()
+                {
+                    tracing::debug!(sender = %hex::encode(sender), block = block_number,
+                        bytes, "app message forwarded to SubscribeMessages");
+                }
+            }
         }
     }
     Ok(())
