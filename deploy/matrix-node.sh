@@ -217,7 +217,7 @@ verify_agent() {
   local i body
   for i in $(seq 1 45); do
     body=$(ssh_box "curl -s --max-time 6 http://127.0.0.1:${AGENT_PORT}/healthz" 2>/dev/null)
-    if echo "$body" | grep -q '"status":"ok"'; then
+    if echo "$body" | grep -q '"status": *"ok"'; then
       log "✔ matrix-admin-agent ready (admin token + matrix sync + egress LOCKED)"
       return 0
     fi
@@ -244,7 +244,7 @@ update_member() {
   [ -n "${VM_ID:-}" ] && { log "stopping old CVM $VM_ID"; _vmm StopVm "{\"id\":\"$VM_ID\"}" >/dev/null 2>&1 || true; }
   local out; out=$(_box_run update "$X") || die "reuse CreateVm failed"
   log "$out"
-  VM_ID=$(echo "$out" | grep -oE '"vm_id":"[^"]*"' | head -1 | sed -E 's/.*:"([^"]*)".*/\1/')
+  VM_ID=$(echo "$out" | grep -oE '"vm_id": *"[^"]*"' | head -1 | sed -E 's/.*"vm_id": *"([^"]*)".*/\1/')
   H="$nh"; _save
   log "✔ in-place update: reused X=$X new vm=$VM_ID (membership/CSK preserved). Waiting for synapse…"
   _wait_synapse
