@@ -36,11 +36,12 @@ COMPOSE="${COMPOSE:-$ROOT/deploy/compose/matrix-node.yaml}"
 MESH_CIDR_IP="${MESH_CIDR_IP:-168951808}"          # 10.18.0.0/16 — pick a UNIQUE /16 per cluster
 MESH_CIDR_PREFIX="${MESH_CIDR_PREFIX:-16}"
 export BOX_VCPU="${BOX_VCPU:-4}" BOX_MEM="${BOX_MEM:-8192}" BOX_DISK="${BOX_DISK:-60}"
-export BOX_PORTS="${BOX_PORTS:-[\"tcp:127.0.0.1:8080:80\",\"tcp:127.0.0.1:9091:9090\"]}"  # no host port >20000
+export BOX_PORTS="${BOX_PORTS:-[\"tcp:127.0.0.1:8080:80\",\"tcp:127.0.0.1:9091:9090\",\"tcp:127.0.0.1:9102:9100\"]}"  # no host port >20000
 # Health-check host ports derived from BOX_PORTS, so multiple nodes can coexist on one box.
 _hostport() { echo "$BOX_PORTS" | tr ',[]' ' ' | tr -d '"' | tr ' ' '\n' | awk -F: -v vm="$1" '$4==vm{print $3; exit}'; }
 NGINX_PORT="$(_hostport 80)";     NGINX_PORT="${NGINX_PORT:-8080}"
 SIDECAR_PORT="$(_hostport 9090)"; SIDECAR_PORT="${SIDECAR_PORT:-9091}"
+AGENT_PORT="$(_hostport 9100)";   AGENT_PORT="${AGENT_PORT:-9102}"
 GW_DOMAIN="${GATEWAY_DOMAIN:-gateway.attestmesh.xyz}"
 RECEIPT="$ROOT/contracts/script/deployments/${CHAIN_ID}.json"
 STATE="$LOGDIR/matrix-node-${NODE}.state"
@@ -74,7 +75,20 @@ _box_run() {
   ssh_box "sudo BOX_NAME='$NODE' BOX_COMPOSE='/tmp/${NODE}.yaml' BOX_VCPU=$BOX_VCPU BOX_MEM=$BOX_MEM BOX_DISK=$BOX_DISK BOX_PORTS='$BOX_PORTS' \
     E_RPC_URL='$RPC_URL' E_BUNDLER_URL='${BUNDLER_URL:-$RPC_URL}' E_GAS_POLICY_ID='${GAS_POLICY_ID:-}' \
     E_POSTGRES_PASSWORD='$PGPW' E_TS_AUTHKEY='$TS_AUTHKEY' E_DSTACK_DOCKER_USERNAME='${guser:-dmvt}' E_DSTACK_DOCKER_PASSWORD='$gtok' \
+    E_BOT_USERNAME='${BOT_USERNAME:-admin-agent}' E_BOT_PASSWORD='${BOT_PASSWORD:-}' \
+    E_MATRIX_ADMIN_MXIDS='${MATRIX_ADMIN_MXIDS:-}' E_MATRIX_ADMIN_SENDERS='${MATRIX_ADMIN_SENDERS:-}' E_INITIAL_ADMIN='${INITIAL_ADMIN:-}' \
+    E_LLM_BASE_URL='${LLM_BASE_URL:-}' E_LLM_MODEL='${LLM_MODEL:-}' E_LLM_API_KEY='${LLM_API_KEY:-}' \
     $BOX_PY /tmp/matrix-node-box.py $mode $app_id"
+}
+
+# Required matrix-admin-agent env (secrets in-memory, like TS_AUTHKEY). MATRIX_ADMIN_SENDERS +
+# INITIAL_ADMIN are optional (empty → on-chain channel off / no declared admin).
+_require_agent_env() {
+  local v missing=""
+  for v in BOT_PASSWORD MATRIX_ADMIN_MXIDS LLM_BASE_URL LLM_MODEL LLM_API_KEY; do
+    [ -n "${!v:-}" ] || missing="$missing $v"
+  done
+  [ -z "$missing" ] || die "missing required matrix-admin-agent env:$missing  (pass them in the invocation, e.g. BOT_PASSWORD=… LLM_API_KEY=…)"
 }
 
 # Poll the box loopback (8080 → nginx → Matrix) for synapse readiness.
@@ -90,7 +104,7 @@ _wait_synapse() {
 
 # 1. Register stock DstackApp + CreateVm via the box, then wait for Matrix to be live.
 deploy_cvm() {
-  _load
+  _load; _require_agent_env
   PGPW="${PGPW:-$(openssl rand -hex 24)}"; _save
   log "▶ box deploy_app node=$NODE compose=$COMPOSE"
   local out; out=$(_box_run deploy) || die "box deploy failed"
@@ -180,10 +194,31 @@ verify() {
   die "$NODE not registered after timeout"
 }
 
+# 6b. Verify the matrix-admin-agent. The CVM is a sealed TEE (no exec; the box can't fetch
+# per-container logs — steps-log §6), so the agent SELF-checks its egress and folds the result into
+# /healthz (exposed on the box loopback like the sidecar). A `"status":"ok"` means: admin token
+# acquired + Matrix synced + EGRESS CONFIRMED LOCKED. If egress isn't locked the agent fails closed
+# (exits, no /healthz) — so this poll catches an un-firewalled agent.
+verify_agent() {
+  _load; [ -n "${X:-}" ] || die "need X (run deploy first)"
+  local i body
+  for i in $(seq 1 45); do
+    body=$(ssh_box "curl -s --max-time 6 http://127.0.0.1:${AGENT_PORT}/healthz" 2>/dev/null)
+    if echo "$body" | grep -q '"status":"ok"'; then
+      log "✔ matrix-admin-agent ready (admin token + matrix sync + egress LOCKED)"
+      return 0
+    fi
+    log "… agent not ready ($i/45): ${body:-<no response>}"
+    sleep 12
+  done
+  die "matrix-admin-agent never reported ready — vm_logs $VM_ID and check the agent bootstrap + agent-egress-fw (the agent fails CLOSED if egress is not locked)"
+}
+
 # Day-2: roll a new compose/env onto the LIVE node, REUSING its app_id (keeps membership + CSK
 # originator). Allowlists the new hash FIRST, stops the old CVM, then CreateVm(app_id=X).
 update_member() {
   _load; [ -n "${X:-}" ] && [ -n "${CLUSTER:-}" ] || die "need X+cluster (do a full deploy first)"
+  _require_agent_env
   PGPW="${PGPW:-$(openssl rand -hex 24)}"
   local nh; nh=$(_box_run hash | grep -oE '^[0-9a-f]{64}$' | tail -1)
   [ -n "$nh" ] || die "could not compute new compose_hash"
@@ -200,6 +235,7 @@ update_member() {
   H="$nh"; _save
   log "✔ in-place update: reused X=$X new vm=$VM_ID (membership/CSK preserved). Waiting for synapse…"
   _wait_synapse
+  verify_agent
 }
 
 log "=== matrix-node bring-up: $NODE ==="
@@ -210,8 +246,9 @@ case "${2:-all}" in
   prime)   prime_gate ;;
   bind)    bind_member ;;
   verify)  verify ;;
+  verify-agent) verify_agent ;;
   update)  update_member ;;
   setup)   deploy_cvm; deploy_cluster; patha_upgrade; prime_gate; bind_member ;;  # on-chain path, no register wait
-  all)     deploy_cvm; deploy_cluster; patha_upgrade; prime_gate; bind_member; verify ;;
-  *) die "usage: matrix-node.sh <node-name> [all|deploy|cluster|patha|prime|bind|verify|update|setup]" ;;
+  all)     deploy_cvm; deploy_cluster; patha_upgrade; prime_gate; bind_member; verify; verify_agent ;;
+  *) die "usage: matrix-node.sh <node-name> [all|deploy|cluster|patha|prime|bind|verify|verify-agent|update|setup]" ;;
 esac

@@ -29,6 +29,7 @@ Expert smart-contract engineer specializing in ERC-2535 diamond proxies, OpenZep
 | Sidecar | Rust binary `cluster-mesh-agent` running inside every node: key derivation, registration, Indexer subscription, wireguard mesh, heartbeats, app-facing gRPC | `sidecar/` | [`docs/specs/sidecar.md`](docs/specs/sidecar.md) |
 | Indexer | Rust service `attestmesh-indexer` (attested): watches every cluster on the chain, pushes signed events with RPC-repro stubs to subscribed members | `indexer/` | [`docs/specs/indexer.md`](docs/specs/indexer.md) |
 | Gas webhook | Cloudflare Worker (TypeScript) gating Alchemy's EIP-4337 paymaster sponsorship for AttestMesh UserOps | `services/gas-sponsorship-webhook/` | [`docs/specs/gas-webhook.md`](docs/specs/gas-webhook.md) |
+| Matrix-admin agent | Python agent co-located on Matrix-node CVMs: executes the full Synapse admin surface from on-chain member commands (via the sidecar app gRPC) and from an LLM bot in Matrix; deny-all egress except a single pinned LLM | own repo `AttestMesh/matrix-admin-agent` + `deploy/compose/matrix-node.yaml` | [`docs/specs/matrix-admin-agent.md`](docs/specs/matrix-admin-agent.md) |
 
 ---
 

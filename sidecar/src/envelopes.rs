@@ -136,6 +136,18 @@ impl PeerEndpoint {
     }
 }
 
+/// Classify a decrypted `MessageFacet` plaintext. Returns `Some(PeerEndpoint)` if
+/// it is the sidecar-internal peer-endpoint envelope (it decodes *and* carries the
+/// reserved kind); otherwise `None`, meaning it is an opaque application payload
+/// that `poll_envelopes` forwards to the app over `SubscribeMessages` (sidecar spec
+/// §12.3). Detection is structural — the sidecar never parses application protocols.
+pub fn classify_internal(plaintext: &[u8]) -> Option<PeerEndpoint> {
+    match PeerEndpoint::decode(plaintext) {
+        Ok(pe) if pe.is_peer_endpoint() => Some(pe),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -244,5 +256,29 @@ mod tests {
         let sealed = seal(&recipient_pub, &pe.encode().unwrap()).unwrap();
         let opened = open(&recipient, &recipient_pub, &sealed).unwrap();
         assert_eq!(PeerEndpoint::decode(&opened).unwrap(), pe);
+    }
+
+    #[test]
+    fn classify_internal_accepts_peer_endpoint() {
+        let pe = PeerEndpoint::new([7u8; 32], "10.0.0.1".into(), 51820, [9u8; 32], [3u8; 32]);
+        let got = classify_internal(&pe.encode().unwrap()).expect("internal");
+        assert_eq!(got, pe);
+    }
+
+    #[test]
+    fn app_payload_is_not_a_peer_endpoint() {
+        // An application payload (e.g. a matrix-admin command) must classify as an
+        // app message, NOT the sidecar-internal envelope, so poll_envelopes forwards
+        // it to SubscribeMessages instead of consuming it silently.
+        let app = br#"{"v":1,"kind":"attestmesh.matrix-admin.command.v1","verb":"get_server_info"}"#;
+        assert!(classify_internal(app).is_none());
+        assert!(classify_internal(b"arbitrary opaque bytes").is_none());
+        assert!(classify_internal(&[]).is_none());
+
+        // A struct-shaped CBOR payload carrying the WRONG kind is also an app message.
+        let mut wrong = PeerEndpoint::new([1u8; 32], "h".into(), 1, [2u8; 32], [3u8; 32]);
+        wrong.kind = [0xAB; 32];
+        assert!(!wrong.is_peer_endpoint());
+        assert!(classify_internal(&wrong.encode().unwrap()).is_none());
     }
 }

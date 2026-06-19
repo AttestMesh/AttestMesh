@@ -291,11 +291,13 @@ interface IMessage is IERC165 {
 
 On success, marks the nonce and emits `MessageSent`. Ciphertext bytes are emitted as event data only — never stored.
 
-**Reserved envelope ids** (AttestMesh-internal protocol messages — the contract treats them as opaque but the sidecar handles them specially):
+**Reserved `kind` discriminators** (the contract treats all ciphertext as opaque; the sidecar consumes its own *internal* kinds and forwards all other *app-layer* kinds to the application over `SubscribeMessages`, sidecar spec §12.3):
 
-| `envelopeId` source string | Purpose | Sender | Recipient |
+| `envelopeId` source string | Layer | Purpose | Sender → Recipient |
 |---|---|---|---|
-| `"attestmesh.peer-endpoint.v1"` | Wireguard peer-endpoint exchange (master spec §7.1 step 7) | Any cluster member | Any cluster member |
+| `"attestmesh.peer-endpoint.v1"` | sidecar-internal | Wireguard peer-endpoint exchange (master spec §7.1 step 7) | Any member → Any member |
+| `"attestmesh.matrix-admin.command.v1"` | app ([`matrix-admin-agent.md`](./matrix-admin-agent.md)) | Encrypted Synapse-administration command | Authorized member (per `MATRIX_ADMIN_SENDERS`) → a Matrix-node member |
+| `"attestmesh.matrix-admin.reply.v1"` | app | Command reply / ack | A Matrix-node member → the command's original sender |
 
 The `DuplicateEnvelope` revert is a general per-`(recipient, envelopeId)` idempotency guard: for any reserved envelope, the first `send` to a given recipient lands and any subsequent send carrying the same `envelopeId` to that recipient reverts at zero protocol cost. For example, a member re-sending a `PeerEndpoint` after a network retry is deduped rather than emitting a second `MessageSent`. v1 takes the dedup at face value — no rate-limiting beyond it.
 
