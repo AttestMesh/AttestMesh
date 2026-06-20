@@ -22,7 +22,9 @@
 #     no window where the allowlist is empty.
 #   - FAIL CLOSED: if the LLM host is unknown/unresolvable, we still lock down; the
 #     agent simply loses LLM egress (it never gains open egress).
-set -eu
+#   - NOT `set -e`: a transient dig/iptables failure must NOT kill the re-resolve loop
+#     (that would leave the agent unable to reach the LLM after a boot-time DNS miss).
+set -u
 
 host_of() {  # strip scheme then :port//path — POSIX param expansion (busybox-safe, no sed)
   h="${1#*://}"; printf '%s' "${h%%[:/]*}"
@@ -32,9 +34,11 @@ LLM_HOST="$(host_of "${LLM_BASE_URL:-}")"      # empty allowed → fail closed (
 LLM_PORT="${LLM_PORT:-443}"
 ALLOW_DNS="${ALLOW_DNS:-127.0.0.11}"
 INTERNAL_HOSTS="${INTERNAL_HOSTS:-synapse postgres nginx}"
-RERESOLVE="${RERESOLVE_SECONDS:-30}"
+LLM_ALLOW_CIDRS="${LLM_ALLOW_CIDRS:-}"         # static :443 allows — pin the LLM's IP/block so it
+                                               # is reachable regardless of resolution timing
+RERESOLVE="${RERESOLVE_SECONDS:-15}"
 
-echo "egress-fw: LLM='${LLM_HOST:-<none>}':$LLM_PORT internal='$INTERNAL_HOSTS' dns=$ALLOW_DNS"
+echo "egress-fw: LLM='${LLM_HOST:-<none>}':$LLM_PORT internal='$INTERNAL_HOSTS' static='$LLM_ALLOW_CIDRS' dns=$ALLOW_DNS"
 
 add() {  # idempotent append to the AMX_EGRESS chain
   iptables -C AMX_EGRESS "$@" 2>/dev/null || iptables -A AMX_EGRESS "$@"
@@ -65,6 +69,9 @@ add -o lo -j ACCEPT
 add -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
 add -d "$ALLOW_DNS" -p udp --dport 53 -j ACCEPT
 add -d "$ALLOW_DNS" -p tcp --dport 53 -j ACCEPT
+# Static LLM pins (resolution-independent): guarantee the pinned LLM IP/block is reachable even if
+# a boot-time dig misses. The dynamic resolve below is the complement, not the gate.
+for c in $LLM_ALLOW_CIDRS; do add -d "$c" -p tcp --dport "$LLM_PORT" -j ACCEPT; done
 
 # Populate the allowlist BEFORE locking the policy (on a fresh netns the policy is
 # still ACCEPT so the first dig works; on a restart the DNS rule above already exists).
