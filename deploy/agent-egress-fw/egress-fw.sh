@@ -67,8 +67,13 @@ iptables -N AMX_EGRESS 2>/dev/null || true
 iptables -C OUTPUT -j AMX_EGRESS 2>/dev/null || iptables -I OUTPUT 1 -j AMX_EGRESS
 add -o lo -j ACCEPT
 add -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
-add -d "$ALLOW_DNS" -p udp --dport 53 -j ACCEPT
-add -d "$ALLOW_DNS" -p tcp --dport 53 -j ACCEPT
+# Outbound DNS to ANY resolver: Docker's embedded DNS (127.0.0.11) forwards EXTERNAL queries from
+# THIS netns to the upstream, so allowing only 127.0.0.11 breaks external name resolution (the LLM
+# host → EAI_AGAIN). Residual: :53 is a low-bandwidth exfil channel (DNS tunneling); all DATA-port
+# egress stays deny-all (the canary :443 is still blocked → egress_locked holds). Tighten later with
+# DNS-locked resolution (dnsmasq restricting which domains resolve) if needed.
+add -p udp --dport 53 -j ACCEPT
+add -p tcp --dport 53 -j ACCEPT
 # Static LLM pins (resolution-independent): guarantee the pinned LLM IP/block is reachable even if
 # a boot-time dig misses. The dynamic resolve below is the complement, not the gate.
 for c in $LLM_ALLOW_CIDRS; do add -d "$c" -p tcp --dport "$LLM_PORT" -j ACCEPT; done
