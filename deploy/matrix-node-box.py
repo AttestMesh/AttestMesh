@@ -28,6 +28,11 @@ VCPU = int(os.environ.get("BOX_VCPU", "4"))
 MEM = int(os.environ.get("BOX_MEM", "8192"))
 DISK = int(os.environ.get("BOX_DISK", "60"))
 PORTS = json.loads(os.environ.get("BOX_PORTS", '["tcp:127.0.0.1:8080:80","tcp:127.0.0.1:9091:9090"]'))
+# Public dstack-gateway exposure. When ON, the gateway publishes https://<app_id>.gateway.<domain>
+# straight to the CVM (for a Matrix node that means nginx:80 → Synapse, reachable from the public
+# internet). A Matrix node must run this OFF so the homeserver is reachable ONLY over the private
+# tailnet. Default ON for backwards-compat; matrix-node.sh sets it OFF. Measured into compose_hash.
+GATEWAY_ENABLED = os.environ.get("BOX_GATEWAY_ENABLED", "true").strip().lower() not in ("0", "false", "no", "off")
 ENV_KEYS = ["RPC_URL", "BUNDLER_URL", "GAS_POLICY_ID", "POSTGRES_PASSWORD", "TS_AUTHKEY",
             "DSTACK_DOCKER_USERNAME", "DSTACK_DOCKER_PASSWORD",
             # matrix-admin-agent (docs/specs/matrix-admin-agent.md §5); key NAMES are
@@ -48,7 +53,7 @@ def app_compose_and_hash(env_key_set):
     ac = {
         "manifest_version": 2, "name": NAME, "runner": "docker-compose",
         "docker_compose_file": open(COMPOSE_PATH).read(), "kms_enabled": True,
-        "gateway_enabled": True, "local_key_provider_enabled": False,
+        "gateway_enabled": GATEWAY_ENABLED, "local_key_provider_enabled": False,
         "key_provider_id": "", "public_logs": True, "public_sysinfo": True,
         "allowed_envs": sorted(set(env_key_set) | {"APP_ID"}),
         "no_instance_id": False, "secure_time": False,
@@ -68,7 +73,7 @@ def main():
     if mode == "deploy":
         env = build_env()
         r = m.deploy_app(name=NAME, docker_compose=open(COMPOSE_PATH).read(), env=env,
-                         gateway_enabled=True, ports=PORTS, vcpu=VCPU, memory_mb=MEM, disk_gb=DISK)
+                         gateway_enabled=GATEWAY_ENABLED, ports=PORTS, vcpu=VCPU, memory_mb=MEM, disk_gb=DISK)
         print(json.dumps({"app_id": r["app_id"], "compose_hash": r["compose_hash"],
                           "vm_id": r["vm_id"], "gateway_url": r.get("gateway_url")}))
         return
@@ -91,7 +96,7 @@ def main():
             "vcpu": VCPU, "memory": MEM, "disk_size": DISK, "app_id": app_id,
             "user_config": "", "ports": [m._parse_port(p) for p in PORTS],
             "hugepages": False, "pin_numa": False, "stopped": False, "no_tee": False,
-            "kms_urls": m.KMS_URLS, "gateway_urls": [m.GATEWAY_RPC], "encrypted_env": enc,
+            "kms_urls": m.KMS_URLS, "gateway_urls": ([m.GATEWAY_RPC] if GATEWAY_ENABLED else []), "encrypted_env": enc,
         }
         r = httpx.post("http://127.0.0.1:9080/prpc/CreateVm?json", json=params, timeout=120)
         vm = ""
