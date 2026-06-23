@@ -37,6 +37,9 @@ MESH_CIDR_IP="${MESH_CIDR_IP:-168951808}"          # 10.18.0.0/16 — pick a UNI
 MESH_CIDR_PREFIX="${MESH_CIDR_PREFIX:-16}"
 export BOX_VCPU="${BOX_VCPU:-4}" BOX_MEM="${BOX_MEM:-8192}" BOX_DISK="${BOX_DISK:-60}"
 export BOX_PORTS="${BOX_PORTS:-[\"tcp:127.0.0.1:8080:80\",\"tcp:127.0.0.1:9091:9090\",\"tcp:127.0.0.1:9102:9100\"]}"  # no host port >20000
+# Matrix is PRIVATE: never publish nginx:80 via the public dstack gateway. Reachable only over the
+# tailnet (and box loopback). Override BOX_GATEWAY_ENABLED=true only to re-expose intentionally.
+export BOX_GATEWAY_ENABLED="${BOX_GATEWAY_ENABLED:-false}"
 # Health-check host ports derived from BOX_PORTS, so multiple nodes can coexist on one box.
 _hostport() { echo "$BOX_PORTS" | tr ',[]' ' ' | tr -d '"' | tr ' ' '\n' | awk -F: -v vm="$1" '$4==vm{print $3; exit}'; }
 NGINX_PORT="$(_hostport 80)";     NGINX_PORT="${NGINX_PORT:-8080}"
@@ -75,7 +78,7 @@ _box_run() {
   [ -n "$gtok" ] || die "no ghcr token in ~/.teesql/ghcr-pull.toml"
   scp -o BatchMode=yes -q "$COMPOSE" "$BOX_HOST:/tmp/${NODE}.yaml"
   scp -o BatchMode=yes -q "$HERE/matrix-node-box.py" "$BOX_HOST:/tmp/matrix-node-box.py"
-  ssh_box "sudo BOX_NAME='$NODE' BOX_COMPOSE='/tmp/${NODE}.yaml' BOX_VCPU=$BOX_VCPU BOX_MEM=$BOX_MEM BOX_DISK=$BOX_DISK BOX_PORTS='$BOX_PORTS' \
+  ssh_box "sudo BOX_NAME='$NODE' BOX_COMPOSE='/tmp/${NODE}.yaml' BOX_VCPU=$BOX_VCPU BOX_MEM=$BOX_MEM BOX_DISK=$BOX_DISK BOX_PORTS='$BOX_PORTS' BOX_GATEWAY_ENABLED='$BOX_GATEWAY_ENABLED' \
     E_RPC_URL='$RPC_URL' E_BUNDLER_URL='${BUNDLER_URL:-$RPC_URL}' E_GAS_POLICY_ID='${GAS_POLICY_ID:-}' \
     E_POSTGRES_PASSWORD='$PGPW' E_TS_AUTHKEY='$TS_AUTHKEY' E_DSTACK_DOCKER_USERNAME='${guser:-dmvt}' E_DSTACK_DOCKER_PASSWORD='$gtok' \
     E_BOT_USERNAME='${BOT_USERNAME:-admin-agent}' E_BOT_PASSWORD='${BOT_PASSWORD:-}' \

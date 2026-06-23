@@ -185,11 +185,10 @@ services:
         except Exception as e:
             print("synapse-init: WARN could not write agent-secrets:", e, flush=True)
 
-        wkd = os.path.join(WK, ".well-known", "matrix"); os.makedirs(wkd, exist_ok=True)
-        with open(os.path.join(wkd, "server"), "w") as f:
-            f.write(json.dumps({"m.server": sn + ":443"}))
-        with open(os.path.join(wkd, "client"), "w") as f:
-            f.write(json.dumps({"m.homeserver": {"base_url": "https://" + sn + "/"}}))
+        # PRIVATE node (tailnet-only, gateway-off, non-federating): intentionally serve NO
+        # .well-known/matrix. A client well-known would point Element at the now-dead public
+        # gateway URL; with it absent, nginx returns 404 and clients use the tailnet homeserver
+        # URL they enter directly. (Server well-known is moot — we don't federate.)
 
         # Synapse runs as uid 991 in this image.
         for root, dirs, files in os.walk(DATA):
