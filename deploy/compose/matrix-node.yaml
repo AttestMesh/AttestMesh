@@ -315,20 +315,44 @@ services:
         NGINX
         exec nginx -g 'daemon off;'
 
-  # ── Tailscale: joins the tailnet sharing nginx's netns, so the node + Matrix are
-  #     reachable over the tailnet at http://<ts-hostname>:80 (tailnet is encrypted). ──
+  # ── Tailscale serve config writer: drops the TS_SERVE_CONFIG the tailscale container consumes
+  #     (HTTPS-terminate on the tailnet :443 → local nginx:80). $${TS_CERT_DOMAIN} is substituted by
+  #     containerboot with this node's MagicDNS name, so it tracks the actual hostname even though
+  #     that changes on each fresh-disk roll. ($$ escapes the literal $ past compose interpolation.) ──
+  ts-serve-init:
+    image: alpine:3.20
+    restart: "no"
+    volumes:
+      - ts-config:/cfg
+    command:
+      - /bin/sh
+      - -c
+      - |
+        cat > /cfg/serve.json <<'JSON'
+        {"TCP":{"443":{"HTTPS":true}},"Web":{"$${TS_CERT_DOMAIN}:443":{"Handlers":{"/":{"Proxy":"http://127.0.0.1:80"}}}}}
+        JSON
+        echo "ts-serve-init: wrote /cfg/serve.json"
+
+  # ── Tailscale: joins the tailnet sharing nginx's netns. Matrix is reachable over the tailnet at
+  #     https://<magicdns-name>/ — `tailscale serve` (TS_SERVE_CONFIG) terminates TLS on :443 and
+  #     proxies to nginx:80; the cert is auto-provisioned by the tailnet's HTTPS feature. ──
   tailscale:
     image: tailscale/tailscale:latest
     restart: unless-stopped
     network_mode: service:nginx
+    depends_on:
+      ts-serve-init:
+        condition: service_completed_successfully
     environment:
       - TS_AUTHKEY=${TS_AUTHKEY}
       - TS_HOSTNAME=matrix-attestmesh
       - TS_STATE_DIR=/var/lib/tailscale
       - TS_USERSPACE=false
       - TS_EXTRA_ARGS=--netfilter-mode=off
+      - TS_SERVE_CONFIG=/cfg/serve.json
     volumes:
       - tailscale-state:/var/lib/tailscale
+      - ts-config:/cfg
     cap_add:
       - NET_ADMIN
       - SYS_MODULE
@@ -355,6 +379,7 @@ services:
         while true; do
           iptables -C INPUT -i tailscale0 -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || iptables -A INPUT -i tailscale0 -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
           iptables -C INPUT -i tailscale0 -p tcp --dport 80 -j ACCEPT 2>/dev/null || iptables -A INPUT -i tailscale0 -p tcp --dport 80 -j ACCEPT
+          iptables -C INPUT -i tailscale0 -p tcp --dport 443 -j ACCEPT 2>/dev/null || iptables -A INPUT -i tailscale0 -p tcp --dport 443 -j ACCEPT
           iptables -C INPUT -i tailscale0 -p icmp -j ACCEPT 2>/dev/null || iptables -A INPUT -i tailscale0 -p icmp -j ACCEPT
           iptables -C INPUT -i tailscale0 -j DROP 2>/dev/null || iptables -A INPUT -i tailscale0 -j DROP
           iptables -C FORWARD -i tailscale0 -j DROP 2>/dev/null || iptables -A FORWARD -i tailscale0 -j DROP
@@ -366,5 +391,6 @@ volumes:
   synapse-data:
   wellknown:
   tailscale-state:
+  ts-config:         # tailscale serve config (TS_SERVE_CONFIG → HTTPS on the tailnet)
   agent-sock:        # sidecar app-facing gRPC UDS, shared sidecar ↔ matrix-admin-agent
   agent-secrets:     # scoped registration-secret drop, synapse-init → matrix-admin-agent
