@@ -33,6 +33,11 @@ PORTS = json.loads(os.environ.get("BOX_PORTS", '["tcp:127.0.0.1:8080:80","tcp:12
 # internet). A Matrix node must run this OFF so the homeserver is reachable ONLY over the private
 # tailnet. Default ON for backwards-compat; matrix-node.sh sets it OFF. Measured into compose_hash.
 GATEWAY_ENABLED = os.environ.get("BOX_GATEWAY_ENABLED", "true").strip().lower() not in ("0", "false", "no", "off")
+# CVM networking mode. "user" = QEMU SLIRP (10.0.2.0/24, no routable presence → Tailscale relays via DERP).
+# "bridge" = TAP on the host's dstack-br0 → routable → the CVM's own Tailscale gets a DIRECT path (fast).
+# In bridge mode the SLIRP KMS alias 10.0.2.2 is reached via a host DNAT (KMS RA-TLS cert is pinned to
+# 10.0.2.2), so kms_urls must stay 10.0.2.2. forward_service_enabled=false (global) → no host port-forward.
+NET_MODE = (os.environ.get("BOX_NET_MODE", "user").strip().lower() or "user")
 ENV_KEYS = ["RPC_URL", "BUNDLER_URL", "GAS_POLICY_ID", "POSTGRES_PASSWORD", "TS_AUTHKEY",
             "DSTACK_DOCKER_USERNAME", "DSTACK_DOCKER_PASSWORD",
             # matrix-admin-agent (docs/specs/matrix-admin-agent.md §5); key NAMES are
@@ -96,7 +101,9 @@ def main():
             "vcpu": VCPU, "memory": MEM, "disk_size": DISK, "app_id": app_id,
             "user_config": "", "ports": [m._parse_port(p) for p in PORTS],
             "hugepages": False, "pin_numa": False, "stopped": False, "no_tee": False,
-            "kms_urls": m.KMS_URLS, "gateway_urls": ([m.GATEWAY_RPC] if GATEWAY_ENABLED else []), "encrypted_env": enc,
+            "kms_urls": (["https://10.0.2.2:9101"] if NET_MODE == "bridge" else m.KMS_URLS),
+            "networking": {"mode": NET_MODE},
+            "gateway_urls": ([m.GATEWAY_RPC] if GATEWAY_ENABLED else []), "encrypted_env": enc,
         }
         r = httpx.post("http://127.0.0.1:9080/prpc/CreateVm?json", json=params, timeout=120)
         vm = ""

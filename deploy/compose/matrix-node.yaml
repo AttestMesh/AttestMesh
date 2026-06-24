@@ -34,9 +34,6 @@ services:
     volumes:
       - /var/run/dstack.sock:/var/run/dstack.sock
       - agent-sock:/var/run/attestmesh          # app-facing gRPC UDS, shared with matrix-admin-agent
-    ports:
-      - "9090:9090"
-      - "51900:51900"
     cap_add:
       - NET_ADMIN
     devices:
@@ -246,8 +243,6 @@ services:
       - LLM_MODEL=${LLM_MODEL}
       - HEALTH_HTTP_ADDR=0.0.0.0:9100
       - LOG_LEVEL=info
-    ports:
-      - "9100:9100"                                    # /healthz → CVM host (box maps to loopback for verify-agent); reports egress_locked
     volumes:
       - agent-sock:/var/run/attestmesh                 # sidecar app-facing gRPC UDS
       - agent-secrets:/agent-secrets:ro                # scoped registration secret only
@@ -279,8 +274,6 @@ services:
     restart: unless-stopped
     depends_on:
       - synapse
-    ports:
-      - "80:80"
     volumes:
       - wellknown:/usr/share/nginx/wellknown:ro
     command:
@@ -293,10 +286,16 @@ services:
           server_name _;
           client_max_body_size 50M;
 
-          location /.well-known/matrix/ {
-            root /usr/share/nginx/wellknown;
+          # Private node: serve a self-referential client well-known WITH CORS — and crucially
+          # `add_header ... always` so the header is present on every response, not just 2xx. A bare
+          # 404 here has no CORS header, so Element's browser-side discovery fetch is CORS-blocked
+          # and it reports "not a valid homeserver". base_url reflects the Host the client used
+          # ($host, preserved by tailscale serve) so it tracks the MagicDNS name across rolls.
+          # (No federation → no server well-known.)
+          location = /.well-known/matrix/client {
             default_type application/json;
-            add_header Access-Control-Allow-Origin *;
+            add_header Access-Control-Allow-Origin * always;
+            return 200 '{"m.homeserver": {"base_url": "https://$$host"}}';
           }
 
           location ~ ^(/_matrix|/_synapse/client) {
@@ -305,6 +304,12 @@ services:
             proxy_set_header X-Forwarded-Proto https;
             proxy_set_header Host $$host;
             proxy_http_version 1.1;
+          }
+
+          # agent /healthz over the tailnet (bridge-mode verify-agent; no host port-maps). Health only.
+          location = /_agent/healthz {
+            proxy_pass http://matrix-admin-agent:9100/healthz;
+            proxy_set_header Host $$host;
           }
 
           location = / {

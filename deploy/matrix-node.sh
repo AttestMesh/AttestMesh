@@ -36,15 +36,24 @@ COMPOSE="${COMPOSE:-$ROOT/deploy/compose/matrix-node.yaml}"
 MESH_CIDR_IP="${MESH_CIDR_IP:-168951808}"          # 10.18.0.0/16 — pick a UNIQUE /16 per cluster
 MESH_CIDR_PREFIX="${MESH_CIDR_PREFIX:-16}"
 export BOX_VCPU="${BOX_VCPU:-4}" BOX_MEM="${BOX_MEM:-8192}" BOX_DISK="${BOX_DISK:-60}"
-export BOX_PORTS="${BOX_PORTS:-[\"tcp:127.0.0.1:8080:80\",\"tcp:127.0.0.1:9091:9090\",\"tcp:127.0.0.1:9102:9100\"]}"  # no host port >20000
-# Matrix is PRIVATE: never publish nginx:80 via the public dstack gateway. Reachable only over the
-# tailnet (and box loopback). Override BOX_GATEWAY_ENABLED=true only to re-expose intentionally.
+# Bridge networking: the CVM is routable (TAP on the host bridge dstack-br0) so its OWN Tailscale gets a
+# DIRECT path (fast, no DERP relay). No host port-maps (forward_service_enabled=false → none created),
+# so the host opens nothing toward the CVM; KMS reached via the host DNAT 10.0.2.2:9101 (cert SAN).
+export BOX_NET_MODE="${BOX_NET_MODE:-bridge}"
+export BOX_PORTS="${BOX_PORTS:-[]}"
+# Matrix is PRIVATE: gateway OFF (never publish to the public dstack gateway); reachable only over the
+# tailnet. Override BOX_GATEWAY_ENABLED=true only to re-expose intentionally.
 export BOX_GATEWAY_ENABLED="${BOX_GATEWAY_ENABLED:-false}"
-# Health-check host ports derived from BOX_PORTS, so multiple nodes can coexist on one box.
-_hostport() { echo "$BOX_PORTS" | tr ',[]' ' ' | tr -d '"' | tr ' ' '\n' | awk -F: -v vm="$1" '$4==vm{print $3; exit}'; }
-NGINX_PORT="$(_hostport 80)";     NGINX_PORT="${NGINX_PORT:-8080}"
-SIDECAR_PORT="$(_hostport 9090)"; SIDECAR_PORT="${SIDECAR_PORT:-9091}"
-AGENT_PORT="$(_hostport 9100)";   AGENT_PORT="${AGENT_PORT:-9102}"
+# Bridge-mode CVMs have NO host port-maps → verify reaches the live CVM over the TAILNET (this host has a
+# direct path). _cvm_fqdn returns the matrix-attestmesh* peer whose Synapse answers.
+TS_SUFFIX="${TS_SUFFIX:-tail39cb2e.ts.net}"
+_cvm_fqdn() {
+  local n
+  for n in $(tailscale status 2>/dev/null | awk 'tolower($2) ~ /^matrix-attestmesh/ {print $2}'); do
+    curl -sS --max-time 6 "https://$n.$TS_SUFFIX/_matrix/client/versions" 2>/dev/null | grep -q '"versions"' && { echo "$n.$TS_SUFFIX"; return 0; }
+  done
+  return 1
+}
 GW_DOMAIN="${GATEWAY_DOMAIN:-gateway.attestmesh.xyz}"
 RECEIPT="$ROOT/contracts/script/deployments/${CHAIN_ID}.json"
 STATE="$LOGDIR/matrix-node-${NODE}.state"
@@ -78,7 +87,7 @@ _box_run() {
   [ -n "$gtok" ] || die "no ghcr token in ~/.teesql/ghcr-pull.toml"
   scp -o BatchMode=yes -q "$COMPOSE" "$BOX_HOST:/tmp/${NODE}.yaml"
   scp -o BatchMode=yes -q "$HERE/matrix-node-box.py" "$BOX_HOST:/tmp/matrix-node-box.py"
-  ssh_box "sudo BOX_NAME='$NODE' BOX_COMPOSE='/tmp/${NODE}.yaml' BOX_VCPU=$BOX_VCPU BOX_MEM=$BOX_MEM BOX_DISK=$BOX_DISK BOX_PORTS='$BOX_PORTS' BOX_GATEWAY_ENABLED='$BOX_GATEWAY_ENABLED' \
+  ssh_box "sudo BOX_NAME='$NODE' BOX_COMPOSE='/tmp/${NODE}.yaml' BOX_VCPU=$BOX_VCPU BOX_MEM=$BOX_MEM BOX_DISK=$BOX_DISK BOX_PORTS='$BOX_PORTS' BOX_GATEWAY_ENABLED='$BOX_GATEWAY_ENABLED' BOX_NET_MODE='$BOX_NET_MODE' \
     E_RPC_URL='$RPC_URL' E_BUNDLER_URL='${BUNDLER_URL:-$RPC_URL}' E_GAS_POLICY_ID='${GAS_POLICY_ID:-}' \
     E_POSTGRES_PASSWORD='$PGPW' E_TS_AUTHKEY='$TS_AUTHKEY' E_DSTACK_DOCKER_USERNAME='${guser:-dmvt}' E_DSTACK_DOCKER_PASSWORD='$gtok' \
     E_BOT_USERNAME='${BOT_USERNAME:-admin-agent}' E_BOT_PASSWORD='${BOT_PASSWORD:-}' \
@@ -109,13 +118,12 @@ _ensure_iapw() {
 
 # Poll the box loopback (8080 → nginx → Matrix) for synapse readiness.
 _wait_synapse() {
-  local i body
+  local i fqdn
   for i in $(seq 1 60); do
-    body=$(ssh_box "curl -s --max-time 6 http://127.0.0.1:${NGINX_PORT}/_matrix/client/versions" 2>/dev/null)
-    echo "$body" | grep -q '"versions"' && { log "✔ synapse live (/_matrix/client/versions)"; return 0; }
-    log "… synapse not ready ($i/60)"; sleep 12
+    fqdn=$(_cvm_fqdn) && { CVM_FQDN="$fqdn"; log "✔ synapse live over tailnet ($fqdn)"; return 0; }
+    log "… synapse not reachable on tailnet yet ($i/60)"; sleep 12
   done
-  die "synapse never came up — inspect the CVM (vm_logs $VM_ID) / box compose"
+  die "synapse never reachable over the tailnet — check tailscale join / vm_logs $VM_ID"
 }
 
 # 1. Register stock DstackApp + CreateVm via the box, then wait for Matrix to be live.
@@ -217,17 +225,18 @@ verify() {
 # (exits, no /healthz) — so this poll catches an un-firewalled agent.
 verify_agent() {
   _load; [ -n "${X:-}" ] || die "need X (run deploy first)"
-  local i body
+  local i body fqdn="${CVM_FQDN:-$(_cvm_fqdn)}"
+  [ -n "$fqdn" ] || die "no tailnet FQDN for the CVM (synapse not reachable over the tailnet?)"
   for i in $(seq 1 45); do
-    body=$(ssh_box "curl -s --max-time 6 http://127.0.0.1:${AGENT_PORT}/healthz" 2>/dev/null)
+    body=$(curl -sS --max-time 6 "https://$fqdn/_agent/healthz" 2>/dev/null)
     if echo "$body" | grep -q '"status": *"ok"'; then
-      log "✔ matrix-admin-agent ready (admin token + matrix sync + egress LOCKED)"
+      log "✔ matrix-admin-agent ready (admin token + matrix sync + egress LOCKED) over tailnet"
       return 0
     fi
     log "… agent not ready ($i/45): ${body:-<no response>}"
     sleep 12
   done
-  die "matrix-admin-agent never reported ready — vm_logs $VM_ID and check the agent bootstrap + agent-egress-fw (the agent fails CLOSED if egress is not locked)"
+  die "matrix-admin-agent never reported ready over the tailnet — vm_logs $VM_ID; check agent bootstrap + agent-egress-fw (fails CLOSED if egress not locked)"
 }
 
 # Day-2: roll a new compose/env onto the LIVE node, REUSING its app_id (keeps membership + CSK
