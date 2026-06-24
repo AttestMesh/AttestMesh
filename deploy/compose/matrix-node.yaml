@@ -140,7 +140,7 @@ services:
         signing_key_path: /data/signing.key
         media_store_path: /data/media_store
         report_stats: false
-        public_baseurl: "https://{sn}/"
+        public_baseurl: "https://homeserver.invalid/"
         listeners:
           - port: 8008
             tls: false
@@ -182,10 +182,15 @@ services:
         except Exception as e:
             print("synapse-init: WARN could not write agent-secrets:", e, flush=True)
 
-        # PRIVATE node (tailnet-only, gateway-off, non-federating): intentionally serve NO
-        # .well-known/matrix. A client well-known would point Element at the now-dead public
-        # gateway URL; with it absent, nginx returns 404 and clients use the tailnet homeserver
-        # URL they enter directly. (Server well-known is moot — we don't federate.)
+        # PRIVATE node (tailnet-only, gateway-off, non-federating). public_baseurl is the sentinel
+        # host `homeserver.invalid` ON PURPOSE: Synapse echoes public_baseurl back in the LOGIN
+        # response's m.homeserver well_known, and a Matrix client then SWITCHES its base_url to
+        # whatever that says. The real tailnet URL changes every fresh-disk roll, so we can't bake
+        # it in here — instead nginx rewrites `homeserver.invalid` → the client's own Host ($host)
+        # on the way out (see the nginx sub_filter), so the login well_known always sends the client
+        # back to the exact tailnet URL it used — never the dead gateway domain. (No static
+        # well-known files are written; nginx serves the client well-known dynamically. No
+        # federation → no server well-known.)
 
         # Synapse runs as uid 991 in this image.
         for root, dirs, files in os.walk(DATA):
@@ -303,7 +308,16 @@ services:
             proxy_set_header X-Forwarded-For $$remote_addr;
             proxy_set_header X-Forwarded-Proto https;
             proxy_set_header Host $$host;
+            proxy_set_header Accept-Encoding "";
             proxy_http_version 1.1;
+            # Rewrite Synapse's public_baseurl sentinel to the client's own Host on the way out, so
+            # the LOGIN response's m.homeserver well_known sends the client back to the tailnet URL it
+            # actually used (the real name churns each fresh-disk roll) instead of the dead gateway
+            # domain. Requires the upstream response uncompressed (Accept-Encoding "" above); Synapse's
+            # client listener already sets compress:false. $host is preserved through tailscale serve.
+            sub_filter 'homeserver.invalid' '$$host';
+            sub_filter_once off;
+            sub_filter_types application/json;
           }
 
           # agent /healthz over the tailnet (bridge-mode verify-agent; no host port-maps). Health only.
