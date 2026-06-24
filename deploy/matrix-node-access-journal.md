@@ -23,8 +23,13 @@ note `matrix-node-on-dstack-box.md`.
 - ✅ **Host plaintext view CLOSED** (was the ⚠️ secondary). Bridge mode + `forward_service_enabled=false`
   + empty per-VM `ports:` → the host opens NOTHING toward the Matrix CVM; verify moved onto the tailnet
   (`/_agent/healthz`). Proven in W6: every private port (80/443/9100/9090/51900) refused from the host.
-- **Remaining (housekeeping only):** commit the 3 deploy files; push branch; rotate GHCR token; delete
-  stale tailnet nodes in the TS admin console (see the last log entry).
+- ✅ **Element "Syncing…" hang FIXED** (2026-06-24): Synapse's *login-response* `well_known` was sending
+  clients to the dead gateway domain (a client switches its base_url to the login well_known); nginx now
+  rewrites it to the client's own tailnet `$host` (churn-proof). See the last log entry. **CONNECT:
+  `https://matrix-attestmesh-4.tail39cb2e.ts.net` → username `lsdan` → IAPW.**
+- **Remaining (housekeeping only):** rotate the GHCR token; delete the stale offline tailnet nodes in the TS
+  admin console (the list grows each roll — now also `matrix-attestmesh-3`); optional: pin a stable URL so the
+  name stops changing per roll (needs predecessor pruning via a TS API key, since fresh-disk rolls re-join).
 
 ---
 
@@ -323,3 +328,23 @@ behind the speed decision.
   **Outstanding:** commit the 3 deploy files (gated on operator ask); push branch; rotate GHCR token; delete
   stale tailnet nodes `bridge-preflight` / `bridge-preflight2` / `matrix-attestmesh-1` / `-2` / `w4-bridge-cvm`
   in the TS admin console.
+- **2026-06-24 (ELEMENT "SYNCING…" HANG — root-caused + FIXED; the real client bug).** After bridge mode,
+  Element STILL hung forever on "Syncing…" on a FRESH login to the live node. Proved it was NOT stale client
+  state (a clean headless-Chromium login hung too) and NOT the server — login, `/sync`, CORS, and HTTP/2
+  multiplexing all green via curl. **ROOT CAUSE:** Synapse's **login response carries an `m.homeserver`
+  well_known** built from `public_baseurl`, which was `https://<app_id>.gateway.attestmesh.xyz/` (the DEAD
+  gateway). Per the Matrix spec a client **switches its base_url to the login well_known**, so Element logged
+  in via the tailnet URL then moved ALL sync traffic to the dead gateway → black-hole → eternal spinner.
+  Proven: post-login sync against the well_known base_url = TLS error (code 000) on the gateway domain vs 200
+  on the tailnet URL. (My earlier "stale `-2` session" guess was WRONG — the user was on the right node;
+  curl never caught it because curl doesn't follow the login well_known.) **FIX (churn-proof, no pinning):**
+  set Synapse `public_baseurl` to the sentinel `https://homeserver.invalid/` and have **nginx `sub_filter`
+  rewrite `homeserver.invalid` → the client's own `$host`** on `/_matrix` responses (+ `Accept-Encoding ""` so
+  the body is uncompressed; `nginx:alpine` ships the sub module). So the login well_known ALWAYS reflects the
+  exact tailnet URL the client used — robust to the per-roll name churn. `server_name` unchanged
+  (MXIDs/identity intact). Rolled: compose_hash `0x84db0bca…`, addComposeHash nonce 927, vm `4fcbdabf`, node
+  now **`matrix-attestmesh-4`**. VERIFIED end-to-end incl. a REAL headless browser (login → follow well_known
+  → sync): well_known base_url = `https://matrix-attestmesh-4.tail39cb2e.ts.net`, sync = **200 + next_batch
+  present** ⇒ initial sync completes, Element leaves the Syncing screen; agent still `llm_ok`+`egress_locked`.
+  **CONNECT: Element → `https://matrix-attestmesh-4.tail39cb2e.ts.net` → username `lsdan` → IAPW.** (Repro
+  harness: `/tmp/eltest/` — playwright-core + a login→well_known→sync fetch page.)
