@@ -11,6 +11,7 @@ export AWS_S3_FORCE_PATH_STYLE="true"            # R2 needs path-style addressin
 export WALG_S3_PREFIX="s3://${R2_BUCKET:-matrix-node-backups}/${BACKUP_PREFIX:-matrix-node}"
 export WALG_COMPRESSION_METHOD="${WALG_COMPRESSION_METHOD:-zstd}"
 export WALG_LIBSODIUM_KEY_TRANSFORM="hex"
+export WALG_LOG_LEVEL="${WALG_LOG_LEVEL:-DEVEL}"   # verbose — captured to the status file for diagnosis
 # Local Postgres connection for backup-push bracketing (pg_backup_start/stop). Local socket = trust.
 export PGHOST="${PGHOST:-/var/run/postgresql}"
 export PGUSER="${PGUSER:-${POSTGRES_USER:-synapse}}"
