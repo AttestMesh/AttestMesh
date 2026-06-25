@@ -1,0 +1,8 @@
+#!/bin/sh
+# Postgres archive_command: CSK-encrypt + ship one WAL segment to R2 (wal-g wal-push). Exits NON-ZERO
+# (so Postgres keeps the segment and retries) until the CSK-derived key exists — a brief sidecar-bringup
+# window therefore never loses WAL. $1 = %p, the WAL file path (relative to PGDATA).
+set -u
+. /usr/local/bin/walg-env.sh
+[ -n "${WALG_LIBSODIUM_KEY:-}" ] || { echo "walg-archive: CSK key not ready, deferring $1" >&2; exit 1; }
+exec wal-g wal-push "$1"

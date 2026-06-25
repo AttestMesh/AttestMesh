@@ -58,6 +58,7 @@ const { Workflow, smithers, outputs } = createSmithers({
   agent: Step,
   client: Step,
   isolation: Step,
+  backup: Step,
 });
 
 // Repo root, from this file's location (deploy/workflows/ → ../..), so it runs from any cwd.
@@ -115,6 +116,11 @@ export default smithers((ctx) => {
         <Task id="isolation" output={outputs.isolation}>
           {() => run("isolation", mn("verify-isolation"))}
         </Task>
+        {process.env.BACKUP_ENABLED === "true" && (
+          <Task id="backup" output={outputs.backup}>
+            {() => run("backup", mn("backup-status"))}
+          </Task>
+        )}
       </Sequence>
     </Workflow>
   );

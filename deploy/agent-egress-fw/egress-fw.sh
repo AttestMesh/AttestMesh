@@ -38,7 +38,14 @@ LLM_ALLOW_CIDRS="${LLM_ALLOW_CIDRS:-}"         # static :443 allows — pin the 
                                                # is reachable regardless of resolution timing
 RERESOLVE="${RERESOLVE_SECONDS:-15}"
 
-echo "egress-fw: LLM='${LLM_HOST:-<none>}':$LLM_PORT internal='$INTERNAL_HOSTS' static='$LLM_ALLOW_CIDRS' dns=$ALLOW_DNS"
+# Generic single-host allow (reused beyond the agent — e.g. the Matrix node's Postgres egressing only to
+# Cloudflare R2 for wal-g backups). Defaults to the LLM_* values so the matrix-admin-agent compose is
+# unchanged; a different consumer sets ALLOW_HOST/ALLOW_PORT/ALLOW_CIDRS (+ INTERNAL_HOSTS='') instead.
+ALLOW_HOST="$(host_of "${ALLOW_BASE_URL:-}")"; ALLOW_HOST="${ALLOW_HOST:-$LLM_HOST}"
+ALLOW_PORT="${ALLOW_PORT:-$LLM_PORT}"
+ALLOW_CIDRS="${ALLOW_CIDRS:-$LLM_ALLOW_CIDRS}"
+
+echo "egress-fw: allow='${ALLOW_HOST:-<none>}':$ALLOW_PORT internal='$INTERNAL_HOSTS' static='$ALLOW_CIDRS' dns=$ALLOW_DNS"
 
 add() {  # idempotent append to the AMX_EGRESS chain
   iptables -C AMX_EGRESS "$@" 2>/dev/null || iptables -A AMX_EGRESS "$@"
@@ -58,7 +65,7 @@ allow_host() {  # $1=host  $2=optional "proto:port" restriction (else any port)
 
 resolve() {
   for h in $INTERNAL_HOSTS; do allow_host "$h"; done
-  allow_host "$LLM_HOST" "tcp:$LLM_PORT"
+  allow_host "$ALLOW_HOST" "tcp:$ALLOW_PORT"
 }
 
 # Dedicated chain so the OUTPUT policy can be DROP while we (idempotently) allow
@@ -76,7 +83,7 @@ add -p udp --dport 53 -j ACCEPT
 add -p tcp --dport 53 -j ACCEPT
 # Static LLM pins (resolution-independent): guarantee the pinned LLM IP/block is reachable even if
 # a boot-time dig misses. The dynamic resolve below is the complement, not the gate.
-for c in $LLM_ALLOW_CIDRS; do add -d "$c" -p tcp --dport "$LLM_PORT" -j ACCEPT; done
+for c in $ALLOW_CIDRS; do add -d "$c" -p tcp --dport "$ALLOW_PORT" -j ACCEPT; done
 
 # Populate the allowlist BEFORE locking the policy (on a fresh netns the policy is
 # still ACCEPT so the first dig works; on a restart the DNS rule above already exists).
@@ -89,7 +96,7 @@ iptables -P OUTPUT DROP
 ip6tables -C OUTPUT -o lo -j ACCEPT 2>/dev/null || ip6tables -A OUTPUT -o lo -j ACCEPT 2>/dev/null || true
 ip6tables -P OUTPUT DROP 2>/dev/null || true
 
-echo "egress-fw: OUTPUT=DROP — agent restricted to internal services + ${LLM_HOST:-<none>}:$LLM_PORT"
+echo "egress-fw: OUTPUT=DROP — restricted to internal services + ${ALLOW_HOST:-<none>}:$ALLOW_PORT"
 while true; do
   sleep "$RERESOLVE"
   resolve   # re-resolve (DNS pinning): pick up any new LLM/internal IPs; old IPs stay (harmless)
