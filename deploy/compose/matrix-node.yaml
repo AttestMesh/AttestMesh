@@ -44,7 +44,7 @@ services:
     # postgres-walg = stock Postgres 16 + wal-g + grpcurl. A transparent passthrough to plain postgres
     # unless BACKUP_ENABLED=true, in which case it ships CSK-encrypted base+WAL PITR backups to R2.
     # (Replaces postgres:16-alpine; the entrypoint chowns the pre-existing data dir for the uid change.)
-    image: ghcr.io/attestmesh/postgres-walg:latest
+    image: ghcr.io/attestmesh/postgres-walg@sha256:5d41d0ac0ab97f29bc692619867e3281481671676a23ad2956c546ab8a821872  # pin by digest so in-place rolls pull the exact image (:latest is cached on the CVM); bump on rebuild
     restart: unless-stopped
     environment:
       - POSTGRES_USER=synapse
@@ -68,6 +68,7 @@ services:
     volumes:
       - pgdata:/var/lib/postgresql/data
       - agent-sock:/var/run/attestmesh          # read the CSK from the sidecar's Agent gRPC (UDS)
+      - walg-status:/walg-status                # backup-pipeline status, surfaced by nginx /_backup/status
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U synapse -d synapse"]
       interval: 10s
@@ -78,7 +79,7 @@ services:
   #    Cloudflare R2 endpoint on :443 for wal-g — deny-all otherwise. Same image/pattern as the agent's
   #    egress-fw; with backups off Postgres initiates nothing, so this just hard-locks it. ──
   postgres-egress-fw:
-    image: ghcr.io/attestmesh/agent-egress-fw:latest
+    image: ghcr.io/attestmesh/agent-egress-fw@sha256:c75c9668e905ca00f86e9583505d52624ba87cb7114a4633f84330bb497ca58f
     restart: unless-stopped
     network_mode: service:postgres
     depends_on:
@@ -295,7 +296,7 @@ services:
   #     the agent has no self-egress tool, and even a jailbroken LLM cannot reach the internet.
   #     Logic lives in the image (auditable), not inline compose shell. ──
   agent-egress-fw:
-    image: ghcr.io/attestmesh/agent-egress-fw:latest
+    image: ghcr.io/attestmesh/agent-egress-fw@sha256:c75c9668e905ca00f86e9583505d52624ba87cb7114a4633f84330bb497ca58f
     restart: unless-stopped
     network_mode: service:matrix-admin-agent
     depends_on:
@@ -318,6 +319,7 @@ services:
       - synapse
     volumes:
       - wellknown:/usr/share/nginx/wellknown:ro
+      - walg-status:/usr/share/nginx/walg-status:ro
     command:
       - /bin/sh
       - -c
@@ -360,6 +362,17 @@ services:
           # agent /healthz over the tailnet (bridge-mode verify-agent; no host port-maps). Health only.
           location = /_agent/healthz {
             proxy_pass http://matrix-admin-agent:9100/healthz;
+            proxy_set_header Host $$host;
+          }
+
+          # Diagnostics over the tailnet (the TEE blocks container logs): the wal-g backup pipeline's
+          # status file, and the sidecar's health (phase + csk_acquired). Read-only, no secrets.
+          location = /_backup/status {
+            default_type text/plain;
+            alias /usr/share/nginx/walg-status/state;
+          }
+          location = /_sidecar/healthz {
+            proxy_pass http://sidecar:9090/healthz;
             proxy_set_header Host $$host;
           }
 
@@ -450,3 +463,4 @@ volumes:
   ts-config:         # tailscale serve config (TS_SERVE_CONFIG → HTTPS on the tailnet)
   agent-sock:        # sidecar app-facing gRPC UDS, shared sidecar ↔ matrix-admin-agent
   agent-secrets:     # scoped registration-secret drop, synapse-init → matrix-admin-agent
+  walg-status:       # wal-g backup-pipeline status (postgres-walg → nginx /_backup/status)
