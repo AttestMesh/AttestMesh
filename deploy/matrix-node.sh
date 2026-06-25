@@ -86,7 +86,7 @@ send_seq() {  # cast send with a FRESHLY-fetched nonce + one retry — handles R
 # Run the box-side helper (matrix-node-box.py) with the sealed secret env passed over SSH (in-memory,
 # never written to disk). Usage: _box_run <deploy|hash|update> [app_id]. Echoes the helper's stdout.
 _box_run() {
-  local mode="$1" app_id="${2:-}" guser gtok
+  local mode="$1" app_id="${2:-}" vm_id="${3:-}" guser gtok
   : "${TS_AUTHKEY:?set TS_AUTHKEY (operator tailscale key)}"
   guser=$(grep -E '^\s*username\s*=' "$HOME/.teesql/ghcr-pull.toml" 2>/dev/null | head -1 | sed -E 's/.*=\s*//' | tr -d "\"' ")
   gtok=$(grep  -E '^\s*token\s*='    "$HOME/.teesql/ghcr-pull.toml" 2>/dev/null | head -1 | sed -E 's/.*=\s*//' | tr -d "\"' ")
@@ -100,7 +100,7 @@ _box_run() {
     E_MATRIX_ADMIN_MXIDS='${MATRIX_ADMIN_MXIDS:-}' E_MATRIX_ADMIN_SENDERS='${MATRIX_ADMIN_SENDERS:-}' \
     E_INITIAL_ADMIN='${INITIAL_ADMIN:-}' E_INITIAL_ADMIN_PASSWORD='${INITIAL_ADMIN_PASSWORD:-}' \
     E_LLM_BASE_URL='${LLM_BASE_URL:-}' E_LLM_MODEL='${LLM_MODEL:-}' E_LLM_API_KEY='${LLM_API_KEY:-}' \
-    $BOX_PY /tmp/matrix-node-box.py $mode $app_id"
+    $BOX_PY /tmp/matrix-node-box.py $mode $app_id $vm_id"
 }
 
 # Required matrix-admin-agent env (secrets in-memory, like TS_AUTHKEY). MATRIX_ADMIN_SENDERS +
@@ -324,12 +324,19 @@ update_member() {
   else
     send_seq "update-addHash-${NODE}" "$CLUSTER" "addComposeHash(bytes32)" "0x$nh"
   fi
-  [ -n "${VM_ID:-}" ] && { log "stopping old CVM $VM_ID"; _vmm StopVm "{\"id\":\"$VM_ID\"}" >/dev/null 2>&1 || true; }
-  local out; out=$(_box_run update "$X") || die "reuse CreateVm failed"
+  # box.py owns the VM lifecycle: with VM_ID it does StopVm→UpgradeApp→StartVm IN PLACE (keeps the disk →
+  # data + tailscale name survive); BOX_FRESH_DISK=1 forces a fresh-disk CreateVm (deliberate wipe).
+  local out; out=$(_box_run update "$X" "${VM_ID:-}") || die "in-place update failed"
   log "$out"
+  echo "$out" | grep -qE '"(upgrade_status|createvm_status)": *200' || die "vmm update did not return 200 — see output above"
+  local mode; mode=$(echo "$out" | grep -oE '"mode": *"[^"]*"' | sed -E 's/.*"mode": *"([^"]*)".*/\1/')
   VM_ID=$(echo "$out" | grep -oE '"vm_id": *"[^"]*"' | head -1 | sed -E 's/.*"vm_id": *"([^"]*)".*/\1/')
   H="$nh"; _save
-  log "✔ in-place update: reused X=$X new vm=$VM_ID (membership/CSK preserved). Waiting for synapse…"
+  if [ "$mode" = upgrade ]; then
+    log "✔ in-place UpgradeApp: app X=$X vm=$VM_ID — DISK + DATA PRESERVED (membership/CSK kept). Waiting for synapse…"
+  else
+    log "✔ fresh-disk CreateVm: app X=$X vm=$VM_ID — data wiped (membership/CSK kept). Waiting for synapse…"
+  fi
   _wait_synapse
   verify_agent
   verify_client
