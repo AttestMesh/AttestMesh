@@ -348,3 +348,15 @@ behind the speed decision.
   present** ⇒ initial sync completes, Element leaves the Syncing screen; agent still `llm_ok`+`egress_locked`.
   **CONNECT: Element → `https://matrix-attestmesh-4.tail39cb2e.ts.net` → username `lsdan` → IAPW.** (Repro
   harness: `/tmp/eltest/` — playwright-core + a login→well_known→sync fetch page.)
+- **2026-06-24 (DOCUMENTED + ORCHESTRATED).** Wrote the authoritative method guide
+  [`matrix-node-deploy.md`](./matrix-node-deploy.md) (architecture, the 6 load-bearing invariants, deploy /
+  day-2 roll / verify / connect / troubleshooting). Hardened `matrix-node.sh`: fixed `verify` (it still
+  probed the removed host-loopback ports `SIDECAR_PORT`/`NGINX_PORT` — now checks Synapse over the tailnet)
+  and added two subcommands — **`verify-client`** (login → follow the login well_known → initial sync 200;
+  asserts the live tailnet URL, catching the `public_baseurl` "Syncing" class) and **`verify-isolation`**
+  (from the box: map vm→qemu MAC→bridge IP, assert every private port refuses). `update` now self-verifies
+  agent+client+isolation after a roll. Both proven against the live node (`verify-client` → sync 200;
+  `verify-isolation` → vm `4fcbdabf` @ `10.0.100.195`, all ports refused). The Smithers orchestrator
+  [`workflows/matrix-node.tsx`](./workflows/matrix-node.tsx) now runs
+  `deploy→cluster→patha→prime→bind→verify→agent→client→isolation` (graph-validated). Commits `8d5b8a2`
+  (doc + driver), `1eeffc7` (orchestrator); the well_known fix itself is `b1ed931`.
