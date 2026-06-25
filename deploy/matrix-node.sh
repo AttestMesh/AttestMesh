@@ -12,13 +12,19 @@
 #             8453.json clusterMemberImpl lacks reinitializeFromDstackApp]
 #   prime   → addAllowedAppId(cluster, X)   (hash already seeded at `cluster`).
 #   bind    → on the box (box deployer key): upgradeToAndCall(X, impl, reinitializeFromDstackApp(cluster)).
-#   verify  → poll memberCount/memberIdOf(X) + sidecar /healthz + Matrix well-known.
+#   verify  → poll memberCount/memberIdOf(X) + Synapse /versions over the tailnet.
+#   verify-agent     → matrix-admin-agent /healthz (admin token + matrix sync + EGRESS LOCKED).
+#   verify-client    → the EXACT Element path: login → follow the login well_known → initial sync 200
+#                      (catches a bad public_baseurl that would hang clients on "Syncing").
+#   verify-isolation → from the BOX, the CVM's private ports must REFUSE (host-isolation invariant).
 #   update  → IN-PLACE roll (new compose/env) REUSING X: addComposeHash(cluster, H') → stop old CVM →
-#             CreateVm(app_id=X). Preserves membership + CSK originator. No new cluster.
+#             CreateVm(app_id=X). Preserves membership + CSK originator. No new cluster. Self-verifies
+#             agent + client + isolation after the roll.
 #
 #   source deploy/env.sh \
 #     && TS_AUTHKEY=tskey-… [BOX_KMS_ROOT_SIGNER=0x7fa6… MESH_CIDR_IP=…] \
-#        deploy/matrix-node.sh <node-name> [all|deploy|cluster|patha|prime|bind|verify|update]
+#        deploy/matrix-node.sh <node-name> \
+#          [all|deploy|cluster|patha|prime|bind|verify|verify-agent|verify-client|verify-isolation|update]
 set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$HERE/.." && pwd)"
@@ -207,9 +213,9 @@ verify() {
     id=$(cast call "$CLUSTER" "memberIdOf(address)(bytes32)" "$X" --rpc-url "$RPC_URL" 2>/dev/null)
     if [ -n "$id" ] && [ "$id" != "$ZERO32" ]; then
       log "✔ $NODE registered: memberId=$id memberCount=$(cast call "$CLUSTER" 'memberCount()(uint256)' --rpc-url "$RPC_URL")"
-      log "  sidecar: $(ssh_box "curl -s --max-time 6 http://127.0.0.1:${SIDECAR_PORT}/healthz" 2>/dev/null)"
-      log "  matrix:  $(ssh_box "curl -s --max-time 6 http://127.0.0.1:${NGINX_PORT}/.well-known/matrix/server" 2>/dev/null)"
-      local xb="${X#0x}"; log "  url:     https://${xb,,}.${GW_DOMAIN}/_matrix/client/versions"
+      local fqdn="${CVM_FQDN:-$(_cvm_fqdn)}"
+      log "  matrix:  $(curl -sS --max-time 6 "https://${fqdn:-unknown}/_matrix/client/versions" 2>/dev/null | head -c 60)"
+      log "  url:     https://${fqdn:-<tailnet>}/  (private tailnet — NOT the public gateway)"
       return 0
     fi
     log "… not registered yet ($i/45, memberCount=$(cast call "$CLUSTER" 'memberCount()(uint256)' --rpc-url "$RPC_URL" 2>/dev/null))"
@@ -239,6 +245,71 @@ verify_agent() {
   die "matrix-admin-agent never reported ready over the tailnet — vm_logs $VM_ID; check agent bootstrap + agent-egress-fw (fails CLOSED if egress not locked)"
 }
 
+# 6c. Verify the CLIENT path the way Element does. Synapse echoes public_baseurl back in the LOGIN
+# response's m.homeserver well_known, and a Matrix client SWITCHES its base_url to whatever that says —
+# so a bad public_baseurl (e.g. the now-dead public gateway) makes Element hang forever on "Syncing"
+# even though the server is perfectly healthy. This logs in, follows that login well_known, and runs the
+# initial sync against it — the exact sequence Element runs — and asserts it lands on the LIVE tailnet
+# URL (the nginx homeserver.invalid→$host rewrite), not the sentinel and not the gateway domain.
+# Uses INITIAL_ADMIN's localpart + the initial-admin password (IAPW from the state file).
+verify_client() {
+  _load; local fqdn="${CVM_FQDN:-$(_cvm_fqdn)}"
+  [ -n "$fqdn" ] || die "no tailnet FQDN for the CVM (synapse not reachable over the tailnet?)"
+  local swk; swk=$(curl -sS --max-time 8 "https://$fqdn/.well-known/matrix/client" 2>/dev/null)
+  echo "$swk" | grep -q "$fqdn" || die "served /.well-known/matrix/client does not reflect \$host: $swk"
+  log "✔ served client well-known → $fqdn (CORS path)"
+  local user pw resp token wk base code
+  user=$(printf '%s' "${INITIAL_ADMIN:-}" | sed -nE 's/^@([^:]+):.*/\1/p')
+  pw="${INITIAL_ADMIN_PASSWORD:-${IAPW:-}}"
+  if [ -z "$user" ] || [ -z "$pw" ]; then
+    log "⚠ no INITIAL_ADMIN/IAPW available — skipping the authenticated login→well_known→sync check"; return 0
+  fi
+  resp=$(curl -sS --max-time 12 -X POST "https://$fqdn/_matrix/client/v3/login" -H 'content-type: application/json' \
+    -d "{\"type\":\"m.login.password\",\"identifier\":{\"type\":\"m.id.user\",\"user\":\"$user\"},\"password\":\"$pw\"}")
+  token=$(printf '%s' "$resp" | jq -r '.access_token // empty')
+  wk=$(printf '%s' "$resp" | jq -r '.well_known."m.homeserver".base_url // empty' | sed 's:/*$::')
+  [ -n "$token" ] || die "login failed for '$user' (check INITIAL_ADMIN / IAPW): $resp"
+  log "login well_known base_url = ${wk:-<none>}"
+  case "$wk" in
+    "https://$fqdn")          : ;;  # exactly the live tailnet URL — correct
+    "")                        log "⚠ login response carries no well_known (client keeps the URL it used)" ;;
+    *homeserver.invalid*)      die "login well_known leaks the sentinel — nginx sub_filter not applied" ;;
+    *gateway.attestmesh.xyz*)  die "login well_known points at the DEAD gateway — public_baseurl fix missing → clients hang on Syncing" ;;
+    *)                         die "login well_known points off-tailnet ($wk) — clients will follow it and fail" ;;
+  esac
+  base="${wk:-https://$fqdn}"
+  code=$(curl -sS --max-time 12 -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $token" "$base/_matrix/client/v3/sync?timeout=0")
+  [ "$code" = 200 ] || die "initial sync against the login well_known ($base) returned $code — Element would hang on 'Syncing'"
+  log "✔ client path OK: login → well_known ($base) → initial sync 200 (Element leaves the Syncing screen)"
+}
+
+# 6d. Host-isolation invariant: from the BOX, the CVM's private services must be UNREACHABLE. Bridge
+# mode + forward_service_enabled=false (global) + no compose ports ⇒ the host opens nothing toward the
+# CVM. Maps the CVM's qemu (by VM_ID) → its TAP MAC → bridge IP, and asserts every private port refuses.
+verify_isolation() {
+  _load; [ -n "${VM_ID:-}" ] || die "no VM_ID in state (run deploy/update first)"
+  log "▶ host-isolation check for vm=$VM_ID"
+  ssh_box "sudo bash -s" <<SCRIPT 2>&1 | tee "$LOGDIR/matrix-isolation-${NODE}.$(ts).log"
+set -u
+VMID="$VM_ID"
+MAC=\$(ps -eo args | grep -F "\$VMID" | grep -v grep | grep -oE 'mac=[0-9a-f:]+' | head -1 | cut -d= -f2)
+[ -n "\$MAC" ] || { echo "ISOLATION: could not find qemu for \$VMID"; exit 3; }
+IP=\$(ip neigh show dev dstack-br0 | grep -i "\$MAC" | grep -oE '^10\.0\.[0-9]+\.[0-9]+' | head -1)
+[ -n "\$IP" ] || { echo "ISOLATION: no bridge IP for MAC \$MAC yet (CVM mid-boot?)"; exit 4; }
+echo "ISOLATION: vm=\$VMID mac=\$MAC bridge_ip=\$IP"
+bad=0
+for p in 80 443 9100 9090 51900; do
+  if curl -sS --max-time 3 -o /dev/null "http://\$IP:\$p/" 2>/dev/null; then
+    echo "  !! \$IP:\$p REACHABLE from host — INVARIANT VIOLATION"; bad=1
+  else echo "  \$IP:\$p refused from host (good)"; fi
+done
+[ \$bad -eq 0 ] && echo "ISOLATION: PASS — host opens nothing toward the CVM" || { echo "ISOLATION: FAIL"; exit 5; }
+SCRIPT
+  local rc=${PIPESTATUS[0]}
+  [ "$rc" = 0 ] || die "host-isolation check failed (rc=$rc) — see the log above"
+  log "✔ host-isolation invariant holds (CVM private ports refuse from the host)"
+}
+
 # Day-2: roll a new compose/env onto the LIVE node, REUSING its app_id (keeps membership + CSK
 # originator). Allowlists the new hash FIRST, stops the old CVM, then CreateVm(app_id=X).
 update_member() {
@@ -261,6 +332,8 @@ update_member() {
   log "✔ in-place update: reused X=$X new vm=$VM_ID (membership/CSK preserved). Waiting for synapse…"
   _wait_synapse
   verify_agent
+  verify_client
+  verify_isolation
 }
 
 log "=== matrix-node bring-up: $NODE ==="
@@ -272,8 +345,10 @@ case "${2:-all}" in
   bind)    bind_member ;;
   verify)  verify ;;
   verify-agent) verify_agent ;;
+  verify-client) verify_client ;;
+  verify-isolation) verify_isolation ;;
   update)  update_member ;;
   setup)   deploy_cvm; deploy_cluster; patha_upgrade; prime_gate; bind_member ;;  # on-chain path, no register wait
-  all)     deploy_cvm; deploy_cluster; patha_upgrade; prime_gate; bind_member; verify; verify_agent ;;
-  *) die "usage: matrix-node.sh <node-name> [all|deploy|cluster|patha|prime|bind|verify|verify-agent|update|setup]" ;;
+  all)     deploy_cvm; deploy_cluster; patha_upgrade; prime_gate; bind_member; verify; verify_agent; verify_client; verify_isolation ;;
+  *) die "usage: matrix-node.sh <node-name> [all|deploy|cluster|patha|prime|bind|verify|verify-agent|verify-client|verify-isolation|update|setup]" ;;
 esac
