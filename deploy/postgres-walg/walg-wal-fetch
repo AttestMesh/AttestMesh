@@ -1,0 +1,6 @@
+#!/bin/sh
+# Postgres restore_command (recovery only): fetch + decrypt one WAL segment from R2 (wal-g wal-fetch).
+# $1 = %f (WAL file name), $2 = %p (destination path).
+set -u
+. /usr/local/bin/walg-env.sh
+exec wal-g wal-fetch "$1" "$2"

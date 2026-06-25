@@ -41,20 +41,57 @@ services:
 
   # ── Postgres for Synapse ────────────────────────────────────────────────────
   postgres:
-    image: postgres:16-alpine
+    # postgres-walg = stock Postgres 16 + wal-g + grpcurl. A transparent passthrough to plain postgres
+    # unless BACKUP_ENABLED=true, in which case it ships CSK-encrypted base+WAL PITR backups to R2.
+    # (Replaces postgres:16-alpine; the entrypoint chowns the pre-existing data dir for the uid change.)
+    image: ghcr.io/attestmesh/postgres-walg:latest
     restart: unless-stopped
     environment:
       - POSTGRES_USER=synapse
       - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
       - POSTGRES_DB=synapse
       - POSTGRES_INITDB_ARGS=--encoding=UTF8 --locale=C
+      # ── wal-g backups (OFF unless BACKUP_ENABLED=true). The encryption key is derived from the cluster
+      #    shared key fetched from the sidecar over agent-sock; base+WAL go to Cloudflare R2 (sealed creds).
+      #    See deploy/postgres-walg/ + deploy/matrix-node-deploy.md. ──
+      - BACKUP_ENABLED=${BACKUP_ENABLED}
+      - BACKUP_PREFIX=${BACKUP_PREFIX}
+      - BACKUP_RESTORE=${BACKUP_RESTORE}
+      - BACKUP_RESTORE_TARGET_TIME=${BACKUP_RESTORE_TARGET_TIME}
+      - R2_ENDPOINT=${R2_ENDPOINT}
+      - R2_BUCKET=${R2_BUCKET}
+      - R2_REGION=${R2_REGION}
+      - R2_ACCESS_KEY_ID=${R2_ACCESS_KEY_ID}
+      - R2_SECRET_ACCESS_KEY=${R2_SECRET_ACCESS_KEY}
+      - AGENT_GRPC_SOCKET=/var/run/attestmesh/agent.sock
+      - WALG_KEY_FILE=/run/walg/key
     volumes:
       - pgdata:/var/lib/postgresql/data
+      - agent-sock:/var/run/attestmesh          # read the CSK from the sidecar's Agent gRPC (UDS)
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U synapse -d synapse"]
       interval: 10s
       timeout: 5s
       retries: 18
+
+  # ── Egress firewall for Postgres: shares its netns and (when backups are on) lets it reach ONLY the
+  #    Cloudflare R2 endpoint on :443 for wal-g — deny-all otherwise. Same image/pattern as the agent's
+  #    egress-fw; with backups off Postgres initiates nothing, so this just hard-locks it. ──
+  postgres-egress-fw:
+    image: ghcr.io/attestmesh/agent-egress-fw:latest
+    restart: unless-stopped
+    network_mode: service:postgres
+    depends_on:
+      - postgres
+    environment:
+      - ALLOW_BASE_URL=${R2_ENDPOINT}            # the only external host Postgres may reach (R2 S3 API)
+      - ALLOW_PORT=443
+      - ALLOW_CIDRS=104.16.0.0/13 172.64.0.0/13  # Cloudflare ranges R2 resolves into (resolution-independent pins)
+      - INTERNAL_HOSTS=                          # Postgres RECEIVES from internal services; it initiates to none
+      - ALLOW_DNS=127.0.0.11
+      - RERESOLVE_SECONDS=30
+    cap_add:
+      - NET_ADMIN
 
   # ── One-shot init: resolve app_id → server_name, generate Synapse config/keys + well-known ──
   # All logic is in Python (no shell $-vars) to sidestep docker-compose ${} interpolation.

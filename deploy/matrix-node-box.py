@@ -48,7 +48,11 @@ ENV_KEYS = ["RPC_URL", "BUNDLER_URL", "GAS_POLICY_ID", "POSTGRES_PASSWORD", "TS_
             # matrix-admin-agent (docs/specs/matrix-admin-agent.md §5); key NAMES are
             # measured into compose_hash, VALUES sealed. Optional ones may be empty.
             "BOT_USERNAME", "BOT_PASSWORD", "MATRIX_ADMIN_MXIDS", "MATRIX_ADMIN_SENDERS",
-            "INITIAL_ADMIN", "INITIAL_ADMIN_PASSWORD", "LLM_BASE_URL", "LLM_MODEL", "LLM_API_KEY"]
+            "INITIAL_ADMIN", "INITIAL_ADMIN_PASSWORD", "LLM_BASE_URL", "LLM_MODEL", "LLM_API_KEY",
+            # wal-g → Cloudflare R2 backups (deploy/postgres-walg). R2_ACCESS_KEY_ID/SECRET are secret; the
+            # rest are config. BACKUP_RESTORE* are set only on a deliberate restore deploy. All optional.
+            "BACKUP_ENABLED", "BACKUP_PREFIX", "BACKUP_RESTORE", "BACKUP_RESTORE_TARGET_TIME",
+            "R2_ENDPOINT", "R2_BUCKET", "R2_REGION", "R2_ACCESS_KEY_ID", "R2_SECRET_ACCESS_KEY"]
 
 
 def build_env():

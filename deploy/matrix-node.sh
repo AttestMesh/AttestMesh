@@ -61,6 +61,28 @@ _cvm_fqdn() {
   return 1
 }
 GW_DOMAIN="${GATEWAY_DOMAIN:-gateway.attestmesh.xyz}"
+# ── wal-g → Cloudflare R2 backups (deploy/postgres-walg). OFF by default; set BACKUP_ENABLED=true to turn
+#    on encrypted base+WAL PITR backups. R2 creds are read from the toml below (NEVER committed) and sealed
+#    into the CVM at deploy; the backup is encrypted with the cluster shared key (fetched in-CVM), so a
+#    re-provisioned node of the same app_id can decrypt it (recovery from total CVM loss). BACKUP_PREFIX
+#    defaults to the app_id → backups live under <bucket>/<app_id>/. ──
+export BACKUP_ENABLED="${BACKUP_ENABLED:-false}"
+BACKUP_CREDS="${BACKUP_CREDS:-$HOME/.attestmesh/matrix-node-backups.toml}"
+_load_backup_creds() {
+  [ -f "$BACKUP_CREDS" ] || die "BACKUP_ENABLED=true but no R2 creds at $BACKUP_CREDS (see deploy/matrix-node-deploy.md)"
+  export R2_ENDPOINT="$(sed -nE 's/^endpoint *= *"?([^"]+)"?.*/\1/p' "$BACKUP_CREDS")"
+  export R2_BUCKET="$(sed -nE 's/^bucket *= *"?([^"]+)"?.*/\1/p' "$BACKUP_CREDS")"
+  export R2_REGION="$(sed -nE 's/^region *= *"?([^"]+)"?.*/\1/p' "$BACKUP_CREDS")"; : "${R2_REGION:=auto}"
+  export R2_ACCESS_KEY_ID="$(sed -nE 's/^access_key_id *= *"?([^"]+)"?.*/\1/p' "$BACKUP_CREDS")"
+  export R2_SECRET_ACCESS_KEY="$(sed -nE 's/^secret_access_key *= *"?([^"]+)"?.*/\1/p' "$BACKUP_CREDS")"
+  [ -n "$R2_ENDPOINT" ] && [ -n "$R2_ACCESS_KEY_ID" ] && [ -n "$R2_SECRET_ACCESS_KEY" ] || die "R2 creds incomplete in $BACKUP_CREDS"
+}
+_prep_backup_env() {   # called before a deploy/update: load creds + default the prefix when backups are on
+  [ "${BACKUP_ENABLED:-false}" = "true" ] || return 0
+  _load_backup_creds
+  local p="${BACKUP_PREFIX:-${X#0x}}"; export BACKUP_PREFIX="$(printf '%s' "$p" | tr 'A-Z' 'a-z')"
+  log "backups ENABLED → R2 bucket=$R2_BUCKET prefix=$BACKUP_PREFIX"
+}
 RECEIPT="$ROOT/contracts/script/deployments/${CHAIN_ID}.json"
 STATE="$LOGDIR/matrix-node-${NODE}.state"
 ZERO32=0x0000000000000000000000000000000000000000000000000000000000000000
@@ -100,6 +122,8 @@ _box_run() {
     E_MATRIX_ADMIN_MXIDS='${MATRIX_ADMIN_MXIDS:-}' E_MATRIX_ADMIN_SENDERS='${MATRIX_ADMIN_SENDERS:-}' \
     E_INITIAL_ADMIN='${INITIAL_ADMIN:-}' E_INITIAL_ADMIN_PASSWORD='${INITIAL_ADMIN_PASSWORD:-}' \
     E_LLM_BASE_URL='${LLM_BASE_URL:-}' E_LLM_MODEL='${LLM_MODEL:-}' E_LLM_API_KEY='${LLM_API_KEY:-}' \
+    E_BACKUP_ENABLED='${BACKUP_ENABLED:-false}' E_BACKUP_PREFIX='${BACKUP_PREFIX:-}' E_BACKUP_RESTORE='${BACKUP_RESTORE:-}' E_BACKUP_RESTORE_TARGET_TIME='${BACKUP_RESTORE_TARGET_TIME:-}' \
+    E_R2_ENDPOINT='${R2_ENDPOINT:-}' E_R2_BUCKET='${R2_BUCKET:-}' E_R2_REGION='${R2_REGION:-}' E_R2_ACCESS_KEY_ID='${R2_ACCESS_KEY_ID:-}' E_R2_SECRET_ACCESS_KEY='${R2_SECRET_ACCESS_KEY:-}' \
     $BOX_PY /tmp/matrix-node-box.py $mode $app_id $vm_id"
 }
 
@@ -134,7 +158,7 @@ _wait_synapse() {
 
 # 1. Register stock DstackApp + CreateVm via the box, then wait for Matrix to be live.
 deploy_cvm() {
-  _load; _require_agent_env; _ensure_iapw
+  _load; _require_agent_env; _ensure_iapw; _prep_backup_env
   PGPW="${PGPW:-$(openssl rand -hex 24)}"; _save
   log "▶ box deploy_app node=$NODE compose=$COMPOSE"
   local out; out=$(_box_run deploy) || die "box deploy failed"
@@ -314,7 +338,7 @@ SCRIPT
 # originator). Allowlists the new hash FIRST, stops the old CVM, then CreateVm(app_id=X).
 update_member() {
   _load; [ -n "${X:-}" ] && [ -n "${CLUSTER:-}" ] || die "need X+cluster (do a full deploy first)"
-  _require_agent_env; _ensure_iapw
+  _require_agent_env; _ensure_iapw; _prep_backup_env
   PGPW="${PGPW:-$(openssl rand -hex 24)}"
   local nh; nh=$(_box_run hash | grep -oE '^[0-9a-f]{64}$' | tail -1)
   [ -n "$nh" ] || die "could not compute new compose_hash"
@@ -343,6 +367,54 @@ update_member() {
   verify_isolation
 }
 
+# Day-2 DISASTER RECOVERY (manual): redeploy onto a FRESH disk and restore Postgres from R2 — the latest
+# base backup + WAL replay to a point-in-time (RESTORE_TO=<SQL timestamp>, else the latest WAL). Reuses the
+# app_id so the node keeps its on-chain identity; the CSK is re-derived in-CVM to decrypt. NOTE: only the
+# Postgres DB is restored — synapse-data (signing key) + tailscale-state are NOT in the backup, so the node
+# comes back with a fresh signing key + a new tailnet name (expected for full recovery).
+restore_member() {
+  _load; [ -n "${X:-}" ] && [ -n "${CLUSTER:-}" ] || die "need X+cluster (deploy first)"
+  [ "${BACKUP_ENABLED:-false}" = "true" ] || die "set BACKUP_ENABLED=true to restore"
+  export BOX_FRESH_DISK=true                          # restore requires an EMPTY data dir
+  export BACKUP_RESTORE="${BACKUP_RESTORE:-LATEST}"
+  [ -n "${RESTORE_TO:-}" ] && export BACKUP_RESTORE_TARGET_TIME="$RESTORE_TO"
+  log "▶ RESTORE (fresh disk, reuse app_id): BACKUP_RESTORE=$BACKUP_RESTORE target=${BACKUP_RESTORE_TARGET_TIME:-latest WAL}"
+  update_member
+}
+
+# Verify backups exist in R2 (dev-box side via the toml creds): base-backup count + latest, WAL count.
+backup_status() {
+  _load; _load_backup_creds
+  local prefix="${BACKUP_PREFIX:-${X#0x}}"; prefix="$(printf '%s' "$prefix" | tr 'A-Z' 'a-z')"
+  BACKUP_PREFIX="$prefix" python3 - <<'PY'
+import os, sys
+try:
+    import boto3
+except Exception:
+    sys.exit("backup-status needs boto3 on this host (pip install --user boto3)")
+s3 = boto3.client('s3', endpoint_url=os.environ['R2_ENDPOINT'], aws_access_key_id=os.environ['R2_ACCESS_KEY_ID'],
+                  aws_secret_access_key=os.environ['R2_SECRET_ACCESS_KEY'], region_name=os.environ.get('R2_REGION', 'auto'))
+bk, pfx = os.environ['R2_BUCKET'], os.environ['BACKUP_PREFIX']
+def ls(sub):
+    out, tok = [], None
+    while True:
+        kw = dict(Bucket=bk, Prefix=f"{pfx}/{sub}")
+        if tok: kw['ContinuationToken'] = tok
+        r = s3.list_objects_v2(**kw); out += r.get('Contents', [])
+        if not r.get('IsTruncated'): break
+        tok = r.get('NextContinuationToken')
+    return out
+bases = [o for o in ls('basebackups_005/') if 'backup_stop_sentinel' in o['Key']]
+wal = ls('wal_005/')
+print(f"R2: s3://{bk}/{pfx}/")
+print(f"  base backups: {len(bases)}" + (f"  (latest {max(o['LastModified'] for o in bases).isoformat()})" if bases else "  — NONE yet"))
+print(f"  WAL segments: {len(wal)}" + (f"  (newest {max(o['LastModified'] for o in wal).isoformat()})" if wal else "  — NONE yet"))
+PY
+}
+
+# `restore --to "<SQL timestamp>"` → point-in-time recovery target.
+[ "${2:-}" = "restore" ] && [ "${3:-}" = "--to" ] && RESTORE_TO="${4:-}"
+
 log "=== matrix-node bring-up: $NODE ==="
 case "${2:-all}" in
   deploy)  deploy_cvm ;;
@@ -355,7 +427,9 @@ case "${2:-all}" in
   verify-client) verify_client ;;
   verify-isolation) verify_isolation ;;
   update)  update_member ;;
+  restore) restore_member ;;
+  backup-status) backup_status ;;
   setup)   deploy_cvm; deploy_cluster; patha_upgrade; prime_gate; bind_member ;;  # on-chain path, no register wait
   all)     deploy_cvm; deploy_cluster; patha_upgrade; prime_gate; bind_member; verify; verify_agent; verify_client; verify_isolation ;;
-  *) die "usage: matrix-node.sh <node-name> [all|deploy|cluster|patha|prime|bind|verify|verify-agent|verify-client|verify-isolation|update|setup]" ;;
+  *) die "usage: matrix-node.sh <node-name> [all|deploy|cluster|patha|prime|bind|verify|verify-agent|verify-client|verify-isolation|update|restore [--to <ts>]|backup-status|setup]" ;;
 esac
