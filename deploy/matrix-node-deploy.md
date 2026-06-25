@@ -107,14 +107,19 @@ The pipeline (each step shells out to `matrix-node.sh`, logs to `deploy/logs/`, 
 source deploy/env.sh
 TS_AUTHKEY=…  BOT_PASSWORD=…  LLM_API_KEY=…  LLM_BASE_URL=…  LLM_MODEL=z-ai/glm-5.2 \
   MATRIX_ADMIN_MXIDS=@you:<server>  INITIAL_ADMIN=@you:<server> \
-  deploy/matrix-node.sh matrix-node update     # addComposeHash(H') → StopVm → CreateVm(app_id=X)
+  deploy/matrix-node.sh matrix-node update     # addComposeHash(H') → StopVm → UpgradeApp(same vm) → StartVm
 deploy/matrix-node.sh matrix-node verify-client      # prove the client path still works
 deploy/matrix-node.sh matrix-node verify-isolation   # prove the host still can't reach it
 ```
 
-A roll does a **fresh disk** (intentional wipe), so the node **re-joins the tailnet under a new name**
-(`matrix-attestmesh-3` → `-4` → …). The login-well_known rewrite makes any name work; just connect to the
-current one (`tailscale status`).
+A roll is now **in-place and disk-preserving** (`UpgradeApp` on the same vm_id keeps `hda.img`): Postgres/
+Synapse data, the signing key, **and** the `tailscale-state` volume all survive — so the node **keeps its
+name** (no more `-3 → -4` churn) and conversations/users persist across rolls. The compose-hash change is
+just the on-chain auth gate. To **deliberately wipe** (the old security-reset behavior), roll with
+`BOX_FRESH_DISK=1`, which forces a fresh-disk `CreateVm` instead. (Caveat: because `synapse-init` skips when
+`homeserver.yaml` already exists, *Synapse config* changes don't auto-apply on an in-place roll — they need a
+migration step or a one-off `BOX_FRESH_DISK=1`.) Verified by the Synapse signing key surviving a roll
+(journal, 2026-06-25).
 
 ## Connect
 

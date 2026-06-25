@@ -360,3 +360,19 @@ behind the speed decision.
   [`workflows/matrix-node.tsx`](./workflows/matrix-node.tsx) now runs
   `deploy→cluster→patha→prime→bind→verify→agent→client→isolation` (graph-validated). Commits `8d5b8a2`
   (doc + driver), `1eeffc7` (orchestrator); the well_known fix itself is `b1ed931`.
+- **2026-06-25 (PERSISTENCE — in-place disk-preserving rolls; data survives updates).** Until now every
+  `update` did StopVm + a FRESH-disk CreateVm → wiped Postgres/Synapse/signing-key/tailscale-state every
+  roll. dstack expert `83924498` (has the dstack source) confirmed the fix: keep the SAME vm_id and do
+  **StopVm → UpgradeApp(=UpdateVm) → StartVm**, which preserves `hda.img`. Disk key = `app_id || instance_id`
+  (the compose_hash is only an on-chain auth gate), so the same instance remounts its disk. `UpgradeApp`
+  (UpdateVmRequest) has **no networking field** → bridge must already be on the VM manifest (it is). Wired
+  into `box.py update <app_id> <vm_id>` (in-place by default; `BOX_FRESH_DISK=1` forces the old fresh-disk
+  CreateVm for a deliberate wipe; polls `GetInfo` for "stopped" before UpgradeApp) + `matrix-node.sh` (box.py
+  owns Stop/Upgrade/Start; dropped the manual StopVm). **PROVEN on the live node:** an in-place roll kept the
+  Synapse signing key `ed25519:a_nadH` byte-identical + both rooms (incl. the bot DM) intact, and the node
+  STAYED `matrix-attestmesh-4` (no name churn — tailscale-state survived). Committed `d54eca0`. ⚠️ Caveat:
+  `synapse-init` skips when `homeserver.yaml` exists → Synapse *config* changes won't auto-apply on an
+  in-place roll (need a migration step or a one-off `BOX_FRESH_DISK=1`). All future rolls (backups, metrics,
+  read-receipts) are now NON-destructive. Next: CSK-encrypted off-box backups (R2 + wal-g PITR, base 6h /
+  24h WAL, manual restore) for recovery from total CVM loss — the backup key is the cluster shared key (the
+  sidecar's `GetClusterSharedKey` gRPC), which is app_id-bound + re-derivable by a fresh CVM.
