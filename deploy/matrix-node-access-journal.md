@@ -376,3 +376,21 @@ behind the speed decision.
   read-receipts) are now NON-destructive. Next: CSK-encrypted off-box backups (R2 + wal-g PITR, base 6h /
   24h WAL, manual restore) for recovery from total CVM loss — the backup key is the cluster shared key (the
   sidecar's `GetClusterSharedKey` gRPC), which is app_id-bound + re-derivable by a fresh CVM.
+- **2026-06-25 (BACKUPS — CSK-encrypted base+WAL PITR to R2; built + WORKING).** Optional, off-by-default
+  backup addon for the node's Postgres: a **`postgres-walg`** image (Postgres 16 + wal-g + grpcurl) that,
+  with `BACKUP_ENABLED=true`, ships continuous WAL + 6-hourly base backups to a dedicated Cloudflare R2
+  bucket **`matrix-node-backups`** (scoped token, isolated from `teesql-backups`), encrypted with a key
+  **HKDF'd from the CLUSTER SHARED KEY** (fetched in-CVM via the sidecar's `GetClusterSharedKey` gRPC over
+  the agent UDS). The CSK is app_id-bound + on-chain-committed → a re-provisioned node of the same app_id
+  re-derives the key + decrypts → **recovery from total CVM loss**. Restore (manual):
+  `matrix-node.sh restore [--to <ts>]` (fresh-disk redeploy → base-fetch → WAL replay to a point-in-time).
+  `postgres-egress-fw` locks Postgres egress to R2 only. **⚠️ `:latest` caching:** in-place UpgradeApp rolls
+  do NOT re-pull a same-tag image, so `postgres-walg` AND `agent-egress-fw` are **digest-pinned** in the
+  compose (bump on rebuild). **3 bugs, all found via local repro + an in-CVM status endpoint (the TEE blocks
+  container logs):** (1) grpcurl needs `-import-path` for an absolute `-proto`, and the `-unix` flag dials
+  TCP in 1.9.x → use the `unix://` scheme; (2) the HKDF read the CSK from stdin while the python came via a
+  heredoc (heredoc owns stdin) → pass the CSK via argv; (3) `postgres-egress-fw` ran the *cached OLD*
+  `agent-egress-fw` (pre-`ALLOW_*` generalization) → blocked R2 → wal-g hung silently. **Observability
+  (KEEP):** nginx `/_backup/status` (wal-g pipeline state + captured errors) + `/_sidecar/healthz` (phase +
+  `csk_acquired`). VERIFIED live: first CSK-encrypted base backup in R2 in ~5s. Commits `99c4367` (addon),
+  `c3dcaae` (fixes). Build: `deploy/postgres-walg/` + `.github/workflows/build-postgres-walg.yml`.
