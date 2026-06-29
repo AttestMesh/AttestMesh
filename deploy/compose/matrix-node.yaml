@@ -178,6 +178,7 @@ services:
         signing_key_path: /data/signing.key
         media_store_path: /data/media_store
         report_stats: false
+        enable_metrics: true
         public_baseurl: "https://homeserver.invalid/"
         listeners:
           - port: 8008
@@ -188,6 +189,12 @@ services:
             resources:
               - names: [client, federation]
                 compress: false
+          # Internal-only Prometheus metrics listener (scraped by the prometheus service on the
+          # compose bridge as synapse:9000/_synapse/metrics). No host port, not on the tailnet.
+          - port: 9000
+            tls: false
+            type: metrics
+            bind_addresses: ['0.0.0.0']
         database:
           name: psycopg2
           args:
@@ -260,7 +267,7 @@ services:
   #     in Matrix for allowlisted operators. Egress is locked by agent-egress-fw (below) to
   #     Synapse + Postgres + the one pinned LLM host. See docs/specs/matrix-admin-agent.md. ──
   matrix-admin-agent:
-    image: ghcr.io/attestmesh/matrix-admin-agent:latest
+    image: ghcr.io/attestmesh/matrix-admin-agent@sha256:09b3a17f47ebbcd4dd180ec00235b0cd34607d4bc75cc85624849f7d872fc000
     restart: unless-stopped
     depends_on:
       postgres:
@@ -284,6 +291,10 @@ services:
       - LLM_BASE_URL=${LLM_BASE_URL}
       - LLM_API_KEY=${LLM_API_KEY}
       - LLM_MODEL=${LLM_MODEL}
+      # Node infra-health metrics: read-only queries to the INTERNAL prometheus service (no host
+      # port, not on the tailnet). METRICS_WINDOW_MINUTES is the default range-query lookback.
+      - PROMETHEUS_URL=http://prometheus:9090
+      - METRICS_WINDOW_MINUTES=${METRICS_WINDOW_MINUTES:-60}
       - HEALTH_HTTP_ADDR=0.0.0.0:9100
       - LOG_LEVEL=info
     volumes:
@@ -304,11 +315,92 @@ services:
     environment:
       - LLM_BASE_URL=${LLM_BASE_URL}                   # the ONE permitted external host (:443)
       - LLM_ALLOW_CIDRS=66.220.6.0/24                  # redpill api.redpill.ai block — guaranteed LLM reachability (resolution-independent)
-      - INTERNAL_HOSTS=synapse postgres nginx          # internal services the agent may reach (by resolved IP)
+      - INTERNAL_HOSTS=synapse postgres nginx prometheus  # internal services the agent may reach (by resolved IP); prometheus = read-only node metrics
       - ALLOW_DNS=127.0.0.11                           # Docker embedded resolver
       - RERESOLVE_SECONDS=15                            # re-resolve pinned + internal hosts (DNS pinning)
     cap_add:
       - NET_ADMIN
+
+  # ── Node metrics stack (INTERNAL-ONLY: no `ports:`, NOT on the tailscale/nginx netns) ─────────
+  #   Reachable only on the compose bridge. The matrix-admin-agent answers operator infra-health
+  #   questions by issuing read-only PromQL to prometheus:9090; the agent egress-fw additionally
+  #   pins `prometheus` in INTERNAL_HOSTS. node-exporter = host/CVM metrics; cadvisor = per-container;
+  #   synapse exposes /_synapse/metrics on :9000. Modest retention (a few hours) — this is a live
+  #   health window, not a long-term TSDB.
+
+  # Prometheus: scrapes the exporters + Synapse. prometheus.yml is written at runtime (heredoc, same
+  # pattern as nginx) so there's no build context. retention default 3h (override METRICS_RETENTION_TIME).
+  prometheus:
+    image: prom/prometheus:latest
+    restart: unless-stopped
+    user: root            # write /etc/prometheus + own the /prometheus TSDB dir
+    depends_on:
+      - synapse
+    volumes:
+      - prometheus-data:/prometheus
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        cat > /etc/prometheus/prometheus.yml <<'PROMYML'
+        global:
+          scrape_interval: 15s
+          scrape_timeout: 10s
+        scrape_configs:
+          - job_name: prometheus
+            static_configs:
+              - targets: ['localhost:9090']
+          - job_name: node
+            static_configs:
+              - targets: ['node-exporter:9100']
+          - job_name: cadvisor
+            static_configs:
+              - targets: ['cadvisor:8080']
+          - job_name: synapse
+            metrics_path: /_synapse/metrics
+            static_configs:
+              - targets: ['synapse:9000']
+        PROMYML
+        exec /bin/prometheus \
+          --config.file=/etc/prometheus/prometheus.yml \
+          --storage.tsdb.path=/prometheus \
+          --storage.tsdb.retention.time=${METRICS_RETENTION_TIME:-3h} \
+          --storage.tsdb.retention.size=512MB \
+          --web.listen-address=0.0.0.0:9090
+
+  # node-exporter: host/CVM CPU, memory, disk, filesystem, load. Reads the guest's /proc,/sys,rootfs.
+  node-exporter:
+    image: prom/node-exporter:latest
+    restart: unless-stopped
+    pid: host
+    command:
+      - --path.procfs=/host/proc
+      - --path.sysfs=/host/sys
+      - --path.rootfs=/host/root
+      - --collector.filesystem.mount-points-exclude=^/(sys|proc|dev|host|etc)($$|/)
+      - --web.listen-address=0.0.0.0:9100
+    volumes:
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+      - /:/host/root:ro,rslave
+
+  # cAdvisor: per-container CPU, memory, network for every compose service.
+  cadvisor:
+    image: gcr.io/cadvisor/cadvisor:latest
+    restart: unless-stopped
+    privileged: true
+    command:
+      - --listen_ip=0.0.0.0
+      - --port=8080
+      - --housekeeping_interval=15s
+    volumes:
+      - /:/rootfs:ro
+      - /var/run:/var/run:ro
+      - /sys:/sys:ro
+      - /var/lib/docker/:/var/lib/docker:ro
+      - /dev/disk/:/dev/disk:ro
+    devices:
+      - /dev/kmsg
 
   # ── Reverse proxy: well-known delegation + /_matrix|/_synapse → synapse ──────
   # config written at runtime (avoids needing a build context / BuildKit heredoc).
@@ -464,3 +556,4 @@ volumes:
   agent-sock:        # sidecar app-facing gRPC UDS, shared sidecar ↔ matrix-admin-agent
   agent-secrets:     # scoped registration-secret drop, synapse-init → matrix-admin-agent
   walg-status:       # wal-g backup-pipeline status (postgres-walg → nginx /_backup/status)
+  prometheus-data:   # internal node-metrics TSDB (short retention; reachable only on the bridge)
