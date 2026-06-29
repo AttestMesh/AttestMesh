@@ -71,3 +71,5 @@ protoc-bin-vendored = "3"
 
 [dev-dependencies]
 tempfile = "3"
+# test-util: paused-clock tests for the punch executor's timing windows.
+tokio = { version = "1", features = ["full", "test-util"] }

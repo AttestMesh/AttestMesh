@@ -2,11 +2,17 @@ syntax = "proto3";
 
 // Peer-control service (sidecar spec §12.5). A second tonic server bound to the
 // node's mesh IP on the attestmesh0 wireguard interface — the only callers are
-// other cluster members reachable over the encrypted mesh. Carries the CSK pull.
+// other cluster members reachable over the encrypted mesh. Carries the CSK pull
+// and the UDP hole-punch negotiation (docs/specs/udp-transport-upgrade.md).
 package attestmesh.peer.v1;
 
 service PeerControl {
   rpc RequestClusterSharedKey(CskRequest) returns (SealedCsk);
+  // Punch coordination rides the already-authenticated mesh: both parties are
+  // mutually attested members, so no extra signing is needed. An older peer
+  // without these RPCs answers UNIMPLEMENTED and the link stays on TCP.
+  rpc NegotiatePunch(PunchOffer) returns (PunchAccept);
+  rpc ReportPunch(PunchReport) returns (Empty);
 }
 
 message CskRequest {
@@ -15,4 +21,37 @@ message CskRequest {
 
 message SealedCsk {
   bytes sealed_csk = 1; // CSK sealed-boxed (x25519) to the requester's on-chain xPubKey
+}
+
+message Empty {}
+
+enum CandidateKind {
+  GUESS = 0;          // egress IP from gateway-domain DNS + port-preservation guess
+  PEER_REFLEXIVE = 1; // observed source from a prior (partial) punch
+  ADVERTISED = 2;     // carried in the PeerEndpoint envelope
+}
+
+message Candidate {
+  string ip = 1;
+  uint32 port = 2;
+  CandidateKind kind = 3;
+}
+
+// Sent by the deterministic initiator (lexically lower memberId).
+message PunchOffer {
+  bytes requester_member_id = 1; // 32 bytes
+  repeated Candidate candidates = 2;
+  uint64 start_at_ms = 3; // proposed T0 (unix ms)
+  bytes nonce = 4;        // 16 bytes, correlates offer/result
+}
+
+message PunchAccept {
+  repeated Candidate candidates = 1;
+  uint64 start_at_ms = 2; // agreed T0 (>= offered)
+}
+
+message PunchReport {
+  bytes nonce = 1;
+  bool success = 2;
+  Candidate observed_source = 3; // peer-reflexive: what wg actually saw
 }

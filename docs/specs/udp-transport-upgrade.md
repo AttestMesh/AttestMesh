@@ -1,6 +1,6 @@
 # Pure-UDP Hole-Punched Mesh Transport
 
-**Status:** APPROVED
+**Status:** IMPLEMENTED
 **Author:** LSDan
 **Created:** 2026-06-10
 **Last Updated:** 2026-06-10
@@ -31,33 +31,33 @@ are unchanged; punch coordination rides the already-authenticated mesh itself.
 
 ### Must Have
 
-- [ ] Every peer link bootstraps over gateway TCP exactly as today; the punch upgrade
+- [x] Every peer link bootstraps over gateway TCP exactly as today; the punch upgrade
       runs only after the link is established (wg handshake completed over TCP).
-- [ ] Punch coordination is peer-to-peer over the existing in-mesh peer gRPC channel
+- [x] Punch coordination is peer-to-peer over the existing in-mesh peer gRPC channel
       (`PeerControl` on `mesh_ip:50051`, the same channel as the CSK pull) — no new
       on-chain messages, no third-party coordinator.
-- [ ] Both sides attempt the punch simultaneously from the kernel wireguard socket
+- [x] Both sides attempt the punch simultaneously from the kernel wireguard socket
       itself (by retargeting the wg peer endpoint), so the NAT mapping that opens is
       the one wireguard will keep using.
-- [ ] Success is judged by observing a fresh wg handshake on the candidate path within
+- [x] Success is judged by observing a fresh wg handshake on the candidate path within
       a bounded window; on failure or on later death of the UDP path, the link reverts
       to the gateway-TCP loopback bridge automatically. Mesh health must never depend
       on punch success.
-- [ ] A peer running an older sidecar (no punch support) degrades cleanly: the gRPC
+- [x] A peer running an older sidecar (no punch support) degrades cleanly: the gRPC
       call returns `UNIMPLEMENTED` and the link stays on TCP.
-- [ ] Per-peer transport state (`tcp` / `punching` / `udp`) is exposed on the health
+- [x] Per-peer transport state (`tcp` / `punching` / `udp`) is exposed on the health
       endpoint and in metrics.
-- [ ] Punch retry is bounded with exponential backoff; a link that repeatedly fails to
+- [x] Punch retry is bounded with exponential backoff; a link that repeatedly fails to
       punch settles on TCP without log spam or churn.
 
 ### Should Have
 
-- [ ] Peer-reflexive candidate refinement: when one direction of a punch lands,
+- [x] Peer-reflexive candidate refinement: when one direction of a punch lands,
       the receiving side reads the observed source `(ip, port)` from the wg device
       (wireguard roams the endpoint on the first authenticated packet) and reports it
       back over `PeerControl`, so the next attempt uses the precise external mapping
       instead of the port-preservation guess.
-- [ ] Optional advertised UDP candidate in the `PeerEndpoint` envelope (new optional
+- [x] Optional advertised UDP candidate in the `PeerEndpoint` envelope (new optional
       CBOR fields — backward compatible) to cut one negotiation round trip.
 
 ### Must NOT Have
@@ -218,14 +218,27 @@ performance note, never a health failure.
 
 ## Traceability
 
-*Filled in during implementation*
+All implementation and tests live in `sidecar/`; test names are in
+`cargo test`'s suite (module path shown).
 
 | Requirement | Implementation | Tests |
 |-------------|----------------|-------|
-| | | |
+| TCP bootstrap unchanged; punch only after the link is established | `src/transport/punch.rs` (`due_for_punch` gates on configured + heartbeat-live + bridge recorded); bridge bootstrap untouched in `src/transport/mod.rs` / `src/bringup.rs` | `transport::punch::due_for_punch_applies_every_gate` |
+| P2P negotiation over `PeerControl`, no new on-chain surface | `proto/peer.proto` (`NegotiatePunch`/`ReportPunch`), `src/peer_grpc.rs`, `Puncher::{initiate,handle_offer}` in `src/transport/punch.rs` | `transport::punch::handle_offer_validates_inputs`, `transport::punch::punch_proto_round_trips` |
+| Simultaneous punch from the kernel wg socket (endpoint retarget) | `MeshControl::set_peer_endpoint` + `peer_status` (`src/wg/mod.rs`, `wg show dump` parser), `execute_punch`; deterministic T0 agreement in `handle_offer`/`initiate` | `wg::parse_wg_dump_finds_peer_endpoint_and_handshake`, `transport::punch::execute_punch_latches_fresh_handshake_on_candidate_path` |
+| Fresh-handshake success window; auto-revert on failure/UDP death; health independent of punch | `execute_punch` (loopback-handshake rejection, timeout revert), `Puncher::watchdog_pass`; health gates untouched (`src/health.rs`) | `transport::punch::execute_punch_{rejects_loopback_handshake,times_out_on_stale_handshake}_and_reverts`, `transport::punch::responder_punch_latches_udp_then_watchdog_reverts`, `health::healthz_and_metrics_expose_transport_state` |
+| Old peers degrade cleanly (`UNIMPLEMENTED` → stay on TCP) | `Puncher::on_unimplemented` (re-probe only at the backoff cap); disabled nodes present the same surface (`src/peer_grpc.rs`) | `peer_grpc::punch_rpcs_unimplemented_when_disabled`, `transport::punch::unimplemented_marks_peer_unsupported_at_cap_cadence` |
+| Per-peer transport on health endpoint + metrics | `LinkTransport` in `src/wg/peer.rs`; `/healthz` `transports` + `punch` counters and `/metrics` Prometheus text in `src/health.rs`; counters in `state::PunchMetrics` | `health::healthz_and_metrics_expose_transport_state`, `wg::peer::transport_swaps_and_nonce_lookup` |
+| Bounded exponential backoff, no churn | `backoff_ms` (doubling, cap 3600 s), `fail_backoff`, `watchdog_pass` re-punch scheduling | `transport::punch::backoff_doubles_and_caps`, `transport::punch::responder_punch_failure_reverts_and_backs_off` |
+| Peer-reflexive refinement (Should-Have) | `PunchReport.observed_source` capture in `run_punch`; `handle_report` stores `self_reflexive`; `rank_targets` prefers reflexive candidates | `transport::punch::handle_report_stores_self_reflexive_by_nonce`, `transport::punch::rank_targets_orders_dedups_and_sanitizes` |
+| Advertised UDP candidate in `PeerEndpoint` (Should-Have, CBOR-compatible) | optional `udp_ip`/`udp_port` in `src/envelopes.rs`; sent in `bringup::send_peer_endpoint`, absorbed in `bringup::poll_envelopes` | `envelopes::peer_endpoint_udp_fields_are_backward_and_forward_compatible`, `envelopes::peer_endpoint_udp_addr_rejects_garbage` |
+| Config knobs (`WG_UDP_PUNCH`, `PUNCH_TIMEOUT_SECS`, `PUNCH_RETRY_BACKOFF_SECS`) | `src/config.rs`; wired in `bringup::launch` | `config::punch_knobs_parse_and_disable` |
+| `WG_TCP_PORT=0` door rejected with `GATEWAY_DOMAIN` | validation in `Config::from_env` | `config::tcp_port_zero_rejected_with_gateway_domain` |
 
 ## Changelog
 
 | Date | Author | Changes |
 |------|--------|---------|
 | 2026-06-10 | LSDan | Initial draft |
+| 2026-06-10 | LSDan | Status → IMPLEMENTING; implementation started on `milestone-b-udp-transport-upgrade` |
+| 2026-06-10 | LSDan | Status → IMPLEMENTED: `transport::punch` module, `NegotiatePunch`/`ReportPunch` RPCs, per-peer link state machine with revert, UDP-path watchdog, config knobs, health/metrics exposure, traceability filled. Fleet-validation-only items (clock-skew tolerance on `start_at_ms`, defguard endpoint-retarget soak) remain open checkboxes above. |

@@ -22,10 +22,22 @@ pub struct Config {
     /// is skipped (registration-only mode).
     pub gateway_domain: Option<String>,
     /// TCP port of the wg-over-TCP ingress (exposed through the gateway).
+    /// `0` disables the ingress — only valid for hypothetical native-inbound-UDP
+    /// fleets with no gateway in the path (udp-transport-upgrade spec, Open
+    /// Questions): rejected when combined with `GATEWAY_DOMAIN`.
     pub wg_tcp_port: u16,
     /// Wireguard outer listen port. Distinct from the in-mesh heartbeat port
     /// (51820): kernel wg owns its UDP socket, so they must not collide.
     pub wg_listen_port: u16,
+    /// Upgrade established links to punched UDP (udp-transport-upgrade spec).
+    /// Gateway TCP remains the bootstrap path and permanent fallback either way.
+    pub wg_udp_punch: bool,
+    /// Window after the agreed T0 in which a fresh wg handshake on the
+    /// candidate path counts as punch success.
+    pub punch_timeout_secs: u64,
+    /// Initial retry backoff after a failed punch; doubles per failure, capped
+    /// at 3600 s, so a never-punchable link settles on TCP without churn.
+    pub punch_retry_backoff_secs: u64,
     pub dstack_socket: String,
     pub agent_grpc_socket: String,
     pub health_http_addr: String,
@@ -43,7 +55,7 @@ fn opt(key: &str, default: &str) -> String {
 
 impl Config {
     pub fn from_env() -> Result<Self> {
-        Ok(Self {
+        let cfg = Self {
             member_contract: match std::env::var("MEMBER_CONTRACT") {
                 Ok(s) if !s.trim().is_empty() => Some(s.parse().context("MEMBER_CONTRACT")?),
                 _ => None,
@@ -63,12 +75,31 @@ impl Config {
             wg_listen_port: opt("WG_LISTEN_PORT", "51821")
                 .parse()
                 .context("WG_LISTEN_PORT")?,
+            wg_udp_punch: opt("WG_UDP_PUNCH", "true")
+                .parse()
+                .context("WG_UDP_PUNCH")?,
+            punch_timeout_secs: opt("PUNCH_TIMEOUT_SECS", "10")
+                .parse()
+                .context("PUNCH_TIMEOUT_SECS")?,
+            punch_retry_backoff_secs: opt("PUNCH_RETRY_BACKOFF_SECS", "30")
+                .parse()
+                .context("PUNCH_RETRY_BACKOFF_SECS")?,
             dstack_socket: opt("DSTACK_SOCKET", "/var/run/dstack.sock"),
             agent_grpc_socket: opt("AGENT_GRPC_SOCKET", "/var/run/attestmesh/agent.sock"),
             health_http_addr: opt("HEALTH_HTTP_ADDR", "127.0.0.1:9090"),
             log_format: opt("LOG_FORMAT", "json"),
             log_level: opt("LOG_LEVEL", "info"),
-        })
+        };
+        // The TCP ingress is the bootstrap path and permanent fallback on
+        // gateway fleets; disabling it only makes sense with no gateway in the
+        // path (native inbound UDP, endpoints from the PeerEndpoint envelope).
+        if cfg.wg_tcp_port == 0 && cfg.gateway_domain.is_some() {
+            anyhow::bail!(
+                "WG_TCP_PORT=0 (no TCP ingress) cannot be combined with GATEWAY_DOMAIN: \
+                 gateway fleets require the TCP bootstrap/fallback path"
+            );
+        }
+        Ok(cfg)
     }
 }
 
@@ -84,7 +115,10 @@ mod tests {
         std::env::set_var("CHAIN_ID", "8453");
         std::env::set_var("RPC_URL", "http://rpc.example");
         std::env::set_var("BUNDLER_URL", "http://bundler.example");
-        std::env::set_var("INDEXER_REGISTRY_ADDR", "0xbC003686943fB957100E517D3CEf66c52B5CDdBf");
+        std::env::set_var(
+            "INDEXER_REGISTRY_ADDR",
+            "0xbC003686943fB957100E517D3CEf66c52B5CDdBf",
+        );
     }
 
     fn clear_optional() {
@@ -94,6 +128,9 @@ mod tests {
             "GATEWAY_DOMAIN",
             "WG_TCP_PORT",
             "WG_LISTEN_PORT",
+            "WG_UDP_PUNCH",
+            "PUNCH_TIMEOUT_SECS",
+            "PUNCH_RETRY_BACKOFF_SECS",
             "DSTACK_SOCKET",
             "AGENT_GRPC_SOCKET",
             "HEALTH_HTTP_ADDR",
@@ -112,7 +149,10 @@ mod tests {
 
         let c = Config::from_env().expect("required set");
         assert_eq!(c.chain_id, 8453);
-        assert_eq!(c.member_contract, None, "Path A: self-discovered at runtime");
+        assert_eq!(
+            c.member_contract, None,
+            "Path A: self-discovered at runtime"
+        );
         assert_eq!(c.gateway_domain, None, "unset → registration-only mode");
         assert_eq!(c.wg_tcp_port, 51900);
         assert_eq!(
@@ -121,6 +161,43 @@ mod tests {
         );
         assert_eq!(c.dstack_socket, "/var/run/dstack.sock");
         assert_eq!(c.health_http_addr, "127.0.0.1:9090");
+        assert!(c.wg_udp_punch, "punch upgrade defaults on");
+        assert_eq!(c.punch_timeout_secs, 10);
+        assert_eq!(c.punch_retry_backoff_secs, 30);
+    }
+
+    #[test]
+    fn punch_knobs_parse_and_disable() {
+        let _g = ENV_LOCK.lock().unwrap();
+        set_required();
+        clear_optional();
+        std::env::set_var("WG_UDP_PUNCH", "false");
+        std::env::set_var("PUNCH_TIMEOUT_SECS", "5");
+        std::env::set_var("PUNCH_RETRY_BACKOFF_SECS", "60");
+        let c = Config::from_env().unwrap();
+        assert!(!c.wg_udp_punch);
+        assert_eq!(c.punch_timeout_secs, 5);
+        assert_eq!(c.punch_retry_backoff_secs, 60);
+        clear_optional();
+    }
+
+    /// Open-Questions resolution (udp-transport-upgrade spec): the WG_TCP_PORT=0
+    /// door exists for native-inbound-UDP fleets only — with a gateway domain in
+    /// play the TCP ingress is the bootstrap/fallback path and must not vanish.
+    #[test]
+    fn tcp_port_zero_rejected_with_gateway_domain() {
+        let _g = ENV_LOCK.lock().unwrap();
+        set_required();
+        clear_optional();
+        std::env::set_var("WG_TCP_PORT", "0");
+
+        // No gateway: the door is open (UDP-only operator profile, no fallback).
+        assert_eq!(Config::from_env().unwrap().wg_tcp_port, 0);
+
+        // With a gateway: fail fast.
+        std::env::set_var("GATEWAY_DOMAIN", "dstack-base-prod5.phala.network");
+        assert!(Config::from_env().is_err());
+        clear_optional();
     }
 
     #[test]
@@ -134,7 +211,10 @@ mod tests {
 
         std::env::set_var("GATEWAY_DOMAIN", "dstack-base-prod5.phala.network");
         let c = Config::from_env().unwrap();
-        assert_eq!(c.gateway_domain.as_deref(), Some("dstack-base-prod5.phala.network"));
+        assert_eq!(
+            c.gateway_domain.as_deref(),
+            Some("dstack-base-prod5.phala.network")
+        );
         std::env::remove_var("GATEWAY_DOMAIN");
     }
 
