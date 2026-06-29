@@ -394,3 +394,12 @@ behind the speed decision.
   (KEEP):** nginx `/_backup/status` (wal-g pipeline state + captured errors) + `/_sidecar/healthz` (phase +
   `csk_acquired`). VERIFIED live: first CSK-encrypted base backup in R2 in ~5s. Commits `99c4367` (addon),
   `c3dcaae` (fixes). Build: `deploy/postgres-walg/` + `.github/workflows/build-postgres-walg.yml`.
+- **2026-06-29 (BACKUPS — 4th bug: WAL archiving silently broken; now FIXED).** The "working" claim above was
+  premature — only the BASE loop worked. ~4 days later the node had **5 base backups** (6h loop + retention
+  pruning to 5: working) but **0 WAL** in R2. Root cause: the Postgres `archive_command` (wal-push) runs AS
+  the **postgres user (uid 999)**, but `walg-csk-key` wrote `/run/walg/key` as **root, mode 600** → wal-push
+  couldn't read the key → deferred forever (and pg_wal grew unbounded). The base loop only worked because the
+  entrypoint starts it as root. **FIX:** `chown postgres:postgres` the key file after writing it. Verified:
+  WAL immediately caught up — **196 segments** + pg_wal recycling. PITR now actually works. Commit `74d7876`.
+  **LESSON:** don't declare a pipeline "works" off the first BASE backup — the WAL/archive path runs as a
+  different user; verify it too. The in-CVM `/_backup/status` made the 4-day-later root-cause instant.
