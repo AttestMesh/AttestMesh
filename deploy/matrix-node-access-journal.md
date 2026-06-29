@@ -403,3 +403,16 @@ behind the speed decision.
   WAL immediately caught up — **196 segments** + pg_wal recycling. PITR now actually works. Commit `74d7876`.
   **LESSON:** don't declare a pipeline "works" off the first BASE backup — the WAL/archive path runs as a
   different user; verify it too. The in-CVM `/_backup/status` made the 4-day-later root-cause instant.
+- **2026-06-29 (METRICS + READ-RECEIPT — built by 2 parallel paseo agents, integrated + VERIFIED).** Two
+  paseo subagents (claude-opus-4-8, isolated worktrees) built the last two features: (1) operator
+  **read-receipt + typing indicator** in the matrix-admin-agent's `_on_message` (the bot sent no ack → felt
+  laggy); (2) a scoped, **read-only `query_metrics` tool** (PromQL → bounded summary, never a raw dump)
+  backed by an **INTERNAL-ONLY Prometheus + node-exporter + cAdvisor** (no host ports, not on the tailscale
+  netns — the agent is the ONLY window into them; that's the whole point). Merged both into
+  matrix-admin-agent `main` (disjoint files, **95 tests green**), rebuilt + **digest-pinned** the agent image
+  (`:latest` is cached on the CVM), applied the metrics compose, rolled IN-PLACE (data preserved: WAL kept
+  archiving 196→220 segments). **VERIFIED end-to-end:** the bot answered "CPU ~70.5%, memory ~21.6%" from the
+  live internal Prometheus → the whole chain (agent tool → Prometheus → node-exporter) works. ⚠️ Synapse's
+  own `/metrics` needs a fresh-disk roll (synapse-init skips on a preserved disk) — node/container metrics
+  work now. Agent: `AttestMesh/matrix-admin-agent` main `cb821b8` (+ branches `feat/read-receipt-typing`,
+  `feat/metrics-tool`); compose `4610ed6`. New env: `PROMETHEUS_URL`, `METRICS_WINDOW_MINUTES` (default 60).
