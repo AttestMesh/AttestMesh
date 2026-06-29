@@ -44,7 +44,7 @@ services:
     # postgres-walg = stock Postgres 16 + wal-g + grpcurl. A transparent passthrough to plain postgres
     # unless BACKUP_ENABLED=true, in which case it ships CSK-encrypted base+WAL PITR backups to R2.
     # (Replaces postgres:16-alpine; the entrypoint chowns the pre-existing data dir for the uid change.)
-    image: ghcr.io/attestmesh/postgres-walg@sha256:5d41d0ac0ab97f29bc692619867e3281481671676a23ad2956c546ab8a821872  # pin by digest so in-place rolls pull the exact image (:latest is cached on the CVM); bump on rebuild
+    image: ghcr.io/attestmesh/postgres-walg@sha256:0edf068ddf5f89f73b41a00ffaf94679495c1d67a559f47f2e713036c6a681ad  # pin by digest so in-place rolls pull the exact image (:latest is cached on the CVM); bump on rebuild
     restart: unless-stopped
     environment:
       - POSTGRES_USER=synapse

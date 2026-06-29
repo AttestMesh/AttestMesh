@@ -21,7 +21,7 @@ if [ "${BACKUP_ENABLED:-false}" = "true" ] && [ "${1:-}" = "postgres" ]; then
   : "${WALG_KEY_FILE:=/run/walg/key}"; export WALG_KEY_FILE
   : "${WALG_STATUS_FILE:=/walg-status/state}"; export WALG_STATUS_FILE
   mkdir -p "$(dirname "$WALG_KEY_FILE")" "$(dirname "$WALG_STATUS_FILE")" 2>/dev/null || true
-  echo "$(date -u +%FT%TZ) boot: postgres-walg image=obs-3 BACKUP_ENABLED=true prefix=${BACKUP_PREFIX:-?} s3=${R2_BUCKET:-?}" > "$WALG_STATUS_FILE" 2>/dev/null || true
+  echo "$(date -u +%FT%TZ) boot: postgres-walg image=obs-4 BACKUP_ENABLED=true prefix=${BACKUP_PREFIX:-?} s3=${R2_BUCKET:-?}" > "$WALG_STATUS_FILE" 2>/dev/null || true
   PGDATA_DIR="${PGDATA:-/var/lib/postgresql/data}"
 
   if [ -n "${BACKUP_RESTORE:-}" ] && [ ! -s "$PGDATA_DIR/PG_VERSION" ]; then

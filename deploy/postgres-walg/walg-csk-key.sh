@@ -45,5 +45,8 @@ prk = hmac.new(b"\x00" * 32, csk, hashlib.sha256).digest()
 okm = hmac.new(prk, b"attestmesh.matrix.walg.v1\x01", hashlib.sha256).digest()
 open(sys.argv[2], "w").write(okm.hex())
 PY
+# The archive_command (wal-push) runs AS the postgres user (uid 999); chown so it can read the key —
+# otherwise WAL archiving silently defers forever (base backups still work: that loop runs as root).
 chmod 600 "$KEY_FILE" 2>/dev/null || true
-[ -s "$KEY_FILE" ] && _st "KEY WRITTEN ($KEY_FILE)" || _st "ERROR: key file empty after HKDF"
+chown postgres:postgres "$KEY_FILE" 2>/dev/null || true
+[ -s "$KEY_FILE" ] && _st "KEY WRITTEN ($KEY_FILE, owner postgres)" || _st "ERROR: key file empty after HKDF"
