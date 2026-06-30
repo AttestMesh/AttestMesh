@@ -5,7 +5,9 @@
   "description": "Durable deploy workflows (smithers) + standardized routines for AttestMesh.",
   "scripts": {
     "graph": "smithers-orchestrator graph workflows/deploy.tsx",
-    "up": "smithers-orchestrator up workflows/deploy.tsx"
+    "up": "smithers-orchestrator up workflows/deploy.tsx",
+    "graph:postgres": "smithers-orchestrator graph workflows/postgres-node.tsx",
+    "up:postgres": "smithers-orchestrator up workflows/postgres-node.tsx"
   },
   "devDependencies": {
     "smithers-orchestrator": "0.22.0",

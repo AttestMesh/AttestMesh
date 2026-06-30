@@ -47,9 +47,9 @@ export BOX_VCPU="${BOX_VCPU:-4}" BOX_MEM="${BOX_MEM:-8192}" BOX_DISK="${BOX_DISK
 # so the host opens nothing toward the CVM; KMS reached via the host DNAT 10.0.2.2:9101 (cert SAN).
 export BOX_NET_MODE="${BOX_NET_MODE:-bridge}"
 export BOX_PORTS="${BOX_PORTS:-[]}"
-# Matrix is PRIVATE: gateway OFF (never publish to the public dstack gateway); reachable only over the
-# tailnet. Override BOX_GATEWAY_ENABLED=true only to re-expose intentionally.
-export BOX_GATEWAY_ENABLED="${BOX_GATEWAY_ENABLED:-false}"
+# Matrix HTTP stays private because nginx has no compose-published port. The dstack gateway is enabled
+# for the sidecar's wg-over-TCP ingress on 51900 so AttestMesh peers can form the mesh.
+export BOX_GATEWAY_ENABLED="${BOX_GATEWAY_ENABLED:-true}"
 # Bridge-mode CVMs have NO host port-maps → verify reaches the live CVM over the TAILNET (this host has a
 # direct path). _cvm_fqdn returns the matrix-attestmesh* peer whose Synapse answers.
 TS_SUFFIX="${TS_SUFFIX:-tail39cb2e.ts.net}"
@@ -118,7 +118,7 @@ _box_run() {
   ssh_box "sudo BOX_NAME='$NODE' BOX_COMPOSE='/tmp/${NODE}.yaml' BOX_VCPU=$BOX_VCPU BOX_MEM=$BOX_MEM BOX_DISK=$BOX_DISK BOX_PORTS='$BOX_PORTS' BOX_GATEWAY_ENABLED='$BOX_GATEWAY_ENABLED' BOX_NET_MODE='$BOX_NET_MODE' \
     E_RPC_URL='$RPC_URL' E_BUNDLER_URL='${BUNDLER_URL:-$RPC_URL}' E_GAS_POLICY_ID='${GAS_POLICY_ID:-}' \
     E_POSTGRES_PASSWORD='$PGPW' E_TS_AUTHKEY='$TS_AUTHKEY' E_DSTACK_DOCKER_USERNAME='${guser:-dmvt}' E_DSTACK_DOCKER_PASSWORD='$gtok' \
-    E_BOT_USERNAME='${BOT_USERNAME:-admin-agent}' E_BOT_PASSWORD='${BOT_PASSWORD:-}' \
+    E_BOT_USERNAME='${BOT_USERNAME:-matrix-admin-agent}' E_BOT_PASSWORD='${BOT_PASSWORD:-}' \
     E_MATRIX_ADMIN_MXIDS='${MATRIX_ADMIN_MXIDS:-}' E_MATRIX_ADMIN_SENDERS='${MATRIX_ADMIN_SENDERS:-}' \
     E_INITIAL_ADMIN='${INITIAL_ADMIN:-}' E_INITIAL_ADMIN_PASSWORD='${INITIAL_ADMIN_PASSWORD:-}' \
     E_LLM_BASE_URL='${LLM_BASE_URL:-}' E_LLM_MODEL='${LLM_MODEL:-}' E_LLM_API_KEY='${LLM_API_KEY:-}' \

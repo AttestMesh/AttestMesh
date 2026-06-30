@@ -106,8 +106,10 @@ All via environment variables; fail-fast on missing required. **S = sealed secre
 | `AGENT_GRPC_SOCKET` | no | P | `/var/run/attestmesh/agent.sock` | Sidecar app-facing UDS (client connects here). |
 | `SIDECAR_ENABLED` | no | P | `auto` | `auto` connect-if-present / `on` require / `off`. |
 | `REG_SECRET_PATH` | no | P | `/agent-secrets/registration_shared_secret` | Scoped file holding the registration shared secret (§13). |
-| `BOT_USERNAME` | no | P | `admin-agent` | Bot localpart → `@admin-agent:<server_name>`. |
+| `BOT_USERNAME` | no | P | `matrix-admin-agent` | Bot localpart → `@matrix-admin-agent:<server_name>`. |
 | `BOT_PASSWORD` | yes | **S** | — | Bot account password (register/login). |
+| `MATRIX_REQUIRE_MENTION` | no | P | `true` | Matrix room messages from allowlisted operators are ignored unless they tag the bot. |
+| `BOOTSTRAP_DEACTIVATE_USERS` | no | P | — | Comma-list of stale local user localparts/MXIDs to deactivate during bootstrap; intended for one-way cleanup after bot renames. The current bot is protected. |
 | `MATRIX_ADMIN_MXIDS` | yes | P | — | Comma-list of human MXIDs allowed to command the bot in Matrix. |
 | `MATRIX_ADMIN_SENDERS` | no | P | — | Comma-list of 32-byte hex memberIds allowed on the on-chain channel. Empty → on-chain channel disabled. |
 | `INITIAL_ADMIN` | no | P/S | — | Declarative human admin(s) to ensure at boot (`@alice:server`; password part, if any, is S). |
