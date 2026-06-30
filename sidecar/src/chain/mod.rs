@@ -144,6 +144,13 @@ impl ChainClient {
             ._0)
     }
 
+    /// `AttestFacet.meshCidr()` — the cluster's wireguard CIDR.
+    pub async fn mesh_cidr(&self, cluster: Address) -> Result<(u32, u8)> {
+        let a = abi::IAttest::new(cluster, &self.provider);
+        let r = a.meshCidr().call().await.context("read meshCidr")?;
+        Ok((r.ip, r.prefix))
+    }
+
     pub async fn member_id_of(&self, cluster: Address, who: Address) -> Result<B256> {
         let a = abi::IAttest::new(cluster, &self.provider);
         Ok(a.memberIdOf(who)

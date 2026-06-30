@@ -226,13 +226,19 @@ pub async fn run(config: Config) -> Result<()> {
     };
     tracing::info!(%cluster, "discovered cluster diamond");
 
-    // Default CIDR for v1; a production build reads AttestFacet.meshCidr().
+    let (mesh_cidr_ip, mesh_cidr_prefix) =
+        chain.mesh_cidr(cluster).await.context("read cluster mesh CIDR")?;
+    tracing::info!(
+        mesh_cidr = %format!("{}/{}", wg::cidr::fmt_ipv4(mesh_cidr_ip), mesh_cidr_prefix),
+        "discovered cluster mesh CIDR"
+    );
+
     let shared = Shared::new(
         keys.clone(),
         member,
         cluster,
-        0x0a0d0000,
-        16,
+        mesh_cidr_ip,
+        mesh_cidr_prefix,
         config.wg_listen_port,
     );
 

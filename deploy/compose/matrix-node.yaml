@@ -17,7 +17,7 @@ services:
 
   # ── AttestMesh node sidecar (cluster-mesh-agent): registers this CVM into the cluster ──
   sidecar:
-    image: ghcr.io/attestmesh/cluster-mesh-agent:latest
+    image: ghcr.io/attestmesh/cluster-mesh-agent@sha256:db0a74f5cb68aab6441ac187522276999fc45ee760db3ae3dea0240e86d5c1af
     restart: unless-stopped
     environment:
       - CHAIN_ID=8453
@@ -31,13 +31,35 @@ services:
       - HEALTH_HTTP_ADDR=0.0.0.0:9090
       - LOG_FORMAT=pretty
       - LOG_LEVEL=info,cluster_mesh_agent=debug
+      - ROLL_ID=20260630T0106Z
     volumes:
       - /var/run/dstack.sock:/var/run/dstack.sock
       - agent-sock:/var/run/attestmesh          # app-facing gRPC UDS, shared with matrix-admin-agent
+    ports:
+      - "51900:51900"
     cap_add:
       - NET_ADMIN
     devices:
       - /dev/net/tun
+
+  # ── Mesh-only Matrix listener ──────────────────────────────────────────────
+  # Runs in the sidecar netns, so it binds on the AttestMesh WireGuard interface
+  # and forwards Matrix client traffic to the internal nginx service. This is not
+  # a public dstack gateway or Tailscale listener; only mesh peers can reach it.
+  matrix-mesh-proxy:
+    image: alpine/socat:1.8.0.0
+    restart: unless-stopped
+    network_mode: service:sidecar
+    depends_on:
+      - sidecar
+      - nginx
+    command:
+      - -d
+      - -d
+      - TCP-LISTEN:18080,fork,reuseaddr,bind=0.0.0.0
+      - TCP:nginx:80
+    labels:
+      attestmesh.roll: "20260630T0016Z"
 
   # ── Postgres for Synapse ────────────────────────────────────────────────────
   postgres:
@@ -267,7 +289,7 @@ services:
   #     in Matrix for allowlisted operators. Egress is locked by agent-egress-fw (below) to
   #     Synapse + Postgres + the one pinned LLM host. See docs/specs/matrix-admin-agent.md. ──
   matrix-admin-agent:
-    image: ghcr.io/attestmesh/matrix-admin-agent@sha256:09b3a17f47ebbcd4dd180ec00235b0cd34607d4bc75cc85624849f7d872fc000
+    image: ghcr.io/attestmesh/matrix-admin-agent@sha256:24d101f848bb28d40601fcc42f2e820c36348fb1c382673f9e73ced02c4e086d
     restart: unless-stopped
     depends_on:
       postgres:
@@ -282,8 +304,10 @@ services:
       - AGENT_GRPC_SOCKET=/var/run/attestmesh/agent.sock
       - REG_SECRET_PATH=/agent-secrets/registration_shared_secret
       - PG_DSN=postgresql://synapse:${POSTGRES_PASSWORD}@postgres:5432/synapse
-      - BOT_USERNAME=${BOT_USERNAME}
+      - BOT_USERNAME=${BOT_USERNAME:-matrix-admin-agent}
       - BOT_PASSWORD=${BOT_PASSWORD}
+      - MATRIX_REQUIRE_MENTION=1
+      - BOOTSTRAP_DEACTIVATE_USERS=admin-agent
       - MATRIX_ADMIN_MXIDS=${MATRIX_ADMIN_MXIDS}
       - MATRIX_ADMIN_SENDERS=${MATRIX_ADMIN_SENDERS}
       - INITIAL_ADMIN=${INITIAL_ADMIN}
@@ -409,6 +433,7 @@ services:
     restart: unless-stopped
     depends_on:
       - synapse
+      - matrix-admin-agent
     volumes:
       - wellknown:/usr/share/nginx/wellknown:ro
       - walg-status:/usr/share/nginx/walg-status:ro
