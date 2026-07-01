@@ -1,0 +1,155 @@
+# AttestMesh Hindsight node for the self-hosted dstack box.
+#
+# Hindsight (https://github.com/vectorize-io/hindsight) — agent memory service
+# (retain / recall / reflect) — as a full, on-chain-anchored AttestMesh node.
+# Same Path-A shape as ssh-node.yaml / matrix-node.yaml: the `sidecar`
+# (cluster-mesh-agent) self-registers the CVM's app_id on-chain after
+# deploy/hindsight-node.sh primes the cluster and upgrades the stock DstackApp
+# proxy to ClusterMember.
+#
+# MESH-ONLY exposure (no Tailscale, no public HTTP):
+#   - The Hindsight API (:8888) and control-plane UI (:9999) are NOT compose-
+#     published, so nothing binds on the guest's outer interface → unreachable
+#     from the box, the gateway, and the internet (host-isolation invariant).
+#   - Two socat listeners run in the sidecar's netns (where the WireGuard mesh
+#     interface lives), so ONLY cluster members can reach them over the mesh:
+#       <mesh-ip>:18888 → hindsight:8888  (API)
+#       <mesh-ip>:18999 → hindsight:9999  (control-plane UI)
+#     Same pattern as matrix-node's matrix-mesh-proxy (:18080).
+#   - Operator access path: the ssh-node's `sshd-mesh` (port 1023, sidecar netns)
+#     → curl the mesh IP, or `ssh -D` for a SOCKS route onto the mesh.
+#   - Defense in depth: the API additionally requires a sealed tenant API key
+#     (ApiKeyTenantExtension), and the UI a sealed access key.
+#
+# Egress: the hindsight netns is locked by agent-egress-fw to the ONE pinned
+# LLM host (redpill.ai) — deny-all otherwise. The full (non-slim) image bakes
+# the local embedding + reranker models and tiktoken encodings in at build
+# time, and HF_HUB_OFFLINE/TRANSFORMERS_OFFLINE stop boot-time HuggingFace
+# etag checks, so no other egress is needed. Do NOT mount a volume over
+# /home/hindsight/.cache — it would hide the baked-in models.
+#
+# No secrets are committed here; all ${VAR} values are sealed into the CVM by
+# deploy/hindsight-node.sh (key NAMES are measured into the compose_hash,
+# VALUES are sealed to the app's X25519 key).
+services:
+  # --- AttestMesh sidecar: on-chain self-registration + wg mesh (Path A) --------
+  sidecar:
+    image: ghcr.io/attestmesh/cluster-mesh-agent@sha256:db0a74f5cb68aab6441ac187522276999fc45ee760db3ae3dea0240e86d5c1af
+    restart: unless-stopped
+    environment:
+      # MEMBER_CONTRACT intentionally unset. Path A upgrades this stock DstackApp
+      # proxy to ClusterMember, then the sidecar self-discovers its app_id from
+      # the dstack guest agent and registers via a sponsored 4337 UserOp.
+      - CHAIN_ID=${CHAIN_ID}
+      - RPC_URL=${RPC_URL}
+      - BUNDLER_URL=${BUNDLER_URL}
+      - GAS_POLICY_ID=${GAS_POLICY_ID}
+      - INDEXER_REGISTRY_ADDR=${INDEXER_REGISTRY_ADDR}
+      - GATEWAY_DOMAIN=${GATEWAY_DOMAIN}
+      - DSTACK_SOCKET=/var/run/dstack.sock
+      - HEALTH_HTTP_ADDR=0.0.0.0:9090
+      - LOG_FORMAT=pretty
+      - LOG_LEVEL=info,cluster_mesh_agent=debug
+    volumes:
+      - /var/run/dstack.sock:/var/run/dstack.sock
+    ports:
+      # 9090 = sidecar health (the only box-visible signal; the TEE blocks
+      # container logs, so this is the pre-mesh observability — synclave parity).
+      # 51900 = wg-over-gateway-TCP mesh ingress (<app_id>-51900s TLS-passthrough).
+      - "9090:9090"
+      - "51900:51900"
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun
+
+  # --- Mesh-only listeners: bind in the sidecar netns (wg iface) ---------------
+  mesh-proxy-api:
+    image: alpine/socat:1.8.0.0
+    restart: unless-stopped
+    network_mode: service:sidecar
+    depends_on:
+      - sidecar
+      - hindsight
+    command:
+      - -d
+      - -d
+      - TCP-LISTEN:18888,fork,reuseaddr,bind=0.0.0.0
+      - TCP:hindsight:8888
+
+  mesh-proxy-ui:
+    image: alpine/socat:1.8.0.0
+    restart: unless-stopped
+    network_mode: service:sidecar
+    depends_on:
+      - sidecar
+      - hindsight
+    command:
+      - -d
+      - -d
+      - TCP-LISTEN:18999,fork,reuseaddr,bind=0.0.0.0
+      - TCP:hindsight:9999
+
+  # --- Hindsight: API (:8888) + control-plane UI (:9999) + embedded pg0 --------
+  hindsight:
+    image: ghcr.io/vectorize-io/hindsight:0.8.4
+    restart: unless-stopped
+    # pg0 needs a clean shutdown; Docker's 10s default can SIGKILL it mid-WAL-flush
+    # (upstream data-loss issue #675).
+    stop_grace_period: 30s
+    environment:
+      # LLM: any OpenAI-compatible endpoint; pinned to redpill.ai, enforced by
+      # the egress firewall below. gpt-oss is the family Hindsight recommends
+      # for structured-output extraction.
+      HINDSIGHT_API_LLM_PROVIDER: openai
+      HINDSIGHT_API_LLM_BASE_URL: ${HINDSIGHT_API_LLM_BASE_URL}
+      HINDSIGHT_API_LLM_MODEL: ${HINDSIGHT_API_LLM_MODEL}
+      HINDSIGHT_API_LLM_API_KEY: ${HINDSIGHT_API_LLM_API_KEY}
+      # Default assumes ~64k output tokens; keep under the hosted model's cap
+      # (must stay > RETAIN_CHUNK_SIZE, default 3000).
+      HINDSIGHT_API_RETAIN_MAX_COMPLETION_TOKENS: "32000"
+      # Stable worker identity across restarts (background consolidation jobs).
+      HINDSIGHT_API_WORKER_ID: hindsight-node
+      # The API ships with NO auth by default — enable the built-in shared-key
+      # tenant extension so even mesh peers must present the sealed key.
+      HINDSIGHT_API_TENANT_EXTENSION: hindsight_api.extensions.builtin.tenant:ApiKeyTenantExtension
+      HINDSIGHT_API_TENANT_API_KEY: ${HINDSIGHT_API_TENANT_API_KEY}
+      # Control-plane UI login gate + the bearer it uses toward the API.
+      HINDSIGHT_CP_ACCESS_KEY: ${HINDSIGHT_CP_ACCESS_KEY}
+      HINDSIGHT_CP_DATAPLANE_API_KEY: ${HINDSIGHT_API_TENANT_API_KEY}
+      # The embedding/reranker models are baked into the full image; these stop
+      # huggingface_hub from attempting etag HEAD requests at model load (which
+      # would hang under the deny-all egress firewall).
+      HF_HUB_OFFLINE: "1"
+      TRANSFORMERS_OFFLINE: "1"
+      HINDSIGHT_API_LOG_FORMAT: json
+    volumes:
+      # Embedded pg0 PostgreSQL data. Named volume → seeded with the image's
+      # UID-1000 (`hindsight`) ownership.
+      - hindsight-data:/home/hindsight/.pg0
+    expose:
+      - "8888"
+      - "9999"
+
+  # --- Egress firewall for Hindsight: deny-all except the pinned LLM host ------
+  #     Shares hindsight's netns and sets default-DROP OUTPUT, allowing ONLY
+  #     loopback (API↔UI↔pg0 are in-container), established/related, Docker DNS,
+  #     and the LLM host:443. Hindsight initiates nothing else; mesh/bridge
+  #     traffic toward it is inbound and covered by conntrack.
+  hindsight-egress-fw:
+    image: ghcr.io/attestmesh/agent-egress-fw@sha256:c75c9668e905ca00f86e9583505d52624ba87cb7114a4633f84330bb497ca58f
+    restart: unless-stopped
+    network_mode: service:hindsight
+    depends_on:
+      - hindsight
+    environment:
+      - LLM_BASE_URL=${HINDSIGHT_API_LLM_BASE_URL}   # the ONE permitted external host (:443)
+      - LLM_ALLOW_CIDRS=66.220.6.0/24                # redpill api.redpill.ai block (resolution-independent)
+      - INTERNAL_HOSTS=                              # hindsight initiates to no internal services
+      - ALLOW_DNS=127.0.0.11                         # Docker embedded resolver
+      - RERESOLVE_SECONDS=30
+    cap_add:
+      - NET_ADMIN
+
+volumes:
+  hindsight-data:
