@@ -173,14 +173,14 @@ A command is one `MessageFacet.send(recipientMemberId = the Matrix node, envelop
   "output": { "user_id": "@alice:server" } }
 ```
 
-`detail`/`output` are scrubbed of secrets (never tokens, passwords, or the registration secret). Replies are best-effort and single-shot (they cost sponsored gas); the sender's source of truth is re-issuing the idempotent command or reading Synapse directly.
+`detail`/`output` are scrubbed of secrets (never tokens, passwords, or the registration secret; sole exception: `create_login_token` returns the token it just minted — that is its purpose). Replies are best-effort and single-shot (they cost sponsored gas); the sender's source of truth is re-issuing the idempotent command or reading Synapse directly.
 
 ### 7.4 Command vocabulary
 
 The core primitive gives **full coverage**; named verbs are convenience/idempotency wrappers over it.
 
-- **`synapse_request`** — the generic primitive. Args: `target` (`admin` | `client`), `method` (GET/POST/PUT/DELETE), `path` (must begin `/_synapse/admin/` for `admin`, `/_matrix/client/` for `client`), `body` (optional JSON). Executed verbatim with the appropriate token. This reaches **all** admin actions (users, rooms, media, devices, federation, registration tokens, server notices, event reports, …) and auto-covers future Synapse endpoints.
-- **Named convenience verbs** (absolute-state / idempotent; nicer LLM calls + replay-safety): `ensure_user{username,password?,admin?,displayname?}`, `set_password{username,password?,logout_devices?}`, `deactivate_user{username,erase?}`, `set_admin{username,admin}`, `list_users{from?,limit?,name?}`, `get_server_info`, `create_room{name?,alias?,topic?,invite?,preset?}`, `send_notice{username|room_id, body}`. Each maps to a specific admin/client endpoint (§10).
+- **`synapse_request`** — the generic primitive. Args: `target` (`admin` | `client`), `method` (GET/POST/PUT/DELETE), `path` (must begin `/_synapse/admin/` for `admin`, `/_matrix/client/` for `client`), `body` (optional JSON). Executed verbatim with the appropriate token. This reaches **all** admin actions (users, rooms, media, devices, federation, registration tokens, server notices, event reports, …) and auto-covers future Synapse endpoints. **Carve-out:** `POST` to any `/login` (token-minting) endpoint is rejected here — minting must go through `create_login_token`, whose token-bearing result is delivered runtime-direct and kept out of model context (a `synapse_request` result is fed back to the LLM).
+- **Named convenience verbs** (absolute-state / idempotent; nicer LLM calls + replay-safety): `ensure_user{username,password?,admin?,displayname?}`, `set_password{username,password?,logout_devices?}`, `create_login_token{username,valid_hours?}` (mints a **new** access token via admin login-as-user; destructive/confirm-first; the fresh token is delivered to the operator runtime-direct and **never enters model context** — the sole exception to the secret-free-output rule), `deactivate_user{username,erase?}`, `set_admin{username,admin}`, `list_users{from?,limit?,name?}`, `get_server_info`, `create_room{name?,alias?,topic?,invite?,preset?}`, `send_notice{username|room_id, body}`. Each maps to a specific admin/client endpoint (§10).
 
 Every verb — generic or named — passes through the executor's validation, scope-check (path prefix), and audit log before any HTTP call (§10, §15).
 
@@ -330,7 +330,7 @@ Edits to `deploy/compose/matrix-node.yaml`:
 - **Trust boundary in:** the sidecar (chain-authenticated `senderMemberId`, decryption to our key) + the sealed sender allowlist (on-chain channel); Synapse-attested `event.sender` + the sealed MXID allowlist (human channel).
 - **Capability:** full Synapse admin/client API — fenced by **scope, not a verb shortlist**: only Synapse's HTTP surface (never shell/host/other services), every call shape-checked + path-scoped + audited, destructive ops confirmed in chat.
 - **Egress:** network-enforced deny-all except Synapse/Postgres/pinned-LLM (§12) — the load-bearing exfiltration control.
-- **Secrets:** registration secret used once then dropped; bot/admin tokens in memory (+ sealed bot password, Postgres-backed token cache); nothing sensitive ever enters LLM prompts, replies, logs, or the repo.
+- **Secrets:** registration secret used once then dropped; bot/admin tokens in memory (+ sealed bot password, Postgres-backed token cache); nothing sensitive ever enters LLM prompts, logs, or the repo. `create_login_token` is the one sanctioned secret-bearing *reply*: a freshly minted token travels runtime-direct to the operator's room (or the encrypted on-chain reply) — the LLM never sees it.
 - **Determinism:** the on-chain channel never invokes the LLM. The LLM is a natural-language front-end for the human channel only, with no privileged path.
 
 ---
