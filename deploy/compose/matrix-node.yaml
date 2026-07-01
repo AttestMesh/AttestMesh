@@ -289,7 +289,7 @@ services:
   #     in Matrix for allowlisted operators. Egress is locked by agent-egress-fw (below) to
   #     Synapse + Postgres + the one pinned LLM host. See docs/specs/matrix-admin-agent.md. ──
   matrix-admin-agent:
-    image: ghcr.io/attestmesh/matrix-admin-agent@sha256:cde949e3d6b682411d2af345e7e5cf6036ae9003662a4662083a3d0849886a8f
+    image: ghcr.io/attestmesh/matrix-admin-agent@sha256:8bc5d5d32045f5b33977375f3cd902c3c5e6c71dc3e675205c3ed5e664b6b4aa
     restart: unless-stopped
     depends_on:
       postgres:
