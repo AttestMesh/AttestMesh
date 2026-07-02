@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import logging
 import os
@@ -8,6 +9,7 @@ import re
 import secrets
 import signal
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
@@ -75,6 +77,10 @@ def _mention_aliases(mxid: str, extra_aliases: tuple[str, ...]) -> tuple[str, ..
 @dataclass(frozen=True)
 class Settings:
     pg_dsn: str
+    pg_password_file: str
+    patroni_url: str
+    patroni_username: str
+    patroni_password_file: str
     matrix_homeserver_url: str
     matrix_user_id: str
     matrix_password: str
@@ -100,6 +106,10 @@ class Settings:
     def load(cls) -> "Settings":
         return cls(
             pg_dsn=_env("PG_DSN", required=True),
+            pg_password_file=_env("PG_PASSWORD_FILE"),
+            patroni_url=_env("PATRONI_URL").rstrip("/"),
+            patroni_username=_env("PATRONI_USERNAME", "patroni"),
+            patroni_password_file=_env("PATRONI_PASSWORD_FILE"),
             matrix_homeserver_url=_env("MATRIX_HOMESERVER_URL", required=True).rstrip("/"),
             matrix_user_id=_env("MATRIX_USER_ID", required=True),
             matrix_password=_env("MATRIX_PASSWORD", required=True),
@@ -150,7 +160,13 @@ class Db:
         self._settings = settings
 
     def _connect(self) -> psycopg.Connection[Any]:
-        conn = psycopg.connect(self._settings.pg_dsn, connect_timeout=5)
+        # On pg-ha nodes the superuser password is CSK-derived and written to a shared
+        # volume by the patroni entrypoint — read it lazily so agent start order doesn't
+        # matter (connects simply fail with a clear error until the file appears).
+        kwargs: dict[str, Any] = {"connect_timeout": 5}
+        if self._settings.pg_password_file:
+            kwargs["password"] = _read_secret_file(self._settings.pg_password_file)
+        conn = psycopg.connect(self._settings.pg_dsn, **kwargs)
         conn.autocommit = True
         with conn.cursor() as cur:
             timeout_ms = max(1, min(300_000, int(self._settings.statement_timeout_ms)))
@@ -320,11 +336,73 @@ class Metrics:
         return out
 
 
+def _read_secret_file(path: str) -> str:
+    try:
+        with open(path, encoding="ascii") as handle:
+            value = handle.read().strip()
+    except OSError as exc:
+        raise ValueError(f"secret file not readable yet: {path} ({exc.__class__.__name__})") from exc
+    if not value:
+        raise ValueError(f"secret file is empty: {path}")
+    return value
+
+
+class Patroni:
+    """Bounded client for the node-local Patroni REST API (pg-ha nodes only).
+
+    Health GETs (/cluster) are unauthenticated by design; unsafe POSTs (switchover)
+    use the CSK-derived REST credential written by the patroni entrypoint.
+    """
+
+    def __init__(self, settings: Settings) -> None:
+        self._settings = settings
+
+    @property
+    def enabled(self) -> bool:
+        return bool(self._settings.patroni_url)
+
+    def cluster(self) -> dict[str, Any]:
+        if not self.enabled:
+            raise ValueError("Patroni is not configured on this node")
+        url = self._settings.patroni_url + "/cluster"
+        with urllib.request.urlopen(url, timeout=5) as response:
+            return json.loads(response.read().decode())
+
+    def switchover(self, candidate: str = "") -> str:
+        if not self.enabled:
+            raise ValueError("Patroni is not configured on this node")
+        members = self.cluster().get("members") or []
+        leader = next((m.get("name") for m in members if m.get("role") == "leader"), None)
+        if not leader:
+            raise ValueError("no current leader — cannot switch over (failover in progress?)")
+        if candidate and candidate == leader:
+            raise ValueError(f"{candidate} is already the leader")
+        payload: dict[str, Any] = {"leader": leader}
+        if candidate:
+            payload["candidate"] = candidate
+        password = _read_secret_file(self._settings.patroni_password_file)
+        request = urllib.request.Request(
+            self._settings.patroni_url + "/switchover",
+            data=json.dumps(payload).encode(),
+            headers={"content-type": "application/json"},
+            method="POST",
+        )
+        credentials = f"{self._settings.patroni_username}:{password}".encode()
+        request.add_header("authorization", "Basic " + base64.b64encode(credentials).decode())
+        try:
+            with urllib.request.urlopen(request, timeout=30) as response:
+                return response.read().decode("utf-8", "replace").strip() or "Switchover accepted."
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", "replace")[:300]
+            raise ValueError(f"Patroni switchover failed: HTTP {exc.code}: {detail}") from exc
+
+
 @dataclass
 class PendingExecution:
     token: str
     sql: str
     created_at: float
+    kind: str = "sql"
 
 
 class Llm:
@@ -334,11 +412,13 @@ class Llm:
         db: Db,
         metrics: Metrics,
         pending: dict[str, PendingExecution],
+        patroni: Patroni | None = None,
     ) -> None:
         self._settings = settings
         self._db = db
         self._metrics = metrics
         self._pending = pending
+        self._patroni = patroni
         self._client = (
             AsyncOpenAI(
                 base_url=settings.llm_base_url,
@@ -401,9 +481,20 @@ class Llm:
         return "I hit the tool-step limit before finishing. Please narrow the request."
 
     def _system_prompt(self) -> str:
-        return (
-            "You are a PostgreSQL administrative agent for one standalone Postgres instance. "
-            "You may inspect database status, run read-only SQL, and inspect bounded machine metrics. "
+        if self._patroni is not None and self._patroni.enabled:
+            flavor = (
+                "You are a PostgreSQL administrative agent for one node of a Patroni-managed "
+                "HA cluster on the AttestMesh wireguard mesh. You may inspect database status, "
+                "the Patroni cluster topology (pgha_cluster), run read-only SQL, and inspect "
+                "bounded machine metrics. Failover is automatic; a manual switchover requires "
+                "the human to run `!pgha switchover` and confirm a token — you cannot do it. "
+            )
+        else:
+            flavor = (
+                "You are a PostgreSQL administrative agent for one standalone Postgres instance. "
+                "You may inspect database status, run read-only SQL, and inspect bounded machine metrics. "
+            )
+        return flavor + (
             "For writes or admin SQL, "
             "call pg_execute; the runtime will stage the statement and require an explicit "
             "confirmation token before it is applied. Never reveal secrets, passwords, DSNs, "
@@ -411,7 +502,19 @@ class Llm:
         )
 
     def _tools(self) -> list[dict[str, Any]]:
-        return [
+        tools: list[dict[str, Any]] = []
+        if self._patroni is not None and self._patroni.enabled:
+            tools.append(
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "pgha_cluster",
+                        "description": "Return the Patroni HA cluster topology: members, roles (leader/replica), states, timelines, and replication lag.",
+                        "parameters": {"type": "object", "properties": {}, "additionalProperties": False},
+                    },
+                }
+            )
+        return tools + [
             {
                 "type": "function",
                 "function": {
@@ -464,6 +567,10 @@ class Llm:
     def _call_tool(self, sender: str, name: str, raw_args: str) -> dict[str, Any]:
         try:
             args = json.loads(raw_args or "{}")
+            if name == "pgha_cluster":
+                if self._patroni is None or not self._patroni.enabled:
+                    return {"ok": False, "error": "Patroni is not configured on this node"}
+                return {"ok": True, **self._patroni.cluster()}
             if name == "pg_status":
                 return self._db.status()
             if name == "pg_query":
@@ -509,9 +616,10 @@ class Bot:
         self._settings = settings
         self._db = db
         self._metrics = Metrics(settings)
+        self._patroni = Patroni(settings)
         self._state = state
         self._pending: dict[str, PendingExecution] = {}
-        self._llm = Llm(settings, db, self._metrics, self._pending)
+        self._llm = Llm(settings, db, self._metrics, self._pending, self._patroni)
         config = AsyncClientConfig(encryption_enabled=False, store_sync_tokens=False)
         self._client = AsyncClient(
             settings.matrix_homeserver_url,
@@ -661,10 +769,36 @@ class Bot:
             return await asyncio.to_thread(self._confirm, sender, confirm.group(1).lower())
 
         lowered = body.lower()
-        if lowered in {"!pg help", "pg help"}:
-            return (
+        if lowered in {"!pg help", "pg help", "!pgha help", "pgha help"}:
+            base = (
                 "Commands: `!pg status`, `!pg metrics`, `!pg query <read-only SQL>`, `!pg exec <SQL>`, "
                 "then `confirm <token>` for staged writes/admin SQL."
+            )
+            if self._patroni.enabled:
+                base += (
+                    "\nHA: `!pgha status` (cluster topology), `!pgha lag` (replication lag), "
+                    "`!pgha switchover [candidate]` (staged; requires `confirm <token>`)."
+                )
+            return base
+        if lowered in {"!pgha status", "pgha status", "!pgha cluster", "pgha cluster"}:
+            return format_pgha_cluster(await asyncio.to_thread(self._patroni.cluster))
+        if lowered in {"!pgha lag", "pgha lag"}:
+            return format_pgha_lag(await asyncio.to_thread(self._patroni.cluster))
+        if lowered.startswith("!pgha switchover") or lowered.startswith("pgha switchover"):
+            if not self._patroni.enabled:
+                return "Patroni is not configured on this node."
+            # Split on the original body case-insensitively; splitting the original body on the
+            # lowercase literal would IndexError when the user typed e.g. "Switchover".
+            parts = re.split(r"(?i)switchover", body, maxsplit=1)
+            candidate = parts[1].strip() if len(parts) > 1 else ""
+            token = secrets.token_hex(3)
+            self._pending[sender] = PendingExecution(
+                token=token, sql=candidate, created_at=time.time(), kind="switchover"
+            )
+            target = f"to `{candidate}`" if candidate else "to the healthiest replica"
+            return (
+                f"Switchover {target} staged but not executed.\n"
+                f"Reply `confirm {token}` within 15 minutes to apply it."
             )
         if lowered in {"!pg status", "pg status"}:
             return format_status(await asyncio.to_thread(self._db.status))
@@ -694,11 +828,14 @@ class Bot:
     def _confirm(self, sender: str, token: str) -> str:
         pending = self._pending.get(sender)
         if not pending or pending.token != token:
-            return "No matching pending SQL statement for that confirmation token."
+            return "No matching pending action for that confirmation token."
         if time.time() - pending.created_at > 900:
             self._pending.pop(sender, None)
-            return "That pending SQL statement expired. Stage it again if still needed."
+            return "That pending action expired. Stage it again if still needed."
         self._pending.pop(sender, None)
+        if pending.kind == "switchover":
+            outcome = self._patroni.switchover(pending.sql)
+            return f"Switchover requested: {outcome}\n" + format_pgha_cluster(self._patroni.cluster())
         result = self._db.execute(pending.sql)
         return "Executed.\n" + format_query_result(result)
 
@@ -755,6 +892,7 @@ async def serve_health(settings: Settings, state: RuntimeState, db: Db) -> None:
                 "room_joined": state.room_joined,
                 "llm_configured": settings.llm_enabled,
                 "metrics_configured": bool(settings.prometheus_url),
+                "patroni_configured": bool(settings.patroni_url),
                 "uptime_s": int(time.time() - state.started_at),
                 "last_error": state.last_error,
             }
@@ -787,6 +925,36 @@ def format_status(status: dict[str, Any]) -> str:
         f"Databases: {', '.join(status['databases'])} ({status['database_count']})\n"
         f"Connections: {status['connection_count']}"
     )
+
+
+def format_pgha_cluster(cluster: dict[str, Any]) -> str:
+    members = cluster.get("members") or []
+    if not members:
+        return "Patroni reports no cluster members (bootstrap in progress?)."
+    lines = [f"HA cluster `{cluster.get('scope', 'pg-ha')}`: {len(members)} members"]
+    for member in members:
+        role = member.get("role", "?")
+        marker = "★" if role == "leader" else "·"
+        lag = member.get("lag")
+        lag_text = "" if role == "leader" or lag is None else f", lag {lag}"
+        lines.append(
+            f"{marker} {member.get('name', '?')}: {role}, {member.get('state', '?')}"
+            f" (tl {member.get('timeline', '?')}{lag_text})"
+        )
+    return "\n".join(lines)
+
+
+def format_pgha_lag(cluster: dict[str, Any]) -> str:
+    members = cluster.get("members") or []
+    replicas = [m for m in members if m.get("role") != "leader"]
+    if not replicas:
+        return "No replicas found."
+    lines = ["Replication lag:"]
+    for member in replicas:
+        lag = member.get("lag")
+        lag_text = "unknown" if lag in (None, "unknown") else f"{lag} bytes"
+        lines.append(f"- {member.get('name', '?')} ({member.get('state', '?')}): {lag_text}")
+    return "\n".join(lines)
 
 
 def format_metrics(rows: list[tuple[str, float | None, str]]) -> str:
@@ -854,7 +1022,17 @@ def _jsonable(value: Any) -> Any:
 
 
 def redact(text: str, settings: Settings) -> str:
-    for secret in (settings.pg_dsn, settings.matrix_password, settings.llm_api_key):
+    secrets_seen = [settings.pg_dsn, settings.matrix_password, settings.llm_api_key]
+    # Also scrub the CSK-derived, file-based credentials on pg-ha nodes (superuser + Patroni
+    # REST): they are identical across every node in the cluster, so a query like
+    # pg_read_file('/pgha-secrets/...') or an echoed Patroni auth error must not reach Matrix.
+    for path in (settings.pg_password_file, settings.patroni_password_file):
+        if path:
+            try:
+                secrets_seen.append(_read_secret_file(path))
+            except Exception:
+                pass
+    for secret in secrets_seen:
         if secret:
             text = text.replace(secret, "<redacted>")
     return text
