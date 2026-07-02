@@ -24,6 +24,11 @@ BOX_RPC="${BOX_RPC:-https://base-rpc.publicnode.com}"
 COMPOSE="${COMPOSE:-$ROOT/deploy/compose/ssh-node.yaml}"
 MATRIX_STATE="${MATRIX_STATE:-$LOGDIR/matrix-node-matrix-node.state}"
 GATEWAY_DOMAIN="${GATEWAY_DOMAIN:-gateway.attestmesh.xyz}"
+# Prefer the operator-maintained union file (Dan's macbook + dev keys, and
+# anyone else granted access) so an `update` never silently drops sealed keys.
+if [ -z "${AUTHORIZED_KEYS_FILE:-}" ] && [ -s "$HOME/.attestmesh/ssh-node-authorized-keys" ]; then
+  AUTHORIZED_KEYS_FILE="$HOME/.attestmesh/ssh-node-authorized-keys"
+fi
 AUTHORIZED_KEYS_FILE="${AUTHORIZED_KEYS_FILE:-$HOME/.ssh/authorized_keys}"
 # Workbench sizing (operator-requested 2026-07-01: full ubuntu shells, roomy).
 export BOX_VCPU="${BOX_VCPU:-8}" BOX_MEM="${BOX_MEM:-65536}" BOX_DISK="${BOX_DISK:-100}"
