@@ -1,0 +1,167 @@
+services:
+  sidecar:
+    image: ghcr.io/attestmesh/cluster-mesh-agent@sha256:db0a74f5cb68aab6441ac187522276999fc45ee760db3ae3dea0240e86d5c1af
+    restart: unless-stopped
+    environment:
+      - CHAIN_ID=${CHAIN_ID}
+      - RPC_URL=${RPC_URL}
+      - BUNDLER_URL=${BUNDLER_URL}
+      - GAS_POLICY_ID=${GAS_POLICY_ID}
+      - INDEXER_REGISTRY_ADDR=${INDEXER_REGISTRY_ADDR}
+      - GATEWAY_DOMAIN=${GATEWAY_DOMAIN}
+      - DSTACK_SOCKET=/var/run/dstack.sock
+      - HEALTH_HTTP_ADDR=0.0.0.0:9090
+      - LOG_FORMAT=pretty
+      - LOG_LEVEL=info,cluster_mesh_agent=debug
+    volumes:
+      - /var/run/dstack.sock:/var/run/dstack.sock
+    ports:
+      - "9090:9090"
+      - "51900:51900"
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun
+
+  # One-shot restore-on-boot: repopulates the control-plane volumes from the
+  # latest app-key-sealed backup ONLY when daemon_data is empty (fresh VM under
+  # the same stable app_id). Normal reboots with a live disk skip. No-ops until
+  # the box wires BACKUP_S3_* (sealed env). See memory: webhost-tenant-data-retention.
+  restore:
+    image: ghcr.io/dmvt/webhost-backup:backup-v1@sha256:e8121ac071000fc8ba27c7b8caae88bc763ef598b4cad13b5a15f06186c1ef54
+    restart: "no"
+    environment:
+      BACKUP_MODE: restore
+      BACKUP_STORAGE: ${BACKUP_STORAGE:-}
+      BACKUP_S3_ENDPOINT: ${BACKUP_S3_ENDPOINT:-}
+      BACKUP_S3_BUCKET: ${BACKUP_S3_BUCKET:-}
+      BACKUP_S3_REGION: ${BACKUP_S3_REGION:-auto}
+      BACKUP_S3_ACCESS_KEY_ID: ${BACKUP_S3_ACCESS_KEY_ID:-}
+      BACKUP_S3_SECRET_ACCESS_KEY: ${BACKUP_S3_SECRET_ACCESS_KEY:-}
+      BACKUP_PREFIX: ${BACKUP_PREFIX:-webhost}
+      BACKUP_APP_ID: ${BACKUP_APP_ID:-}
+    volumes:
+      - daemon_data:/restore/daemon_data
+      - briefs:/restore/briefs
+      - caddy_data_v2:/restore/caddy_data_v2
+      - caddy_config_v2:/restore/caddy_config_v2
+      - /var/run/dstack.sock:/var/run/dstack.sock
+
+  # Our own control service (repo: webhost-control, seeded from Fleet Control's
+  # services/daemon). Hosts tenant apps AND owns the source-privacy brief +
+  # Runyard privacy-audit — replacing dmvt's tee-daemon + console. The control
+  # API is gateway-exposed, so TEE_DAEMON_TOKEN is REQUIRED (the image refuses
+  # to boot without it). RUNYARD_HUB_TOKEN stays sealed in this cluster.
+  tee-daemon:
+    image: ghcr.io/dmvt/webhost-control:v1
+    environment:
+      TEE_DAEMON_TOKEN: ${TEE_DAEMON_TOKEN}
+      DAEMON_VOLUME_NAME: ${DAEMON_VOLUME_NAME:-dstack_daemon_data}
+      DAEMON_VOLUME_MOUNT: ${DAEMON_VOLUME_MOUNT:-/var/lib/tee-daemon}
+      # Source-privacy brief output (shared RO with concierge) + tree-hash cache.
+      BRIEFS_DIR: /data/briefs
+      DIGEST_CACHE_DIR: /data/digests
+      APP_DOMAIN: ${APP_DOMAIN}
+      # Runyard privacy-audit (co-located Runyard node, Cluster-2 internal).
+      RUNYARD_HUB_URL: ${RUNYARD_HUB_URL:-}
+      RUNYARD_HUB_TOKEN: ${RUNYARD_HUB_TOKEN:-}
+      RUNYARD_PRIVACY_AUDIT_CAPABILITY: ${RUNYARD_PRIVACY_AUDIT_CAPABILITY:-privacy-audit}
+      RUNYARD_EXECUTION_MODE: ${RUNYARD_EXECUTION_MODE:-auto}
+      RUNYARD_RUNNER_LOCATION: ${RUNYARD_RUNNER_LOCATION:-}
+      RUNYARD_PRIVACY_AUDIT_LLM: ${RUNYARD_PRIVACY_AUDIT_LLM:-auto}
+      RUNYARD_CALLBACK_SECRET: ${RUNYARD_CALLBACK_SECRET:-}
+      RUNYARD_CALLBACK_URL: ${RUNYARD_CALLBACK_URL:-}
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /var/run/dstack.sock:/var/run/dstack.sock:ro
+      - daemon_data:/var/lib/tee-daemon
+      - briefs:/data/briefs
+      - digests:/data/digests
+    expose:
+      - "8080"
+    depends_on:
+      restore:
+        condition: service_completed_successfully
+
+  # Periodic app-key-sealed DR backups of the control-plane volumes (read-only).
+  # The pre-release export is the same `backup` op run on demand by the release
+  # runbook before the old VM is stopped.
+  backup:
+    image: ghcr.io/dmvt/webhost-backup:backup-v1@sha256:e8121ac071000fc8ba27c7b8caae88bc763ef598b4cad13b5a15f06186c1ef54
+    restart: unless-stopped
+    environment:
+      BACKUP_MODE: schedule
+      BACKUP_INTERVAL_SECONDS: ${BACKUP_INTERVAL_SECONDS:-3600}
+      BACKUP_STORAGE: ${BACKUP_STORAGE:-}
+      BACKUP_S3_ENDPOINT: ${BACKUP_S3_ENDPOINT:-}
+      BACKUP_S3_BUCKET: ${BACKUP_S3_BUCKET:-}
+      BACKUP_S3_REGION: ${BACKUP_S3_REGION:-auto}
+      BACKUP_S3_ACCESS_KEY_ID: ${BACKUP_S3_ACCESS_KEY_ID:-}
+      BACKUP_S3_SECRET_ACCESS_KEY: ${BACKUP_S3_SECRET_ACCESS_KEY:-}
+      BACKUP_PREFIX: ${BACKUP_PREFIX:-webhost}
+      BACKUP_APP_ID: ${BACKUP_APP_ID:-}
+    volumes:
+      - daemon_data:/src/daemon_data:ro
+      - briefs:/src/briefs:ro
+      - caddy_data_v2:/src/caddy_data_v2:ro
+      - caddy_config_v2:/src/caddy_config_v2:ro
+      - /var/run/dstack.sock:/var/run/dstack.sock
+    depends_on:
+      restore:
+        condition: service_completed_successfully
+
+  # NOTE: dmvt's webhost-console (the old Next.js UI + orchestration) is removed.
+  # The UI is now Synclave (Cluster 1); brief-gen + Runyard moved into tee-daemon
+  # (webhost-control) above. Synclave reaches this cluster ONLY via the gateway-
+  # exposed, token-gated control API (/_api on tee-daemon), never the browser.
+
+  concierge:
+    image: ghcr.io/dmvt/concierge:v1
+    environment:
+      CONCIERGE_PORT: 8787
+      CONCIERGE_BRIEFS: /data/briefs
+      VENICE_BASE_URL: ${VENICE_BASE_URL:-https://api.redpill.ai/v1}
+      VENICE_MODEL: ${VENICE_MODEL:-deepseek/deepseek-v3.2}
+      VENICE_API_KEY: ${VENICE_API_KEY}
+      # Lets the observer fetch a project's observed egress (public for attested apps).
+      CONCIERGE_DAEMON_URL: ${CONCIERGE_DAEMON_URL:-http://tee-daemon:8080}
+    volumes:
+      - briefs:/data/briefs:ro
+    expose:
+      - "8787"
+
+  frontproxy:
+    image: ghcr.io/dmvt/webhost-frontproxy:unverified-v1@sha256:e2b6466d38f2bbcaeee53ec8ef46a7c67a54077bb3a1c44b8ba4b206da8f00f8
+    environment:
+      APP_DOMAIN: ${APP_DOMAIN}
+      CONSOLE_HOST: ${CONSOLE_HOST:-console.${APP_DOMAIN}}
+      # No console UI on this CVM (Synclave is the UI). Point the console host at
+      # the daemon so it serves the public verifier/viewer landing page instead.
+      CONSOLE_UPSTREAM: http://tee-daemon:8080
+      DAEMON_UPSTREAM: http://tee-daemon:8080
+      CONCIERGE_UPSTREAM: http://concierge:8787
+      FRONTPROXY_PORT: 8088
+    ports:
+      - "80:8088"
+    depends_on:
+      - concierge
+      - tee-daemon
+
+  tlsproxy:
+    image: ghcr.io/dmvt/webhost-tlsproxy:tls-v4@sha256:d38f090a9f54cf0498591ce3b00fc5b47a7a8c353942fa1082bc74ff0e7e4120
+    environment:
+      CLOUDFLARE_API_TOKEN: ${CLOUDFLARE_API_TOKEN}
+    ports:
+      - "443:443"
+    volumes:
+      - caddy_data_v2:/data
+      - caddy_config_v2:/config
+    depends_on:
+      - frontproxy
+
+volumes:
+  daemon_data:
+  briefs:
+  digests:
+  caddy_data_v2:
+  caddy_config_v2:
