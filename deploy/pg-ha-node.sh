@@ -421,6 +421,7 @@ verify_ha() {
     printf 'PEERS=%q\nVPW=%q\nEXPECT=%q\n' "$PGHA_PEERS" "$PGHA_VERIFY_PASSWORD" "$PGHA_COUNT"
     cat <<'RSCRIPT'
 set -u
+export LC_ALL=C   # the Ubuntu psql wrapper is perl; missing locales spam stderr otherwise
 need=""
 for t in psql jq curl; do command -v "$t" >/dev/null 2>&1 || need=1; done
 if [ -n "$need" ]; then
@@ -457,9 +458,9 @@ done
 echo "HA: etcd + Patroni REST healthy on all ${#NAMES[@]} nodes"
 
 for n in "${NAMES[@]}"; do
-  r=$(psql "postgresql://meshverify:$VPW@${IP[$n]}:5432/postgres" -tAc 'select pg_is_in_recovery()' 2>&1 | tr -d '[:space:]')
+  r=$(psql "postgresql://meshverify:$VPW@${IP[$n]}:5432/postgres" -tAc 'select pg_is_in_recovery()' 2>/dev/null | tr -d '[:space:]')
   [ "$r" = f ] || { echo "HA: FAIL - $n :5432 did not route to the primary (got: $r)"; exit 5; }
-  r=$(psql "postgresql://meshverify:$VPW@${IP[$n]}:5433/postgres" -tAc 'select pg_is_in_recovery()' 2>&1 | tr -d '[:space:]')
+  r=$(psql "postgresql://meshverify:$VPW@${IP[$n]}:5433/postgres" -tAc 'select pg_is_in_recovery()' 2>/dev/null | tr -d '[:space:]')
   [ "$r" = t ] || { echo "HA: FAIL - $n :5433 did not route to a replica (got: $r)"; exit 6; }
 done
 echo "HA: HAProxy routing correct on every node (5432→primary, 5433→replica)"
@@ -722,6 +723,7 @@ case "$ACTION" in
   verify-isolation-all) verify_isolation_all ;;
   verify-agent) verify_agent ;;
   update) update_member "$ARG3"; verify_ha ;;
+  update-only) update_member "$ARG3" ;;   # diagnostic roll without the verify-ha gate
   update-all) update_all ;;
   all) deploy_all; prime_all; bind_all; verify_all; verify_ha; verify_isolation_all; verify_agent ;;
   *) die "unknown action: $ACTION" ;;

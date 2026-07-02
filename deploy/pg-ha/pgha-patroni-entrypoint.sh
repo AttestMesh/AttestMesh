@@ -12,8 +12,12 @@ PGDATA_DIR="${PGDATA:-/var/lib/postgresql/data}"
 MESH_CIDR="${PGHA_MESH_CIDR:-10.18.0.0/16}"
 RUN_DIR=/run/pgha
 SECRETS_DIR="${PGHA_SECRETS_DIR:-/pgha-secrets}"
-mkdir -p "$RUN_DIR" "$SECRETS_DIR" /var/run/postgresql
-chown postgres:postgres "$RUN_DIR" /var/run/postgresql
+mkdir -p "$RUN_DIR" "$SECRETS_DIR" /var/run/postgresql "$PGDATA_DIR"
+chown postgres:postgres "$RUN_DIR" /var/run/postgresql "$PGDATA_DIR"
+# The pgdata volume mount point arrives 0755 — initdb fixes that on the leader, but
+# pg_basebackup does NOT on replicas, and postgres then refuses to start ("data directory
+# has invalid permissions"). Enforce 0700 up front; idempotent across rolls.
+chmod 700 "$PGDATA_DIR"
 # Patroni execs its bootstrap/post_init commands AS postgres, but the shared status file may
 # have been created root-owned by an earlier root-phase entrypoint (etcd/this script). Make
 # the status area world-appendable so the walg_restore bootstrap + post_init can self-report
@@ -21,6 +25,8 @@ chown postgres:postgres "$RUN_DIR" /var/run/postgresql
 mkdir -p "$(dirname "$STAT")"
 chmod 1777 "$(dirname "$STAT")" 2>/dev/null || true
 touch "$STAT" 2>/dev/null && chmod 666 "$STAT" 2>/dev/null || true
+mkdir -p "$(dirname "$STAT")/pglog"
+chown postgres:postgres "$(dirname "$STAT")/pglog"
 
 _st "boot: waiting for attestmesh0"
 MY_IP="$(wait_for_mesh_ip)"
@@ -115,6 +121,14 @@ postgresql:
   bin_dir: /usr/lib/postgresql/16/bin
   unix_socket_directories: /var/run/postgresql
   pgpass: $RUN_DIR/pgpass
+  parameters:
+    # The TEE blocks container stdout, so postgres logs to the shared status volume —
+    # readable over the mesh via the :8009 status server (spec §8 observability rule).
+    logging_collector: "on"
+    log_directory: /pgha-status/pglog
+    log_filename: postgresql-%a.log
+    log_truncate_on_rotation: "on"
+    log_rotation_age: 1d
   authentication:
     superuser:
       username: postgres
@@ -128,6 +142,11 @@ postgresql:
   pg_hba:
     - local all all trust
     - host all all 127.0.0.1/32 trust
+    # Replication connections match ONLY lines whose db field is `replication` — the
+    # localhost entries above do NOT cover them, and Patroni checks the replication
+    # credential against the local postgres (and pg_rewind needs it after failovers).
+    - local replication all trust
+    - host replication replicator 127.0.0.1/32 scram-sha-256
     - host replication replicator $MESH_CIDR scram-sha-256
     - host replication rewind_user $MESH_CIDR scram-sha-256
     - host all all $MESH_CIDR scram-sha-256
@@ -139,4 +158,9 @@ chmod 600 "$CONF"
 chown postgres:postgres "$CONF"
 
 _st "starting patroni (etcd3=$ETCD_HOSTS, connect=$MY_IP:5434, bootstrap=$BOOTSTRAP_METHOD)"
-exec gosu postgres patroni "$CONF"
+# Patroni's stdout/stderr carry its own errors AND postmaster stderr from before the
+# logging collector engages — the TEE blocks container stdout, so keep them on the
+# mesh-readable status volume instead.
+PLOG="$(dirname "$STAT")/patroni-$NODE.log"
+touch "$PLOG"; chown postgres:postgres "$PLOG"
+exec gosu postgres bash -c "exec patroni '$CONF' >> '$PLOG' 2>&1"
