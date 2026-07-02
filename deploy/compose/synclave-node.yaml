@@ -67,24 +67,19 @@ services:
       retries: 20
     restart: unless-stopped
 
-  tee-daemon:
-    image: ghcr.io/dmvt/webhost-tee-daemon:static-build-v16
-    environment:
-      TEE_DAEMON_TOKEN: ${TEE_DAEMON_TOKEN}
-      # THE FIX: without DAEMON_VOLUME_NAME the daemon can't resolve its data
-      # volume → app builds fail (ERR_PNPM_NO_PKG_MANIFEST / empty /app).
-      DAEMON_VOLUME_NAME: ${DAEMON_VOLUME_NAME:-dstack_daemon_data}
-      DAEMON_VOLUME_MOUNT: ${DAEMON_VOLUME_MOUNT:-/var/lib/tee-daemon}
-    volumes:
-      - /var/run/docker.sock:/var/run/docker.sock
-      - /var/run/dstack.sock:/var/run/dstack.sock:ro
-      - daemon_data:/var/lib/tee-daemon
-    expose:
-      - "8080"
-    restart: unless-stopped
+  # NOTE: no tee-daemon here anymore. App-Hosting (the daemon) now runs in the ISOLATED webhost
+  # cluster (Cluster 2, webhost-node.yaml). This node is control-plane only: UI + API + auth/
+  # billing. The API reaches Cluster 2 solely via its gateway-exposed, token-gated control API
+  # (DAEMON_URL below). Tenant apps + the concierge are served by Cluster 2 under its own domain.
 
   app:
-    image: ghcr.io/dmvt/synclave-app:v3
+    # v6 = cluster API bridge: logged-in users see the live C3 members as CVM
+    # graph nodes, with the API URL sealed to the dstack bridge listener.
+    # Digest-pinned: in-place UpgradeApp rolls never re-pull a same-tag image.
+    # v7 = webhost absorption: privacy-audit trust surface + webhost admin panel; the daemon link
+    # now points across the cluster boundary at Cluster 2's gateway control API. Build from the
+    # webhost-dashboard-feature branch and digest-pin at cutover.
+    image: ghcr.io/dmvt/synclave-app:v7
     environment:
       API_HOST: 0.0.0.0
       API_PORT: 80
@@ -96,13 +91,27 @@ services:
       GITHUB_CLIENT_ID: ${GITHUB_CLIENT_ID}
       GITHUB_CLIENT_SECRET: ${GITHUB_CLIENT_SECRET}
       GITHUB_OAUTH_CALLBACK_URL: ${GITHUB_OAUTH_CALLBACK_URL}
-      DAEMON_URL: http://tee-daemon:8080
+      # Cluster-2 webhost-control gateway URL (token-gated). Sealed at deploy.
+      DAEMON_URL: ${DAEMON_URL}
       TEE_DAEMON_TOKEN: ${TEE_DAEMON_TOKEN}
+      # Webhost admin panel operators (comma-separated emails).
+      PLATFORM_ADMIN_EMAILS: ${PLATFORM_ADMIN_EMAILS:-}
       PUBLIC_BASE_URL: ${PUBLIC_BASE_URL}
       APP_DOMAIN: ${APP_DOMAIN}
+      CLUSTER_API_URL: ${CLUSTER_API_URL}
+      CLUSTER_NETWORK_ID: ${CLUSTER_NETWORK_ID}
+      CLUSTER_NAME: ${CLUSTER_NAME}
+      CLUSTER_SELF_APP_ID: ${CLUSTER_SELF_APP_ID}
+      CLUSTER_NETWORKS: ${CLUSTER_NETWORKS:-}
       CORS_ORIGIN: ${CORS_ORIGIN}
       CLOUDFLARE_API_TOKEN: ${CLOUDFLARE_API_TOKEN}
+      # CF app-fronting: each tenant deploy creates a PROXIED <slug>.app DNS
+      # record in this zone pointing at the origin (the box haproxy).
+      CLOUDFLARE_ZONE_ID: ${CLOUDFLARE_ZONE_ID}
+      CLOUDFLARE_ORIGIN_IP: ${CLOUDFLARE_ORIGIN_IP}
       ADMIN_API_KEY: ${ADMIN_API_KEY}
+      LABELS_API_URL: ${LABELS_API_URL:-}
+      LABELS_API_TOKEN: ${LABELS_API_TOKEN:-}
     expose:
       - "80"
     depends_on:
@@ -110,20 +119,22 @@ services:
         condition: service_healthy
     restart: unless-stopped
 
+  # Control-plane only: fronts the console host → the app (UI + API). Tenant-app and concierge
+  # traffic is NOT served here (that lives in Cluster 2), so the daemon/concierge upstreams point
+  # back at the app as harmless placeholders — no <slug>.app or /concierge route reaches this node.
   frontproxy:
     image: ghcr.io/dmvt/webhost-frontproxy:unverified-v1
     environment:
       APP_DOMAIN: ${APP_DOMAIN}
       CONSOLE_HOST: ${CONSOLE_HOST}
       CONSOLE_UPSTREAM: http://app:80
-      DAEMON_UPSTREAM: http://tee-daemon:8080
-      CONCIERGE_UPSTREAM: http://tee-daemon:8080
+      DAEMON_UPSTREAM: http://app:80
+      CONCIERGE_UPSTREAM: http://app:80
       FRONTPROXY_PORT: "8088"
     expose:
       - "8088"
     depends_on:
       - app
-      - tee-daemon
     restart: unless-stopped
 
   tlsproxy:
@@ -143,6 +154,5 @@ services:
 
 volumes:
   pgdata:
-  daemon_data:
   caddy_data:
   caddy_config:
