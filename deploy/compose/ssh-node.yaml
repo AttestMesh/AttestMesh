@@ -1,4 +1,4 @@
-# AttestMesh SSH ingress + Hermes agent node for the self-hosted dstack box.
+# AttestMesh SSH ingress node for the self-hosted dstack box.
 #
 # The node joins an existing ClusterDiamond through the sidecar, and exposes two
 # sshd services through the dstack gateway (TLS-passthrough, SNI = host):
@@ -12,27 +12,10 @@
 #   ssh root@<alias>
 #   ProxyCommand openssl s_client -quiet -connect <app_id>-102X.<gateway-domain>:443 -servername <same>
 #
-# It also runs the Nous Research Hermes Agent ("Verity", @dstack-expert) as
-# supervised services in the sidecar netns (so it reaches the Matrix node's
-# mesh-only Synapse proxy and the Hindsight memory API over WireGuard):
-#
-#   hermes-gateway — `hermes gateway`: hosts the Matrix connector. Waits until
-#                    the operator has configured /root/.hermes (config.yaml +
-#                    .env with MATRIX_*/HINDSIGHT_*/model keys) via the shells.
-#   paseo          — Paseo daemon (:6767, mesh-reachable only) whose sole
-#                    provider runs `hermes acp`.
-#
-# All four app services share ONE image (ghcr.io/attestmesh/hermes-workbench,
-# built by .github/workflows/build-hermes-workbench.yml from
-# deploy/hermes-workbench/Dockerfile): a full ubuntu 26.04 workbench with the
-# Hermes venv + Paseo CLI baked in, so the agent runtime survives rolls. All
-# agent state and secrets stay on the /root `workspace` volume — sealed keys
-# aside, nothing here configures Hermes; the operator does that over ssh, and
-# it persists across in-place rolls (a fresh-disk roll wipes it).
-# SSH public keys are sealed into the CVM as SSH_AUTHORIZED_KEYS_B64 by
-# deploy/ssh-node.sh; no key material is committed. sshd host keys are
-# generated at first boot onto the volume (stable across rolls, not baked in
-# the image).
+# Both shells are a FULL ubuntu 26.04 workbench (build tools, python, net tools)
+# and share the /root workspace volume (survives in-place rolls; a fresh-disk
+# roll wipes it). SSH public keys are sealed into the CVM as
+# SSH_AUTHORIZED_KEYS_B64 by deploy/ssh-node.sh; no key material is committed.
 services:
   sidecar:
     image: ghcr.io/attestmesh/cluster-mesh-agent@sha256:db0a74f5cb68aab6441ac187522276999fc45ee760db3ae3dea0240e86d5c1af
@@ -65,7 +48,27 @@ services:
       - /dev/net/tun
 
   sshd:
-    image: ghcr.io/attestmesh/hermes-workbench@sha256:856568473706c0db44ce2685f9058b364598946082112fb146a3950e2a68d3b6
+    build:
+      context: .
+      dockerfile_inline: |
+        FROM ubuntu:26.04@sha256:53958ec7b67c2c9355df922dd08dbf0360611f8c3cdb656875e81873db9ffdba
+        RUN apt-get update \
+          && DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            ca-certificates openssh-server openssh-client \
+            build-essential git python3 python3-pip python3-venv \
+            curl wget jq ripgrep unzip rsync \
+            iproute2 iputils-ping dnsutils netcat-openbsd socat wireguard-tools \
+            vim nano tmux htop less \
+          && rm -rf /var/lib/apt/lists/*
+        RUN mkdir -p /run/sshd \
+          && sed -i 's/^#\?Port .*/Port 1022/' /etc/ssh/sshd_config \
+          && sed -i 's/^#\?PermitRootLogin .*/PermitRootLogin prohibit-password/' /etc/ssh/sshd_config \
+          && sed -i 's/^#\?PubkeyAuthentication .*/PubkeyAuthentication yes/' /etc/ssh/sshd_config \
+          && sed -i 's/^#\?PasswordAuthentication .*/PasswordAuthentication no/' /etc/ssh/sshd_config \
+          && sed -i 's/^#\?KbdInteractiveAuthentication .*/KbdInteractiveAuthentication no/' /etc/ssh/sshd_config \
+          && sed -i 's/^#\?PermitEmptyPasswords .*/PermitEmptyPasswords no/' /etc/ssh/sshd_config \
+          && sed -i 's@session\s*required\s*pam_loginuid.so@session optional pam_loginuid.so@g' /etc/pam.d/sshd
+        EXPOSE 1022
     restart: unless-stopped
     environment:
       - SSH_AUTHORIZED_KEYS_B64=${SSH_AUTHORIZED_KEYS_B64}
@@ -76,21 +79,39 @@ services:
       - -lc
       - |
         set -euo pipefail
-        install -d -m 700 /root/.ssh /root/.ssh-host /run/sshd
+        install -d -m 700 /root/.ssh /run/sshd
         printf '%s' "$SSH_AUTHORIZED_KEYS_B64" | base64 -d > /root/.ssh/authorized_keys
         chmod 600 /root/.ssh/authorized_keys
         chown -R root:root /root/.ssh
         test -s /root/.ssh/authorized_keys
-        k=/root/.ssh-host/ssh_host_ed25519_key_1022
-        [ -s "$k" ] || ssh-keygen -q -t ed25519 -N '' -f "$k"
-        exec /usr/sbin/sshd -D -e -o Port=1022 -h "$k"
+        exec /usr/sbin/sshd -D -e
     ports:
       - "1022:1022"
 
   # Mesh jump shell: same workbench, but INSIDE the sidecar's netns — where the
   # WireGuard mesh interface lives. NET_ADMIN is for `wg show` (peer discovery).
   sshd-mesh:
-    image: ghcr.io/attestmesh/hermes-workbench@sha256:856568473706c0db44ce2685f9058b364598946082112fb146a3950e2a68d3b6
+    build:
+      context: .
+      dockerfile_inline: |
+        FROM ubuntu:26.04@sha256:53958ec7b67c2c9355df922dd08dbf0360611f8c3cdb656875e81873db9ffdba
+        RUN apt-get update \
+          && DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            ca-certificates openssh-server openssh-client \
+            build-essential git python3 python3-pip python3-venv \
+            curl wget jq ripgrep unzip rsync \
+            iproute2 iputils-ping dnsutils netcat-openbsd socat wireguard-tools \
+            vim nano tmux htop less \
+          && rm -rf /var/lib/apt/lists/*
+        RUN mkdir -p /run/sshd \
+          && sed -i 's/^#\?Port .*/Port 1023/' /etc/ssh/sshd_config \
+          && sed -i 's/^#\?PermitRootLogin .*/PermitRootLogin prohibit-password/' /etc/ssh/sshd_config \
+          && sed -i 's/^#\?PubkeyAuthentication .*/PubkeyAuthentication yes/' /etc/ssh/sshd_config \
+          && sed -i 's/^#\?PasswordAuthentication .*/PasswordAuthentication no/' /etc/ssh/sshd_config \
+          && sed -i 's/^#\?KbdInteractiveAuthentication .*/KbdInteractiveAuthentication no/' /etc/ssh/sshd_config \
+          && sed -i 's/^#\?PermitEmptyPasswords .*/PermitEmptyPasswords no/' /etc/ssh/sshd_config \
+          && sed -i 's@session\s*required\s*pam_loginuid.so@session optional pam_loginuid.so@g' /etc/pam.d/sshd
+        EXPOSE 1023
     restart: unless-stopped
     network_mode: service:sidecar
     depends_on:
@@ -106,57 +127,14 @@ services:
       - -lc
       - |
         set -euo pipefail
-        install -d -m 700 /root/.ssh /root/.ssh-host /run/sshd
+        install -d -m 700 /root/.ssh /run/sshd
         printf '%s' "$SSH_AUTHORIZED_KEYS_B64" | base64 -d > /root/.ssh/authorized_keys
         chmod 600 /root/.ssh/authorized_keys
         chown -R root:root /root/.ssh
         test -s /root/.ssh/authorized_keys
-        k=/root/.ssh-host/ssh_host_ed25519_key_1023
-        [ -s "$k" ] || ssh-keygen -q -t ed25519 -N '' -f "$k"
-        exec /usr/sbin/sshd -D -e -o Port=1023 -h "$k"
-
-  # Hermes platform gateway (Matrix connector). Reads everything from
-  # /root/.hermes on the workspace volume — config.yaml, .env (secrets),
-  # crypto store — none of it is sealed or baked. Until the operator has
-  # configured it over ssh, this idles politely instead of crash-looping.
-  hermes-gateway:
-    image: ghcr.io/attestmesh/hermes-workbench@sha256:856568473706c0db44ce2685f9058b364598946082112fb146a3950e2a68d3b6
-    restart: unless-stopped
-    network_mode: service:sidecar
-    depends_on:
-      - sidecar
-    volumes:
-      - workspace:/root
-    command:
-      - /bin/bash
-      - -lc
-      - |
-        set -euo pipefail
-        until [ -s /root/.hermes/.env ]; do
-          echo "hermes-gateway: waiting for /root/.hermes/.env (configure via the ssh shells)"
-          sleep 60
-        done
-        exec hermes gateway
-
-  # Paseo daemon: ACP driver for Hermes (`paseo run --provider hermes …`,
-  # app.paseo.sh via its relay). Listens on :6767 in the sidecar netns —
-  # reachable from mesh peers only; NOT published through the dstack gateway.
-  # State/config in /root/.paseo on the workspace volume.
-  paseo:
-    image: ghcr.io/attestmesh/hermes-workbench@sha256:856568473706c0db44ce2685f9058b364598946082112fb146a3950e2a68d3b6
-    restart: unless-stopped
-    network_mode: service:sidecar
-    depends_on:
-      - sidecar
-    volumes:
-      - workspace:/root
-    command:
-      - /bin/bash
-      - -lc
-      - exec paseo daemon start --foreground
+        exec /usr/sbin/sshd -D -e
 
 volumes:
-  # Shared /root workbench for the shells + hermes + paseo (bash history,
-  # clones, ~/.hermes, ~/.paseo, sshd host keys).
+  # Shared /root workbench for both shells (bash history, clones, downloads).
   # Survives in-place rolls; wiped on a fresh-disk roll.
   workspace:
