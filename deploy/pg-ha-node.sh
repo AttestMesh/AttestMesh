@@ -449,11 +449,19 @@ done
 [ -n "$ok" ] || { echo "HA: FAIL - cluster never converged"; exit 2; }
 echo "$c" | jq -c '.members[] | {name, role, state, timeline, lag}'
 
+# Per-node checks poll: a just-rolled CVM takes minutes to come back, and update-all
+# runs this gate immediately after StartVm.
 for n in "${NAMES[@]}"; do
-  curl -fsS --max-time 5 "http://${IP[$n]}:2379/health" 2>/dev/null | grep -q '"true"' \
-    || { echo "HA: FAIL - etcd unhealthy on $n"; exit 3; }
-  curl -fsS --max-time 5 "http://${IP[$n]}:8008/cluster" >/dev/null 2>&1 \
-    || { echo "HA: FAIL - Patroni REST down on $n"; exit 4; }
+  ok=""
+  for i in $(seq 1 40); do
+    if curl -fsS --max-time 5 "http://${IP[$n]}:2379/health" 2>/dev/null | grep -q '"true"' \
+       && curl -fsS --max-time 5 "http://${IP[$n]}:8008/cluster" >/dev/null 2>&1; then
+      ok=1; break
+    fi
+    [ $((i % 4)) -eq 0 ] && echo "  … waiting for $n etcd/REST ($i/40)"
+    sleep 12
+  done
+  [ -n "$ok" ] || { echo "HA: FAIL - etcd/Patroni REST unhealthy on $n after 8m"; exit 3; }
 done
 echo "HA: etcd + Patroni REST healthy on all ${#NAMES[@]} nodes"
 
