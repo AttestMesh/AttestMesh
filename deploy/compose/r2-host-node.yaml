@@ -1,0 +1,118 @@
+# R2-host node: encrypting S3 gateway for mesh clients, mirrored to Cloudflare R2.
+#
+# Mesh clients PUT/GET plaintext over S3 (creds S3GW_*); the s3gw encrypts/decrypts with a
+# CLUSTER-SHARED-KEY-derived crypt key (fetched in-CVM over the sidecar agent UDS) and stores only
+# ciphertext — content AND filenames — in the R2 bucket. R2 is authoritative; the local disk holds
+# only a disposable VFS write-back cache, so the node is ~stateless and a fresh CVM of the same
+# app_id re-derives the key and reads everything back (recovery from total CVM loss).
+#
+# Exposure is MESH-ONLY: no tailscale, no dstack gateway ingress, no published app port. The S3
+# listener is surfaced exclusively on the sidecar's wireguard IP by a socat proxy in the sidecar
+# netns (postgres-node precedent). In bridge mode only published `ports:` bind on the CVM
+# interface — 9090 (sidecar health, box-side verify) and 51900 (wg transport) are the ONLY ones.
+# s3gw egress is deny-all except the R2 endpoint (+ Docker DNS). See docs/specs/r2-host-node.md.
+
+services:
+  sidecar:
+    image: ghcr.io/attestmesh/cluster-mesh-agent@sha256:db0a74f5cb68aab6441ac187522276999fc45ee760db3ae3dea0240e86d5c1af
+    restart: unless-stopped
+    environment:
+      # MEMBER_CONTRACT intentionally unset: the sidecar self-discovers the app_id.
+      - CHAIN_ID=${CHAIN_ID}
+      - RPC_URL=${RPC_URL}
+      - BUNDLER_URL=${BUNDLER_URL}
+      - GAS_POLICY_ID=${GAS_POLICY_ID}
+      - INDEXER_REGISTRY_ADDR=${INDEXER_REGISTRY_ADDR}
+      - GATEWAY_DOMAIN=${GATEWAY_DOMAIN}
+      - DSTACK_SOCKET=/var/run/dstack.sock
+      - AGENT_GRPC_SOCKET=/var/run/attestmesh/agent.sock
+      - HEALTH_HTTP_ADDR=0.0.0.0:9090
+      - LOG_FORMAT=pretty
+      - LOG_LEVEL=info,cluster_mesh_agent=debug
+    volumes:
+      - /var/run/dstack.sock:/var/run/dstack.sock
+      - agent-sock:/var/run/attestmesh
+    ports:
+      - "9090:9090"
+      - "51900:51900"
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun
+
+  # Mesh-only S3 listener. It shares the sidecar netns so it can bind specifically
+  # to attestmesh0 and forward to the internal s3gw service. There is intentionally
+  # no compose `ports:` entry for 19000.
+  s3-mesh-proxy:
+    image: alpine/socat:1.8.0.0
+    restart: unless-stopped
+    network_mode: service:sidecar
+    depends_on:
+      - sidecar
+      - s3gw
+    entrypoint:
+      - /bin/sh
+      - -ec
+    command:
+      - |
+        while :; do
+          ip="$(ip -4 -o addr show dev attestmesh0 2>/dev/null | awk '{print $4}' | cut -d/ -f1)"
+          [ -n "$$ip" ] && break
+          sleep 1
+        done
+        exec socat -d -d TCP-LISTEN:19000,fork,reuseaddr,bind="$${ip}" TCP:s3gw:19000
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+
+  # rclone serve s3 over crypt over R2. The entrypoint blocks until the sidecar has
+  # the CSK, derives the crypt password/password2 in-process, then execs rclone —
+  # key material never touches disk. Boot phases + rclone NOTICE log land on the
+  # s3gw-status volume (the TEE blocks container stdout).
+  s3gw:
+    image: ghcr.io/attestmesh/r2host-s3gw@sha256:7fd59551fc5b181330c050bf0cd5de5f1bae725f8fb87bc437c173da77eaa3f3
+    restart: unless-stopped
+    depends_on:
+      - sidecar
+    environment:
+      - R2_ENDPOINT=${R2_ENDPOINT}
+      - R2_BUCKET=${R2_BUCKET}
+      - R2_REGION=${R2_REGION}
+      - R2_ACCESS_KEY_ID=${R2_ACCESS_KEY_ID}
+      - R2_SECRET_ACCESS_KEY=${R2_SECRET_ACCESS_KEY}
+      - S3GW_ACCESS_KEY_ID=${S3GW_ACCESS_KEY_ID}
+      - S3GW_SECRET_ACCESS_KEY=${S3GW_SECRET_ACCESS_KEY}
+      - S3GW_LISTEN_PORT=19000
+      - S3GW_VFS_CACHE_MODE=writes
+      - S3GW_VFS_CACHE_MAX_SIZE=40G
+      - AGENT_GRPC_SOCKET=/var/run/attestmesh/agent.sock
+    volumes:
+      - agent-sock:/var/run/attestmesh
+      - s3gw-status:/s3gw-status
+      - vfs-cache:/vfs-cache
+    expose:
+      - "19000"
+
+  # s3gw egress is deny-by-default: only the R2 endpoint (re-resolved — it sits on
+  # Cloudflare anycast; a stale IP looks like hung PUTs) and Docker DNS. Inbound
+  # from the mesh proxy rides established-connection return traffic.
+  s3gw-egress-fw:
+    image: ghcr.io/attestmesh/agent-egress-fw@sha256:c75c9668e905ca00f86e9583505d52624ba87cb7114a4633f84330bb497ca58f
+    restart: unless-stopped
+    network_mode: service:s3gw
+    depends_on:
+      - s3gw
+    environment:
+      - ALLOW_BASE_URL=${R2_ENDPOINT}
+      - INTERNAL_HOSTS=
+      - ALLOW_DNS=127.0.0.11
+      - RERESOLVE_SECONDS=30
+    cap_add:
+      - NET_ADMIN
+
+volumes:
+  agent-sock:
+  s3gw-status:
+  vfs-cache:
