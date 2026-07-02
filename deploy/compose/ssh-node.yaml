@@ -65,7 +65,7 @@ services:
       - /dev/net/tun
 
   sshd:
-    image: ghcr.io/attestmesh/hermes-workbench:latest
+    image: ghcr.io/attestmesh/hermes-workbench@sha256:856568473706c0db44ce2685f9058b364598946082112fb146a3950e2a68d3b6
     restart: unless-stopped
     environment:
       - SSH_AUTHORIZED_KEYS_B64=${SSH_AUTHORIZED_KEYS_B64}
@@ -90,7 +90,7 @@ services:
   # Mesh jump shell: same workbench, but INSIDE the sidecar's netns — where the
   # WireGuard mesh interface lives. NET_ADMIN is for `wg show` (peer discovery).
   sshd-mesh:
-    image: ghcr.io/attestmesh/hermes-workbench:latest
+    image: ghcr.io/attestmesh/hermes-workbench@sha256:856568473706c0db44ce2685f9058b364598946082112fb146a3950e2a68d3b6
     restart: unless-stopped
     network_mode: service:sidecar
     depends_on:
@@ -120,7 +120,7 @@ services:
   # crypto store — none of it is sealed or baked. Until the operator has
   # configured it over ssh, this idles politely instead of crash-looping.
   hermes-gateway:
-    image: ghcr.io/attestmesh/hermes-workbench:latest
+    image: ghcr.io/attestmesh/hermes-workbench@sha256:856568473706c0db44ce2685f9058b364598946082112fb146a3950e2a68d3b6
     restart: unless-stopped
     network_mode: service:sidecar
     depends_on:
@@ -143,7 +143,7 @@ services:
   # reachable from mesh peers only; NOT published through the dstack gateway.
   # State/config in /root/.paseo on the workspace volume.
   paseo:
-    image: ghcr.io/attestmesh/hermes-workbench:latest
+    image: ghcr.io/attestmesh/hermes-workbench@sha256:856568473706c0db44ce2685f9058b364598946082112fb146a3950e2a68d3b6
     restart: unless-stopped
     network_mode: service:sidecar
     depends_on:
