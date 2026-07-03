@@ -50,7 +50,7 @@ services:
   # r1 masters on REDISHA_BOOTSTRAP=new with an empty data dir, r2/r3 REPLICAOF r1.
   # AOF on; the redisdata volume survives rolls (no_instance_id=true, app-bound disk key).
   redis:
-    image: ghcr.io/attestmesh/redis-ha@sha256:PLACEHOLDER_REDIS_HA
+    image: ghcr.io/attestmesh/redis-ha@sha256:94d71ce430a6cf301126e4258e6a1573c893bf3cdfa0a4b0793d193585aa1191 # pinned 2026-07-03
     restart: unless-stopped
     network_mode: service:sidecar
     entrypoint: ["/usr/local/bin/redisha-redis-entrypoint.sh"]
@@ -71,7 +71,7 @@ services:
   # the initial bootstrap. Its requirepass is the sealed verify password (control plane,
   # no data), auth-pass towards redis is CSK-derived.
   sentinel:
-    image: ghcr.io/attestmesh/redis-ha@sha256:PLACEHOLDER_REDIS_HA
+    image: ghcr.io/attestmesh/redis-ha@sha256:94d71ce430a6cf301126e4258e6a1573c893bf3cdfa0a4b0793d193585aa1191 # pinned 2026-07-03
     restart: unless-stopped
     network_mode: service:sidecar
     entrypoint: ["/usr/local/bin/redisha-sentinel-entrypoint.sh"]
@@ -92,7 +92,7 @@ services:
   # Backend health = tcp-check AUTH + INFO replication, expecting role:master/role:slave
   # on every peer's :6380 (redis has no HTTP role endpoint).
   haproxy:
-    image: ghcr.io/attestmesh/redis-ha@sha256:PLACEHOLDER_REDIS_HA
+    image: ghcr.io/attestmesh/redis-ha@sha256:94d71ce430a6cf301126e4258e6a1573c893bf3cdfa0a4b0793d193585aa1191 # pinned 2026-07-03
     restart: unless-stopped
     network_mode: service:sidecar
     entrypoint: ["/usr/local/bin/redisha-haproxy-entrypoint.sh"]
@@ -109,7 +109,7 @@ services:
   # Mesh-only status page (:8009): the TEE blocks container logs, so every redis-ha
   # entrypoint self-reports to /redisha-status and this serves it read-only to mesh peers.
   status-server:
-    image: ghcr.io/attestmesh/redis-ha@sha256:PLACEHOLDER_REDIS_HA
+    image: ghcr.io/attestmesh/redis-ha@sha256:94d71ce430a6cf301126e4258e6a1573c893bf3cdfa0a4b0793d193585aa1191 # pinned 2026-07-03
     restart: unless-stopped
     network_mode: service:sidecar
     entrypoint:
