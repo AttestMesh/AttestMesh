@@ -1,7 +1,7 @@
 # Hermes Agent Node
 
-**Status**: IMPLEMENTED (deploy trio, 2026-07-02)
-**Related**: [`matrix-admin-agent.md`](./matrix-admin-agent.md) (account provisioning), `deploy/compose/hermes-node.yaml`, `deploy/hermes-node.sh`, `deploy/hermes-node-box.py`, `deploy/hermes-matrix-provision.py`, `deploy/hermes-workbench/Dockerfile`
+**Status**: IMPLEMENTED (deploy trio, 2026-07-02; not yet exercised end-to-end)
+**Related**: [`matrix-admin-agent.md`](./matrix-admin-agent.md) (account provisioning), [`csk-rotation.md`](./csk-rotation.md) (eviction/rotation posture), [`../../deploy/hermes-node-runbook.md`](../../deploy/hermes-node-runbook.md) (operator runbook), `deploy/compose/hermes-node.yaml`, `deploy/hermes-node.sh`, `deploy/hermes-node-box.py`, `deploy/hermes-matrix-provision.py`, `deploy/hermes-workbench/Dockerfile`
 
 ## 1. Purpose
 
