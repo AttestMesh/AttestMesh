@@ -7,7 +7,7 @@
 #     -> prime (allowlist compose_hash + app_id on the cluster)
 #     -> bind  (upgradeToAndCall the proxy to ClusterMember, box deployer key)
 #     -> verify (sidecar self-registers -> memberIdOf(X) != 0)
-#     -> verify-app / verify-daemon (service reachability)
+#     -> verify-app / verify-daemon (service reachability; daemon lives on webhost)
 #
 # Day-2 rolls: `update` recomputes the compose_hash, allowlists it FIRST, then does
 # an in-place, DISK-PRESERVING UpgradeApp (BOX_FRESH_DISK=1 forces a wipe).
@@ -278,29 +278,13 @@ verify_app() {
   die "synclave app did not become healthy at https://${host}"
 }
 
-# Daemon reachability. The tee-daemon API is routed by the frontproxy ONLY on
-# *.APP_DOMAIN hosts (/_api/* -> tee-daemon:8080); an unauthenticated GET to
-# /_api/projects returning 401 proves the daemon answered (auth-gated).
-# The public *.app path additionally depends on the dstack gateway routing the
-# SNI (broken today: no _dstack-app-address TXT) — so with SYNCLAVE_CVM_IP set
-# the probe runs ON THE BOX against the CVM's tlsproxy directly.
+# Daemon reachability. Synclave is control-plane only now; the app-hosting
+# daemon lives in the isolated Open Webhost node. Keep this action for the
+# canonical Synclave deploy checklist, but delegate to the daemon owner.
 verify_daemon() {
-  _load
-  local probe_host="${DAEMON_PROBE_HOST:-verify-daemon.${APP_DOMAIN}}" i code
-  for i in $(seq 1 30); do
-    if [ -n "${SYNCLAVE_CVM_IP:-}" ]; then
-      code=$(ssh_box "curl -sk -o /dev/null -w '%{http_code}' --max-time 10 --resolve ${probe_host}:443:${SYNCLAVE_CVM_IP} https://${probe_host}/_api/projects" 2>/dev/null || true)
-    else
-      code=$(curl -sk -o /dev/null -w '%{http_code}' --max-time 10 "https://${probe_host}/_api/projects" 2>/dev/null || true)
-    fi
-    if [ "$code" = 401 ] || [ "$code" = 200 ]; then
-      log "✔ tee-daemon reachable: ${probe_host}/_api/projects -> $code (401 = answered, auth-gated)"
-      return 0
-    fi
-    log "… tee-daemon not reachable yet ($i/30, /_api/projects -> ${code:-000})"
-    sleep 10
-  done
-  die "tee-daemon did not respond at https://${probe_host}/_api/projects"
+  local webhost_node="${WEBHOST_NODE:-webhost}"
+  log "verify-daemon: delegating to Open Webhost node ${webhost_node}"
+  "$HERE/webhost-node.sh" "$webhost_node" verify-daemon
 }
 
 update_member() {
