@@ -76,9 +76,8 @@ services:
     # v6 = cluster API bridge: logged-in users see the live C3 members as CVM
     # graph nodes, with the API URL sealed to the dstack bridge listener.
     # Digest-pinned: in-place UpgradeApp rolls never re-pull a same-tag image.
-    # v10 = dashboard mesh-network/CVM creation actions on top of the merged
-    # console: cluster graph visibility + webhost admin/privacy audit + billing.
-    image: ghcr.io/dmvt/synclave-app:v10@sha256:c5a6a1ca6baa08abeab3c031282416b8983209e238393ed8a147d2e037c191f0
+    # v11 = Add CVM remains visible and opens on live cluster-synced networks.
+    image: ghcr.io/dmvt/synclave-app:v11@sha256:7023890a03fa8a68c56855236bc89c87aa4cb7427156a8377cac026a1069aabd
     environment:
       API_HOST: 0.0.0.0
       API_PORT: 80
