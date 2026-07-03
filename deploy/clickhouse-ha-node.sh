@@ -32,8 +32,8 @@ CHHA_COUNT="${CHHA_COUNT:-3}"
 # gateway OFF, bridge, app-bound disk key (no_instance_id) so chdata/keeper-data survive
 # fresh-disk rolls of the same app.
 export BOX_VCPU="${BOX_VCPU:-2}" BOX_MEM="${BOX_MEM:-4096}" BOX_DISK="${BOX_DISK:-60}"
-export BOX_PORTS="${BOX_PORTS:-[]}" BOX_GATEWAY_ENABLED="${BOX_GATEWAY_ENABLED:-false}" BOX_NET_MODE="${BOX_NET_MODE:-bridge}"
-export BOX_NO_INSTANCE_ID="${BOX_NO_INSTANCE_ID:-true}"
+export BOX_PORTS="${BOX_PORTS:-[]}" BOX_GATEWAY_ENABLED="${BOX_GATEWAY_ENABLED:-true}" BOX_NET_MODE="${BOX_NET_MODE:-bridge}"
+export BOX_NO_INSTANCE_ID="${BOX_NO_INSTANCE_ID:-false}"
 
 CSTATE="$LOGDIR/clickhouse-ha-${NODE}.state"
 ZERO32=0x0000000000000000000000000000000000000000000000000000000000000000
