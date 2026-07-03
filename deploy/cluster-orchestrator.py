@@ -11,6 +11,7 @@ import secrets
 import subprocess
 import threading
 import time
+from collections.abc import Mapping
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
@@ -62,18 +63,34 @@ def save_job(job: dict[str, Any]) -> None:
     atomic_write(JOBS / f"{job['id']}.json", job)
 
 
-def parse_env(raw: str) -> str:
+def parse_env(raw: str) -> dict[str, str]:
     if not raw.strip():
-        return ""
-    lines: list[str] = []
+        return {}
+    parsed: dict[str, str] = {}
     for line in raw.splitlines():
         stripped = line.strip()
         if not stripped or stripped.startswith("#"):
             continue
         if not re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", stripped):
             raise ValueError(f"Invalid environment line: {line!r}")
-        lines.append(stripped)
-    return "\n".join(lines) + ("\n" if lines else "")
+        key, value = stripped.split("=", 1)
+        parsed[key] = value
+    return parsed
+
+
+def env_text(env: Mapping[str, str]) -> str:
+    return "".join(f"{k}={v}\n" for k, v in sorted(env.items()))
+
+
+def env_for_catalog(catalog_id: str | None, user_env: dict[str, str]) -> dict[str, str]:
+    env = dict(user_env)
+    if catalog_id == "postgres":
+        if not env.get("POSTGRES_PASSWORD"):
+            raise ValueError("Postgres requires POSTGRES_PASSWORD in Advanced environment.")
+        env.setdefault("POSTGRES_USER", "postgres")
+        env.setdefault("POSTGRES_DB", "postgres")
+        env.setdefault("POSTGRES_INITDB_ARGS", "--encoding=UTF8 --locale=C")
+    return env
 
 
 def workload_image(body: dict[str, Any]) -> str:
@@ -90,7 +107,94 @@ def workload_image(body: dict[str, Any]) -> str:
     return image
 
 
-def compose_for(name: str, image: str, catalog_id: str | None) -> str:
+def postgres_compose(name: str) -> str:
+    return f"""services:
+  sidecar:
+    image: ghcr.io/attestmesh/cluster-mesh-agent@sha256:db0a74f5cb68aab6441ac187522276999fc45ee760db3ae3dea0240e86d5c1af
+    restart: unless-stopped
+    environment:
+      - CHAIN_ID=${{CHAIN_ID}}
+      - RPC_URL=${{RPC_URL}}
+      - BUNDLER_URL=${{BUNDLER_URL}}
+      - GAS_POLICY_ID=${{GAS_POLICY_ID}}
+      - INDEXER_REGISTRY_ADDR=${{INDEXER_REGISTRY_ADDR}}
+      - GATEWAY_DOMAIN=${{GATEWAY_DOMAIN}}
+      - DSTACK_SOCKET=/var/run/dstack.sock
+      - HEALTH_HTTP_ADDR=0.0.0.0:9090
+      - LOG_FORMAT=pretty
+      - LOG_LEVEL=info,cluster_mesh_agent=debug
+    volumes:
+      - /var/run/dstack.sock:/var/run/dstack.sock
+    ports:
+      - "51900:51900"
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun
+
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    env_file:
+      - /tmp/attestmesh-workload.env
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U $${{POSTGRES_USER:-postgres}} -d $${{POSTGRES_DB:-postgres}}"]
+      interval: 10s
+      timeout: 5s
+      retries: 18
+    labels:
+      attestmesh.name: "{name}"
+      attestmesh.source: "fleet-control"
+
+  postgres-mesh-proxy:
+    image: alpine/socat:1.8.0.0
+    restart: unless-stopped
+    network_mode: service:sidecar
+    depends_on:
+      sidecar:
+        condition: service_started
+      postgres:
+        condition: service_healthy
+    entrypoint:
+      - /bin/sh
+      - -ec
+    command:
+      - |
+        while :; do
+          ip="$$(ip -4 -o addr show dev attestmesh0 2>/dev/null | awk '{{print $$4}}' | cut -d/ -f1)"
+          [ -n "$$ip" ] && break
+          sleep 1
+        done
+        exec socat -d -d TCP-LISTEN:5432,fork,reuseaddr,bind="$${{ip}}" TCP:postgres:5432
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+
+  postgres-egress-fw:
+    image: ghcr.io/attestmesh/agent-egress-fw@sha256:c75c9668e905ca00f86e9583505d52624ba87cb7114a4633f84330bb497ca58f
+    restart: unless-stopped
+    network_mode: service:postgres
+    depends_on:
+      - postgres
+    environment:
+      - INTERNAL_HOSTS=
+      - ALLOW_BASE_URL=
+      - ALLOW_CIDRS=
+      - ALLOW_DNS=127.0.0.11
+      - RERESOLVE_SECONDS=30
+    cap_add:
+      - NET_ADMIN
+
+volumes:
+  pgdata:
+"""
+
+
+def generic_compose(name: str, image: str, catalog_id: str | None) -> str:
     command = ""
     if catalog_id == "agent-runtime":
         command = "\n    command: [\"sh\", \"-lc\", \"while true; do sleep 3600; done\"]"
@@ -127,6 +231,12 @@ def compose_for(name: str, image: str, catalog_id: str | None) -> str:
       attestmesh.name: "{name}"
       attestmesh.source: "fleet-control"
 """
+
+
+def compose_for(name: str, image: str, catalog_id: str | None) -> str:
+    if catalog_id == "postgres":
+        return postgres_compose(name)
+    return generic_compose(name, image, catalog_id)
 
 
 def run_job(job_id: str) -> None:
@@ -230,7 +340,8 @@ class Handler(BaseHTTPRequestHandler):
             if not network_id or not cluster or not member_impl:
                 raise ValueError("networkId, cluster, and memberImpl are required")
             image = workload_image(body)
-            env_text = parse_env(str(body.get("env") or ""))
+            catalog_id = str(body.get("catalogId") or "").strip() or None
+            env = env_for_catalog(catalog_id, parse_env(str(body.get("env") or "")))
             job_id = secrets.token_hex(8)
             node = slug(f"{network_id}-{name}-{job_id[:6]}")
             flavor = str(body.get("flavor") or "medium")
@@ -246,14 +357,25 @@ class Handler(BaseHTTPRequestHandler):
                 "networkId": network_id,
                 "name": name,
                 "source": body.get("source"),
-                "catalogId": body.get("catalogId"),
+                "catalogId": catalog_id,
                 "imageRef": image,
                 "flavor": flavor,
                 "cluster": cluster,
                 "memberImpl": member_impl,
                 "nodeName": node,
                 "composePath": str(compose_path),
-                "appEnvB64": base64.b64encode(env_text.encode()).decode(),
+                "appEnvB64": base64.b64encode(env_text(env).encode()).decode(),
+                "connection": (
+                    {
+                        "kind": "postgres",
+                        "host": "meshIp",
+                        "port": 5432,
+                        "database": env.get("POSTGRES_DB", "postgres"),
+                        "user": env.get("POSTGRES_USER", "postgres"),
+                    }
+                    if catalog_id == "postgres"
+                    else None
+                ),
                 "box": box,
                 "createdAt": now,
                 "updatedAt": now,
