@@ -3,7 +3,8 @@
 #   redisha-redis-entrypoint.sh | redisha-sentinel-entrypoint.sh | redisha-haproxy-entrypoint.sh
 # All shared secrets are HKDF-derived from the cluster shared key at boot (same recipe as pg-ha);
 # the image contains none. Built/pushed by .github/workflows/build-redis-ha.yml.
-FROM redis:7.4-bookworm@sha256:b2b95679e3b46fb51864949ed25ea976fc3a6bcc00a40a1bc00d568cb2822e50  # pinned 2026-07-03
+# pinned 2026-07-03
+FROM redis:7.4-bookworm@sha256:b2b95679e3b46fb51864949ed25ea976fc3a6bcc00a40a1bc00d568cb2822e50
 
 ARG GRPCURL_VERSION=v1.9.3
 

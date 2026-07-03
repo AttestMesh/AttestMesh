@@ -2,7 +2,8 @@
 # (docs/research/fugu-subscription-pooling.md §3). Redis auth is HKDF-derived in-CVM from
 # the CLUSTER SHARED KEY (sidecar agent UDS) by the entrypoint — the image holds no secrets.
 # Built/pushed by .github/workflows/build-fugu-router.yml.
-FROM ghcr.io/berriai/litellm:v1.83.14-stable@sha256:c81eb79cd4333c6cfe374c0ec929110fd23f0ee5f7fd198855a6fbddc77b83ba  # pinned 2026-07-03
+# pinned 2026-07-03
+FROM ghcr.io/berriai/litellm:v1.83.14-stable@sha256:c81eb79cd4333c6cfe374c0ec929110fd23f0ee5f7fd198855a6fbddc77b83ba
 
 ARG GRPCURL_VERSION=v1.9.3
 RUN set -eux; \

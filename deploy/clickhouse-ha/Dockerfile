@@ -5,7 +5,8 @@
 # Keeper is the bundled clickhouse-keeper (no zookeeper image). All shared secrets are
 # HKDF-derived from the cluster shared key at boot (same recipe as pg-ha); the image
 # contains none. Built/pushed by .github/workflows/build-clickhouse-ha.yml.
-FROM clickhouse/clickhouse-server:24.8@sha256:1ffa82edee000a42c09313bd9f1293d94c570aee74babc1b3ca9983a35fa597b  # pinned 2026-07-03
+# pinned 2026-07-03
+FROM clickhouse/clickhouse-server:24.8@sha256:1ffa82edee000a42c09313bd9f1293d94c570aee74babc1b3ca9983a35fa597b
 
 ARG GRPCURL_VERSION=v1.9.3
 
