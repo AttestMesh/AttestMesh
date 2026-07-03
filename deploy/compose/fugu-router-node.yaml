@@ -290,7 +290,7 @@ services:
   #    Its entrypoint CSK-derives the redis password over the agent gRPC before exec.
   #    DSN is the multi-host pg-ha forwarder path (survives node rolls/failover). ──
   litellm:
-    image: ghcr.io/attestmesh/fugu-router@sha256:PLACEHOLDER_FUGU_ROUTER
+    image: ghcr.io/attestmesh/fugu-router@sha256:8d1c03473a6e0b5413afcbc51b3d345cf02d19ff2fe3b5533a5ba748a95f6036 # pinned 2026-07-03
     restart: unless-stopped
     depends_on:
       - sidecar
