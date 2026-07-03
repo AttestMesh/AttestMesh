@@ -102,8 +102,9 @@ def main() -> None:
         room,
         f"{BOT} please do the following, in order: "
         f"1) ensure_user username={AGENT} (a normal non-admin user; generate a random password). "
-        f"2) create_login_token username={AGENT} with no expiry. "
-        f"Reply with the minted access token. I confirm both actions in advance — yes, proceed.",
+        f"2) create_login_token username={AGENT} valid_hours=8760 — exactly 8760, the maximum "
+        f"(the executor coerces omitted valid_hours to 24h; 8760 = 1 year is the longest allowed). "
+        f"Reply with the minted access token.",
     )
 
     since = None
@@ -121,15 +122,17 @@ def main() -> None:
             if ev.get("type") != "m.room.message" or ev.get("sender") != BOT:
                 continue
             body = ev.get("content", {}).get("body", "")
-            print(f"bot: {body[:200]}", file=sys.stderr)
+            print(f"bot: {TOKEN_RE.sub('syt_[REDACTED]', body)[:200]}", file=sys.stderr)
             match = TOKEN_RE.search(body)
             if match:
                 print(json.dumps({"user_id": f"@{AGENT}:{SERVER}", "access_token": match.group(1)}))
                 return
-            # Confirm-first flow: nudge past confirmation prompts, bounded.
+            # Confirm-first flow: the agent's matcher accepts the reply only if
+            # the mention-stripped body is EXACTLY an affirmative ("yes"), so
+            # mention via m.mentions metadata only, bare body. Bounded.
             if confirms < 3:
                 confirms += 1
-                say(tok, room, f"{BOT} yes — confirmed, proceed.")
+                say(tok, room, "yes")
     raise SystemExit("timed out waiting for the bot to mint the token")
 
 
