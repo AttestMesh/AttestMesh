@@ -45,6 +45,15 @@ CORS_ORIGIN="${CORS_ORIGIN:-https://console.attestmesh.xyz}"
 CONSOLE_HOST="${CONSOLE_HOST:-console.attestmesh.xyz}"
 APP_DOMAIN="${APP_DOMAIN:-app.attestmesh.xyz}"
 GITHUB_OAUTH_CALLBACK_URL="${GITHUB_OAUTH_CALLBACK_URL:-https://console.attestmesh.xyz/api/v1/auth/github/callback}"
+# mesh-state-api runs on the self-hosted box and is reachable from the Synclave
+# CVM via a bridge-only listener on dstack-br0.
+CLUSTER_API_URL="${CLUSTER_API_URL:-http://10.0.100.1:8787}"
+CLUSTER_NETWORK_ID="${CLUSTER_NETWORK_ID:-net_attestmesh_live}"
+CLUSTER_NAME="${CLUSTER_NAME:-AttestMesh C3}"
+# CF app-fronting (non-secret): the attestmesh.xyz zone + the origin the proxied
+# <slug>.app records point at (the box haproxy public IP).
+CLOUDFLARE_ZONE_ID="${CLOUDFLARE_ZONE_ID:-5b276342195bda12c978f20ed38a3757}"
+CLOUDFLARE_ORIGIN_IP="${CLOUDFLARE_ORIGIN_IP:-173.231.234.133}"
 
 # CVM sizing (tee-daemon spawns tenant containers → give it headroom; confirm vs live).
 export BOX_VCPU="${BOX_VCPU:-4}" BOX_MEM="${BOX_MEM:-8192}" BOX_DISK="${BOX_DISK:-60}"
@@ -113,6 +122,10 @@ send_seq() {
 }
 
 # Forward compose + helper to the box and run a box-side mode with sealed E_* env.
+# HARDENED: the E_* values (secrets included) are piped over ssh stdin as a
+# %q-quoted env payload and sourced by the remote shell — they never appear on
+# the remote argv (`ps`), in sudo logs, or in shell history. Only the non-secret
+# BOX_* knobs ride the command line.
 _box_run() {
   local mode="$1" app_id="${2:-}" vm_id="${3:-}" guser gtok
   guser=$(grep -E '^\s*username\s*=' "$HOME/.teesql/ghcr-pull.toml" 2>/dev/null | head -1 | sed -E 's/.*=\s*//' | tr -d "\"' ")
@@ -120,14 +133,45 @@ _box_run() {
   [ -n "$gtok" ] || die "no ghcr token in ~/.teesql/ghcr-pull.toml"
   scp -o BatchMode=yes -q "$COMPOSE" "$BOX_HOST:/tmp/${NODE}.yaml"
   scp -o BatchMode=yes -q "$HERE/synclave-node-box.py" "$BOX_HOST:/tmp/synclave-node-box.py"
-  ssh_box "sudo BOX_NAME='$NODE' BOX_COMPOSE='/tmp/${NODE}.yaml' BOX_VCPU=$BOX_VCPU BOX_MEM=$BOX_MEM BOX_DISK=$BOX_DISK BOX_PORTS='$BOX_PORTS' BOX_GATEWAY_ENABLED='$BOX_GATEWAY_ENABLED' BOX_NET_MODE='$BOX_NET_MODE' BOX_FRESH_DISK='${BOX_FRESH_DISK:-}' \
-    E_CHAIN_ID='$CHAIN_ID' E_RPC_URL='$RPC_URL' E_BUNDLER_URL='${BUNDLER_URL:-$RPC_URL}' E_GAS_POLICY_ID='${GAS_POLICY_ID:-}' E_INDEXER_REGISTRY_ADDR='$INDEXER_REGISTRY_ADDR' E_GATEWAY_DOMAIN='$GATEWAY_DOMAIN' \
-    E_POSTGRES_PASSWORD='$POSTGRES_PASSWORD' E_TEE_DAEMON_TOKEN='$TEE_DAEMON_TOKEN' E_SESSION_SECRET='$SESSION_SECRET' E_DATABASE_URL='$DATABASE_URL' \
-    E_PRIVY_APP_ID='$PRIVY_APP_ID' E_PRIVY_APP_SECRET='$PRIVY_APP_SECRET' E_GITHUB_CLIENT_ID='$GITHUB_CLIENT_ID' E_GITHUB_CLIENT_SECRET='$GITHUB_CLIENT_SECRET' E_GITHUB_OAUTH_CALLBACK_URL='$GITHUB_OAUTH_CALLBACK_URL' \
-    E_PUBLIC_BASE_URL='$PUBLIC_BASE_URL' E_APP_DOMAIN='$APP_DOMAIN' E_CORS_ORIGIN='$CORS_ORIGIN' E_CONSOLE_HOST='$CONSOLE_HOST' \
-    E_CLOUDFLARE_API_TOKEN='$CLOUDFLARE_API_TOKEN' E_ADMIN_API_KEY='$ADMIN_API_KEY' E_TLS_FULLCHAIN_B64='$TLS_FULLCHAIN_B64' E_TLS_KEY_B64='$TLS_KEY_B64' \
-    E_DSTACK_DOCKER_USERNAME='${guser:-dmvt}' E_DSTACK_DOCKER_PASSWORD='$gtok' E_DSTACK_DOCKER_REGISTRY='ghcr.io' \
-    $BOX_PY /tmp/synclave-node-box.py $mode $app_id $vm_id"
+  {
+    printf 'E_CHAIN_ID=%q\n'                 "$CHAIN_ID"
+    printf 'E_RPC_URL=%q\n'                  "$RPC_URL"
+    printf 'E_BUNDLER_URL=%q\n'              "${BUNDLER_URL:-$RPC_URL}"
+    printf 'E_GAS_POLICY_ID=%q\n'            "${GAS_POLICY_ID:-}"
+    printf 'E_INDEXER_REGISTRY_ADDR=%q\n'    "$INDEXER_REGISTRY_ADDR"
+    printf 'E_GATEWAY_DOMAIN=%q\n'           "$GATEWAY_DOMAIN"
+    printf 'E_POSTGRES_PASSWORD=%q\n'        "$POSTGRES_PASSWORD"
+    printf 'E_TEE_DAEMON_TOKEN=%q\n'         "$TEE_DAEMON_TOKEN"
+    printf 'E_SESSION_SECRET=%q\n'           "$SESSION_SECRET"
+    printf 'E_DATABASE_URL=%q\n'             "$DATABASE_URL"
+    printf 'E_PRIVY_APP_ID=%q\n'             "$PRIVY_APP_ID"
+    printf 'E_PRIVY_APP_SECRET=%q\n'         "$PRIVY_APP_SECRET"
+    printf 'E_GITHUB_CLIENT_ID=%q\n'         "$GITHUB_CLIENT_ID"
+    printf 'E_GITHUB_CLIENT_SECRET=%q\n'     "$GITHUB_CLIENT_SECRET"
+    printf 'E_GITHUB_OAUTH_CALLBACK_URL=%q\n' "$GITHUB_OAUTH_CALLBACK_URL"
+    printf 'E_DAEMON_URL=%q\n'               "${DAEMON_URL:-}"
+    printf 'E_PUBLIC_BASE_URL=%q\n'          "$PUBLIC_BASE_URL"
+    printf 'E_APP_DOMAIN=%q\n'               "$APP_DOMAIN"
+    printf 'E_CLUSTER_API_URL=%q\n'          "$CLUSTER_API_URL"
+    printf 'E_CLUSTER_NETWORK_ID=%q\n'       "$CLUSTER_NETWORK_ID"
+    printf 'E_CLUSTER_NAME=%q\n'             "$CLUSTER_NAME"
+    printf 'E_CLUSTER_SELF_APP_ID=%q\n'      "${CLUSTER_SELF_APP_ID:-${X:-}}"
+    printf 'E_CLUSTER_NETWORKS=%q\n'         "${CLUSTER_NETWORKS:-}"
+    printf 'E_CORS_ORIGIN=%q\n'              "$CORS_ORIGIN"
+    printf 'E_CONSOLE_HOST=%q\n'             "$CONSOLE_HOST"
+    printf 'E_CLOUDFLARE_API_TOKEN=%q\n'     "$CLOUDFLARE_API_TOKEN"
+    printf 'E_CLOUDFLARE_ZONE_ID=%q\n'       "$CLOUDFLARE_ZONE_ID"
+    printf 'E_CLOUDFLARE_ORIGIN_IP=%q\n'     "$CLOUDFLARE_ORIGIN_IP"
+    printf 'E_ADMIN_API_KEY=%q\n'            "$ADMIN_API_KEY"
+    printf 'E_LABELS_API_URL=%q\n'           "${LABELS_API_URL:-}"
+    printf 'E_LABELS_API_TOKEN=%q\n'         "${LABELS_API_TOKEN:-}"
+    printf 'E_TLS_FULLCHAIN_B64=%q\n'        "$TLS_FULLCHAIN_B64"
+    printf 'E_TLS_KEY_B64=%q\n'              "$TLS_KEY_B64"
+    printf 'E_DSTACK_DOCKER_USERNAME=%q\n'   "${guser:-dmvt}"
+    printf 'E_DSTACK_DOCKER_PASSWORD=%q\n'   "$gtok"
+    printf 'E_DSTACK_DOCKER_REGISTRY=%q\n'   "ghcr.io"
+  } | ssh_box "sudo BOX_NAME='$NODE' BOX_COMPOSE='/tmp/${NODE}.yaml' BOX_VCPU=$BOX_VCPU BOX_MEM=$BOX_MEM BOX_DISK=$BOX_DISK BOX_PORTS='$BOX_PORTS' BOX_GATEWAY_ENABLED='$BOX_GATEWAY_ENABLED' BOX_NET_MODE='$BOX_NET_MODE' BOX_FRESH_DISK='${BOX_FRESH_DISK:-}' \
+    bash -c 'set -a; . /dev/stdin; set +a; exec $BOX_PY /tmp/synclave-node-box.py $mode $app_id $vm_id'"
 }
 
 deploy_cvm() {

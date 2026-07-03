@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Box-side deploy helper for deploy/synclave-node.sh.
+"""Box-side deploy helper for deploy/webhost-node.sh.
 
 Runs ON the self-hosted on-chain dstack box. Mirrors ssh-node-box.py /
 matrix-node-box.py: it wraps the SAME mcp_dstack primitives the MCP tool uses to
@@ -21,8 +21,8 @@ Secrets arrive via E_* env vars (passed in-memory over SSH) and are NEVER writte
 The app-compose built here MUST mirror the deploy path's app_compose (incl. the docker-login
 pre_launch_script + APP_ID in allowed_envs); keep in sync with ssh-node-box.py.
 
-  sudo E_RPC_URL=… … BOX_COMPOSE=/tmp/synclave-node.yaml \
-    /opt/dstack-mcp/venv/bin/python synclave-node-box.py deploy
+  sudo E_RPC_URL=… … BOX_COMPOSE=/tmp/webhost-node.yaml \
+    /opt/dstack-mcp/venv/bin/python webhost-node-box.py deploy
 """
 
 from __future__ import annotations
@@ -36,8 +36,8 @@ import time
 sys.path.insert(0, "/opt/dstack-mcp")
 import mcp_dstack as m  # noqa: E402
 
-NAME = os.environ.get("BOX_NAME", "synclave-node")
-COMPOSE_PATH = os.environ.get("BOX_COMPOSE", "/tmp/synclave-node.yaml")
+NAME = os.environ.get("BOX_NAME", "webhost-node")
+COMPOSE_PATH = os.environ.get("BOX_COMPOSE", "/tmp/webhost-node.yaml")
 VCPU = int(os.environ.get("BOX_VCPU", "4"))
 MEM = int(os.environ.get("BOX_MEM", "8192"))
 DISK = int(os.environ.get("BOX_DISK", "60"))
@@ -64,37 +64,39 @@ ENV_KEYS = [
     "GAS_POLICY_ID",
     "INDEXER_REGISTRY_ADDR",
     "GATEWAY_DOMAIN",
-    # --- Synclave application (key NAMES measured into compose_hash, VALUES sealed;
+    # --- Open webhost application (key NAMES measured into compose_hash, VALUES sealed;
     #     some are non-secret config, still sealed for a single measured surface) ---
-    "POSTGRES_PASSWORD",
     "TEE_DAEMON_TOKEN",
-    "SESSION_SECRET",
-    "DATABASE_URL",
-    "PRIVY_APP_ID",
-    "PRIVY_APP_SECRET",
-    "GITHUB_CLIENT_ID",
-    "GITHUB_CLIENT_SECRET",
-    "GITHUB_OAUTH_CALLBACK_URL",
-    "DAEMON_URL",
-    "PUBLIC_BASE_URL",
+    "GITHUB_ID",
+    "GITHUB_SECRET",
+    "NEXTAUTH_SECRET",
+    "NEXTAUTH_URL",
     "APP_DOMAIN",
-    "CLUSTER_API_URL",
-    "CLUSTER_NETWORK_ID",
-    "CLUSTER_NAME",
-    "CLUSTER_SELF_APP_ID",
-    "CLUSTER_NETWORKS",
-    "CORS_ORIGIN",
     "CONSOLE_HOST",
+    "REDPILL_API_KEY",
+    "REDPILL_BASE_URL",
+    "REDPILL_MODEL",
+    "VENICE_API_KEY",
+    "VENICE_BASE_URL",
+    "VENICE_MODEL",
+    "RUNYARD_HUB_URL",
+    "RUNYARD_HUB_TOKEN",
+    "RUNYARD_PRIVACY_AUDIT_CAPABILITY",
+    "RUNYARD_EXECUTION_MODE",
+    "RUNYARD_RUNNER_LOCATION",
+    "RUNYARD_PRIVACY_AUDIT_LLM",
+    "RUNYARD_CALLBACK_SECRET",
+    "RUNYARD_CALLBACK_URL",
     "CLOUDFLARE_API_TOKEN",
-    # CF app-fronting: zone for the proxied <slug>.app records + the origin IP
-    # (box haproxy) they point at. Non-secret, still sealed (one measured surface).
-    "CLOUDFLARE_ZONE_ID",
-    "CLOUDFLARE_ORIGIN_IP",
-    "ADMIN_API_KEY",
-    "LABELS_API_URL",
-    "LABELS_API_TOKEN",
-    "TLS_FULLCHAIN_B64",
-    "TLS_KEY_B64",
+    "BACKUP_STORAGE",
+    "BACKUP_S3_ENDPOINT",
+    "BACKUP_S3_BUCKET",
+    "BACKUP_S3_REGION",
+    "BACKUP_S3_ACCESS_KEY_ID",
+    "BACKUP_S3_SECRET_ACCESS_KEY",
+    "BACKUP_PREFIX",
+    "BACKUP_APP_ID",
+    "BACKUP_INTERVAL_SECONDS",
     # --- private-registry pull creds (ghcr.io/dmvt/* + attestmesh sidecar) ---
     "DSTACK_DOCKER_USERNAME",
     "DSTACK_DOCKER_PASSWORD",
@@ -193,7 +195,7 @@ def main() -> None:
         app_id = sys.argv[2] if len(sys.argv) > 2 else ""
         vm_id = sys.argv[3] if len(sys.argv) > 3 else ""
         if not app_id or not vm_id:
-            raise SystemExit("usage: synclave-node-box.py update <app_id> <vm_id>")
+            raise SystemExit("usage: webhost-node-box.py update <app_id> <vm_id>")
 
         env = build_env()
         compose_file, compose_hash = app_compose_and_hash(list(env.keys()))
@@ -299,7 +301,7 @@ def main() -> None:
         )
         return
 
-    raise SystemExit("usage: synclave-node-box.py [deploy|hash|update <app_id> <vm_id>]")
+    raise SystemExit("usage: webhost-node-box.py [deploy|hash|update <app_id> <vm_id>]")
 
 
 if __name__ == "__main__":

@@ -1,9 +1,18 @@
 #!/usr/bin/env python3
-"""Box-side deploy helper for deploy/synclave-node.sh.
+"""Box-side deploy helper for deploy/runyard-node.sh.
 
-Runs ON the self-hosted on-chain dstack box. Mirrors ssh-node-box.py /
-matrix-node-box.py: it wraps the SAME mcp_dstack primitives the MCP tool uses to
+Runs ON the self-hosted on-chain dstack box. Mirrors synclave-node-box.py /
+ssh-node-box.py: it wraps the SAME mcp_dstack primitives the MCP tool uses to
 register a stock DstackApp on Base, seal the runtime env, and CreateVm / UpgradeApp.
+
+RunYard-specific vs synclave:
+  - RunYard's four sealed env key NAMES (RUNYARD_HUB_SESSION_SECRET,
+    SECRETS_ENC_KEY, RUNYARD_HUB_BOOTSTRAP_TOKEN, RUNYARD_HUB_TOKEN) — measured
+    into the compose_hash via allowed_envs.
+  - no_instance_id: True — the disk key is bound to the app_id alone (not
+    app_id||instance_id), so hub-data / runner-workspace survive future upgrades
+    and any fresh CreateVm that reuses the app_id. Deliberate for a stateful
+    control plane.
 
 Three modes:
   deploy          — register a stock DstackApp + seal env + bridge CreateVm (gateway ON).
@@ -12,17 +21,14 @@ Three modes:
                     allowlist a new hash on the cluster BEFORE an in-place update.
   update <app_id> <vm_id>
                   — roll a new compose/env onto an existing app. Default = IN-PLACE,
-                    DISK-PRESERVING UpgradeApp (StopVm → UpgradeApp same vm_id → StartVm)
-                    so the Postgres/daemon/caddy volumes survive; the compose_hash change
-                    is only an on-chain KMS auth gate, not part of the disk key. With
-                    BOX_FRESH_DISK=1 (a DELIBERATE wipe) it does a fresh-disk CreateVm.
+                    DISK-PRESERVING UpgradeApp (StopVm -> UpgradeApp same vm_id -> StartVm).
+                    With BOX_FRESH_DISK=1 (a DELIBERATE wipe) it does a fresh-disk CreateVm;
+                    with no_instance_id:True the app-bound disk key means even a fresh
+                    CreateVm re-derives the same key, so volumes persist unless wiped.
 
 Secrets arrive via E_* env vars (passed in-memory over SSH) and are NEVER written to disk.
-The app-compose built here MUST mirror the deploy path's app_compose (incl. the docker-login
-pre_launch_script + APP_ID in allowed_envs); keep in sync with ssh-node-box.py.
-
-  sudo E_RPC_URL=… … BOX_COMPOSE=/tmp/synclave-node.yaml \
-    /opt/dstack-mcp/venv/bin/python synclave-node-box.py deploy
+Keep the app-compose (allowed_envs, pre_launch_script, no_instance_id) in sync with the
+deploy/update paths — the compose_hash must match on every roll.
 """
 
 from __future__ import annotations
@@ -36,20 +42,28 @@ import time
 sys.path.insert(0, "/opt/dstack-mcp")
 import mcp_dstack as m  # noqa: E402
 
-NAME = os.environ.get("BOX_NAME", "synclave-node")
-COMPOSE_PATH = os.environ.get("BOX_COMPOSE", "/tmp/synclave-node.yaml")
-VCPU = int(os.environ.get("BOX_VCPU", "4"))
-MEM = int(os.environ.get("BOX_MEM", "8192"))
-DISK = int(os.environ.get("BOX_DISK", "60"))
+NAME = os.environ.get("BOX_NAME", "runyard-node")
+COMPOSE_PATH = os.environ.get("BOX_COMPOSE", "/tmp/runyard-node.yaml")
+VCPU = int(os.environ.get("BOX_VCPU", "16"))
+MEM = int(os.environ.get("BOX_MEM", "65536"))
+DISK = int(os.environ.get("BOX_DISK", "500"))
 PORTS = json.loads(os.environ.get("BOX_PORTS", "[]"))
-# CVM networking: "bridge" (default) → routable on dstack-br0; the box haproxy SNI
-# backend + the dstack gateway reach tlsproxy:443 at the CVM's bridge IP. In bridge
-# mode KMS is the SLIRP alias 10.0.2.2 (RA-TLS cert SAN), reached via the host DNAT.
+# CVM networking: "bridge" (default) -> routable on dstack-br0; the box reaches
+# the sidecar health (:9090) at the CVM's bridge IP, and (access model b) the hub
+# for admin. In bridge mode KMS is the SLIRP alias 10.0.2.2 (RA-TLS cert SAN).
 NET_MODE = (os.environ.get("BOX_NET_MODE", "bridge").strip().lower() or "bridge")
-# Gateway ON: tenant apps at *.app.attestmesh.xyz route through the dstack gateway,
-# and the CVM is reachable at <app_id>-<port>s.gateway.attestmesh.xyz. Measured into
+# Gateway ON: the sidecar's wg-over-gateway-TCP transport needs it
+# (<app_id>-51900s). The hub is NOT published, so it stays private. Measured into
 # compose_hash (gateway_enabled).
 GATEWAY_ENABLED = os.environ.get("BOX_GATEWAY_ENABLED", "true").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+# no_instance_id: app-bound disk key (state persists across upgrades). Defaults ON
+# for RunYard; overridable for parity/testing.
+NO_INSTANCE_ID = os.environ.get("BOX_NO_INSTANCE_ID", "true").strip().lower() in {
     "1",
     "true",
     "yes",
@@ -64,38 +78,15 @@ ENV_KEYS = [
     "GAS_POLICY_ID",
     "INDEXER_REGISTRY_ADDR",
     "GATEWAY_DOMAIN",
-    # --- Synclave application (key NAMES measured into compose_hash, VALUES sealed;
-    #     some are non-secret config, still sealed for a single measured surface) ---
-    "POSTGRES_PASSWORD",
-    "TEE_DAEMON_TOKEN",
-    "SESSION_SECRET",
-    "DATABASE_URL",
-    "PRIVY_APP_ID",
-    "PRIVY_APP_SECRET",
-    "GITHUB_CLIENT_ID",
-    "GITHUB_CLIENT_SECRET",
-    "GITHUB_OAUTH_CALLBACK_URL",
-    "DAEMON_URL",
-    "PUBLIC_BASE_URL",
-    "APP_DOMAIN",
-    "CLUSTER_API_URL",
-    "CLUSTER_NETWORK_ID",
-    "CLUSTER_NAME",
-    "CLUSTER_SELF_APP_ID",
-    "CLUSTER_NETWORKS",
-    "CORS_ORIGIN",
-    "CONSOLE_HOST",
-    "CLOUDFLARE_API_TOKEN",
-    # CF app-fronting: zone for the proxied <slug>.app records + the origin IP
-    # (box haproxy) they point at. Non-secret, still sealed (one measured surface).
-    "CLOUDFLARE_ZONE_ID",
-    "CLOUDFLARE_ORIGIN_IP",
-    "ADMIN_API_KEY",
-    "LABELS_API_URL",
-    "LABELS_API_TOKEN",
-    "TLS_FULLCHAIN_B64",
-    "TLS_KEY_B64",
-    # --- private-registry pull creds (ghcr.io/dmvt/* + attestmesh sidecar) ---
+    # --- RunYard application (key NAMES measured into compose_hash, VALUES sealed) ---
+    "RUNYARD_HUB_SESSION_SECRET",
+    "SECRETS_ENC_KEY",
+    "RUNYARD_HUB_BOOTSTRAP_TOKEN",
+    "RUNYARD_HUB_TOKEN",
+    # --- tailnet ingress (tailscale sidecar sharing the hub's netns) ---
+    "TS_AUTHKEY",
+    # --- registry pull creds (sidecar image is private ghcr.io/attestmesh/*;
+    #     hub/runner are public, login is a harmless no-op for them) ---
     "DSTACK_DOCKER_USERNAME",
     "DSTACK_DOCKER_PASSWORD",
     "DSTACK_DOCKER_REGISTRY",
@@ -121,11 +112,12 @@ def app_compose_and_hash(env_keys: list[str]) -> tuple[str, str]:
         "public_logs": True,
         "public_sysinfo": True,
         "allowed_envs": sorted(set(env_keys) | {"APP_ID"}),
-        "no_instance_id": False,  # stable per-instance disk (app_id||instance_id)
+        "no_instance_id": NO_INSTANCE_ID,  # app-bound disk key (state persistence)
         "secure_time": False,
     }
-    # Log in to the private registry inside the guest so ghcr.io/dmvt/* +
-    # ghcr.io/attestmesh/* images pull. Creds arrive sealed as DSTACK_DOCKER_*.
+    # Log in to the private registry inside the guest so ghcr.io/attestmesh/*
+    # (the sidecar) pulls. Public hub/runner pulls don't need it. Creds arrive
+    # sealed as DSTACK_DOCKER_*; the guard makes it a no-op when absent.
     app_compose["pre_launch_script"] = (
         'if [ -n "$DSTACK_DOCKER_PASSWORD" ]; then '
         'echo "$DSTACK_DOCKER_PASSWORD" | docker login "${DSTACK_DOCKER_REGISTRY:-ghcr.io}" '
@@ -193,7 +185,7 @@ def main() -> None:
         app_id = sys.argv[2] if len(sys.argv) > 2 else ""
         vm_id = sys.argv[3] if len(sys.argv) > 3 else ""
         if not app_id or not vm_id:
-            raise SystemExit("usage: synclave-node-box.py update <app_id> <vm_id>")
+            raise SystemExit("usage: runyard-node-box.py update <app_id> <vm_id>")
 
         env = build_env()
         compose_file, compose_hash = app_compose_and_hash(list(env.keys()))
@@ -206,9 +198,8 @@ def main() -> None:
             "on",
         }
 
-        # Best-effort: the VM may already be stopped, or removed entirely (e.g. a
-        # RemoveVm was needed to clear a stale/duplicate vsock CID). Either way the
-        # fresh-disk CreateVm below reuses the app_id, so a missing vm_id is fine.
+        # Best-effort: the VM may already be stopped, or removed entirely. Either
+        # way the fresh-disk CreateVm below reuses the app_id.
         try:
             m.vmm("StopVm", {"id": vm_id})
         except Exception:
@@ -266,9 +257,8 @@ def main() -> None:
             )
             return
 
-        # IN-PLACE, DISK-PRESERVING roll. UpgradeApp (UpdateVmRequest) has NO
-        # networking field — bridge mode must already be on the VM manifest (set at
-        # the original CreateVm). vcpu/memory/disk/image omitted → unchanged.
+        # IN-PLACE, DISK-PRESERVING roll. UpgradeApp has NO networking field —
+        # bridge mode must already be on the VM manifest (set at CreateVm).
         upgrade = m.vmm(
             "UpgradeApp",
             {
@@ -299,7 +289,7 @@ def main() -> None:
         )
         return
 
-    raise SystemExit("usage: synclave-node-box.py [deploy|hash|update <app_id> <vm_id>]")
+    raise SystemExit("usage: runyard-node-box.py [deploy|hash|update <app_id> <vm_id>]")
 
 
 if __name__ == "__main__":
