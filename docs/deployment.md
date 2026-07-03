@@ -96,6 +96,186 @@ source deploy/env.sh                                   # load ~/.teesql creds
 #                                CLUSTER=… MEMBER_IMPL=… deploy/node-pathA.sh attestmesh-node-1 setup
 ```
 
+## `deploy/` directory map
+
+`deploy/` is the operator-facing deployment workspace. It is intentionally split into:
+
+- **Thin, durable orchestration** in `deploy/workflows/*.tsx` (Smithers).
+- **Logged, re-entrant routines** in `deploy/*.sh` plus the box-side Python helpers.
+- **Measured runtime payloads** in `deploy/compose/*.yaml` and the support image directories.
+- **Local runtime state** under ignored paths such as `deploy/logs/`, `deploy/.smithers/`,
+  `deploy/smithers.db*`, `deploy/node_modules/`, `deploy/*.env`, and `deploy/__pycache__/`.
+
+Tracked layout:
+
+```text
+deploy/
+├── env.sh                         # non-secret env bridge; reads secrets from ~/.teesql
+├── lib.sh                         # shared logging, require(), run_step()
+├── onchain.sh                     # contracts, cluster, Path A facet, app-id allowlist
+├── webhook.sh                     # Cloudflare Worker deploy + gas-webhook route repair
+├── indexer.sh                     # shared Phala indexer deploy/register/update
+├── node-pathA.sh                  # Phala base-KMS cluster node deploy/update
+├── node.sh                        # legacy custom-app-id node path, kept for reference
+├── matrix-node.sh                 # self-hosted box Matrix node driver
+├── postgres-node.sh               # self-hosted box standalone Postgres node driver
+├── pg-ha-node.sh                  # self-hosted box Postgres HA cluster driver (N nodes)
+├── ssh-node.sh                    # self-hosted box SSH-ingress node driver
+├── matrix-node-box.py             # runs on the box; deploy/hash/update Matrix CVMs
+├── postgres-node-box.py           # runs on the box; deploy/hash/update Postgres CVMs
+├── pg-ha-node-box.py              # runs on the box; register/create/hash/update/stop/start pg-ha CVMs
+├── ssh-node-box.py                # runs on the box; deploy/hash/update SSH CVMs
+├── matrix-probe.py                # send-a-command / await-bot-reply Matrix room probe (MATRIX_PROBE_* env)
+├── package.json                   # Smithers command aliases + dev dependencies
+├── bun.lock                       # pinned deploy-workspace JS dependencies
+├── workflows/
+│   ├── deploy.tsx                 # full Phala stack workflow
+│   ├── matrix-node.tsx            # private Matrix node workflow
+│   ├── postgres-node.tsx          # standalone Postgres node workflow
+│   └── pg-ha.tsx                  # Postgres HA cluster workflow (Patroni + etcd + HAProxy)
+├── compose/
+│   ├── node-1.yaml                # sidecar-only cluster member on Phala
+│   ├── indexer-1.yaml             # attested shared indexer CVM
+│   ├── matrix-node.yaml           # Matrix homeserver + sidecar + agents + metrics
+│   ├── postgres-node.yaml         # Postgres service node + sidecar + admin agent
+│   ├── pg-ha-node.yaml            # one Postgres HA node: sidecar-netns Patroni/etcd/HAProxy + admin agent
+│   └── ssh-node.yaml              # sidecar + sshd exposed through gateway TLS
+├── agent-egress-fw/
+│   ├── Dockerfile                 # egress firewall helper image
+│   └── egress-fw.sh               # default-DROP outbound policy script
+├── postgres-walg/
+│   ├── Dockerfile                 # Postgres image with optional WAL-G backup/restore
+│   ├── docker-entrypoint-walg.sh  # stock Postgres entrypoint wrapper
+│   ├── walg-archive               # archive_command wrapper
+│   ├── walg-backup-loop.sh        # periodic base backups + retention
+│   ├── walg-csk-key.sh            # writes WAL-G key derived from the cluster shared key
+│   ├── walg-env.sh                # WAL-G / R2 environment assembly
+│   ├── walg-restore.sh            # restore base backup + WAL replay
+│   ├── walg-wal-fetch             # restore_command wrapper
+│   └── agent.proto                # sidecar agent gRPC contract copy for CSK access
+├── pg-ha/
+│   ├── Dockerfile                 # Patroni + etcd + HAProxy on the postgres-walg base
+│   ├── pgha-common.sh             # mesh-IP wait/guard + CSK-HKDF secret derivation helpers
+│   ├── pgha-etcd-entrypoint.sh    # etcd bootstrap state machine (new/join/restart)
+│   ├── pgha-patroni-entrypoint.sh # renders patroni.yml from CSK-derived credentials
+│   ├── pgha-haproxy-entrypoint.sh # primary/replica routing on the mesh IP
+│   ├── pgha-backup-loop.sh        # WAL-G base backups, primary-only
+│   ├── pgha-post-init.sh          # creates the meshverify verification user
+│   └── pgha-walg-bootstrap.sh     # Patroni custom bootstrap: DR restore from R2
+├── postgres-admin-agent/
+│   ├── Dockerfile
+│   ├── pyproject.toml
+│   ├── README.md
+│   └── postgres_admin_agent/      # Matrix bot for Postgres status/query/admin ops (+ Patroni !pgha)
+└── matrix-node-*.md               # Matrix-specific runbooks, journals, and history
+```
+
+### Root drivers
+
+The root shell scripts are the main operational interface. They all source `deploy/lib.sh`,
+write timestamped logs under `deploy/logs/`, and persist small state files there so a failed
+step can be re-run without rediscovering app IDs or VM IDs.
+
+| File | Role | Main subcommands / behavior |
+|---|---|---|
+| `env.sh` | Loads public deployment constants plus secrets from `~/.teesql`. | Exports Base mainnet RPC/bundler, gas policy, deployer key/address, KMS root, compose hash, and optional Phala key. Contains no committed secrets. |
+| `lib.sh` | Shared shell helpers. | `log`, `die`, `require`, and `run_step`; every `run_step` writes a per-step logfile and tails failures. |
+| `onchain.sh` | Track A on-chain deployment. | `preflight`, `infra`, `cluster [name]`, `patha-upgrade <cluster>`, `seed-appid <cluster> <member>`, `all`. Generates cluster config JSON under `contracts/script/clusters/`. |
+| `webhook.sh` | Gas-sponsorship worker deployment. | `deploy` runs Wrangler from `services/gas-sponsorship-webhook` and ensures `gas-webhook.teesql.com/*` points at the current worker; `route` repairs only the route. |
+| `indexer.sh` | Shared attested indexer deployment. | `ensure` no-ops if `IndexerRegistry.current()` is already set; otherwise `deploy -> register -> verify`. Also supports `env-file`, `update`, and direct substeps. |
+| `node-pathA.sh` | Phala base-KMS cluster member deployment. | `deploy -> prime -> upgrade -> verify`; `setup` skips the long verify poll, `update` allowlists a new compose hash before rolling, `restart` re-pulls images, `mesh-verify` polls `phase=healthy`. |
+| `node.sh` | Legacy custom-app-id flow. | Kept as a reference for a future KMS that supports `--custom-app-id`; the Base KMS path uses `node-pathA.sh`. |
+| `matrix-node.sh` | Private Matrix homeserver on the self-hosted dstack box. | `deploy -> cluster -> patha -> prime -> bind -> verify -> verify-agent -> verify-client -> verify-isolation`; `update` is disk-preserving by default, `restore` is a deliberate fresh-disk WAL-G recovery, `backup-status` checks R2. |
+| `postgres-node.sh` | Standalone PostgreSQL node on the self-hosted box. | Joins the Matrix node's cluster, inherits the Matrix mesh endpoint, then verifies registration, mesh DB endpoint, Matrix admin-agent replies, Prometheus-backed metrics, and host isolation. |
+| `pg-ha-node.sh` | Postgres HA cluster (Patroni + etcd + HAProxy) as `PGHA_COUNT` nodes (default 3) on the self-hosted box. | `deploy-all` (= `register-all` -> `compute-peers` -> `create-all`, precomputing every node's mesh IP off-chain for etcd static bootstrap) -> `prime-all` -> `bind-all` -> `verify-all` (incl. on-chain `meshIpOf` cross-check) -> `verify-ha` (leader/replica/routing/replication from the ssh-node mesh shell) -> `verify-isolation-all` -> `verify-agent`. Day-2: `update <pgN>` / serialized `update-all`, `verify-failover` drill. See `docs/specs/pg-ha.md`. |
+| `ssh-node.sh` | Minimal SSH ingress node on the self-hosted box. | Joins the existing Matrix cluster by default, seals this machine's `~/.ssh/authorized_keys`, exposes root SSH through `<app_id>-1022.<gateway-domain>:443`, and verifies the gateway SSH banner. |
+
+### Smithers workflows
+
+The workflows are resumable wrappers around the shell drivers; they do not contain the deployment
+logic themselves. They are useful when the sequence matters and a failed step should resume exactly
+where it stopped.
+
+| File | Workflow | Sequence |
+|---|---|---|
+| `workflows/deploy.tsx` | `attestmesh-deploy-full` | `preflight -> infra -> cluster -> pathaUpgrade -> webhook -> indexerEnsure -> node1 env/deploy/prime/upgrade/verify -> node2 env/deploy/prime/upgrade/verify -> meshVerify`. |
+| `workflows/matrix-node.tsx` | `attestmesh-matrix-node` | `deploy -> cluster -> patha -> prime -> bind -> verify -> agent -> client -> isolation`, with an optional backup-status task when backups are enabled. |
+| `workflows/postgres-node.tsx` | `attestmesh-postgres-node` | `deploy -> prime -> bind -> verify -> meshEndpoint -> agent -> metrics -> isolation`. |
+| `workflows/pg-ha.tsx` | `attestmesh-pg-ha` | `deployAll -> primeAll -> bindAll -> verifyAll -> ha -> isolation -> agent`; node count via `--input '{"count":N}'` (looping lives in the driver's re-entrant `-all` actions, so the graph stays static). |
+
+### Compose payloads
+
+The compose files are measured into the dstack app compose hash, so changing any of them is an
+auth-gated deployment change. For member CVMs, the new hash must be allowlisted before the updated
+CVM boots.
+
+| File | Runtime payload |
+|---|---|
+| `compose/node-1.yaml` | Minimal Phala member node: the `cluster-mesh-agent` sidecar with gateway-exposed sidecar ports. Used by `node-pathA.sh` for generic cluster members. |
+| `compose/indexer-1.yaml` | Attested indexer service plus a small state volume. It is a stock dstack app, not a cluster member. |
+| `compose/matrix-node.yaml` | Full private Matrix stack: sidecar, mesh proxy, WAL-G-enabled Postgres, Synapse init, Synapse, nginx, Tailscale serve, matrix-admin-agent, egress firewalls, Prometheus, node-exporter, cAdvisor, and persistent volumes. The Matrix HTTP path stays tailnet-only; the host-isolation checks assert private ports are not reachable from the box. |
+| `compose/postgres-node.yaml` | Standalone Postgres service node: sidecar, mesh proxies to Matrix/Postgres, Postgres, postgres-admin-agent, egress firewalls, Prometheus, node-exporter, cAdvisor, and persistent volumes. It has no Tailscale; Matrix control traffic goes over the AttestMesh mesh. |
+| `compose/pg-ha-node.yaml` | One Postgres HA node: sidecar, then Patroni/etcd/HAProxy sharing the SIDECAR netns (they bind the mesh IP directly — clients hit any node's mesh IP `:5432` for the primary, `:5433` for replicas; Postgres itself is on `:5434`), a mesh-only `:8009` status page, the Matrix mesh proxy, the Patroni-aware postgres-admin-agent + egress firewall, and the observability trio. All shared credentials are HKDF-derived from the CSK at boot. |
+| `compose/ssh-node.yaml` | Minimal self-hosted box node: sidecar plus OpenSSH on port `1022`. The deploy driver seals `authorized_keys` as base64 and the gateway exposes SSH via the dstack TLS endpoint, following the `ssh-over-gateway` pattern from `Dstack-TEE/dstack-examples`. |
+
+### Box-side helpers
+
+`matrix-node-box.py`, `postgres-node-box.py`, `pg-ha-node-box.py`, and `ssh-node-box.py` are copied
+over SSH to the self-hosted dstack box and run there with sealed `E_*` environment variables. They are
+intentionally small mirrors of the box MCP's `mcp_dstack.deploy_app` shape:
+
+- `deploy` registers a stock DstackApp, seals the runtime env, creates the VM, and prints
+  `app_id`, `compose_hash`, and `vm_id`.
+- `hash` renders the measured app-compose without secrets and prints the compose hash so the
+  cluster can allowlist it before a roll.
+- `update <app_id> <vm_id>` stops the VM, performs disk-preserving `UpgradeApp` on the same VM
+  when possible, and falls back to fresh-disk `CreateVm` only when explicitly requested.
+
+`pg-ha-node-box.py` additionally splits `deploy` into `register` (DstackApp contract only, so the
+driver can precompute mesh IPs before any CVM exists) and `create <app_id>`, and adds
+`stop <vm_id>` / `start <vm_id>` power controls for the failover drill.
+
+### Support images
+
+The subdirectories under `deploy/` build images consumed by the compose payloads:
+
+- `agent-egress-fw/` builds the network-namespace firewall used beside admin agents and backup
+  egress paths. It installs a default-DROP outbound policy, allows loopback, established traffic,
+  DNS, explicitly resolved internal service IPs, and a single configured external host/port.
+- `postgres-walg/` wraps Postgres with optional WAL-G support. With `BACKUP_ENABLED=true`, it
+  restores into an empty data directory when requested, writes a WAL-G encryption key from the
+  cluster shared key, runs periodic base backups, and enables WAL archiving. With backups off, it
+  behaves like stock Postgres.
+- `postgres-admin-agent/` is a Python Matrix bot for the Postgres nodes. It supports deterministic
+  `!pg` status/metrics/query/exec commands, gates write/admin SQL behind explicit confirmation, and
+  can route natural-language requests through an OpenAI-compatible LLM. On pg-ha nodes it is
+  Patroni-aware: `!pgha status|cluster|lag` plus a confirmation-gated `!pgha switchover`, with the
+  DB superuser and Patroni REST credentials read lazily from the CSK-derived `pgha-secrets` volume.
+- `pg-ha/` builds `ghcr.io/attestmesh/pg-ha` — Patroni, a pinned etcd, and HAProxy layered on the
+  `postgres-walg` base. One image serves three container roles via entrypoint selection; every
+  cluster-wide secret (superuser, replication, rewind, Patroni REST, etcd root, WAL-G key) is
+  HKDF-derived from the cluster shared key at boot, so all N nodes agree with no secret exchange.
+
+### Deploy-local docs and generated state
+
+The Matrix-specific docs under `deploy/` are part of the operator record:
+
+- `matrix-node-deploy.md` is the current authoritative Matrix node deployment guide.
+- `matrix-node-runbook.md` is explicitly superseded and kept as historical context.
+- `matrix-node-access-journal.md` and `matrix-node-steps-log.md` preserve the debugging history
+  and the reasoning behind the current invariants.
+
+Generated state is intentionally local:
+
+- `deploy/logs/` holds timestamped command logs and state files like
+  `node-pathA-<name>.state`, `indexer-<name>.state`, `matrix-node-<name>.state`, and
+  `postgres-node-<name>.state` / `ssh-node-<name>.state`. The pg-ha driver keeps one cluster
+  state file `pg-ha-<name>.state` (PGHA_PEERS, verify credential, initialized flag) plus
+  per-node `pg-ha-node-<name>-pg<i>.state` files (app id, compose hash, VM id, mesh IP).
+- `deploy/.smithers/` and `deploy/smithers.db*` are Smithers execution state.
+- `deploy/node_modules/`, temporary env files, and Python `__pycache__/` directories are not
+  deployment source.
+
 ## Deployed addresses — Base mainnet (8453)
 
 Canonical receipt: `contracts/script/deployments/8453.json` (written by `DeployInfra`).

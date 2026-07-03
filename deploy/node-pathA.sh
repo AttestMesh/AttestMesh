@@ -24,6 +24,8 @@ npx --yes phala status 2>&1 | grep -qiE "logged in" || die "phala not logged in 
 
 NODE="${1:?usage: node-pathA.sh <node-name> [all|setup|deploy|prime|upgrade|verify|env-file]}"
 NODE_ID="${NODE_ID:-26}"
+INSTANCE_TYPE="${INSTANCE_TYPE:-}"
+DISK_SIZE="${DISK_SIZE:-}"
 COMPOSE="${COMPOSE:-$ROOT/deploy/compose/${NODE}.yaml}"
 # Sealed env (Alchemy + ghcr secrets) — never committed; auto-built by env-file/deploy if absent.
 ENV_FILE="${ENV_FILE:-/tmp/attestmesh-${NODE}.env}"
@@ -74,8 +76,12 @@ deploy_cvm() {
   [ -f "$ENV_FILE" ] || _build_env_file
   local lf="$LOGDIR/pathA-deploy-${NODE}.$(ts).log"
   log "▶ phala deploy (base KMS, stock) node=$NODE compose=$COMPOSE node-id=$NODE_ID"
+  local resource_flags=()
+  [ -z "$INSTANCE_TYPE" ] || resource_flags+=(--instance-type "$INSTANCE_TYPE")
+  [ -z "$DISK_SIZE" ] || resource_flags+=(--disk-size "$DISK_SIZE")
   npx --yes phala deploy --kms base --kms-contract "$KMS_CONTRACT" \
     --name "$NODE" --compose "$COMPOSE" -e "$ENV_FILE" --node-id "$NODE_ID" \
+    "${resource_flags[@]}" \
     --private-key "$PRIVATE_KEY" --rpc-url "$RPC_URL" \
     --ssh-pubkey "$HOME/.ssh/id_ed25519.pub" 2>&1 | tee "$lf"
   CVM_ID=$(grep -iE 'CVM ID:' "$lf" | awk '{print $NF}' | tr -d '[:space:]')

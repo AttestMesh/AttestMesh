@@ -53,7 +53,7 @@ services:
   # API is gateway-exposed, so TEE_DAEMON_TOKEN is REQUIRED (the image refuses
   # to boot without it). RUNYARD_HUB_TOKEN stays sealed in this cluster.
   tee-daemon:
-    image: ghcr.io/dmvt/webhost-control:v1
+    image: ghcr.io/dmvt/webhost-control:v2@sha256:d6a551901bcc7ce5f249f6e7676186cb145745084ff6f660363f9275cba7abcb
     environment:
       TEE_DAEMON_TOKEN: ${TEE_DAEMON_TOKEN}
       DAEMON_VOLUME_NAME: ${DAEMON_VOLUME_NAME:-dstack_daemon_data}
@@ -116,7 +116,7 @@ services:
   # exposed, token-gated control API (/_api on tee-daemon), never the browser.
 
   concierge:
-    image: ghcr.io/dmvt/concierge:v1
+    image: ghcr.io/dmvt/concierge:v1@sha256:7951bf0ca4dfe31483f7ca439958b394bf924da1abcb7621ed6a05467efa8747
     environment:
       CONCIERGE_PORT: 8787
       CONCIERGE_BRIEFS: /data/briefs

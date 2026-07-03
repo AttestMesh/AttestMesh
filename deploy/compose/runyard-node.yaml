@@ -1,0 +1,213 @@
+# AttestMesh RunYard node for the self-hosted dstack box.
+#
+# RunYard (a self-hosted control plane for AI agent runs: a `hub` web app + a
+# `runner` that executes workflows) as a full, on-chain-anchored AttestMesh node.
+# Same Path-A shape as ssh-node.yaml / synclave-node.yaml: the `sidecar`
+# (cluster-mesh-agent) self-registers the CVM's app_id on-chain after
+# deploy/runyard-node.sh primes the cluster (allowlist compose_hash + app_id)
+# and upgrades the stock DstackApp proxy to ClusterMember.
+#
+# ACCESS MODEL (b): the hub publishes :80 so the box operator can reach it at the
+# CVM's dstack-br0 IP — but with gateway OFF that port is reachable ONLY from the
+# box over the bridge, never public (there is no gateway to route it). The
+# co-located runner reaches it in-compose at http://hub:80 regardless. (In bridge
+# mode `expose` alone is NOT reachable at the CVM interface — only published
+# `ports:` are — so the hub must publish, not merely expose.)
+#
+# GATEWAY IS OFF (gateway_enabled:false), forced by no_instance_id:true — on
+# dstack 0.5.11 an empty instance_id makes the dstack-gateway registration 400
+# ("instance id is empty") and the CVM boot-loops. The sidecar self-registers
+# on-chain via RPC/bundler (no gateway needed), so membership is unaffected; the
+# only thing lost is wg-over-gateway mesh transport, which has no gateway-on C3
+# peer today (matrix-node is gateway-off). The hub is reached box-side over the
+# dstack-br0 bridge, not the gateway, so access model (b) is unaffected.
+#
+# The hub/runner images are PUBLIC on ghcr (anon-pullable) — no docker login is
+# required. The guarded docker-login pre_launch_script (wired by the box helper)
+# is a harmless no-op for public pulls and only fires for the private sidecar
+# image if a token is present.
+#
+# no_instance_id:true — the app-bound disk key (set in runyard-node-box.py) makes
+# hub-data / runner-workspace survive future in-place upgrades without
+# instance-id binding.
+#
+# No secrets are committed here; all ${VAR} values are sealed into the CVM by
+# deploy/runyard-node.sh (key NAMES are measured into the compose_hash, VALUES
+# are sealed to the app's X25519 key). RUNYARD_HUB_TOKEN is sealed to the SAME
+# value as RUNYARD_HUB_BOOTSTRAP_TOKEN (single admin cred, reused by the
+# co-located runner — acceptable for single-tenant).
+services:
+  # --- AttestMesh sidecar: on-chain self-registration + wg mesh (Path A) --------
+  sidecar:
+    image: ghcr.io/attestmesh/cluster-mesh-agent@sha256:db0a74f5cb68aab6441ac187522276999fc45ee760db3ae3dea0240e86d5c1af
+    restart: unless-stopped
+    environment:
+      # MEMBER_CONTRACT intentionally unset. Path A upgrades this stock DstackApp
+      # proxy to ClusterMember, then the sidecar self-discovers its app_id from
+      # the dstack guest agent and registers via a sponsored 4337 UserOp.
+      - CHAIN_ID=${CHAIN_ID}
+      - RPC_URL=${RPC_URL}
+      - BUNDLER_URL=${BUNDLER_URL}
+      - GAS_POLICY_ID=${GAS_POLICY_ID}
+      - INDEXER_REGISTRY_ADDR=${INDEXER_REGISTRY_ADDR}
+      - GATEWAY_DOMAIN=${GATEWAY_DOMAIN}
+      - DSTACK_SOCKET=/var/run/dstack.sock
+      - HEALTH_HTTP_ADDR=0.0.0.0:9090
+      - LOG_FORMAT=pretty
+      - LOG_LEVEL=info,cluster_mesh_agent=debug
+    volumes:
+      - /var/run/dstack.sock:/var/run/dstack.sock
+    ports:
+      # 9090 = health (box-reachable at the CVM dstack-br0 IP for verify).
+      # 51900 = wg-over-gateway-TCP mesh transport (<app_id>-51900s).
+      - "9090:9090"
+      - "51900:51900"
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun
+
+  # --- RunYard application stack -------------------------------------------------
+  hub:
+    image: ghcr.io/yolo-maxi/runyard-hub@sha256:6bf33acf307b31a4a99c03578f8fab60fe94cf63a827a9e567553e9ef47e816e
+    environment:
+      HOST: 0.0.0.0
+      PORT: "80"
+      RUNYARD_HUB_DATA_DIR: /data
+      RUNYARD_HUB_SESSION_SECRET: ${RUNYARD_HUB_SESSION_SECRET}
+      SECRETS_ENC_KEY: ${SECRETS_ENC_KEY}
+      RUNYARD_HUB_BOOTSTRAP_TOKEN: ${RUNYARD_HUB_BOOTSTRAP_TOKEN}
+    volumes:
+      - hub-data:/data
+    ports:
+      # Published (not just `expose`d) so the box operator can reach the hub UI at
+      # the CVM's dstack-br0 IP:80 — the access-model-(b) admin path. In bridge
+      # mode only published ports bind on the CVM interface; `expose` alone is
+      # compose-network-internal. Safe because gateway is OFF: with no gateway to
+      # route it, :80 is reachable ONLY from the box over dstack-br0, never public.
+      - "80:80"
+    restart: unless-stopped
+
+  runner:
+    image: ghcr.io/yolo-maxi/runyard-runner@sha256:bf957165dd20def4a91a397aadc5be3c23ee37ed7e5dc84e1da9b6b0afcf6c22
+    environment:
+      RUNYARD_HUB_URL: http://hub:80
+      RUNYARD_HUB_TOKEN: ${RUNYARD_HUB_TOKEN}
+      REAUTH_ENABLED: "1"
+      SMITHERS_RUNNER_TAGS: smithers,vps,reauth
+      DOCKER_HOST: unix:///var/run/docker.sock
+    volumes:
+      # workflow-templates/ ships in the HUB image but NOT the runner image, and
+      # runnerRuntime.js imports it → the runner crash-looped on ERR_MODULE_NOT_FOUND
+      # for /app/workflow-templates/workflows/improve-repo.js. seed-templates (below)
+      # copies the full dir out of the hub image into this shared volume.
+      - wf-templates:/app/workflow-templates
+      - codex-auth:/root/.codex
+      - claude-auth:/root/.claude
+      - runner-workspace:/workspace
+      - /var/run/docker.sock:/var/run/docker.sock
+    depends_on:
+      hub:
+        condition: service_started
+      seed-templates:
+        condition: service_completed_successfully   # wait for the template copy
+    restart: unless-stopped
+
+  # one-shot: seed the runner's missing /app/workflow-templates from the HUB image
+  # (which carries the full 22-file template set). Re-runs on every roll, so the
+  # templates track the hub image if it's ever bumped.
+  seed-templates:
+    image: ghcr.io/yolo-maxi/runyard-hub@sha256:6bf33acf307b31a4a99c03578f8fab60fe94cf63a827a9e567553e9ef47e816e
+    restart: "no"
+    # Run as root: the hub image's default user is `node` (uid 1000), which can't
+    # write the root-owned fresh volume mountpoint. `cp -a` as root preserves the
+    # source's node:node ownership, so the runner (node user) can still read them.
+    user: "0:0"
+    volumes:
+      - wf-templates:/seed
+    command:
+      - /bin/sh
+      - -c
+      - |
+        set -e
+        cp -a /app/workflow-templates/. /seed/
+        test -f /seed/workflows/improve-repo.js
+        echo "seed-templates: copied $(ls /seed/workflows | wc -l) workflow files (improve-repo.js present)"
+
+  # ── Tailscale serve config writer: HTTPS-terminate on the tailnet :443 → the
+  #     hub on 127.0.0.1:80 (tailscale shares the hub's netns). $${TS_CERT_DOMAIN}
+  #     is substituted by `tailscale serve` at runtime. ──
+  ts-serve-init:
+    image: alpine:3.20
+    restart: "no"
+    volumes:
+      - ts-config:/cfg
+    command:
+      - /bin/sh
+      - -c
+      - |
+        cat > /cfg/serve.json <<'JSON'
+        {"TCP":{"443":{"HTTPS":true}},"Web":{"$${TS_CERT_DOMAIN}:443":{"Handlers":{"/":{"Proxy":"http://127.0.0.1:80"}}}}}
+        JSON
+        echo "ts-serve-init: wrote /cfg/serve.json"
+
+  # ── Tailscale: joins the tailnet sharing the HUB's netns. The hub is reachable
+  #     over the tailnet at https://<magicdns-name>/ — `tailscale serve` terminates
+  #     TLS on :443 and proxies to the hub on 127.0.0.1:80 (auto HTTPS cert). The
+  #     box→hub:80 bridge path (published above) is a DIFFERENT interface and is
+  #     unaffected. TS_AUTHKEY is tag:teesql-c01 (the only tag the OAuth client can
+  #     mint; NOT matrix's tag:office — ACL reachability depends on the tailnet
+  #     granting Dan's devices → tag:teesql-c01:443). ──
+  tailscale:
+    image: tailscale/tailscale:latest
+    network_mode: service:hub
+    restart: unless-stopped
+    depends_on:
+      ts-serve-init:
+        condition: service_completed_successfully
+    environment:
+      - TS_AUTHKEY=${TS_AUTHKEY}
+      - TS_HOSTNAME=runyard-hub
+      - TS_STATE_DIR=/var/lib/tailscale
+      - TS_USERSPACE=false
+      - TS_EXTRA_ARGS=--netfilter-mode=off
+      - TS_SERVE_CONFIG=/cfg/serve.json
+    volumes:
+      - tailscale-state:/var/lib/tailscale
+      - ts-config:/cfg
+    cap_add: [NET_ADMIN, SYS_MODULE]
+    devices: ["/dev/net/tun"]
+
+  # ── Tailnet firewall: only the hub (:80/:443) is reachable over tailscale0.
+  #     Shares the hub's netns; only touches `-i tailscale0`, so runner→hub and the
+  #     box→hub:80 bridge path are undisturbed. ──
+  ts-firewall:
+    image: alpine:3.20
+    network_mode: service:hub
+    restart: unless-stopped
+    depends_on: [tailscale]
+    cap_add: [NET_ADMIN]
+    command:
+      - /bin/sh
+      - -c
+      - |
+        apk add --no-cache iptables >/dev/null 2>&1 || true
+        while ! [ -d /sys/class/net/tailscale0 ]; do sleep 2; done
+        while true; do
+          iptables -C INPUT -i tailscale0 -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || iptables -A INPUT -i tailscale0 -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+          iptables -C INPUT -i tailscale0 -p tcp --dport 80 -j ACCEPT 2>/dev/null || iptables -A INPUT -i tailscale0 -p tcp --dport 80 -j ACCEPT
+          iptables -C INPUT -i tailscale0 -p tcp --dport 443 -j ACCEPT 2>/dev/null || iptables -A INPUT -i tailscale0 -p tcp --dport 443 -j ACCEPT
+          iptables -C INPUT -i tailscale0 -p icmp -j ACCEPT 2>/dev/null || iptables -A INPUT -i tailscale0 -p icmp -j ACCEPT
+          iptables -C INPUT -i tailscale0 -j DROP 2>/dev/null || iptables -A INPUT -i tailscale0 -j DROP
+          iptables -C FORWARD -i tailscale0 -j DROP 2>/dev/null || iptables -A FORWARD -i tailscale0 -j DROP
+          sleep 30
+        done
+
+volumes:
+  hub-data:
+  codex-auth:
+  claude-auth:
+  runner-workspace:
+  wf-templates:        # runner's workflow-templates, seeded from the hub image
+  tailscale-state:     # tailscale node identity (persists across rolls)
+  ts-config:           # tailscale serve config (TS_SERVE_CONFIG → HTTPS on tailnet)
