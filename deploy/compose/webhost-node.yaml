@@ -58,6 +58,10 @@ services:
       TEE_DAEMON_TOKEN: ${TEE_DAEMON_TOKEN}
       DAEMON_VOLUME_NAME: ${DAEMON_VOLUME_NAME:-dstack_daemon_data}
       DAEMON_VOLUME_MOUNT: ${DAEMON_VOLUME_MOUNT:-/var/lib/tee-daemon}
+      # dstack-0.5.11 does not ship Docker's `runsc` runtime yet. Keep the
+      # other tenant hardening controls live, but use Docker's default runtime
+      # until the base image has gVisor configured.
+      DAEMON_CONTAINER_RUNTIME: ""
       # Source-privacy brief output (shared RO with concierge) + tree-hash cache.
       BRIEFS_DIR: /data/briefs
       DIGEST_CACHE_DIR: /data/digests
