@@ -52,7 +52,7 @@ services:
   # 3-node ensemble from CH_PEERS (sealed at CreateVm); server_id = own position in the
   # peer list. keeper-data survives rolls (no_instance_id=true, app-bound disk key).
   keeper:
-    image: ghcr.io/attestmesh/clickhouse-ha@sha256:PLACEHOLDER_CLICKHOUSE_HA
+    image: ghcr.io/attestmesh/clickhouse-ha@sha256:1c2ccc946afdc1c50354017bef0bbc636e7dbb1dcc6e1e0f5ed728b7e0af7216 # pinned 2026-07-03
     restart: unless-stopped
     network_mode: service:sidecar
     entrypoint: ["/usr/local/bin/chha-keeper-entrypoint.sh"]
@@ -73,7 +73,7 @@ services:
   # IP, credentials CSK-derived). Internal ports :18123 (http) / :19001 (native) — HAProxy
   # owns the mesh :8123/:9000.
   server:
-    image: ghcr.io/attestmesh/clickhouse-ha@sha256:PLACEHOLDER_CLICKHOUSE_HA
+    image: ghcr.io/attestmesh/clickhouse-ha@sha256:1c2ccc946afdc1c50354017bef0bbc636e7dbb1dcc6e1e0f5ed728b7e0af7216 # pinned 2026-07-03
     restart: unless-stopped
     network_mode: service:sidecar
     entrypoint: ["/usr/local/bin/chha-server-entrypoint.sh"]
@@ -93,7 +93,7 @@ services:
   # Healthy-replica routing on the mesh IP: :8123 (http) + :9000 (native) round-robin
   # across all three backends, option httpchk GET /ping against each peer's :18123.
   haproxy:
-    image: ghcr.io/attestmesh/clickhouse-ha@sha256:PLACEHOLDER_CLICKHOUSE_HA
+    image: ghcr.io/attestmesh/clickhouse-ha@sha256:1c2ccc946afdc1c50354017bef0bbc636e7dbb1dcc6e1e0f5ed728b7e0af7216 # pinned 2026-07-03
     restart: unless-stopped
     network_mode: service:sidecar
     entrypoint: ["/usr/local/bin/chha-haproxy-entrypoint.sh"]
@@ -110,7 +110,7 @@ services:
   # Mesh-only status page (:8009): the TEE blocks container logs, so every chha entrypoint
   # self-reports to /chha-status and this serves it read-only to mesh peers for debugging.
   status-server:
-    image: ghcr.io/attestmesh/clickhouse-ha@sha256:PLACEHOLDER_CLICKHOUSE_HA
+    image: ghcr.io/attestmesh/clickhouse-ha@sha256:1c2ccc946afdc1c50354017bef0bbc636e7dbb1dcc6e1e0f5ed728b7e0af7216 # pinned 2026-07-03
     restart: unless-stopped
     network_mode: service:sidecar
     entrypoint:
