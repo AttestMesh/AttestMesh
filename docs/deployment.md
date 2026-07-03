@@ -120,11 +120,13 @@ deploy/
 ├── matrix-node.sh                 # self-hosted box Matrix node driver
 ├── postgres-node.sh               # self-hosted box standalone Postgres node driver
 ├── pg-ha-node.sh                  # self-hosted box Postgres HA cluster driver (N nodes)
-├── ssh-node.sh                    # self-hosted box SSH-ingress node driver
+├── ssh-node.sh                    # self-hosted box SSH-ingress node driver (bridge + mesh shells)
+├── hindsight-node.sh              # self-hosted box Hindsight (agent memory) node driver
 ├── matrix-node-box.py             # runs on the box; deploy/hash/update Matrix CVMs
 ├── postgres-node-box.py           # runs on the box; deploy/hash/update Postgres CVMs
 ├── pg-ha-node-box.py              # runs on the box; register/create/hash/update/stop/start pg-ha CVMs
 ├── ssh-node-box.py                # runs on the box; deploy/hash/update SSH CVMs
+├── hindsight-node-box.py          # runs on the box; deploy/hash/update Hindsight CVMs
 ├── matrix-probe.py                # send-a-command / await-bot-reply Matrix room probe (MATRIX_PROBE_* env)
 ├── package.json                   # Smithers command aliases + dev dependencies
 ├── bun.lock                       # pinned deploy-workspace JS dependencies
@@ -139,7 +141,8 @@ deploy/
 │   ├── matrix-node.yaml           # Matrix homeserver + sidecar + agents + metrics
 │   ├── postgres-node.yaml         # Postgres service node + sidecar + admin agent
 │   ├── pg-ha-node.yaml            # one Postgres HA node: sidecar-netns Patroni/etcd/HAProxy + admin agent
-│   └── ssh-node.yaml              # sidecar + sshd exposed through gateway TLS
+│   ├── ssh-node.yaml              # sidecar + two sshd workbench shells (bridge :1022, mesh :1023)
+│   └── hindsight-node.yaml        # mesh-only Hindsight memory node (sidecar + socat mesh proxies + egress-fw)
 ├── agent-egress-fw/
 │   ├── Dockerfile                 # egress firewall helper image
 │   └── egress-fw.sh               # default-DROP outbound policy script
@@ -188,7 +191,8 @@ step can be re-run without rediscovering app IDs or VM IDs.
 | `matrix-node.sh` | Private Matrix homeserver on the self-hosted dstack box. | `deploy -> cluster -> patha -> prime -> bind -> verify -> verify-agent -> verify-client -> verify-isolation`; `update` is disk-preserving by default, `restore` is a deliberate fresh-disk WAL-G recovery, `backup-status` checks R2. |
 | `postgres-node.sh` | Standalone PostgreSQL node on the self-hosted box. | Joins the Matrix node's cluster, inherits the Matrix mesh endpoint, then verifies registration, mesh DB endpoint, Matrix admin-agent replies, Prometheus-backed metrics, and host isolation. |
 | `pg-ha-node.sh` | Postgres HA cluster (Patroni + etcd + HAProxy) as `PGHA_COUNT` nodes (default 3) on the self-hosted box. | `deploy-all` (= `register-all` -> `compute-peers` -> `create-all`, precomputing every node's mesh IP off-chain for etcd static bootstrap) -> `prime-all` -> `bind-all` -> `verify-all` (incl. on-chain `meshIpOf` cross-check) -> `verify-ha` (leader/replica/routing/replication from the ssh-node mesh shell) -> `verify-isolation-all` -> `verify-agent`. Day-2: `update <pgN>` / serialized `update-all`, `verify-failover` drill. See `docs/specs/pg-ha.md`. |
-| `ssh-node.sh` | Minimal SSH ingress node on the self-hosted box. | Joins the existing Matrix cluster by default, seals this machine's `~/.ssh/authorized_keys`, exposes root SSH through `<app_id>-1022.<gateway-domain>:443`, and verifies the gateway SSH banner. |
+| `ssh-node.sh` | SSH ingress + operator workbench node on the self-hosted box (8 vcpu / 64 GB / 100 GB, full ubuntu 26.04 shells). | Joins the existing Matrix cluster by default, seals the union key file `~/.attestmesh/ssh-node-authorized-keys` (falls back to `~/.ssh/authorized_keys`), and exposes TWO root shells through gateway TLS: `<app_id>-1022.<gw>:443` (compose bridge) and `<app_id>-1023.<gw>:443` (**inside the sidecar netns = ON the wg mesh**; `ssh -D` = SOCKS onto the mesh). Verifies the gateway SSH banner. |
+| `hindsight-node.sh` | Hindsight agent-memory node (vectorize-io Hindsight 0.8.4) on the self-hosted box — **mesh-only, no Tailscale, no public HTTP**. | `deploy -> prime -> bind -> verify -> verify-sidecar -> verify-app -> verify-e2e -> verify-isolation`; verify-app/e2e run over the wg mesh via the ssh-node mesh shell (retain→LLM→recall roundtrip + 401-without-key auth check). `update` is disk-preserving (pg0 memory store survives); LLM model/keys are sealed values → rotate with a plain `update`, no re-allowlist. See `deploy/hindsight-node-runbook.md`. |
 
 ### Smithers workflows
 
@@ -216,11 +220,13 @@ CVM boots.
 | `compose/matrix-node.yaml` | Full private Matrix stack: sidecar, mesh proxy, WAL-G-enabled Postgres, Synapse init, Synapse, nginx, Tailscale serve, matrix-admin-agent, egress firewalls, Prometheus, node-exporter, cAdvisor, and persistent volumes. The Matrix HTTP path stays tailnet-only; the host-isolation checks assert private ports are not reachable from the box. |
 | `compose/postgres-node.yaml` | Standalone Postgres service node: sidecar, mesh proxies to Matrix/Postgres, Postgres, postgres-admin-agent, egress firewalls, Prometheus, node-exporter, cAdvisor, and persistent volumes. It has no Tailscale; Matrix control traffic goes over the AttestMesh mesh. |
 | `compose/pg-ha-node.yaml` | One Postgres HA node: sidecar, then Patroni/etcd/HAProxy sharing the SIDECAR netns (they bind the mesh IP directly — clients hit any node's mesh IP `:5432` for the primary, `:5433` for replicas; Postgres itself is on `:5434`), a mesh-only `:8009` status page, the Matrix mesh proxy, the Patroni-aware postgres-admin-agent + egress firewall, and the observability trio. All shared credentials are HKDF-derived from the CSK at boot. |
-| `compose/ssh-node.yaml` | Minimal self-hosted box node: sidecar plus OpenSSH on port `1022`. The deploy driver seals `authorized_keys` as base64 and the gateway exposes SSH via the dstack TLS endpoint, following the `ssh-over-gateway` pattern from `Dstack-TEE/dstack-examples`. |
+| `compose/ssh-node.yaml` | Operator workbench node: sidecar plus TWO full-ubuntu-26.04 OpenSSH shells — `sshd` (`:1022`, compose bridge) and `sshd-mesh` (`:1023`, `network_mode: service:sidecar` so it sits ON the wg mesh; wireguard-tools + NET_ADMIN for peer discovery). Both share a `/root` workspace volume; the driver seals `authorized_keys` as base64 and the gateway exposes SSH via the dstack TLS endpoints (`ssh-over-gateway` pattern from `Dstack-TEE/dstack-examples`). |
+| `compose/hindsight-node.yaml` | Mesh-only Hindsight memory node: sidecar (publishes only `:9090` health + `:51900` wg), two socat listeners in the SIDECAR netns (`<mesh-ip>:18888` → API, `:18999` → control-plane UI — reachable by cluster members only), the Hindsight 0.8.4 container (embedded pg0, baked-in local embeddings, `HF_HUB_OFFLINE`), and an egress firewall pinning the netns to the single redpill.ai LLM host. API is tenant-key gated (`ApiKeyTenantExtension`), UI access-key gated; keys persist in the driver state file. |
 
 ### Box-side helpers
 
-`matrix-node-box.py`, `postgres-node-box.py`, `pg-ha-node-box.py`, and `ssh-node-box.py` are copied
+`matrix-node-box.py`, `postgres-node-box.py`, `pg-ha-node-box.py`, `ssh-node-box.py`, and
+`hindsight-node-box.py` are copied
 over SSH to the self-hosted dstack box and run there with sealed `E_*` environment variables. They are
 intentionally small mirrors of the box MCP's `mcp_dstack.deploy_app` shape:
 
@@ -258,18 +264,24 @@ The subdirectories under `deploy/` build images consumed by the compose payloads
 
 ### Deploy-local docs and generated state
 
-The Matrix-specific docs under `deploy/` are part of the operator record:
+The per-node docs under `deploy/` are part of the operator record:
 
 - `matrix-node-deploy.md` is the current authoritative Matrix node deployment guide.
 - `matrix-node-runbook.md` is explicitly superseded and kept as historical context.
 - `matrix-node-access-journal.md` and `matrix-node-steps-log.md` preserve the debugging history
   and the reasoning behind the current invariants.
+- `hindsight-node-runbook.md` is the authoritative Hindsight memory-node runbook (mesh-only
+  access, day-2 rolls/rotation, the post-bind sidecar-health gotcha, and the pre-bind
+  debug-shell pattern for reading container logs inside a TEE CVM).
+- `hermes-node-runbook.md` covers the Hermes agent nodes.
 
 Generated state is intentionally local:
 
 - `deploy/logs/` holds timestamped command logs and state files like
   `node-pathA-<name>.state`, `indexer-<name>.state`, `matrix-node-<name>.state`, and
-  `postgres-node-<name>.state` / `ssh-node-<name>.state`. The pg-ha driver keeps one cluster
+  `postgres-node-<name>.state` / `ssh-node-<name>.state` / `hindsight-node-<name>.state`
+  (the matrix and hindsight state files hold live credentials — IAPW/PGPW and the Hindsight
+  tenant + UI access keys respectively — treat them as secrets). The pg-ha driver keeps one cluster
   state file `pg-ha-<name>.state` (PGHA_PEERS, verify credential, initialized flag) plus
   per-node `pg-ha-node-<name>-pg<i>.state` files (app id, compose hash, VM id, mesh IP).
 - `deploy/.smithers/` and `deploy/smithers.db*` are Smithers execution state.
@@ -341,6 +353,8 @@ Procedure: `source deploy/env.sh && CLUSTER=… MEMBER_IMPL=… ENV_FILE=… COM
 | 2026-06-10 | **indexer deployed (shared infra)** | `attestmesh-indexer-1` (CVM `bb97eedf…`, app `7917d8ec…`) — stock dstack app (NOT a member; ONE indexer serves every cluster + network). 3 more live-only bugs en route: (7) `/DeriveKey`→`/GetKey` (same dstack 0.5.x drift as the sidecar — crash-loop); (8) boot catch-up scanned from genesis (~47M Base blocks; health/gRPC start only after catch-up → never up). Fixed with `INDEXER_START_BLOCK` floor = factory deploy block (computed by `deploy/indexer.sh` via getCode binary search) + chunked discovery → **catch-up in 23s**; (9) pubkey scrape needed ANSI stripping. Registered: `setIndexer(https://7917d8ec…-50051.dstack-base-prod5.phala.network, codeId=compose hash, pubKey=0xa44ecf22…)`. |
 | 2026-06-10 | **gateway gRPC reality** | The gateway-terminated route DOES proxy gRPC/h2 (verified via grpcurl: full Subscribe replay with signed envelopes + TDX attestation quote), but answers ALPN with http/1.1 → tonic needs `ClientTlsConfig::assume_http2(true)` (bug 10, `c240d16`). |
 | 2026-06-10 | **✅ FULL SYSTEM LIVE** | All four components deployed + working on Base mainnet: contracts, gas webhook, **indexer** (registered, bounded catch-up, signed+attested pushes), and both nodes **subscribed** (`indexer subscription open` on both) while `phase=healthy` — 9 verified pushes absorbed on node-1; pushes wake the chain-read reconcile pass (poll fallback stays). Day-0 bring-up + day-2 ops fully codified in `deploy/{onchain,webhook,indexer,node-pathA}.sh` + the 17-task `attestmesh-deploy-full` smithers workflow. |
+| 2026-07-01 | **ssh-node rebuilt as workbench** | The ssh-node VM was lost (removed from the VMM); recreated fresh-disk under the SAME app_id `0x02Cafb3c…` (C3 membership + gateway names kept) at 8 vcpu / 64 GB / 100 GB with full ubuntu 26.04 shells and a second sshd `:1023` INSIDE the sidecar netns — a shell ON the wg mesh (`attestmesh-mesh-node`; `ssh -D` = SOCKS onto the mesh). `ssh-node-box.py` hardened to tolerate a removed VM (StopVm try/except + `GetInfo found:false`). Host keys churn on fresh-disk rolls (`ssh-keygen -R '[<host>]:443'`). |
+| 2026-07-01 | **✅ Hindsight memory node LIVE (C3 member #5)** | vectorize-io Hindsight 0.8.4 as a mesh-ONLY node: app_id `0xa151d945…`, memberId `0xd1ab76cf…`, mesh IP `10.18.78.76` (API `:18888`, UI `:18999`, tenant-key auth), LLM `openai/gpt-oss-120b` via redpill with the netns egress-locked to that one host (verified in-TEE: example.com BLOCKED, redpill 200). E2E verified over the mesh (retain→LLM extraction→recall + 401 without key) + host-isolation PASS. Lessons codified in `deploy/hindsight-node-runbook.md`: sidecar `:9090` binds only POST-bind (pre-bind loops "cluster not resolvable"); pre-bind container-log access via a temporary docker.sock debug-shell roll allowlisted on the stock DstackApp (box deployer), rolled back clean before bind; `ip neigh` stale for fresh CVMs → ping-sweep first. |
 
 ## Milestone-A reference: the real dstack guest-agent API
 
