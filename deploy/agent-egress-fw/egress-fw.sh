@@ -33,7 +33,14 @@ host_of() {  # strip scheme then :port//path — POSIX param expansion (busybox-
 LLM_HOST="$(host_of "${LLM_BASE_URL:-}")"      # empty allowed → fail closed (no LLM allow)
 LLM_PORT="${LLM_PORT:-443}"
 ALLOW_DNS="${ALLOW_DNS:-127.0.0.11}"
-INTERNAL_HOSTS="${INTERNAL_HOSTS:-synapse postgres nginx}"
+# Single dash: an explicitly-empty INTERNAL_HOSTS= means "no whole-host allows"
+# (use INTERNAL_HOST_PORTS for least-privilege), while UNSET keeps the default.
+INTERNAL_HOSTS="${INTERNAL_HOSTS-synapse postgres nginx}"
+# Least-privilege internal allows: space-separated host:port entries, each opened on
+# that TCP port only (vs INTERNAL_HOSTS which opens ALL ports on the resolved IP).
+# Use this when a shared-netns peer like `sidecar` exposes more ports than the agent
+# should reach (e.g. allow only the DB forwarders, not the Matrix proxy / wg transport).
+INTERNAL_HOST_PORTS="${INTERNAL_HOST_PORTS:-}"
 LLM_ALLOW_CIDRS="${LLM_ALLOW_CIDRS:-}"         # static :443 allows — pin the LLM's IP/block so it
                                                # is reachable regardless of resolution timing
 RERESOLVE="${RERESOLVE_SECONDS:-15}"
@@ -45,7 +52,7 @@ ALLOW_HOST="$(host_of "${ALLOW_BASE_URL:-}")"; ALLOW_HOST="${ALLOW_HOST:-$LLM_HO
 ALLOW_PORT="${ALLOW_PORT:-$LLM_PORT}"
 ALLOW_CIDRS="${ALLOW_CIDRS:-$LLM_ALLOW_CIDRS}"
 
-echo "egress-fw: allow='${ALLOW_HOST:-<none>}':$ALLOW_PORT internal='$INTERNAL_HOSTS' static='$ALLOW_CIDRS' dns=$ALLOW_DNS"
+echo "egress-fw: allow='${ALLOW_HOST:-<none>}':$ALLOW_PORT internal='$INTERNAL_HOSTS' internal_ports='$INTERNAL_HOST_PORTS' static='$ALLOW_CIDRS' dns=$ALLOW_DNS"
 
 add() {  # idempotent append to the AMX_EGRESS chain
   iptables -C AMX_EGRESS "$@" 2>/dev/null || iptables -A AMX_EGRESS "$@"
@@ -65,6 +72,7 @@ allow_host() {  # $1=host  $2=optional "proto:port" restriction (else any port)
 
 resolve() {
   for h in $INTERNAL_HOSTS; do allow_host "$h"; done
+  for hp in $INTERNAL_HOST_PORTS; do allow_host "${hp%%:*}" "tcp:${hp##*:}"; done
   allow_host "$ALLOW_HOST" "tcp:$ALLOW_PORT"
 }
 
