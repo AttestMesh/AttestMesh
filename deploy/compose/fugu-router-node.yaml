@@ -281,8 +281,11 @@ services:
         source /usr/local/bin/pgha-common.sh
         _st "deriving redis-ha + clickhouse-ha client credentials (waits for CSK)"
         umask 077
-        csk_derive attestmesh.redisha.auth.v1  > /derived/redis-password
-        csk_derive attestmesh.chha.client.v1   > /derived/clickhouse-password
+        # tr -d '\n': csk_derive ends in print()'s trailing newline, but the servers set
+        # their password via $(csk_derive) which strips it — the stock langfuse wrappers
+        # read these with cat, so the file must be newline-free or auth mismatches.
+        csk_derive attestmesh.redisha.auth.v1 | tr -d '\n' > /derived/redis-password
+        csk_derive attestmesh.chha.client.v1  | tr -d '\n' > /derived/clickhouse-password
         chmod 644 /derived/redis-password /derived/clickhouse-password
         _st "OK: derived secrets written to /derived"
 
@@ -298,7 +301,10 @@ services:
     environment:
       - LITELLM_MASTER_KEY=${LITELLM_MASTER_KEY}
       - LITELLM_SALT_KEY=${LITELLM_SALT_KEY}
-      - DATABASE_URL=postgresql://litellm:${LITELLM_DB_PASSWORD}@sidecar:15431,sidecar:15432,sidecar:15433/litellm
+      # Single-host DSN: LiteLLM uses Prisma, which cannot parse a multi-host postgres URL
+      # (would leave migrations unrun). sidecar:15431 forwards to pg1's HAProxy :5432 =
+      # current primary, so this still survives pg-ha failover; only pg1 node-down loses it.
+      - DATABASE_URL=postgresql://litellm:${LITELLM_DB_PASSWORD}@sidecar:15431/litellm
       - SAKANA_API_BASE=${SAKANA_API_BASE}
       - SAKANA_SUB_1_KEY=${SAKANA_SUB_1_KEY}
       - SAKANA_SUB_2_KEY=${SAKANA_SUB_2_KEY}
