@@ -157,6 +157,8 @@ _box_run() {
     printf 'E_CLUSTER_NAME=%q\n'             "$CLUSTER_NAME"
     printf 'E_CLUSTER_SELF_APP_ID=%q\n'      "${CLUSTER_SELF_APP_ID:-${X:-}}"
     printf 'E_CLUSTER_NETWORKS=%q\n'         "${CLUSTER_NETWORKS:-}"
+    printf 'E_CLUSTER_ORCHESTRATOR_URL=%q\n' "${CLUSTER_ORCHESTRATOR_URL:-}"
+    printf 'E_CLUSTER_ORCHESTRATOR_TOKEN=%q\n' "${CLUSTER_ORCHESTRATOR_TOKEN:-}"
     printf 'E_CORS_ORIGIN=%q\n'              "$CORS_ORIGIN"
     printf 'E_CONSOLE_HOST=%q\n'             "$CONSOLE_HOST"
     printf 'E_CLOUDFLARE_API_TOKEN=%q\n'     "$CLOUDFLARE_API_TOKEN"
