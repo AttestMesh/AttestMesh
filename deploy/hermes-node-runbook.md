@@ -98,7 +98,15 @@ bash deploy/hermes-node.sh <agent> all
   next loop).
 - **provision-matrix times out** — it drives the admin bot's LLM; check the DM
   room from Element (the transcript shows where it stalled), then re-run (it's
-  idempotent; `ensure_user` is absolute-state, a fresh token is minted).
+  idempotent; `ensure_user` is absolute-state, a fresh token is minted; blank
+  `MATRIX_ACCESS_TOKEN=` in the env file first or it skips).
+- **⚠️ Matrix tokens expire after 1 year** — the admin agent's
+  `create_login_token` caps `valid_hours` at 8760 and coerces omitted values to
+  24h (executor bug vs its docstring: None should mean no expiry — fix at the
+  next matrix-admin-agent roll). Rotate before expiry: blank the token in the
+  env file → `provision-matrix` → `update` (or paste into
+  `/root/.hermes/.env` over ssh and restart the gateway container-free via a
+  roll). Minted 2026-07-03 for tessera → rotate by 2027-07.
 - **verify-hermes 30× "not connected"** — ssh in (`-1022`), read
   `/root/.hermes/logs/gateway.log`; the usual suspects are a bad token or the
   matrix mesh IP (must be the matrix node's `matrix-mesh-proxy` at :18080).
