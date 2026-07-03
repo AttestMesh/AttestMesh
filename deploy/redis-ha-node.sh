@@ -31,8 +31,8 @@ REDISHA_COUNT="${REDISHA_COUNT:-3}"
 # Redis is light; small CVMs. Mesh-only: gateway OFF, bridge, app-bound disk key
 # (no_instance_id) so redisdata survives fresh-disk rolls of the same app.
 export BOX_VCPU="${BOX_VCPU:-2}" BOX_MEM="${BOX_MEM:-2048}" BOX_DISK="${BOX_DISK:-20}"
-export BOX_PORTS="${BOX_PORTS:-[]}" BOX_GATEWAY_ENABLED="${BOX_GATEWAY_ENABLED:-false}" BOX_NET_MODE="${BOX_NET_MODE:-bridge}"
-export BOX_NO_INSTANCE_ID="${BOX_NO_INSTANCE_ID:-true}"
+export BOX_PORTS="${BOX_PORTS:-[]}" BOX_GATEWAY_ENABLED="${BOX_GATEWAY_ENABLED:-true}" BOX_NET_MODE="${BOX_NET_MODE:-bridge}"
+export BOX_NO_INSTANCE_ID="${BOX_NO_INSTANCE_ID:-false}"
 
 CSTATE="$LOGDIR/redis-ha-${NODE}.state"
 ZERO32=0x0000000000000000000000000000000000000000000000000000000000000000
