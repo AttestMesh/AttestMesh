@@ -46,10 +46,29 @@ replica-announce-port 6380
 CONF
 
 # ls -A: appendonlydir/ (AOF) or dump.rdb — either means this node has prior state.
+# A replica target must never be this node itself: with bootstrap=join and an empty
+# disk, the first peer would otherwise REPLICAOF itself and the cluster has no master
+# (hit live 2026-07-03). Empty + no other live master -> the first peer becomes master
+# regardless of bootstrap mode; a live master found on another peer wins.
+find_live_master() {
+  local n ip
+  for n in $(peer_names); do
+    [ "$n" = "$NODE" ] && continue
+    ip="$(peer_ip "$n")"
+    if timeout 3 redis-cli -h "$ip" -p 6380 -a "$AUTH_PW" --no-auth-warning info replication 2>/dev/null \
+        | grep -q '^role:master'; then
+      echo "$ip"; return 0
+    fi
+  done
+  return 1
+}
 if [ -n "$(ls -A "$DATA" 2>/dev/null)" ]; then
   _st "existing data in $DATA -> plain restart (role reconciled by sentinel)"
-elif [ "${REDISHA_BOOTSTRAP:-new}" = "new" ] && [ "$NODE" = "$FIRST" ]; then
-  _st "empty data + bootstrap=new + first peer -> starting as master"
+elif MASTER_IP="$(find_live_master)"; then
+  _st "empty data -> bootstrapping as replica of live master $MASTER_IP:6380"
+  echo "replicaof $MASTER_IP 6380" >> "$CFG"
+elif [ "$NODE" = "$FIRST" ]; then
+  _st "empty data + no live master + first peer -> starting as master"
 else
   _st "empty data -> bootstrapping as replica of $FIRST ($FIRST_IP:6380)"
   echo "replicaof $FIRST_IP 6380" >> "$CFG"
