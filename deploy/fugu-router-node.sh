@@ -520,11 +520,25 @@ def req(method, path, query="", body=b""):
     with urllib.request.urlopen(r, timeout=20) as resp:
         return resp.status, resp.read()
 
+# r2gw (rclone serve s3 over crypt) has measured read-after-write lag (~7s) — poll GETs.
+def get_poll(path, deadline=45):
+    import time
+    last = None
+    for _ in range(deadline // 3):
+        try:
+            return req("GET", path)
+        except urllib.error.HTTPError as e:
+            last = e
+            if e.code != 404:
+                raise
+            time.sleep(3)
+    raise last
+
 stamp = datetime.datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
 key = f"langfuse-events/verify/put-{stamp}.txt"
 st, _ = req("PUT", f"/{BUCKET}/{key}", body=b"attestmesh verify-s3 " + stamp.encode())
 assert st in (200, 201), f"PutObject failed: {st}"
-st, got = req("GET", f"/{BUCKET}/{key}")
+st, got = get_poll(f"/{BUCKET}/{key}")
 assert st == 200 and b"verify-s3" in got, "GET readback failed"
 print("PUT: OK")
 
@@ -548,7 +562,7 @@ body = ("<CompleteMultipartUpload>" + "".join(
 q = f"uploadId={urllib.parse.quote(uid)}"
 st, _ = req("POST", f"/{BUCKET}/{mkey}", query=q, body=body)
 assert st == 200, f"CompleteMultipartUpload failed: {st}"
-st, got = req("GET", f"/{BUCKET}/{mkey}")
+st, got = get_poll(f"/{BUCKET}/{mkey}")
 assert st == 200 and len(got) == 2 * len(part), f"multipart readback size mismatch: {len(got)}"
 print("MULTIPART: OK (2x5MiB round-trip)")
 print("S3: PASS")
