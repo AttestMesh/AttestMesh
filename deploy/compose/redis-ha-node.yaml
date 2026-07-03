@@ -1,0 +1,137 @@
+# Redis HA node (one of N): Redis + Sentinel + HAProxy over the AttestMesh wireguard mesh
+# (pg-ha pattern, minimal v1: NO admin agent / prometheus / matrix proxy — future work, see
+# deploy/fugu-router-runbook.md).
+#
+# The HA trio (redis/sentinel/haproxy) shares the SIDECAR netns so it can bind the mesh IP
+# and reach the other redis nodes over attestmesh0 — replication, sentinel gossip, and
+# HAProxy health checks are all mesh flows. Mesh clients connect to ANY node's mesh IP
+# :6379 (current master) or :6381 (replicas/reads). Redis itself listens on 6380 so HAProxy
+# can own 6379/6381 in the shared netns; sentinel is :26379. No host `ports:` beyond the
+# sidecar's wg-over-TCP 51900 + :9090 health; host isolation is asserted by
+# deploy/redis-ha-node.sh verify-isolation.
+#
+# Auth: requirepass/masterauth/sentinel auth-pass are HKDF-derived from the CSK inside the
+# entrypoints (csk_derive attestmesh.redisha.auth.v1 — redisha-common.sh) — zero secret
+# exchange; any C3 member derives the same client password in-CVM (fugu-router does).
+# REDISHA_VERIFY_PASSWORD (sealed) is the driver-side verification credential: the redis
+# entrypoint creates a `meshverify` ACL user with it and sentinel uses it as its own
+# requirepass, so verify-ha/verify-failover can run from the mesh shell without the CSK.
+
+services:
+  sidecar:
+    image: ghcr.io/attestmesh/cluster-mesh-agent@sha256:db0a74f5cb68aab6441ac187522276999fc45ee760db3ae3dea0240e86d5c1af
+    restart: unless-stopped
+    environment:
+      # MEMBER_CONTRACT intentionally unset: the sidecar self-discovers the app_id.
+      - CHAIN_ID=${CHAIN_ID}
+      - RPC_URL=${RPC_URL}
+      - BUNDLER_URL=${BUNDLER_URL}
+      - GAS_POLICY_ID=${GAS_POLICY_ID}
+      - INDEXER_REGISTRY_ADDR=${INDEXER_REGISTRY_ADDR}
+      - GATEWAY_DOMAIN=${GATEWAY_DOMAIN}
+      - DSTACK_SOCKET=/var/run/dstack.sock
+      - AGENT_GRPC_SOCKET=/var/run/attestmesh/agent.sock
+      - HEALTH_HTTP_ADDR=0.0.0.0:9090
+      - LOG_FORMAT=pretty
+      - LOG_LEVEL=info,cluster_mesh_agent=debug
+    volumes:
+      - /var/run/dstack.sock:/var/run/dstack.sock
+      - agent-sock:/var/run/attestmesh
+    ports:
+      - "9090:9090"
+      - "51900:51900"
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun
+
+  # Redis 7 data plane: :6380 internally (HAProxy owns the mesh-facing :6379/:6381).
+  # Bootstrap state machine (new/join) + REPLICAOF wiring lives in the entrypoint —
+  # r1 masters on REDISHA_BOOTSTRAP=new with an empty data dir, r2/r3 REPLICAOF r1.
+  # AOF on; the redisdata volume survives rolls (no_instance_id=true, app-bound disk key).
+  redis:
+    image: ghcr.io/attestmesh/redis-ha@sha256:PLACEHOLDER_REDIS_HA
+    restart: unless-stopped
+    network_mode: service:sidecar
+    entrypoint: ["/usr/local/bin/redisha-redis-entrypoint.sh"]
+    depends_on:
+      - sidecar
+    environment:
+      - REDISHA_NODE_NAME=${REDISHA_NODE_NAME}
+      - REDIS_PEERS=${REDIS_PEERS}
+      - REDISHA_BOOTSTRAP=${REDISHA_BOOTSTRAP}
+      - REDISHA_VERIFY_PASSWORD=${REDISHA_VERIFY_PASSWORD}
+      - AGENT_GRPC_SOCKET=/var/run/attestmesh/agent.sock
+    volumes:
+      - redisdata:/data
+      - agent-sock:/var/run/attestmesh
+      - redisha-status:/redisha-status
+
+  # Sentinel :26379: static peer list from REDIS_PEERS, quorum 2; owns failover after
+  # the initial bootstrap. Its requirepass is the sealed verify password (control plane,
+  # no data), auth-pass towards redis is CSK-derived.
+  sentinel:
+    image: ghcr.io/attestmesh/redis-ha@sha256:PLACEHOLDER_REDIS_HA
+    restart: unless-stopped
+    network_mode: service:sidecar
+    entrypoint: ["/usr/local/bin/redisha-sentinel-entrypoint.sh"]
+    depends_on:
+      - redis
+    environment:
+      - REDISHA_NODE_NAME=${REDISHA_NODE_NAME}
+      - REDIS_PEERS=${REDIS_PEERS}
+      - REDISHA_BOOTSTRAP=${REDISHA_BOOTSTRAP}
+      - REDISHA_VERIFY_PASSWORD=${REDISHA_VERIFY_PASSWORD}
+      - AGENT_GRPC_SOCKET=/var/run/attestmesh/agent.sock
+    volumes:
+      - sentinel-data:/sentinel-data
+      - agent-sock:/var/run/attestmesh
+      - redisha-status:/redisha-status
+
+  # Master/replica routing on the mesh IP: :6379 → current master, :6381 → replicas.
+  # Backend health = tcp-check AUTH + INFO replication, expecting role:master/role:slave
+  # on every peer's :6380 (redis has no HTTP role endpoint).
+  haproxy:
+    image: ghcr.io/attestmesh/redis-ha@sha256:PLACEHOLDER_REDIS_HA
+    restart: unless-stopped
+    network_mode: service:sidecar
+    entrypoint: ["/usr/local/bin/redisha-haproxy-entrypoint.sh"]
+    depends_on:
+      - redis
+    environment:
+      - REDISHA_NODE_NAME=${REDISHA_NODE_NAME}
+      - REDIS_PEERS=${REDIS_PEERS}
+      - AGENT_GRPC_SOCKET=/var/run/attestmesh/agent.sock
+    volumes:
+      - agent-sock:/var/run/attestmesh
+      - redisha-status:/redisha-status
+
+  # Mesh-only status page (:8009): the TEE blocks container logs, so every redis-ha
+  # entrypoint self-reports to /redisha-status and this serves it read-only to mesh peers.
+  status-server:
+    image: ghcr.io/attestmesh/redis-ha@sha256:PLACEHOLDER_REDIS_HA
+    restart: unless-stopped
+    network_mode: service:sidecar
+    entrypoint:
+      - /bin/bash
+      - -ec
+    command:
+      - |
+        while :; do
+          ip="$(ip -4 -o addr show dev attestmesh0 2>/dev/null | awk '{print $$4}' | cut -d/ -f1)"
+          [ -n "$$ip" ] && break
+          sleep 1
+        done
+        exec python3 -m http.server 8009 --bind "$$ip" --directory /redisha-status
+    depends_on:
+      - sidecar
+    environment:
+      - REDISHA_NODE_NAME=${REDISHA_NODE_NAME}
+    volumes:
+      - redisha-status:/redisha-status:ro
+
+volumes:
+  redisdata:
+  sentinel-data:
+  agent-sock:
+  redisha-status:

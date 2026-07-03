@@ -1,0 +1,93 @@
+# fugu-router LiteLLM proxy config — docs/research/fugu-subscription-pooling.md §3.4.
+# Same-named deployments form one routing pool; PAYG keys are EXCLUDED from the pool and
+# reached only via fallbacks (drain-then-spill, §3.2). The entrypoint prunes any deployment
+# whose api_key env var is unset at runtime (SAKANA_SUB_3_KEY is optional).
+# Custom Fugu pricing is mandatory: LiteLLM's built-in price table has no Sakana entries,
+# so without model_info costs the computed spend is silently zero (paper §3.4).
+
+model_list:
+  # ---- fugu-ultra: coordinator/verifier tier (dated pin — rolling alias drifts, §3.3) ----
+  - model_name: fugu-ultra
+    litellm_params:
+      model: openai/fugu-ultra-20260615
+      api_base: os.environ/SAKANA_API_BASE
+      api_key: os.environ/SAKANA_SUB_1_KEY
+    model_info:
+      input_cost_per_token: 5e-6 # $5/M (§2.1 rate card; <=272K context)
+      output_cost_per_token: 3e-5 # $30/M
+      cache_read_input_token_cost: 5e-7 # $0.50/M cached input
+  - model_name: fugu-ultra
+    litellm_params:
+      model: openai/fugu-ultra-20260615
+      api_base: os.environ/SAKANA_API_BASE
+      api_key: os.environ/SAKANA_SUB_2_KEY
+    model_info:
+      input_cost_per_token: 5e-6
+      output_cost_per_token: 3e-5
+      cache_read_input_token_cost: 5e-7
+  - model_name: fugu-ultra
+    litellm_params:
+      model: openai/fugu-ultra-20260615
+      api_base: os.environ/SAKANA_API_BASE
+      api_key: os.environ/SAKANA_SUB_3_KEY # optional; pruned at boot if unset
+    model_info:
+      input_cost_per_token: 5e-6
+      output_cost_per_token: 3e-5
+      cache_read_input_token_cost: 5e-7
+  - model_name: fugu-ultra-payg
+    litellm_params:
+      model: openai/fugu-ultra-20260615
+      api_base: os.environ/SAKANA_API_BASE
+      api_key: os.environ/SAKANA_PAYG_KEY
+    model_info:
+      input_cost_per_token: 5e-6
+      output_cost_per_token: 3e-5
+      cache_read_input_token_cost: 5e-7
+
+  # ---- fugu: worker tier (standard, underlying-model passthrough billing, §3.3) ----
+  # No model_info costs: passthrough pricing depends on the underlying model Sakana routes
+  # to and is unknown per-request — spend for the standard tier is NOT tracked yet.
+  # Reconcile against the Sakana console (§4.3) until a defensible per-token rate exists.
+  - model_name: fugu
+    litellm_params:
+      model: openai/fugu
+      api_base: os.environ/SAKANA_API_BASE
+      api_key: os.environ/SAKANA_SUB_1_KEY
+  - model_name: fugu
+    litellm_params:
+      model: openai/fugu
+      api_base: os.environ/SAKANA_API_BASE
+      api_key: os.environ/SAKANA_SUB_2_KEY
+  - model_name: fugu
+    litellm_params:
+      model: openai/fugu
+      api_base: os.environ/SAKANA_API_BASE
+      api_key: os.environ/SAKANA_SUB_3_KEY # optional; pruned at boot if unset
+  - model_name: fugu-payg
+    litellm_params:
+      model: openai/fugu
+      api_base: os.environ/SAKANA_API_BASE
+      api_key: os.environ/SAKANA_PAYG_KEY
+
+router_settings:
+  # Placement happens in the ACP adapter (§3.2); this strategy governs new-session
+  # placement signals and fallback only — never live-session moves (cache locality).
+  routing_strategy: usage-based-routing-v2
+  # redis-ha via the sidecar-netns socat forwarder (compose sets REDIS_HOST=sidecar,
+  # REDIS_PORT=16379); REDIS_PASSWORD is CSK-derived by the entrypoint, never in env files.
+  redis_host: os.environ/REDIS_HOST
+  redis_port: os.environ/REDIS_PORT
+  redis_password: os.environ/REDIS_PASSWORD
+  fallbacks:
+    - fugu-ultra: ["fugu-ultra-payg"]
+    - fugu: ["fugu-payg"]
+  cooldown_time: 60 # rate-limit-shaped errors; quota-exhaustion handling refined post-calibration (§5)
+
+litellm_settings:
+  callbacks: ["langfuse", "fugu_telemetry.fugu_telemetry_handler"]
+  drop_params: true
+
+general_settings:
+  master_key: os.environ/LITELLM_MASTER_KEY
+  database_url: os.environ/DATABASE_URL
+  salt_key: os.environ/LITELLM_SALT_KEY

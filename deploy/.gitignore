@@ -8,3 +8,4 @@ bun.lock
 bun.lockb
 smithers.db*
 __pycache__/
+*.state
