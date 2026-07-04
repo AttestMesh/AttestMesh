@@ -21,8 +21,12 @@ RUN set -eux; \
 FROM ghcr.io/berriai/litellm:v1.83.14-stable@sha256:c81eb79cd4333c6cfe374c0ec929110fd23f0ee5f7fd198855a6fbddc77b83ba
 
 COPY --from=tools /usr/local/bin/grpcurl /usr/local/bin/jq /usr/local/bin/
-# langfuse tracer package for the success_callback (the litellm base does not bundle it).
-RUN pip install --no-cache-dir "langfuse<3"
+# langfuse tracer package for the success_callback. The base image has no `pip` on PATH,
+# so go through the interpreter (ensurepip fallback); no-op if the base already bundles it.
+RUN python3 -c "import langfuse" 2>/dev/null || \
+    python3 -m pip install --no-cache-dir "langfuse<3" || \
+    (python3 -m ensurepip --upgrade && python3 -m pip install --no-cache-dir "langfuse<3"); \
+    python3 -c "import langfuse; print('langfuse', langfuse.__version__)"
 
 COPY agent.proto /etc/fugu-router/agent.proto
 COPY config.yaml fugu_telemetry.py /app/
