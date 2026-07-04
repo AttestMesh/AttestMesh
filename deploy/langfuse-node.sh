@@ -126,6 +126,16 @@ _ha_ips() {
   done
 }
 
+# fugu-router mesh IP (the :18410 forwarder target — for the dashboard's LLM-connection /
+# playground features). FUGU_ROUTER_IP env override wins. Sealed as a value, not measured.
+_fugu_ip() {
+  if [ -z "${FUGU_ROUTER_IP:-}" ]; then
+    local f="$LOGDIR/fugu-router-node-fugu-router.state"
+    [ -f "$f" ] && FUGU_ROUTER_IP=$(grep '^MESH_IP=' "$f" | cut -d= -f2-) || true
+  fi
+  [ -n "${FUGU_ROUTER_IP:-}" ] || die "empty fugu-router mesh IP (no MESH_IP= in fugu-router-node-fugu-router.state — export FUGU_ROUTER_IP)"
+}
+
 # Written ONCE into the 0600 secrets file and re-read every run. The langfuse values
 # are COPIED from the existing fugu-router secrets — NEVER regenerated: litellm on
 # fugu-router keeps sending the SAME pk/sk, and the pg-ha 'langfuse' role password
@@ -183,6 +193,7 @@ _require_env() {
   [ -n "$INDEXER_REGISTRY_ADDR" ] && [ "$INDEXER_REGISTRY_ADDR" != null ] || die "missing INDEXER_REGISTRY_ADDR"
   _ensure_secrets
   _ha_ips
+  _fugu_ip
   [ -n "${S3_ACCESS_KEY_ID:-}" ] && [ -n "${S3_SECRET_ACCESS_KEY:-}" ] && [ -n "${S3_BUCKET:-}" ] \
     || die "S3 creds/bucket missing in $SECRETS_FILE (seeded from $FUGU_SECRETS; bucket must be PRE-CREATED)"
   [ -n "${TS_AUTHKEY:-}" ] || die "TS_AUTHKEY empty in $SECRETS_FILE (reuse $TS_AUTHKEY_FILE or mint via the Tailscale OAuth client)"
@@ -221,6 +232,7 @@ _box_run() {
     printf 'E_CH_HA_IP_1=%q\n' "${CH_HA_IP_1:-}"
     printf 'E_CH_HA_IP_2=%q\n' "${CH_HA_IP_2:-}"
     printf 'E_CH_HA_IP_3=%q\n' "${CH_HA_IP_3:-}"
+    printf 'E_FUGU_ROUTER_IP=%q\n' "${FUGU_ROUTER_IP:-}"
     printf 'E_LANGFUSE_DB_PASSWORD=%q\n' "${LANGFUSE_DB_PASSWORD:-}"
     printf 'E_LANGFUSE_NEXTAUTH_SECRET=%q\n' "${LANGFUSE_NEXTAUTH_SECRET:-}"
     printf 'E_LANGFUSE_SALT=%q\n' "${LANGFUSE_SALT:-}"

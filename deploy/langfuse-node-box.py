@@ -89,6 +89,7 @@ ENV_KEYS = [
     "CH_HA_IP_1",
     "CH_HA_IP_2",
     "CH_HA_IP_3",
+    "FUGU_ROUTER_IP",
     # --- Langfuse v3 (headless init => deterministic pk/sk — the SAME pair the
     #     fugu-router litellm callback sends) ---
     "LANGFUSE_DB_PASSWORD",
