@@ -333,17 +333,6 @@ services:
         [ "$$ok" = "1" ] || { _st "FAILED: database langfuse not present after retries"; exit 1; }
         _st "OK: database langfuse ensured ON CLUSTER default"
 
-  # TEMP: make the diag volume writable by the non-root langfuse user (uid 1000) so its
-  # stdout/stderr tap can be captured. Remove with the diag volume once boot is green.
-  diag-init:
-    image: alpine/socat:1.8.0.0
-    restart: on-failure
-    volumes:
-      - diag:/diag
-    entrypoint: ["/bin/sh", "-ec"]
-    command:
-      - chmod 0777 /diag
-
   # ── LiteLLM proxy (fugu-router image: bakes config.yaml + fugu_telemetry callback).
   #    Its entrypoint CSK-derives the redis password over the agent gRPC before exec.
   #    DSN is the multi-host pg-ha forwarder path (survives node rolls/failover). ──
@@ -412,14 +401,12 @@ services:
     image: langfuse/langfuse:3@sha256:273ff149897aa7024b7c28254c9bd6b7a62a336ddb4476e928e89d0734b64923 # pinned 2026-07-03
     restart: unless-stopped
     depends_on:
-      diag-init:
-        condition: service_completed_successfully
       ch-provision:
         condition: service_completed_successfully
       csk-derive:
         condition: service_completed_successfully
       pg-provision:
-        condition: service_started
+        condition: service_completed_successfully
     environment: &langfuse-env
       - DATABASE_URL=postgresql://langfuse:${LANGFUSE_DB_PASSWORD}@sidecar:15431/langfuse
       - NEXTAUTH_URL=http://localhost:3000
@@ -457,7 +444,6 @@ services:
       - LANGFUSE_S3_MEDIA_UPLOAD_FORCE_PATH_STYLE=true
     volumes:
       - derived-secrets:/derived:ro
-      - diag:/diag
     expose:
       - "3000"
     entrypoint:
@@ -465,8 +451,6 @@ services:
       - -ec
     command:
       - |
-        exec >> /diag/web.log 2>&1
-        set -x
         export REDIS_AUTH="$$(cat /derived/redis-password)"
         export CLICKHOUSE_PASSWORD="$$(cat /derived/clickhouse-password)"
         export CLICKHOUSE_DB=langfuse
@@ -476,18 +460,15 @@ services:
     image: langfuse/langfuse-worker:3@sha256:ef2490d1ac96b88063deb383acec884a53efe5a9ae998432ee54ed655833f31b # pinned 2026-07-03
     restart: unless-stopped
     depends_on:
-      diag-init:
-        condition: service_completed_successfully
       ch-provision:
         condition: service_completed_successfully
       csk-derive:
         condition: service_completed_successfully
       pg-provision:
-        condition: service_started
+        condition: service_completed_successfully
     environment: *langfuse-env
     volumes:
       - derived-secrets:/derived:ro
-      - diag:/diag
     expose:
       - "3030"
     entrypoint:
@@ -495,8 +476,6 @@ services:
       - -ec
     command:
       - |
-        exec >> /diag/worker.log 2>&1
-        set -x
         export REDIS_AUTH="$$(cat /derived/redis-password)"
         export CLICKHOUSE_PASSWORD="$$(cat /derived/clickhouse-password)"
         export CLICKHOUSE_DB=langfuse
@@ -556,29 +535,6 @@ services:
       - ALL
     security_opt:
       - no-new-privileges:true
-
-  # TEMP diagnostic: serve the langfuse stdout/stderr tap on the mesh (:18430). Remove with
-  # the diag volume + tee once boot is green.
-  diag-server:
-    image: alpine/socat:1.8.0.0
-    restart: unless-stopped
-    network_mode: service:sidecar
-    depends_on:
-      - sidecar
-    volumes:
-      - diag:/diag:ro
-      - derived-secrets:/derived:ro
-    entrypoint:
-      - /bin/sh
-      - -ec
-    command:
-      - |
-        while :; do
-          ip="$(ip -4 -o addr show dev attestmesh0 2>/dev/null | awk '{print $$4}' | cut -d/ -f1)"
-          [ -n "$$ip" ] && break
-          sleep 1
-        done
-        exec socat TCP-LISTEN:18430,fork,reuseaddr,bind="$${ip}" SYSTEM:'echo ==DERIVED==; ls -la /derived 2>&1; echo; echo ==CSK-STATUS==; cat /derived/csk-derive.status 2>&1; echo; echo ==REDIS-PW-BYTES==; wc -c /derived/redis-password 2>&1; echo ==CH-PW-BYTES==; wc -c /derived/clickhouse-password 2>&1; echo; echo ==PG-PROV==; cat /derived/pg-provision.status 2>&1; echo; echo ==WORKER==; tail -c 5000 /diag/worker.log 2>&1; echo; echo ==WEB==; tail -c 5000 /diag/web.log 2>&1'
 
   mesh-proxy-langfuse:
     image: alpine/socat:1.8.0.0
@@ -674,5 +630,4 @@ volumes:
   agent-sock:
   derived-secrets:   # CSK-derived redis/CH client passwords (csk-derive -> langfuse wrappers)
   ts-state:          # tailscale node state (survives in-place rolls)
-  diag:              # TEMP: langfuse stdout/stderr tap for boot debugging (remove after green)
   ts-config:         # tailscale serve config (TS_SERVE_CONFIG -> HTTPS on the tailnet)
