@@ -21,6 +21,9 @@ RUN set -eux; \
 FROM ghcr.io/berriai/litellm:v1.83.14-stable@sha256:c81eb79cd4333c6cfe374c0ec929110fd23f0ee5f7fd198855a6fbddc77b83ba
 
 COPY --from=tools /usr/local/bin/grpcurl /usr/local/bin/jq /usr/local/bin/
+# langfuse tracer package for the success_callback (the litellm base does not bundle it).
+RUN pip install --no-cache-dir "langfuse<3"
+
 COPY agent.proto /etc/fugu-router/agent.proto
 COPY config.yaml fugu_telemetry.py /app/
 COPY --chmod=755 fugu-router-entrypoint.sh /usr/local/bin/fugu-router-entrypoint.sh
