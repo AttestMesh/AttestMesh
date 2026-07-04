@@ -32,6 +32,7 @@ pub mod health;
 pub mod heartbeat;
 pub mod indexer_client;
 pub mod keys;
+pub mod peer_cache;
 pub mod peer_grpc;
 pub mod state;
 pub mod transport;

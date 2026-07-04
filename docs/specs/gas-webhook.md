@@ -66,6 +66,7 @@ services/gas-sponsorship-webhook/
 | `RPC_URL` | yes | env (secret) | Alchemy or other EVM RPC for the `eth_call` lookups |
 | `ALCHEMY_WEBHOOK_TOKEN` | yes | env (secret) | shared-secret used in the webhook URL by Alchemy |
 | `CACHE_TTL_SECONDS` | no | env (plaintext, default `86400`) | KV cache TTL for `isDeployedCluster` answers |
+| `MAX_DAILY_OPS_PER_SENDER` | no | env (plaintext, default `100`) | per-sender approved-UserOp cap per UTC day; `0` disables (§6 step 8) |
 | `LOG_LEVEL` | no | env (plaintext, default `info`) | `info` \| `warn` \| `error` |
 
 KV namespaces (declared in `wrangler.toml`):
@@ -119,7 +120,7 @@ or
 { "approved": false, "reason": "selector-not-allowed" }
 ```
 
-`reason` is one of: `bad-token`, `chain-mismatch`, `not-cluster-member`, `outer-selector-not-execute`, `value-nonzero`, `inner-selector-not-allowed`, `target-not-our-cluster`, `rpc-failure`. Used for ops dashboards; never blocks-or-allows differently based on reason.
+`reason` is one of: `bad-token`, `chain-mismatch`, `not-cluster-member`, `outer-selector-not-execute`, `value-nonzero`, `inner-selector-not-allowed`, `target-not-our-cluster`, `sender-daily-cap`, `rpc-failure`. Used for ops dashboards; never blocks-or-allows differently based on reason.
 
 ### 5.2 `GET /check?cluster=<addr>` — Sidecar startup probe
 
@@ -139,15 +140,16 @@ Returns `200 OK` body `{ ok: true }` if the worker can reach `RPC_URL` (lightwei
 
 ## 6. Policy
 
-Run in this order; first failure short-circuits. Costs in order are: zero, zero, zero, zero, zero, zero, one cached eth_call (rare miss → one RPC roundtrip).
+Run in this order; first failure short-circuits. Costs in order are: zero, zero, zero, zero, zero, zero, one cached eth_call (rare miss → one RPC roundtrip), one KV read (+ one KV write per approved op).
 
 1. **Token**: `URL.searchParams.get("token") === ALCHEMY_WEBHOOK_TOKEN` (constant-time). Else `bad-token`.
 2. **Chain id**: `chainId === EXPECTED_CHAIN_ID`. Else `chain-mismatch`.
-3. **Sender provenance**: `userOperation.sender` is a known ClusterMember. Implementation: `eth_call ClusterMemberFactory.isOurMember(sender)`. Cached separately under `MEMBER_PROVENANCE_CACHE`. Else `not-cluster-member`.
+3. **Sender provenance**: `userOperation.sender` is a known ClusterMember. Path A is checked first — `sender.cluster()` → `isDeployedCluster(cluster)` → `cluster.allowedAppIds(sender)`, cached under a `pathA:` key — because every live member today is Path A and its answer is a positive (full-TTL) hit; `ClusterMemberFactory.isOurMember(sender)` is the fallback for factory-minted members (for a Path A member it is a negative answer, whose 10-min TTL would be re-missed and re-written on nearly every request). Cached under `MEMBER_PROVENANCE_CACHE`. Else `not-cluster-member`.
 4. **Outer selector**: First 4 bytes of `userOperation.callData` match `ClusterMember.execute(address,uint256,bytes)` selector (`0xb61d27f6`). Else `outer-selector-not-execute`.
 5. **Value zero**: The second arg of the decoded `execute(...)` call is `0`. Else `value-nonzero`.
 6. **Inner selector**: The first 4 bytes of the third arg (`data`) match one of the entries in `selectors.ts` (see §7). Else `inner-selector-not-allowed`.
 7. **Target provenance**: The first arg of `execute(...)` (the target address) returns `true` from `ClusterDiamondFactory.isDeployedCluster`. Cached. Else `target-not-our-cluster`.
+8. **Sender daily cap** (security audit M2): a KV counter `cap:{chainId}:{sender}:{YYYY-MM-DD}` (UTC day, `MEMBER_PROVENANCE_CACHE`) of *approved* ops; at `MAX_DAILY_OPS_PER_SENDER` further ops are denied `sender-daily-cap` until the day rolls over. Runs last so denials never consume quota (or write to KV). Soft by design (KV is eventually consistent) — it bounds runaway loops, not exact metering — and fails open on KV errors.
 
 If all pass: `{ approved: true }`.
 

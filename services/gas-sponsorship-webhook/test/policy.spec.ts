@@ -28,6 +28,7 @@ import { RpcFailureError } from "../src/provenance.js";
 import type { Config } from "../src/env.js";
 import type { ProvenanceDeps } from "../src/provenance.js";
 import { createLogger } from "../src/log.js";
+import { fakeKV, brokenKV } from "./helpers.js";
 import { encodeExecute } from "../src/decode.js";
 
 const TOKEN = "super-secret-token";
@@ -43,6 +44,7 @@ const config: Config = {
   alchemyWebhookToken: TOKEN,
   cacheTtlSeconds: 86_400,
   negativeCacheTtlSeconds: 600,
+  maxDailyOpsPerSender: 0,
   logLevel: "error",
 };
 
@@ -85,7 +87,7 @@ function validInput(overrides: Partial<PolicyInput> = {}): PolicyInput {
 
 beforeEach(() => {
   // Default: factory membership + cluster provenance pass; Path A app_id check defaults
-  // off (it is only consulted when isOurMember is false).
+  // off (checked first, so a factory member falls through appId=false to isOurMember).
   memberImpl = vi.fn(async () => true);
   clusterImpl = vi.fn(async () => true);
   appIdImpl = vi.fn(async () => false);
@@ -268,5 +270,59 @@ describe("evaluatePolicy", () => {
       provenance,
     );
     expect(decision).toEqual({ approved: true });
+  });
+  // Step-3 ordering: Path A first, so a steady Path A sender is one positive cache
+  // hit instead of a 10-min negative-cache rewrite per request.
+  it("checks isAllowlistedAppId before isOurMember, skipping the latter on a hit", async () => {
+    const order: string[] = [];
+    appIdImpl = vi.fn(async () => {
+      order.push("appId");
+      return true;
+    });
+    memberImpl = vi.fn(async () => {
+      order.push("member");
+      return true;
+    });
+    const decision = await evaluatePolicy(validInput(), config, provenance);
+    expect(decision).toEqual({ approved: true });
+    expect(order).toEqual(["appId"]);
+  });
+
+  // 8. per-sender daily cap (audit M2)
+  describe("sender daily cap", () => {
+    const cappedConfig: Config = { ...config, maxDailyOpsPerSender: 2 };
+
+    it("approves up to the cap, then denies sender-daily-cap", async () => {
+      const kv = fakeKV();
+      const deps: ProvenanceDeps = { ...provenance, config: cappedConfig, memberCache: kv };
+      expect(await evaluatePolicy(validInput(), cappedConfig, deps)).toEqual({ approved: true });
+      expect(await evaluatePolicy(validInput(), cappedConfig, deps)).toEqual({ approved: true });
+      expect(await evaluatePolicy(validInput(), cappedConfig, deps)).toEqual({
+        approved: false,
+        reason: "sender-daily-cap",
+      });
+    });
+
+    it("does not consume quota on denied ops (cap check runs last)", async () => {
+      const kv = fakeKV();
+      const deps: ProvenanceDeps = { ...provenance, config: cappedConfig, memberCache: kv };
+      memberImpl = vi.fn(async () => false);
+      appIdImpl = vi.fn(async () => false);
+      const decision = await evaluatePolicy(validInput(), cappedConfig, deps);
+      expect(decision).toEqual({ approved: false, reason: "not-cluster-member" });
+      expect(kv.store.size).toBe(0);
+    });
+
+    it("fails open when KV is broken", async () => {
+      const deps: ProvenanceDeps = { ...provenance, config: cappedConfig, memberCache: brokenKV() };
+      expect(await evaluatePolicy(validInput(), cappedConfig, deps)).toEqual({ approved: true });
+    });
+
+    it("is disabled when the cap is 0", async () => {
+      const kv = fakeKV();
+      const deps: ProvenanceDeps = { ...provenance, memberCache: kv };
+      expect(await evaluatePolicy(validInput(), config, deps)).toEqual({ approved: true });
+      expect(kv.store.size).toBe(0);
+    });
   });
 });

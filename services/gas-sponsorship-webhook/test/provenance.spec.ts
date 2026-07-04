@@ -24,6 +24,7 @@ const config: Config = {
   alchemyWebhookToken: "tok",
   cacheTtlSeconds: 86_400,
   negativeCacheTtlSeconds: 600,
+  maxDailyOpsPerSender: 0,
   logLevel: "error",
 };
 
