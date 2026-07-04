@@ -14,10 +14,23 @@ the composes, the drivers are the `.sh` files:
 | clickhouse-ha (ch1–ch3) | `deploy/compose/clickhouse-ha-node.yaml` | `deploy/clickhouse-ha-node.sh` | `deploy/clickhouse-ha-node-box.py` |
 | fugu-router (1 CVM) | `deploy/compose/fugu-router-node.yaml` | `deploy/fugu-router-node.sh` | `deploy/fugu-router-node-box.py` |
 
-**Design stance: MESH-ONLY**, with ONE deliberate exception — the fugu-router
-CVM joins the tailnet (tail39cb2e) exposing ONLY the Langfuse UI over
-`tailscale serve` (:443), scope-enforced by an iptables `ts-firewall` on the
-tailscale netns. LiteLLM stays strictly mesh-only.
+> **UPDATE 2026-07-04 — langfuse split.** Langfuse (web/worker + its ClickHouse,
+> S3, tailnet, and pg role/db wiring) moved OFF this node onto its own CVM,
+> **langfuse-node** (`deploy/langfuse-node.sh` + `deploy/compose/langfuse-node.yaml`,
+> own runbook). fugu-router is now a **strictly mesh-only LiteLLM proxy**: pg-ha
+> + redis-ha forwarders only, and a `:18420` sidecar-netns forwarder to
+> `LANGFUSE_NODE_IP:18420` (read from `deploy/logs/langfuse-node-langfuse-node.state`)
+> for the trace callback. The tailnet membership, `verify-clickhouse` /
+> `verify-s3` / `verify-tailnet` phases, and the multipart/presigned-URL risks
+> all moved with langfuse; `verify-langfuse-trace` now queries the langfuse-node
+> API directly. Rolling fugu-router onto this slimmed compose (fresh Langfuse
+> stack on langfuse-node, fresh `LANGFUSE_INIT_*` state) is also the clean-slate
+> path for known issue #1 below (the 401 api-key mismatch on the churned DB).
+> Sections below describing langfuse-on-fugu-router are kept for history.
+
+**Design stance: MESH-ONLY** — fugu-router itself has NO tailnet membership.
+The Langfuse dashboard's tailnet exposure lives on langfuse-node now; LiteLLM
+stays strictly mesh-only (`:18410`).
 
 ---
 
@@ -208,7 +221,10 @@ deployed and serving on mesh `:18420` + the tailnet; Postgres (pg-ha), ClickHous
 (clickhouse-ha, DB `langfuse` created ON CLUSTER by `ch-provision`), Redis (redis-ha), and
 S3 (r2-host, multipart verified) are all wired and reachable.
 
-**1. Langfuse trace ingestion — 401 api-key mismatch (OPEN).**
+**1. Langfuse trace ingestion — 401 api-key mismatch (OPEN — the langfuse-node
+split IS the clean-slate fix path: fresh PG state + `LANGFUSE_INIT_*` rebuilt
+from scratch on the new CVM; keep fugu-router's `LANGFUSE_INIT_PROJECT_*` in
+sync with langfuse-node's, then re-fire a completion and re-check).**
 LiteLLM's langfuse logger (`LangfusePromptManagement`) is loaded and attempts to POST traces,
 but Langfuse rejects them (the ingestion bull-queues stay empty). Direct `curl -u pk:sk` to
 `/api/public/*` with the env project keys also returns 401. Diagnosis: the persisted

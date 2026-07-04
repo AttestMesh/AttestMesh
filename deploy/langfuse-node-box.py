@@ -1,19 +1,23 @@
 #!/usr/bin/env python3
-"""Box-side deploy helper for deploy/fugu-router-node.sh.
+"""Box-side deploy helper for deploy/langfuse-node.sh.
 
 Runs ON the self-hosted on-chain dstack box. Near-verbatim copy of
-telegram-sync-node-box.py (NAME/ENV_KEYS adjusted): wraps the SAME mcp_dstack
+fugu-router-node-box.py (NAME/ENV_KEYS adjusted): wraps the SAME mcp_dstack
 primitives to register a stock DstackApp on Base, seal the runtime env, and
 CreateVm / UpgradeApp.
 
-fugu-router-specific vs telegram-sync:
-  - Sealed env carries the Sakana subscription/PAYG keys + egress CIDRs, the
-    LiteLLM secrets, the langfuse-node callback project keys, and the redis-ha
-    + langfuse-node mesh IPs for the socat forwarders. Key NAMES are measured
-    into the compose_hash, VALUES are sealed. The redis-ha / pg-ha superuser
-    passwords are NOT sealed — they are CSK-derived in-CVM.
-  - gateway_enabled: False + no_instance_id: True — strictly mesh-only node
-    (no tailnet; the Langfuse stack lives on the langfuse-node CVM).
+langfuse-specific vs fugu-router:
+  - Sealed env carries ONLY the Langfuse secrets (DB password, NextAuth/salt/
+    encryption keys, deterministic INIT identities incl. the pk/sk the fugu-router
+    litellm callback sends), the r2-host S3 creds, the redis-ha/clickhouse-ha mesh
+    IPs for the socat forwarders, and the tailnet TS_AUTHKEY. Key NAMES are
+    measured into the compose_hash, VALUES are sealed. The redis-ha /
+    clickhouse-ha / pg-ha superuser passwords are NOT sealed — they are
+    CSK-derived in-CVM.
+  - gateway_enabled: True + no_instance_id: False — this node is DIALED by the
+    gateway-off fugu-router (wg transport is dial-out-only via <app_id>-51900s;
+    "HA clusters need gateway on" lesson), and the no_instance_id+gateway pair
+    boot-loops on dstack 0.5.11.
 
 Three modes:
   deploy          — register a stock DstackApp + seal env + bridge CreateVm.
@@ -44,8 +48,8 @@ import time
 sys.path.insert(0, "/opt/dstack-mcp")
 import mcp_dstack as m  # noqa: E402
 
-NAME = os.environ.get("BOX_NAME", "fugu-router-node")
-COMPOSE_PATH = os.environ.get("BOX_COMPOSE", "/tmp/fugu-router-node.yaml")
+NAME = os.environ.get("BOX_NAME", "langfuse-node")
+COMPOSE_PATH = os.environ.get("BOX_COMPOSE", "/tmp/langfuse-node.yaml")
 VCPU = int(os.environ.get("BOX_VCPU", "2"))
 MEM = int(os.environ.get("BOX_MEM", "4096"))
 DISK = int(os.environ.get("BOX_DISK", "30"))
@@ -54,15 +58,16 @@ PORTS = json.loads(os.environ.get("BOX_PORTS", "[]"))
 # the sidecar health (:9090) at the CVM's bridge IP. In bridge mode KMS is the
 # SLIRP alias 10.0.2.2 (RA-TLS cert SAN).
 NET_MODE = (os.environ.get("BOX_NET_MODE", "bridge").strip().lower() or "bridge")
-# Gateway OFF: mesh-only node, nothing served publicly. Measured into compose_hash.
-GATEWAY_ENABLED = os.environ.get("BOX_GATEWAY_ENABLED", "false").strip().lower() in {
+# Gateway ON: the gateway-off fugu-router dials IN here over <app_id>-51900s
+# (wg transport is dial-out-only). Measured into compose_hash.
+GATEWAY_ENABLED = os.environ.get("BOX_GATEWAY_ENABLED", "true").strip().lower() in {
     "1",
     "true",
     "yes",
     "on",
 }
-# no_instance_id: app-bound disk key (see module docstring).
-NO_INSTANCE_ID = os.environ.get("BOX_NO_INSTANCE_ID", "true").strip().lower() in {
+# no_instance_id: MUST stay False with gateway on (dstack 0.5.11 boot-loop gotcha).
+NO_INSTANCE_ID = os.environ.get("BOX_NO_INSTANCE_ID", "false").strip().lower() in {
     "1",
     "true",
     "yes",
@@ -77,25 +82,32 @@ ENV_KEYS = [
     "GAS_POLICY_ID",
     "INDEXER_REGISTRY_ADDR",
     "GATEWAY_DOMAIN",
-    # --- external node mesh IPs (socat forwarder targets) ---
+    # --- external HA-cluster mesh IPs (socat forwarder targets) ---
     "REDIS_HA_IP_1",
     "REDIS_HA_IP_2",
     "REDIS_HA_IP_3",
-    "LANGFUSE_NODE_IP",
-    # --- Sakana Fugu keys + egress pin ---
-    "SAKANA_API_BASE",
-    "SAKANA_SUB_1_KEY",
-    "SAKANA_SUB_2_KEY",
-    "SAKANA_SUB_3_KEY",
-    "SAKANA_PAYG_KEY",
-    "SAKANA_CIDRS",
-    # --- LiteLLM ---
-    "LITELLM_MASTER_KEY",
-    "LITELLM_SALT_KEY",
-    "LITELLM_DB_PASSWORD",
-    # --- langfuse-node callback project keys (must match langfuse-node's init) ---
+    "CH_HA_IP_1",
+    "CH_HA_IP_2",
+    "CH_HA_IP_3",
+    # --- Langfuse v3 (headless init => deterministic pk/sk — the SAME pair the
+    #     fugu-router litellm callback sends) ---
+    "LANGFUSE_DB_PASSWORD",
+    "LANGFUSE_NEXTAUTH_SECRET",
+    "LANGFUSE_SALT",
+    "LANGFUSE_ENCRYPTION_KEY",
+    "LANGFUSE_INIT_ORG_ID",
+    "LANGFUSE_INIT_PROJECT_ID",
     "LANGFUSE_INIT_PROJECT_PUBLIC_KEY",
     "LANGFUSE_INIT_PROJECT_SECRET_KEY",
+    "LANGFUSE_INIT_USER_EMAIL",
+    "LANGFUSE_INIT_USER_PASSWORD",
+    # --- r2-host S3 (bucket PRE-CREATED) ---
+    "S3_ACCESS_KEY_ID",
+    "S3_SECRET_ACCESS_KEY",
+    "S3_BUCKET",
+    "S3_REGION",
+    # --- tailnet (Langfuse UI only; ts-firewall enforces) ---
+    "TS_AUTHKEY",
     # --- registry pull creds (private ghcr.io/attestmesh/* images) ---
     "DSTACK_DOCKER_USERNAME",
     "DSTACK_DOCKER_PASSWORD",
@@ -122,12 +134,12 @@ def app_compose_and_hash(env_keys: list[str]) -> tuple[str, str]:
         "public_logs": True,
         "public_sysinfo": True,
         "allowed_envs": sorted(set(env_keys) | {"APP_ID"}),
-        "no_instance_id": NO_INSTANCE_ID,  # app-bound disk key
+        "no_instance_id": NO_INSTANCE_ID,  # False: gateway on (boot-loop gotcha)
         "secure_time": False,
     }
     # Log in to the private registry inside the guest so ghcr.io/attestmesh/*
-    # (sidecar, fugu-router, egress-fw, pg-ha) pull. Creds arrive sealed as
-    # DSTACK_DOCKER_*; the guard makes it a no-op when absent.
+    # (sidecar, egress-fw, pg-ha) pull. Creds arrive sealed as DSTACK_DOCKER_*;
+    # the guard makes it a no-op when absent.
     app_compose["pre_launch_script"] = (
         'if [ -n "$DSTACK_DOCKER_PASSWORD" ]; then '
         'echo "$DSTACK_DOCKER_PASSWORD" | docker login "${DSTACK_DOCKER_REGISTRY:-ghcr.io}" '
@@ -195,7 +207,7 @@ def main() -> None:
         app_id = sys.argv[2] if len(sys.argv) > 2 else ""
         vm_id = sys.argv[3] if len(sys.argv) > 3 else ""
         if not app_id or not vm_id:
-            raise SystemExit("usage: fugu-router-node-box.py update <app_id> <vm_id>")
+            raise SystemExit("usage: langfuse-node-box.py update <app_id> <vm_id>")
 
         env = build_env()
         compose_file, compose_hash = app_compose_and_hash(list(env.keys()))
@@ -299,7 +311,7 @@ def main() -> None:
         )
         return
 
-    raise SystemExit("usage: fugu-router-node-box.py [deploy|hash|update <app_id> <vm_id>]")
+    raise SystemExit("usage: langfuse-node-box.py [deploy|hash|update <app_id> <vm_id>]")
 
 
 if __name__ == "__main__":
