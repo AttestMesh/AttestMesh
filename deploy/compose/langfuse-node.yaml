@@ -318,6 +318,22 @@ services:
         [ "$$ok" = "1" ] || { _st "FAILED: database langfuse not present after retries"; exit 1; }
         _st "OK: database langfuse ensured ON CLUSTER default"
 
+  # ── fugu-router forwarder: :18410 -> the LiteLLM proxy's mesh endpoint, so the
+  #    dashboard's LLM-connection / playground features can call the router. Whitelisted
+  #    via LANGFUSE_LLM_CONNECTION_WHITELISTED_HOST=sidecar (SSRF guard host-bypass). ──
+  fugu-proxy:
+    image: alpine/socat:1.8.0.0
+    restart: unless-stopped
+    network_mode: service:sidecar
+    depends_on:
+      - sidecar
+    command: ["TCP-LISTEN:18410,fork,reuseaddr,bind=0.0.0.0", "TCP:${FUGU_ROUTER_IP}:18410"]
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+
   # ── Langfuse v3 (web + worker). TELEMETRY_ENABLED=false and the egress-fw's enforce
   #    telemetry-off at the network layer. LANGFUSE_INIT_* makes org/project/user + the
   #    callback pk/sk deterministic and sealed (the SAME pk/sk the fugu-router litellm
@@ -346,6 +362,9 @@ services:
       - SALT=${LANGFUSE_SALT}
       - ENCRYPTION_KEY=${LANGFUSE_ENCRYPTION_KEY}
       - TELEMETRY_ENABLED=false
+      # SSRF-guard whitelist: allow LLM connections to the compose-internal forwarder
+      # (base URL http://sidecar:18410/v1 -> fugu-router over the mesh).
+      - LANGFUSE_LLM_CONNECTION_WHITELISTED_HOST=sidecar
       - LANGFUSE_INIT_ORG_ID=${LANGFUSE_INIT_ORG_ID}
       - LANGFUSE_INIT_PROJECT_ID=${LANGFUSE_INIT_PROJECT_ID}
       - LANGFUSE_INIT_PROJECT_PUBLIC_KEY=${LANGFUSE_INIT_PROJECT_PUBLIC_KEY}
@@ -423,7 +442,7 @@ services:
       - langfuse-web
     environment:
       - INTERNAL_HOSTS=
-      - INTERNAL_HOST_PORTS=sidecar:15431 sidecar:15432 sidecar:15433 sidecar:16379 sidecar:16380 sidecar:16381 sidecar:18123 sidecar:18124 sidecar:18125 sidecar:19001 sidecar:19002 sidecar:19003 sidecar:19000 langfuse-worker:3030
+      - INTERNAL_HOST_PORTS=sidecar:15431 sidecar:15432 sidecar:15433 sidecar:16379 sidecar:16380 sidecar:16381 sidecar:18123 sidecar:18124 sidecar:18125 sidecar:19001 sidecar:19002 sidecar:19003 sidecar:19000 sidecar:18410 langfuse-worker:3030
       - ALLOW_DNS=127.0.0.11
       - RERESOLVE_SECONDS=30
     cap_add:
@@ -437,7 +456,7 @@ services:
       - langfuse-worker
     environment:
       - INTERNAL_HOSTS=
-      - INTERNAL_HOST_PORTS=sidecar:15431 sidecar:15432 sidecar:15433 sidecar:16379 sidecar:16380 sidecar:16381 sidecar:18123 sidecar:18124 sidecar:18125 sidecar:19001 sidecar:19002 sidecar:19003 sidecar:19000 langfuse-web:3000
+      - INTERNAL_HOST_PORTS=sidecar:15431 sidecar:15432 sidecar:15433 sidecar:16379 sidecar:16380 sidecar:16381 sidecar:18123 sidecar:18124 sidecar:18125 sidecar:19001 sidecar:19002 sidecar:19003 sidecar:19000 sidecar:18410 langfuse-web:3000
       - ALLOW_DNS=127.0.0.11
       - RERESOLVE_SECONDS=30
     cap_add:
