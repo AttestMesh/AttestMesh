@@ -84,7 +84,12 @@ router_settings:
   cooldown_time: 60 # rate-limit-shaped errors; quota-exhaustion handling refined post-calibration (§5)
 
 litellm_settings:
-  callbacks: ["langfuse", "fugu_telemetry.fugu_telemetry_handler"]
+  # langfuse belongs in success/failure_callback (the documented integration hook); the
+  # custom orchestration-token logger goes in callbacks as an import path (PYTHONPATH=/app).
+  # Mixing "langfuse" into `callbacks` silently fails to register the tracer.
+  success_callback: ["langfuse"]
+  failure_callback: ["langfuse"]
+  callbacks: ["fugu_telemetry.fugu_telemetry_handler"]
   drop_params: true
 
 general_settings:
