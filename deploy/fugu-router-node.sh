@@ -1,13 +1,14 @@
 #!/usr/bin/env bash
 # Fugu-router AttestMesh node on the self-hosted on-chain dstack box.
 #
-# Deploys the LiteLLM Sakana-Fugu subscription-pooling proxy + Langfuse v3
-# observability as a full on-chain-anchored AttestMesh node via the canonical
-# Path-A flow (telegram-sync template). All data services are EXTERNAL cluster
-# nodes: pg-ha (roles litellm+langfuse created by the CVM's own pg-provision),
-# redis-ha, clickhouse-ha, r2-host. Mesh endpoints :18410 (LiteLLM) / :18420
-# (Langfuse UI); tailnet exposes ONLY Langfuse (ts-firewall). See
-# deploy/fugu-router-runbook.md for the full runbook + risks.
+# Deploys the LiteLLM Sakana-Fugu subscription-pooling proxy as a strictly
+# MESH-ONLY on-chain-anchored AttestMesh node via the canonical Path-A flow
+# (telegram-sync template). Data services are EXTERNAL cluster nodes: pg-ha
+# (role litellm created by the CVM's own pg-provision) + redis-ha. Langfuse
+# observability lives on its OWN CVM (langfuse-node), reached through the
+# CVM's :18420 sidecar-netns forwarder — no tailnet on this node. Mesh
+# endpoint :18410 (LiteLLM). See deploy/fugu-router-runbook.md for the full
+# runbook + risks.
 #
 #   setup   (ONCE, BEFORE deploy: generate ~/.attestmesh/fugu-router.env — all
 #     secrets except the Sakana keys, which Dan pastes at the gate; prints the
@@ -17,11 +18,11 @@
 #   -> bind  (hash pre-check — C3 membership is permanent — then upgradeToAndCall)
 #   -> verify (sidecar self-registers -> memberIdOf(X) != 0)
 #   -> verify-health (box-side :9090; the port only binds POST-bind)
-#   -> verify-db / verify-clickhouse / verify-s3 / verify-redis (data planes)
+#   -> verify-db / verify-redis (data planes)
 #   -> verify-proxy (real fugu-ultra completion through :18410)
 #   -> verify-langfuse-trace (the completion's trace, with orchestration-token
-#      metadata, visible via the Langfuse public API — callback->worker->CH->S3)
-#   -> verify-isolation / verify-tailnet
+#      metadata, visible via the langfuse-node public API — callback->langfuse-node)
+#   -> verify-isolation
 #
 # Secrets live in ~/.attestmesh/fugu-router.env (generated ONCE) and ride to the
 # box over ssh STDIN (printf %q; webhost pattern) — never on argv.
@@ -33,7 +34,7 @@ source "$HERE/lib.sh"
 : "${RPC_URL:?source deploy/env.sh first}"
 require PRIVATE_KEY RPC_URL CHAIN_ID DEPLOYER_ADDR
 
-NODE="${1:?usage: fugu-router-node.sh <node-name> [setup|deploy|prime|bind|verify|verify-health|verify-db|verify-clickhouse|verify-s3|verify-redis|verify-proxy|verify-langfuse-trace|verify-isolation|verify-tailnet|update|all]}"
+NODE="${1:?usage: fugu-router-node.sh <node-name> [setup|deploy|prime|bind|verify|verify-health|verify-db|verify-redis|verify-proxy|verify-langfuse-trace|verify-isolation|update|all]}"
 ACTION="${2:-all}"
 BOX_HOST="${BOX_HOST:-ubuntu@173.231.234.133}"
 BOX_PY="${BOX_PY:-/opt/dstack-mcp/venv/bin/python}"
@@ -42,23 +43,20 @@ BOX_RPC="${BOX_RPC:-https://base-rpc.publicnode.com}"
 COMPOSE="${COMPOSE:-$ROOT/deploy/compose/fugu-router-node.yaml}"
 MATRIX_STATE="${MATRIX_STATE:-$LOGDIR/matrix-node-matrix-node.state}"
 GATEWAY_DOMAIN="${GATEWAY_DOMAIN:-gateway.attestmesh.xyz}"
-TS_SUFFIX="${TS_SUFFIX:-tail39cb2e.ts.net}"
 
 # The mesh jump host: the ssh-node's sshd-mesh (port 1023, sidecar netns — it sits
 # ON the wg mesh). See deploy/compose/ssh-node.yaml + ~/.ssh/config.
 MESH_SSH_HOST="${MESH_SSH_HOST:-attestmesh-mesh-node}"
 
 SECRETS_FILE="${SECRETS_FILE:-$HOME/.attestmesh/fugu-router.env}"
-R2HOST_ENV="${R2HOST_ENV:-$HOME/.attestmesh/r2-host.env}"
 
-# Sibling cluster state (for the redis/ch mesh IPs + verify credentials).
+# Sibling cluster/node state (for the redis/langfuse mesh IPs + verify credentials).
 REDISHA_CSTATE="${REDISHA_CSTATE:-$LOGDIR/redis-ha-redis-ha.state}"
-CHHA_CSTATE="${CHHA_CSTATE:-$LOGDIR/clickhouse-ha-clickhouse-ha.state}"
+LANGFUSE_STATE="${LANGFUSE_STATE:-$LOGDIR/langfuse-node-langfuse-node.state}"
 
 # pg-ha peer mesh IPs (informational — the compose hardcodes them for its socat
 # forwarders; verify-db probes pg1 directly).
 PG1_MESH_IP="${PG1_MESH_IP:-10.18.147.86}"
-R2_HOST_MESH_IP="${R2_HOST_MESH_IP:-10.18.163.210}"
 
 # CVM sizing: all heavy data services are external; 30 GB holds images only.
 export BOX_VCPU="${BOX_VCPU:-2}" BOX_MEM="${BOX_MEM:-4096}" BOX_DISK="${BOX_DISK:-30}"
@@ -97,8 +95,8 @@ _default_cluster_env() {
   [ -n "${CLUSTER:-}" ] && [ -n "${MEMBER_IMPL:-}" ] || die "could not resolve CLUSTER/MEMBER_IMPL"
 }
 
-# redis-ha / clickhouse-ha mesh IPs from their node state files (compute-peers output);
-# REDIS_HA_IP_N / CH_HA_IP_N env overrides win. Sealed into the CVM (values, not hash).
+# redis-ha mesh IPs from their node state files (compute-peers output); REDIS_HA_IP_N
+# env overrides win. Sealed into the CVM (values, not hash).
 _ha_ips() {
   local i f
   for i in 1 2 3; do
@@ -107,33 +105,32 @@ _ha_ips() {
       [ -f "$f" ] || die "missing $f (deploy redis-ha through compute-peers first, or export REDIS_HA_IP_$i)"
       eval "REDIS_HA_IP_$i=\$(grep '^MESH_IP=' '$f' | cut -d= -f2-)"
     fi
-    if [ -z "$(eval echo "\${CH_HA_IP_$i:-}")" ]; then
-      f="$LOGDIR/clickhouse-ha-node-clickhouse-ha-ch$i.state"
-      [ -f "$f" ] || die "missing $f (deploy clickhouse-ha through compute-peers first, or export CH_HA_IP_$i)"
-      eval "CH_HA_IP_$i=\$(grep '^MESH_IP=' '$f' | cut -d= -f2-)"
-    fi
-    [ -n "$(eval echo "\${REDIS_HA_IP_$i}")" ] && [ -n "$(eval echo "\${CH_HA_IP_$i}")" ] \
-      || die "empty redis/ch mesh IP for index $i"
+    [ -n "$(eval echo "\${REDIS_HA_IP_$i}")" ] || die "empty redis mesh IP for index $i"
   done
 }
 
+# langfuse-node mesh IP (the :18420 forwarder target — litellm's trace callback);
+# LANGFUSE_NODE_IP env override wins. Sealed into the CVM (value, not hash).
+_langfuse_ip() {
+  if [ -z "${LANGFUSE_NODE_IP:-}" ]; then
+    [ -f "$LANGFUSE_STATE" ] || die "missing $LANGFUSE_STATE (deploy langfuse-node through mesh discovery first, or export LANGFUSE_NODE_IP)"
+    LANGFUSE_NODE_IP=$(grep '^MESH_IP=' "$LANGFUSE_STATE" | cut -d= -f2-)
+  fi
+  [ -n "${LANGFUSE_NODE_IP:-}" ] || die "empty langfuse-node mesh IP (no MESH_IP= in $LANGFUSE_STATE — export LANGFUSE_NODE_IP to override)"
+}
+
 # Generated ONCE into the 0600 secrets file and re-read every run. Existing values
-# always win (regenerating would desync the DB roles + Langfuse init credentials).
+# always win (regenerating would desync the DB role + Langfuse project credentials).
 # The Sakana keys are the ONLY fields left blank for Dan (deploy gate).
 _ensure_secrets() {
   umask 077
   mkdir -p "$(dirname "$SECRETS_FILE")"
   if [ ! -s "$SECRETS_FILE" ]; then
-    # S3 creds come from the r2-host deployment env (dedicated gateway creds).
-    local s3ak="" s3sk="" s3bucket="" s3region="us-east-1"
-    if [ -f "$R2HOST_ENV" ]; then
-      s3ak=$(grep -E '^(S3_ACCESS_KEY_ID|AWS_ACCESS_KEY_ID|S3GW_ACCESS_KEY)=' "$R2HOST_ENV" | head -1 | cut -d= -f2-)
-      s3sk=$(grep -E '^(S3_SECRET_ACCESS_KEY|AWS_SECRET_ACCESS_KEY|S3GW_SECRET_KEY)=' "$R2HOST_ENV" | head -1 | cut -d= -f2-)
-      s3bucket=$(grep -E '^(S3_BUCKET|R2_BUCKET|BUCKET)=' "$R2HOST_ENV" | head -1 | cut -d= -f2-)
-    fi
     cat > "$SECRETS_FILE" <<EOF
 # fugu-router node secrets — generated $(date -u +%FT%TZ) by fugu-router-node.sh setup.
 # Sakana keys are pasted by the operator (deploy gate). Do the training opt-out FIRST.
+# LANGFUSE_INIT_PROJECT_* are the callback credentials litellm sends to langfuse-node —
+# they MUST match the langfuse-node deployment's LANGFUSE_INIT project keys.
 SAKANA_API_BASE=
 SAKANA_SUB_1_KEY=
 SAKANA_SUB_2_KEY=
@@ -143,23 +140,10 @@ SAKANA_CIDRS=
 LITELLM_MASTER_KEY=sk-$(openssl rand -hex 24)
 LITELLM_SALT_KEY=sk-$(openssl rand -hex 24)
 LITELLM_DB_PASSWORD=$(openssl rand -hex 24)
-LANGFUSE_DB_PASSWORD=$(openssl rand -hex 24)
-LANGFUSE_NEXTAUTH_SECRET=$(openssl rand -hex 32)
-LANGFUSE_SALT=$(openssl rand -hex 32)
-LANGFUSE_ENCRYPTION_KEY=$(openssl rand -hex 32)
-LANGFUSE_INIT_ORG_ID=attestmesh
-LANGFUSE_INIT_PROJECT_ID=fugu-router
 LANGFUSE_INIT_PROJECT_PUBLIC_KEY=pk-lf-$(openssl rand -hex 16)
 LANGFUSE_INIT_PROJECT_SECRET_KEY=sk-lf-$(openssl rand -hex 16)
-LANGFUSE_INIT_USER_EMAIL=lsdan@flashbots.net
-LANGFUSE_INIT_USER_PASSWORD=$(openssl rand -hex 16)
-S3_ACCESS_KEY_ID=${s3ak}
-S3_SECRET_ACCESS_KEY=${s3sk}
-S3_BUCKET=${s3bucket}
-S3_REGION=${s3region}
-TS_AUTHKEY=
 EOF
-    log "generated fresh fugu-router secrets -> $SECRETS_FILE (S3 creds seeded from r2-host.env: ${s3ak:+yes}${s3ak:-NO — fill in manually})"
+    log "generated fresh fugu-router secrets -> $SECRETS_FILE (sync LANGFUSE_INIT_PROJECT_* with langfuse-node)"
   fi
   # shellcheck disable=SC1090
   source "$SECRETS_FILE"
@@ -191,9 +175,7 @@ _require_env() {
   _ensure_secrets
   _require_sakana
   _ha_ips
-  [ -n "${S3_ACCESS_KEY_ID:-}" ] && [ -n "${S3_SECRET_ACCESS_KEY:-}" ] && [ -n "${S3_BUCKET:-}" ] \
-    || die "S3 creds/bucket missing in $SECRETS_FILE (from ~/.attestmesh/r2-host.env; bucket must be PRE-CREATED)"
-  [ -n "${TS_AUTHKEY:-}" ] || die "TS_AUTHKEY empty in $SECRETS_FILE (mint via the Tailscale OAuth client — Wave-1 agent D)"
+  _langfuse_ip
 }
 
 send_seq() {
@@ -226,9 +208,7 @@ _box_run() {
     printf 'E_REDIS_HA_IP_1=%q\n' "${REDIS_HA_IP_1:-}"
     printf 'E_REDIS_HA_IP_2=%q\n' "${REDIS_HA_IP_2:-}"
     printf 'E_REDIS_HA_IP_3=%q\n' "${REDIS_HA_IP_3:-}"
-    printf 'E_CH_HA_IP_1=%q\n' "${CH_HA_IP_1:-}"
-    printf 'E_CH_HA_IP_2=%q\n' "${CH_HA_IP_2:-}"
-    printf 'E_CH_HA_IP_3=%q\n' "${CH_HA_IP_3:-}"
+    printf 'E_LANGFUSE_NODE_IP=%q\n' "${LANGFUSE_NODE_IP:-}"
     printf 'E_SAKANA_API_BASE=%q\n' "${SAKANA_API_BASE:-}"
     printf 'E_SAKANA_SUB_1_KEY=%q\n' "${SAKANA_SUB_1_KEY:-}"
     printf 'E_SAKANA_SUB_2_KEY=%q\n' "${SAKANA_SUB_2_KEY:-}"
@@ -238,21 +218,8 @@ _box_run() {
     printf 'E_LITELLM_MASTER_KEY=%q\n' "${LITELLM_MASTER_KEY:-}"
     printf 'E_LITELLM_SALT_KEY=%q\n' "${LITELLM_SALT_KEY:-}"
     printf 'E_LITELLM_DB_PASSWORD=%q\n' "${LITELLM_DB_PASSWORD:-}"
-    printf 'E_LANGFUSE_DB_PASSWORD=%q\n' "${LANGFUSE_DB_PASSWORD:-}"
-    printf 'E_LANGFUSE_NEXTAUTH_SECRET=%q\n' "${LANGFUSE_NEXTAUTH_SECRET:-}"
-    printf 'E_LANGFUSE_SALT=%q\n' "${LANGFUSE_SALT:-}"
-    printf 'E_LANGFUSE_ENCRYPTION_KEY=%q\n' "${LANGFUSE_ENCRYPTION_KEY:-}"
-    printf 'E_LANGFUSE_INIT_ORG_ID=%q\n' "${LANGFUSE_INIT_ORG_ID:-}"
-    printf 'E_LANGFUSE_INIT_PROJECT_ID=%q\n' "${LANGFUSE_INIT_PROJECT_ID:-}"
     printf 'E_LANGFUSE_INIT_PROJECT_PUBLIC_KEY=%q\n' "${LANGFUSE_INIT_PROJECT_PUBLIC_KEY:-}"
     printf 'E_LANGFUSE_INIT_PROJECT_SECRET_KEY=%q\n' "${LANGFUSE_INIT_PROJECT_SECRET_KEY:-}"
-    printf 'E_LANGFUSE_INIT_USER_EMAIL=%q\n' "${LANGFUSE_INIT_USER_EMAIL:-}"
-    printf 'E_LANGFUSE_INIT_USER_PASSWORD=%q\n' "${LANGFUSE_INIT_USER_PASSWORD:-}"
-    printf 'E_S3_ACCESS_KEY_ID=%q\n' "${S3_ACCESS_KEY_ID:-}"
-    printf 'E_S3_SECRET_ACCESS_KEY=%q\n' "${S3_SECRET_ACCESS_KEY:-}"
-    printf 'E_S3_BUCKET=%q\n' "${S3_BUCKET:-}"
-    printf 'E_S3_REGION=%q\n' "${S3_REGION:-us-east-1}"
-    printf 'E_TS_AUTHKEY=%q\n' "${TS_AUTHKEY:-}"
     printf 'E_DSTACK_DOCKER_USERNAME=%q\n' "${guser:-dmvt}"
     printf 'E_DSTACK_DOCKER_PASSWORD=%q\n' "$gtok"
     printf 'E_DSTACK_DOCKER_REGISTRY=%q\n' "ghcr.io"
@@ -264,14 +231,13 @@ _box_run() {
 # (the deploy gate) are missing so orchestration can block on it visibly.
 setup() {
   _ensure_secrets
-  if [ -z "${SAKANA_SUB_1_KEY:-}" ] || [ -z "${SAKANA_PAYG_KEY:-}" ] || [ -z "${SAKANA_API_BASE:-}" ] || [ -z "${TS_AUTHKEY:-}" ]; then
+  if [ -z "${SAKANA_SUB_1_KEY:-}" ] || [ -z "${SAKANA_PAYG_KEY:-}" ] || [ -z "${SAKANA_API_BASE:-}" ]; then
     log "setup: $SECRETS_FILE generated/present."
     log "STILL MISSING (fill in before deploy):"
     [ -z "${SAKANA_API_BASE:-}" ]  && log "  - SAKANA_API_BASE"
     [ -z "${SAKANA_SUB_1_KEY:-}" ] && log "  - SAKANA_SUB_1_KEY (+ optional SUB_2/SUB_3)"
     [ -z "${SAKANA_PAYG_KEY:-}" ]  && log "  - SAKANA_PAYG_KEY"
     [ -z "${SAKANA_CIDRS:-}" ]     && log "  - SAKANA_CIDRS (narrowest observed egress CIDRs)"
-    [ -z "${TS_AUTHKEY:-}" ]       && log "  - TS_AUTHKEY (tailnet key for the Langfuse UI)"
     log "REMINDER: complete the Sakana TRAINING OPT-OUT before pasting any key."
     exit 2
   fi
@@ -291,7 +257,7 @@ deploy_cvm() {
   [ -n "$X" ] && [ "$X" != null ] || die "could not parse app_id from box deploy: $out"
   _save
   log "✔ deployed fugu-router node app_id=$X compose_hash=$H vm=$VM_ID"
-  log "mesh-only: LiteLLM <mesh-ip>:18410, Langfuse <mesh-ip>:18420 (+ tailnet https)"
+  log "mesh-only: LiteLLM <mesh-ip>:18410 (Langfuse dashboard lives on langfuse-node)"
 }
 
 prime_gate() {
@@ -393,8 +359,9 @@ SCRIPT
 }
 
 # Discover this node's mesh IP from the jump host: enumerate wg peer allowed-ips and
-# probe the mesh-only Langfuse port :18420 (langfuse-web answers /api/public/health as
-# soon as it's up — the stable "this is the fugu-router node" fingerprint).
+# probe the mesh-only LiteLLM port :18410 (any HTTP answer on /health/liveliness — the
+# stable "this is the fugu-router node" fingerprint; :18420 would ALSO match the
+# langfuse-node CVM, so it cannot disambiguate).
 _mesh_discover_snippet() {
   cat <<'SNIP'
 IF=$(wg show interfaces 2>/dev/null | awk '{print $1; exit}')
@@ -402,7 +369,7 @@ CAND=""
 [ -n "$IF" ] && CAND=$(wg show "$IF" allowed-ips 2>/dev/null | awk '{print $2}' | cut -d/ -f1)
 [ -n "$CAND" ] || CAND=$(ip -o route show 2>/dev/null | awk '/dev wg/ {print $1}' | cut -d/ -f1)
 for ip in $CAND; do
-  code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 4 "http://$ip:18420/api/public/health" 2>/dev/null)
+  code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 4 "http://$ip:18410/health/liveliness" 2>/dev/null)
   if [ -n "$code" ] && [ "$code" != "000" ]; then
     echo "MESH_IP=$ip"
     exit 0
@@ -431,8 +398,9 @@ SCRIPT
   return 1
 }
 
-# The CVM's pg-provision created roles+dbs at boot; prove it from the mesh shell by
-# logging in as litellm AND langfuse and checking their migrated tables.
+# The CVM's pg-provision created the litellm role+db at boot; prove it from the mesh
+# shell by logging in as litellm and checking its migrated tables (the langfuse role/db
+# is langfuse-node's own pg-provision's job).
 verify_db() {
   _load; _ensure_secrets
   local out
@@ -440,138 +408,11 @@ verify_db() {
 export LC_ALL=C
 psql "postgresql://litellm:${LITELLM_DB_PASSWORD}@${PG1_MESH_IP}:5432/litellm?connect_timeout=5" -tAc \
   "SELECT current_user || ':' || count(*) FROM information_schema.tables WHERE table_name = 'LiteLLM_VerificationToken'" 2>&1
-psql "postgresql://langfuse:${LANGFUSE_DB_PASSWORD}@${PG1_MESH_IP}:5432/langfuse?connect_timeout=5" -tAc \
-  "SELECT current_user || ':' || count(*) FROM information_schema.tables WHERE table_name IN ('projects','api_keys')" 2>&1
 SCRIPT
 )
   echo "$out"
-  echo "$out" | grep -q '^litellm:1$'  || die "verify-db failed: LiteLLM schema not migrated (got: $out)"
-  echo "$out" | grep -q '^langfuse:2$' || die "verify-db failed: Langfuse migrations missing (got: $out)"
-  log "✔ pg-ha roles+dbs live: litellm + langfuse schemas migrated"
-}
-
-# Langfuse's /api/public/ready covers its ClickHouse connection; additionally prove the
-# Langfuse schema exists as REPLICATED tables on all three ch nodes (system.replicas).
-verify_clickhouse() {
-  _load; _ensure_secrets
-  _discover_mesh_ip || die "node not discoverable on the mesh"
-  local vpw
-  vpw=$(grep '^CHHA_VERIFY_PASSWORD=' "$CHHA_CSTATE" | cut -d= -f2-)
-  [ -n "$vpw" ] || die "no CHHA_VERIFY_PASSWORD in $CHHA_CSTATE"
-  _ha_ips
-  local out
-  out=$(ssh_mesh "bash -s" <<SCRIPT 2>/dev/null
-code=\$(curl -s -o /dev/null -w '%{http_code}' --max-time 8 "http://$MESH_IP:18420/api/public/ready")
-echo "READY=\$code"
-for ip in $CH_HA_IP_1 $CH_HA_IP_2 $CH_HA_IP_3; do
-  n=\$(curl -fsS --max-time 8 "http://\$ip:8123/" -u "meshverify:$vpw" \
-    --data-binary "SELECT count() FROM system.replicas WHERE database = 'langfuse'" 2>/dev/null)
-  echo "REPLICAS \$ip=\${n:-?}"
-done
-SCRIPT
-)
-  echo "$out"
-  echo "$out" | grep -q '^READY=200' || die "Langfuse /api/public/ready not 200"
-  local bad
-  bad=$(echo "$out" | grep '^REPLICAS' | awk -F= '$2 == "?" || $2 == 0 || $2 == "" {print}')
-  [ -z "$bad" ] || die "Langfuse tables not replicated on all ch nodes: $bad"
-  log "✔ Langfuse ready + schema present as replicated tables on all three ch nodes"
-}
-
-# SigV4 PutObject + a FULL multipart round-trip against r2-host (risk 1: rclone-serve-s3
-# multipart unproven). Pure-stdlib python on the mesh jump — no boto needed.
-verify_s3() {
-  _load; _ensure_secrets
-  local out
-  # Creds ride stdin inside the ssh-encrypted script text — never the remote argv.
-  out=$({
-    printf 'export S3_EP=%q S3_BUCKET=%q S3_REGION=%q AK=%q SK=%q\n' \
-      "http://${R2_HOST_MESH_IP}:19000" "$S3_BUCKET" "${S3_REGION:-us-east-1}" \
-      "$S3_ACCESS_KEY_ID" "$S3_SECRET_ACCESS_KEY"
-    echo "python3 - <<'PY'"
-    cat <<'PY_BODY'
-import datetime, hashlib, hmac, os, sys, urllib.request, urllib.parse
-EP, BUCKET, REGION = os.environ["S3_EP"], os.environ["S3_BUCKET"], os.environ["S3_REGION"]
-AK, SK = os.environ["AK"], os.environ["SK"]
-HOST = urllib.parse.urlparse(EP).netloc
-
-def sign(method, path, query="", body=b""):
-    t = datetime.datetime.utcnow()
-    amz, ds = t.strftime("%Y%m%dT%H%M%SZ"), t.strftime("%Y%m%d")
-    ph = hashlib.sha256(body).hexdigest()
-    headers = {"host": HOST, "x-amz-content-sha256": ph, "x-amz-date": amz}
-    ch = "".join(f"{k}:{headers[k]}\n" for k in sorted(headers))
-    sh = ";".join(sorted(headers))
-    creq = f"{method}\n{path}\n{query}\n{ch}\n{sh}\n{ph}"
-    scope = f"{ds}/{REGION}/s3/aws4_request"
-    sts = f"AWS4-HMAC-SHA256\n{amz}\n{scope}\n{hashlib.sha256(creq.encode()).hexdigest()}"
-    k = hmac.new(("AWS4" + SK).encode(), ds.encode(), hashlib.sha256).digest()
-    for part in (REGION, "s3", "aws4_request"):
-        k = hmac.new(k, part.encode(), hashlib.sha256).digest()
-    sig = hmac.new(k, sts.encode(), hashlib.sha256).hexdigest()
-    headers["Authorization"] = f"AWS4-HMAC-SHA256 Credential={AK}/{scope}, SignedHeaders={sh}, Signature={sig}"
-    del headers["host"]
-    return headers
-
-def req(method, path, query="", body=b""):
-    url = f"{EP}{path}" + (f"?{query}" if query else "")
-    r = urllib.request.Request(url, data=body if body else None, method=method,
-                               headers=sign(method, path, query, body))
-    with urllib.request.urlopen(r, timeout=20) as resp:
-        return resp.status, resp.read()
-
-# r2gw (rclone serve s3 over crypt) has measured read-after-write lag (~7s) — poll GETs.
-def get_poll(path, deadline=45):
-    import time
-    last = None
-    for _ in range(deadline // 3):
-        try:
-            return req("GET", path)
-        except urllib.error.HTTPError as e:
-            last = e
-            if e.code != 404:
-                raise
-            time.sleep(3)
-    raise last
-
-stamp = datetime.datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
-key = f"langfuse-events/verify/put-{stamp}.txt"
-st, _ = req("PUT", f"/{BUCKET}/{key}", body=b"attestmesh verify-s3 " + stamp.encode())
-assert st in (200, 201), f"PutObject failed: {st}"
-st, got = get_poll(f"/{BUCKET}/{key}")
-assert st == 200 and b"verify-s3" in got, "GET readback failed"
-print("PUT: OK")
-
-mkey = f"langfuse-events/verify/multipart-{stamp}.bin"
-st, xml = req("POST", f"/{BUCKET}/{mkey}", query="uploads=")
-assert st == 200, f"CreateMultipartUpload failed: {st}"
-uid = xml.decode().split("<UploadId>")[1].split("</UploadId>")[0]
-etags = []
-part = os.urandom(5 * 1024 * 1024)  # 5 MiB min part size
-for n in (1, 2):
-    q = f"partNumber={n}&uploadId={urllib.parse.quote(uid)}"
-    url = f"{EP}/{BUCKET}/{mkey}?{q}"
-    r = urllib.request.Request(url, data=part, method="PUT",
-                               headers=sign("PUT", f"/{BUCKET}/{mkey}", q, part))
-    with urllib.request.urlopen(r, timeout=60) as resp:
-        assert resp.status == 200, f"UploadPart {n} failed"
-        etags.append(resp.headers["ETag"])
-body = ("<CompleteMultipartUpload>" + "".join(
-    f"<Part><PartNumber>{n}</PartNumber><ETag>{e}</ETag></Part>" for n, e in zip((1, 2), etags)
-) + "</CompleteMultipartUpload>").encode()
-q = f"uploadId={urllib.parse.quote(uid)}"
-st, _ = req("POST", f"/{BUCKET}/{mkey}", query=q, body=body)
-assert st == 200, f"CompleteMultipartUpload failed: {st}"
-st, got = get_poll(f"/{BUCKET}/{mkey}")
-assert st == 200 and len(got) == 2 * len(part), f"multipart readback size mismatch: {len(got)}"
-print("MULTIPART: OK (2x5MiB round-trip)")
-print("S3: PASS")
-PY_BODY
-    echo "PY"
-  } | ssh_mesh "bash -s" 2>&1)
-  echo "$out" | tee "$LOGDIR/fugu-s3-${NODE}.$(ts).log" >&2
-  echo "$out" | grep -q '^S3: PASS' || die "verify-s3 failed (multipart against r2-host — see risk 1)"
-  log "✔ r2-host S3: PutObject + full multipart round-trip OK under langfuse-events/verify/"
+  echo "$out" | grep -q '^litellm:1$' || die "verify-db failed: LiteLLM schema not migrated (got: $out)"
+  log "✔ pg-ha role+db live: litellm schema migrated"
 }
 
 # SET/GET through the CVM's :16379 forwarder path (bound in the sidecar netns, so it is
@@ -621,19 +462,20 @@ SCRIPT
   log "✔ LiteLLM live on :18410 — models listed + one real fugu-ultra completion returned"
 }
 
-# Poll the Langfuse public API until verify-proxy's completion appears as a trace WITH
-# the orchestration-token metadata — proves callback -> worker -> ClickHouse -> S3.
+# Poll the langfuse-node public API until verify-proxy's completion appears as a trace
+# WITH the orchestration-token metadata — proves litellm's callback -> :18420 forwarder
+# -> langfuse-node ingest end-to-end.
 verify_langfuse_trace() {
   _load; _ensure_secrets
-  _discover_mesh_ip || die "node not discoverable on the mesh"
+  _langfuse_ip
   local i out
   for i in $(seq 1 40); do
     out=$(ssh_mesh "bash -s" <<SCRIPT 2>/dev/null
-curl -fsS --max-time 10 -u "${LANGFUSE_INIT_PROJECT_PUBLIC_KEY}:${LANGFUSE_INIT_PROJECT_SECRET_KEY}" "http://$MESH_IP:18420/api/public/traces?limit=10"
+curl -fsS --max-time 10 -u "${LANGFUSE_INIT_PROJECT_PUBLIC_KEY}:${LANGFUSE_INIT_PROJECT_SECRET_KEY}" "http://$LANGFUSE_NODE_IP:18420/api/public/traces?limit=10"
 SCRIPT
 )
     if echo "$out" | grep -q '"orchestration'; then
-      log "✔ trace with orchestration-token metadata visible in Langfuse"
+      log "✔ trace with orchestration-token metadata visible on langfuse-node"
       echo "$out" | head -c 600
       return 0
     fi
@@ -644,7 +486,7 @@ SCRIPT
     fi
     sleep 15
   done
-  die "no trace with orchestration-token metadata appeared within 10m — check fugu_telemetry callback + langfuse-worker"
+  die "no trace with orchestration-token metadata appeared within 10m — check fugu_telemetry callback + the langfuse-node ingest path"
 }
 
 # From the box: every service port must refuse on the bridge IP; only 9090/51900 answer.
@@ -658,7 +500,7 @@ VMID="$VM_ID"
 $(_bridge_ip_snippet)
 echo "ISOLATION: vm=\$VMID bridge_ip=\$IP"
 bad=0
-for p in 3000 3030 4000 15431 15432 15433 16379 16380 16381 18123 18124 18125 19000 19001 19002 19003 18410 18420; do
+for p in 4000 15431 15432 15433 16379 16380 16381 18410 18420; do
   if timeout 3 bash -c "</dev/tcp/\$IP/\$p" 2>/dev/null; then
     echo "  !! \$IP:\$p REACHABLE from host — INVARIANT VIOLATION"; bad=1
   else echo "  \$IP:\$p refused from host (good)"; fi
@@ -669,37 +511,6 @@ SCRIPT
   local rc=${PIPESTATUS[0]}
   [ "$rc" = 0 ] || die "host-isolation check failed (rc=$rc)"
   log "✔ host-isolation invariant holds"
-}
-
-# Tailnet exposes ONLY Langfuse: https health 200 on the MagicDNS name; LiteLLM
-# (:18410/:4000) and the forwarder ports must NOT answer on the tailnet IP.
-verify_tailnet() {
-  _load
-  local fqdn="" n tsip
-  if [ -n "${FUGU_TAILNET_FQDN:-}" ]; then
-    fqdn="$FUGU_TAILNET_FQDN"
-  else
-    for n in $(tailscale status 2>/dev/null | awk 'tolower($2) ~ /^fugu-router/ {print $2}'); do
-      if curl -sS --max-time 8 "https://$n.$TS_SUFFIX/api/public/health" 2>/dev/null | grep -qi 'ok\|"status"'; then
-        fqdn="$n.$TS_SUFFIX"; break
-      fi
-    done
-  fi
-  [ -n "$fqdn" ] || die "could not find a live fugu-router tailnet FQDN (tailscale status; MagicDNS name bumps each fresh-disk roll)"
-  local code
-  code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 8 "https://$fqdn/api/public/health")
-  [ "$code" = 200 ] || die "tailnet Langfuse health returned $code (want 200)"
-  log "✔ Langfuse healthy over the tailnet at https://$fqdn"
-  tsip=$(tailscale status 2>/dev/null | awk -v h="${fqdn%%.*}" '$2 == h {print $1}' | head -1)
-  [ -n "$tsip" ] || die "could not resolve the node's tailnet IP"
-  local bad=0 p
-  for p in 4000 18410 3000 18420 16379 15431 18123 19000 9090; do
-    if timeout 3 bash -c "</dev/tcp/$tsip/$p" 2>/dev/null; then
-      log "  !! $tsip:$p REACHABLE over the tailnet — ts-firewall scope violation"; bad=1
-    fi
-  done
-  [ "$bad" = 0 ] || die "verify-tailnet FAILED: non-Langfuse ports reachable over the tailnet"
-  log "✔ ts-firewall scope proven: only :443 (Langfuse serve) answers on the tailnet"
 }
 
 update_member() {
@@ -724,7 +535,6 @@ update_member() {
   _save
   mode=$(echo "$j" | jq -r '.mode // "upgrade"')
   log "✔ fugu-router node update complete mode=$mode vm=$VM_ID"
-  log "NOTE: the tailnet MagicDNS name may bump on a fresh-disk roll — check tailscale status."
 }
 
 log "=== Fugu-router AttestMesh node: $NODE ==="
@@ -736,14 +546,11 @@ case "$ACTION" in
   verify) verify ;;
   verify-health) verify_health ;;
   verify-db) verify_db ;;
-  verify-clickhouse) verify_clickhouse ;;
-  verify-s3) verify_s3 ;;
   verify-redis) verify_redis ;;
   verify-proxy) verify_proxy ;;
   verify-langfuse-trace) verify_langfuse_trace ;;
   verify-isolation) verify_isolation ;;
-  verify-tailnet) verify_tailnet ;;
   update) update_member ;;
-  all) setup; deploy_cvm; prime_gate; bind_member; verify; verify_health; verify_db; verify_clickhouse; verify_s3; verify_redis; verify_isolation; verify_tailnet; verify_proxy; verify_langfuse_trace ;;
-  *) die "usage: fugu-router-node.sh <node-name> [setup|deploy|prime|bind|verify|verify-health|verify-db|verify-clickhouse|verify-s3|verify-redis|verify-proxy|verify-langfuse-trace|verify-isolation|verify-tailnet|update|all]" ;;
+  all) setup; deploy_cvm; prime_gate; bind_member; verify; verify_health; verify_db; verify_redis; verify_isolation; verify_proxy; verify_langfuse_trace ;;
+  *) die "usage: fugu-router-node.sh <node-name> [setup|deploy|prime|bind|verify|verify-health|verify-db|verify-redis|verify-proxy|verify-langfuse-trace|verify-isolation|update|all]" ;;
 esac
