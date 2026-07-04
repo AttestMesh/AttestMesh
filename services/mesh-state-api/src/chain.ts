@@ -78,6 +78,124 @@ export interface Timeline {
   events: TimelineEvent[];
 }
 
+const RETRYABLE_RPC_STATUSES = new Set([408, 425, 429, 500, 502, 503, 504]);
+let rpcGate: Promise<void> = Promise.resolve();
+let nextRpcAt = 0;
+
+function sleep(ms: number, signal?: AbortSignal | null): Promise<void> {
+  if (ms <= 0) return Promise.resolve();
+  return new Promise((resolve, reject) => {
+    const cleanup = () => signal?.removeEventListener("abort", abort);
+    const timer = setTimeout(() => {
+      cleanup();
+      resolve();
+    }, ms);
+    const abort = () => {
+      clearTimeout(timer);
+      cleanup();
+      reject(signal?.reason instanceof Error ? signal.reason : new Error("aborted"));
+    };
+    if (signal?.aborted) {
+      abort();
+      return;
+    }
+    signal?.addEventListener("abort", abort, { once: true });
+  });
+}
+
+function retryAfterMs(headers: Headers): number | null {
+  const raw = headers.get("retry-after")?.trim();
+  if (!raw) return null;
+  const seconds = Number(raw);
+  if (Number.isFinite(seconds) && seconds >= 0) return Math.round(seconds * 1000);
+  const dateMs = Date.parse(raw);
+  if (Number.isFinite(dateMs)) return Math.max(0, dateMs - Date.now());
+  return null;
+}
+
+function retryDelayMs(attempt: number, cfg: Config, headers?: Headers): number {
+  const retryAfter = headers ? retryAfterMs(headers) : null;
+  if (retryAfter !== null) return Math.min(retryAfter, cfg.rpcRetryMaxMs);
+  const exponential = cfg.rpcRetryBaseMs * 2 ** attempt;
+  const jitter = 0.8 + Math.random() * 0.4;
+  return Math.min(Math.round(exponential * jitter), cfg.rpcRetryMaxMs);
+}
+
+function isReadRpcBody(body: RequestInit["body"] | null | undefined): boolean {
+  if (typeof body !== "string") return false;
+  try {
+    const parsed = JSON.parse(body) as unknown;
+    const calls = Array.isArray(parsed) ? parsed : [parsed];
+    return calls.every((call) => {
+      if (!call || typeof call !== "object" || !("method" in call)) return false;
+      const method = (call as { method?: unknown }).method;
+      return typeof method === "string" && !method.startsWith("eth_send") && !method.startsWith("wallet_");
+    });
+  } catch {
+    return false;
+  }
+}
+
+function timeoutSignal(parent: AbortSignal | null | undefined, timeoutMs: number): {
+  signal: AbortSignal | null;
+  cleanup: () => void;
+} {
+  if (timeoutMs <= 0) return { signal: parent ?? null, cleanup: () => {} };
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(new Error("rpc request timed out")), timeoutMs);
+  const abort = () => controller.abort(parent?.reason);
+  if (parent?.aborted) abort();
+  else parent?.addEventListener("abort", abort, { once: true });
+  return {
+    signal: controller.signal,
+    cleanup: () => {
+      clearTimeout(timer);
+      parent?.removeEventListener("abort", abort);
+    },
+  };
+}
+
+async function waitForRpcSlot(minIntervalMs: number, signal?: AbortSignal | null): Promise<void> {
+  if (minIntervalMs <= 0) return;
+  const turn = rpcGate.then(async () => {
+    const waitMs = Math.max(0, nextRpcAt - Date.now());
+    nextRpcAt = Date.now() + waitMs + minIntervalMs;
+    await sleep(waitMs, signal);
+  });
+  rpcGate = turn.catch(() => {});
+  await turn;
+}
+
+async function retryingFetch(cfg: Config, input: string | URL | Request, init?: RequestInit): Promise<Response> {
+  const readRpc = isReadRpcBody(init?.body);
+  const maxAttempts = readRpc ? cfg.rpcRetryCount + 1 : 1;
+  let lastError: unknown;
+
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    const { signal, cleanup } = timeoutSignal(init?.signal, cfg.rpcTimeoutMs);
+    try {
+      await waitForRpcSlot(cfg.rpcMinIntervalMs, init?.signal);
+      const response = await fetch(input, { ...init, signal });
+      if (!readRpc || !RETRYABLE_RPC_STATUSES.has(response.status) || attempt === maxAttempts - 1) {
+        return response;
+      }
+      const delayMs = retryDelayMs(attempt, cfg, response.headers);
+      console.warn(JSON.stringify({ msg: "mesh-state-api rpc retry", status: response.status, attempt: attempt + 1, delayMs }));
+      await sleep(delayMs, init?.signal);
+    } catch (err) {
+      lastError = err;
+      if (init?.signal?.aborted || attempt === maxAttempts - 1) throw err;
+      const delayMs = retryDelayMs(attempt, cfg);
+      console.warn(JSON.stringify({ msg: "mesh-state-api rpc retry", error: String(err), attempt: attempt + 1, delayMs }));
+      await sleep(delayMs, init?.signal);
+    } finally {
+      cleanup();
+    }
+  }
+
+  throw lastError instanceof Error ? lastError : new Error(String(lastError));
+}
+
 interface IndexedMember {
   memberId: string;
   memberContract: `0x${string}`;
@@ -99,7 +217,7 @@ interface IndexedCluster extends ClusterDeployment {
   events: TimelineEvent[];
 }
 
-interface MeshIndexState {
+export interface MeshIndexState {
   version: 1;
   chainId: number;
   clusterFactoryAddr: `0x${string}`;
@@ -111,7 +229,14 @@ export function makeClient(cfg: Config): PublicClient {
   // Chain is Base for v1; still pin the multicall address explicitly (below) so a
   // custom CHAIN_ID doesn't silently lose batching.
   const chain = cfg.chainId === base.id ? base : undefined;
-  return createPublicClient({ chain, transport: http(cfg.rpcUrl) }) as PublicClient;
+  return createPublicClient({
+    chain,
+    transport: http(cfg.rpcUrl, {
+      fetchFn: (input, init) => retryingFetch(cfg, input, init),
+      retryCount: 0,
+      timeout: 0,
+    }),
+  }) as PublicClient;
 }
 
 function sortDeployments(deployments: ClusterDeployment[]): ClusterDeployment[] {
@@ -174,6 +299,10 @@ async function readIndexState(cfg: Config): Promise<MeshIndexState> {
   } catch {
     return emptyIndexState(cfg);
   }
+}
+
+export async function readMeshIndex(cfg: Config): Promise<MeshIndexState> {
+  return readIndexState(cfg);
 }
 
 async function writeIndexState(cfg: Config, state: MeshIndexState): Promise<void> {
@@ -261,6 +390,12 @@ export async function fetchClusterDeployments(client: PublicClient, cfg: Config)
         deploymentLogIndex: Number(l.logIndex),
       });
     }
+    await writeDiscoveryState(cfg, {
+      chainId: cfg.chainId,
+      clusterFactoryAddr: cfg.clusterFactoryAddr,
+      scannedToBlock: Number(to),
+      deployments: sortDeployments([...byCluster.values()]),
+    });
   }
 
   const deployments = sortDeployments([...byCluster.values()]);
@@ -335,6 +470,9 @@ export async function updateMeshIndex(client: PublicClient, cfg: Config): Promis
       state.clusters.push(indexed);
       clustersByAddr.set(cluster.toLowerCase(), indexed);
     }
+    state.scannedToBlock = Number(to);
+    state.clusters = sortDeployments(state.clusters) as IndexedCluster[];
+    await writeIndexState(cfg, state);
   }
   state.scannedToBlock = toBlock;
 
@@ -408,8 +546,9 @@ export async function updateMeshIndex(client: PublicClient, cfg: Config): Promis
 
         addTimelineEvent(cluster, event);
       }
+      cluster.scannedToBlock = Number(to);
+      await writeIndexState(cfg, state);
     }
-    cluster.scannedToBlock = toBlock;
   }
 
   state.clusters = sortDeployments(state.clusters) as IndexedCluster[];
