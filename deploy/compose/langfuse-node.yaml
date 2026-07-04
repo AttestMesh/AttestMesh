@@ -376,7 +376,6 @@ services:
       - LANGFUSE_S3_MEDIA_UPLOAD_FORCE_PATH_STYLE=true
     volumes:
       - derived-secrets:/derived:ro
-      - diag:/diag
     expose:
       - "3000"
     entrypoint:
@@ -384,8 +383,6 @@ services:
       - -ec
     command:
       - |
-        exec >> /diag/web.log 2>&1
-        set -x
         export REDIS_AUTH="$$(cat /derived/redis-password)"
         export CLICKHOUSE_PASSWORD="$$(cat /derived/clickhouse-password)"
         export CLICKHOUSE_DB=langfuse
@@ -404,7 +401,6 @@ services:
     environment: *langfuse-env
     volumes:
       - derived-secrets:/derived:ro
-      - diag:/diag
     expose:
       - "3030"
     entrypoint:
@@ -412,8 +408,6 @@ services:
       - -ec
     command:
       - |
-        exec >> /diag/worker.log 2>&1
-        set -x
         export REDIS_AUTH="$$(cat /derived/redis-password)"
         export CLICKHOUSE_PASSWORD="$$(cat /derived/clickhouse-password)"
         export CLICKHOUSE_DB=langfuse
@@ -540,40 +534,8 @@ services:
           sleep 30
         done
 
-  # TEMP boot-debug tap (remove once green): diag-init makes /diag writable for the
-  # non-root langfuse user; diag-server dumps the captured logs on mesh :18431.
-  diag-init:
-    image: alpine/socat:1.8.0.0
-    restart: on-failure
-    volumes:
-      - diag:/diag
-    entrypoint: ["/bin/sh", "-ec"]
-    command:
-      - chmod 0777 /diag
-
-  diag-server:
-    image: alpine/socat:1.8.0.0
-    restart: unless-stopped
-    network_mode: service:sidecar
-    depends_on:
-      - sidecar
-    volumes:
-      - diag:/diag:ro
-      - derived-secrets:/derived:ro
-    entrypoint:
-      - /bin/sh
-      - -ec
-    command:
-      - |
-        while :; do
-          ip="$(ip -4 -o addr show dev attestmesh0 2>/dev/null | awk '{print $$4}' | cut -d/ -f1)"
-          [ -n "$$ip" ] && break
-          sleep 1
-        done
-        exec socat TCP-LISTEN:18431,fork,reuseaddr,bind="$${ip}" SYSTEM:'echo ==DERIVED==; ls -la /derived 2>&1; echo ==STATUSES==; cat /derived/*.status 2>&1 | tail -30; echo ==WORKER==; tail -c 4000 /diag/worker.log 2>&1; echo; echo ==WEB==; tail -c 4000 /diag/web.log 2>&1'
 
 volumes:
-  diag:               # TEMP boot-debug tap
   agent-sock:
   derived-secrets:   # CSK-derived redis/CH client passwords (csk-derive -> langfuse wrappers)
   ts-state:          # tailscale node state (survives in-place rolls)
