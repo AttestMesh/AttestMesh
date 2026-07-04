@@ -9,6 +9,7 @@ import {
   fetchSnapshot,
   fetchTimeline,
   makeClient,
+  readMeshIndex,
   snapshotsFromIndex,
   timelinesFromIndex,
   updateMeshIndex,
@@ -168,6 +169,16 @@ export function createApp(cfg: Config) {
     stale: boolean;
   }> => {
     if (cfg.indexedReads) {
+      if (!indexCache.peek()) {
+        const diskIndex = await readMeshIndex(cfg);
+        if (diskIndex.clusters.length > 0) {
+          return {
+            deployments: deploymentsFromIndex(diskIndex),
+            snapshots: snapshotsFromIndex(diskIndex, cfg),
+            stale: true,
+          };
+        }
+      }
       const index = await indexCache.get();
       return {
         deployments: deploymentsFromIndex(index.value),
@@ -190,6 +201,16 @@ export function createApp(cfg: Config) {
     stale: boolean;
   }> => {
     if (cfg.indexedReads) {
+      if (!indexCache.peek()) {
+        const diskIndex = await readMeshIndex(cfg);
+        if (diskIndex.clusters.length > 0) {
+          return {
+            deployments: deploymentsFromIndex(diskIndex),
+            timelines: timelinesFromIndex(diskIndex),
+            stale: true,
+          };
+        }
+      }
       const index = await indexCache.get();
       return {
         deployments: deploymentsFromIndex(index.value),
@@ -298,25 +319,46 @@ export function createApp(cfg: Config) {
           return;
         }
         case "/healthz": {
-          const peek = discoveryCache.peek();
-          try {
-            const c = await discoveryCache.get();
+          const indexPeek = cfg.indexedReads ? indexCache.peek() : null;
+          if (indexPeek) {
+            const deployments = deploymentsFromIndex(indexPeek.value);
             json(res, 200, {
               ok: true,
-              rpcReachable: !c.stale,
-              clusterCount: c.value.length,
-              clusters: c.value,
-              cacheAgeMs: Date.now() - c.fetchedAt,
-              stale: c.stale || undefined,
+              rpcReachable: !indexPeek.stale,
+              clusterCount: deployments.length,
+              clusters: deployments,
+              cacheAgeMs: Date.now() - indexPeek.fetchedAt,
+              indexed: true,
+              stale: indexPeek.stale || undefined,
             });
-          } catch {
-            json(res, 503, {
-              ok: false,
-              rpcReachable: false,
-              clusterCount: peek?.value.length ?? null,
-              clusters: peek?.value ?? [],
-            });
+            return;
           }
+          if (cfg.indexedReads) {
+            const diskIndex = await readMeshIndex(cfg);
+            if (diskIndex.clusters.length > 0) {
+              const deployments = deploymentsFromIndex(diskIndex);
+              json(res, 200, {
+                ok: true,
+                rpcReachable: null,
+                clusterCount: deployments.length,
+                clusters: deployments,
+                cacheAgeMs: null,
+                indexed: true,
+                stale: true,
+              });
+              return;
+            }
+          }
+          const peek = discoveryCache.peek();
+          json(res, 200, {
+            ok: true,
+            rpcReachable: peek ? !peek.stale : null,
+            clusterCount: peek?.value.length ?? null,
+            clusters: peek?.value ?? [],
+            cacheAgeMs: peek ? Date.now() - peek.fetchedAt : null,
+            indexed: false,
+            stale: peek?.stale || undefined,
+          });
           return;
         }
         default:

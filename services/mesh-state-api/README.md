@@ -25,16 +25,17 @@ The default mode is indexed:
 
 ```bash
 npm install
-RPC_URL=https://base-mainnet.g.alchemy.com/v2/<key> \
+RPC_URL=https://mainnet.base.org \
 CLUSTER_FACTORY_ADDR=0xf6E85fD138E3208d3AAE63ce4E2A33f20e82b9fb \
 CLUSTER_FACTORY_START_BLOCK=46868742 \
   LISTEN_ADDR=127.0.0.1:8787 \
   npm start
 ```
 
-Runs on Node ≥ 20 with native TypeScript execution (no build step). `RPC_URL` is the only
-secret env. The factory address and start block are required runtime config; cluster
-addresses are never configured directly.
+Runs on Node ≥ 20 with native TypeScript execution (no build step). `RPC_URL` should be
+the public Base mainnet reader (`https://mainnet.base.org`) for this service; Alchemy is
+reserved for write/bundler flows elsewhere. The factory address and start block are
+required runtime config; cluster addresses are never configured directly.
 
 - A reliable RPC endpoint is still needed for historical `getLogs`, but indexed
   mode makes it low-volume after the first scan. `INDEXED_READS=0` restores the
@@ -42,6 +43,10 @@ addresses are never configured directly.
 - `INDEX_REFRESH_MS=300000` controls the background index refresh interval.
 - `TIMELINE_ENABLED=0` disables expensive live timeline scans. In indexed mode,
   `/mesh/timeline` is served from the local projection.
+- Rate limiting is handled at the HTTP transport: read JSON-RPC calls retry on
+  `408`, `425`, `429`, and `5xx`, honor `Retry-After`, and otherwise use exponential
+  backoff with jitter. Tune with `RPC_RETRY_COUNT`, `RPC_RETRY_BASE_MS`,
+  `RPC_RETRY_MAX_MS`, per-attempt `RPC_TIMEOUT_MS`, and `RPC_MIN_INTERVAL_MS`.
 
 ## Endpoints (frozen v1.0 — see spec §5)
 

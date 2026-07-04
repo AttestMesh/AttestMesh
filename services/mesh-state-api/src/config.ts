@@ -17,6 +17,11 @@ export interface Config {
   indexedReads: boolean;
   indexRefreshMs: number;
   timelineEnabled: boolean;
+  rpcRetryCount: number;
+  rpcRetryBaseMs: number;
+  rpcRetryMaxMs: number;
+  rpcTimeoutMs: number;
+  rpcMinIntervalMs: number;
 }
 
 function req(name: string): string {
@@ -32,6 +37,14 @@ function optBool(name: string, dflt: boolean): boolean {
   const v = process.env[name];
   if (v === undefined || v === "") return dflt;
   return !["0", "false", "no", "off"].includes(v.toLowerCase());
+}
+function optInt(name: string, dflt: number): number {
+  const raw = opt(name, String(dflt));
+  const value = Number(raw);
+  if (!Number.isInteger(value) || value < 0) {
+    throw new Error(`${name} must be a non-negative integer, got ${raw}`);
+  }
+  return value;
 }
 
 export function loadConfig(): Config {
@@ -62,5 +75,10 @@ export function loadConfig(): Config {
     indexedReads: optBool("INDEXED_READS", true),
     indexRefreshMs: Number(opt("INDEX_REFRESH_MS", "300000")),
     timelineEnabled: optBool("TIMELINE_ENABLED", false),
+    rpcRetryCount: optInt("RPC_RETRY_COUNT", 5),
+    rpcRetryBaseMs: optInt("RPC_RETRY_BASE_MS", 1000),
+    rpcRetryMaxMs: optInt("RPC_RETRY_MAX_MS", 30000),
+    rpcTimeoutMs: optInt("RPC_TIMEOUT_MS", 30000),
+    rpcMinIntervalMs: optInt("RPC_MIN_INTERVAL_MS", 250),
   };
 }
