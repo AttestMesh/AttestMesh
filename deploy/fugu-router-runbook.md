@@ -194,3 +194,58 @@ itself tracks the primary.
   value; refine quota-vs-ratelimit handling post-calibration via `update`.
 - Repo-wide fix for E_* secret transit (env-file over stdin) tracked in the
   2026-07 deploy-scripts review.
+
+---
+
+## Known issues / follow-ups (as of 2026-07-04 deploy)
+
+The core system is live and verified: both HA clusters (redis-ha, clickhouse-ha) passed
+HA + failover + isolation drills; the fugu-router node is a registered C3 member; **real
+Fugu Ultra completions flow through `:18410`** and the responses carry the orchestration-token
+split (`prompt_tokens_details.orchestration_input_tokens`) that `fugu_telemetry` captures
+(the custom callback IS loaded — confirmed in `/health/readiness`). Langfuse UI/storage is
+deployed and serving on mesh `:18420` + the tailnet; Postgres (pg-ha), ClickHouse
+(clickhouse-ha, DB `langfuse` created ON CLUSTER by `ch-provision`), Redis (redis-ha), and
+S3 (r2-host, multipart verified) are all wired and reachable.
+
+**1. Langfuse trace ingestion — 401 api-key mismatch (OPEN).**
+LiteLLM's langfuse logger (`LangfusePromptManagement`) is loaded and attempts to POST traces,
+but Langfuse rejects them (the ingestion bull-queues stay empty). Direct `curl -u pk:sk` to
+`/api/public/*` with the env project keys also returns 401. Diagnosis: the persisted
+`api_keys` row's `fast_hashed_secret_key` does not verify against the env
+`LANGFUSE_INIT_PROJECT_SECRET_KEY` — the **public** keys match (env == PG row), only the
+secret hash differs. `LANGFUSE_SALT`/init keys ARE in `allowed_envs` and reach the container,
+and HKDF/derivation is not involved here (these are sealed, not CSK-derived). Most likely a
+langfuse headless-init artifact on a database churned by ~15 debug rolls, not a clean-deploy
+condition. **Next step to try:** on a clean external Langfuse PG (or after
+`DELETE FROM api_keys; DELETE FROM projects; DELETE FROM organizations;` + restart so
+`LANGFUSE_INIT` rebuilds from scratch), re-fire a completion and check
+`SELECT count() FROM langfuse.observations`. If it still mismatches, dump the container's
+actual `SALT`/`LANGFUSE_INIT_PROJECT_SECRET_KEY` (temporary env tap) and compare byte-for-byte
+to the sealed env, then reconcile langfuse's hash function. The `fugu_telemetry` orchestration
+capture — the paper's novel contribution — is independently proven in the completion payloads.
+
+**2. redis-ha HAProxy does not auto-recover after a failover (OPEN, workaround known).**
+After the `verify-failover` drill promoted a new master, all three nodes' HAProxy `:6379`/`:6381`
+listeners stopped routing (accept-but-timeout) until the HAProxy containers were restarted
+(an in-place roll of the redis nodes fixed it immediately). Backends `:6380` stayed healthy
+throughout. The `tcp-check` (`AUTH`→`INFO replication`→expect `role:master`, then a `QUIT`→
+`expect +OK` dance) is fragile; harden it (drop the QUIT step, add a `PING`→`+PONG` probe) so
+routing re-converges within a check window without a manual restart. Nothing in this stack
+uses `:6381` (replica reads), so only `:6379` matters operationally today.
+
+**3. `ch-provision` curl raced the forwarder on first boot (FIXED, verify on next clean deploy).**
+The langfuse ClickHouse database must be pre-created (`CREATE DATABASE langfuse ON CLUSTER
+default`) because langfuse's migration runner `SHOW TABLES FROM langfuse` before creating it.
+The `ch-provision` one-shot now retries + verifies `EXISTS DATABASE` in a loop; the first
+version's single curl didn't stick and the DB was created manually during this deploy.
+
+**4. dstack in-place `UpgradeApp` does not reliably recreate changed one-shot/diagnostic
+containers.** Several compose edits to already-exited one-shots (and the diag containers) were
+not picked up until a `BOX_FRESH_DISK=1` roll. For config changes to `restart: on-failure`
+one-shots (csk-derive, ch-provision, pg-provision) whose output persists on a named volume,
+prefer a fresh-disk roll, or make their output volumes ephemeral so they always re-run.
+
+**5. Smithers routines not yet authored** for redis-ha / clickhouse-ha / fugu-router (the
+trios are directly runnable and were used for this whole deploy). `deploy/workflows/pg-ha.tsx`
+is the model for the two HA clusters. Follow-up.
