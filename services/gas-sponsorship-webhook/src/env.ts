@@ -21,6 +21,7 @@ export interface Env {
   CANONICAL_CLUSTER_FACTORY: string;
   CANONICAL_MEMBER_FACTORY: string;
   CACHE_TTL_SECONDS?: string;
+  MAX_DAILY_OPS_PER_SENDER?: string;
   LOG_LEVEL?: string;
 
   // Secrets.
@@ -38,11 +39,20 @@ export interface Config {
   cacheTtlSeconds: number;
   /** TTL for negative (`false`) answers — short so new members/clusters surface quickly (spec §8). */
   negativeCacheTtlSeconds: number;
+  /** Per-sender approved-UserOp cap per UTC day; 0 disables (spec §6 step 8, audit M2). */
+  maxDailyOpsPerSender: number;
   logLevel: LogLevel;
 }
 
 /** Full default TTL for positive answers when `CACHE_TTL_SECONDS` is unset (spec §4, §8). */
 export const DEFAULT_CACHE_TTL_SECONDS = 86_400;
+/**
+ * Default per-sender daily cap when `MAX_DAILY_OPS_PER_SENDER` is unset. Sized from
+ * live traffic: a healthy member's worst legitimate day (join burst = one envelope
+ * per peer, plus retries to slow peers) stays well under 100, while the 2026-07
+ * resend storm ran 150-500 ops/day per stuck sender.
+ */
+export const DEFAULT_MAX_DAILY_OPS_PER_SENDER = 100;
 /** Fixed TTL for negative answers (spec §8). */
 export const NEGATIVE_CACHE_TTL_SECONDS = 600;
 /** Cloudflare KV enforces a 60s floor on expirationTtl. */
@@ -106,6 +116,17 @@ export function parseEnv(env: Env): Config {
     cacheTtl = parsed;
   }
 
+  let maxDailyOps = DEFAULT_MAX_DAILY_OPS_PER_SENDER;
+  if (env.MAX_DAILY_OPS_PER_SENDER !== undefined && env.MAX_DAILY_OPS_PER_SENDER !== "") {
+    const parsed = Number(env.MAX_DAILY_OPS_PER_SENDER);
+    if (!Number.isInteger(parsed) || parsed < 0) {
+      throw new EnvError(
+        `MAX_DAILY_OPS_PER_SENDER must be an integer >= 0 (0 disables), got "${env.MAX_DAILY_OPS_PER_SENDER}"`,
+      );
+    }
+    maxDailyOps = parsed;
+  }
+
   return {
     expectedChainId: chainId,
     canonicalClusterFactory: parseAddressVar("CANONICAL_CLUSTER_FACTORY", env.CANONICAL_CLUSTER_FACTORY),
@@ -114,6 +135,7 @@ export function parseEnv(env: Env): Config {
     alchemyWebhookToken: env.ALCHEMY_WEBHOOK_TOKEN,
     cacheTtlSeconds: cacheTtl,
     negativeCacheTtlSeconds: NEGATIVE_CACHE_TTL_SECONDS,
+    maxDailyOpsPerSender: maxDailyOps,
     logLevel: parseLogLevel(env.LOG_LEVEL),
   };
 }

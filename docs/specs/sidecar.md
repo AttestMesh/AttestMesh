@@ -197,11 +197,17 @@ The 12 numbered steps from master spec §7.1 map onto modules as follows. This i
 | 6 Subscribe to Indexer | `indexer_client::connect` | reads `IndexerRegistry` → opens gRPC stream |
 | 7 Wait peer endpoints | `envelopes::handle_message_sent` | decrypt sealed-box, parse, hand to wg + heartbeat |
 | 7' Pull CSK (onboardee) | `csk::pull_from_peer` | after first live tunnel |
-| 8 Send own endpoint | `envelopes::send_peer_endpoint` | per discovered peer |
+| 8 Send own endpoint | `envelopes::send_peer_endpoint` | per discovered peer; see the resend rules below |
 | 9 Heartbeat | `heartbeat::send_loop` + `heartbeat::recv_loop` | 2s interval, 3-miss threshold |
 | 10 Convergence gate | `state::gates::first_converged` | fires exactly once |
 | 11 Become healthy | `health::set_ready` | dual-gate: first-converged AND CSK-acquired |
 | 12 Steady-state | `state::steady_state` | serves peer CSK-pull requests, handles peer drops, indexer reconnects |
+
+**PeerEndpoint resend rules.** Every send is a sponsored UserOp, so re-announcing is bounded on three fronts (live-found 2026-07: the unbounded 600s resend burned ~1.3k sponsored ops/day fleet-wide):
+
+- *Backoff*: while a peer's Ed25519 key is unknown, resends start at 600s and double per attempt, capped at 24h — an on-chain orphan (dead VM, no `removeMember` on live clusters) costs one envelope/day instead of 144.
+- *Persistence*: learned peer Ed25519 keys are mirrored to the dstack sealed store (`peer_cache`, label `attestmesh.peer_ed25519.v1`) and reloaded at bring-up, so a restart doesn't forget peers and re-enter the resend loop.
+- *Reply-on-receive*: receiving a peer's PeerEndpoint triggers one reply (suppressed if we sent to that peer within the last 600s, which prevents ping-pong) even when its key is already known — a peer that restarted without its sealed store can re-learn our key from its first announce instead of resending forever.
 
 ### 7.2 State transitions are observable
 

@@ -39,11 +39,32 @@ const ENTRY_POINT: Address =
 pub const PEER_GRPC_PORT: u16 = 50051;
 const RECONCILE_INTERVAL: Duration = Duration::from_secs(15);
 const CSK_RETRY: Duration = Duration::from_secs(10);
-/// Re-send our PeerEndpoint envelope while a peer's Ed25519 key is still unknown
-/// (the peer is symmetric-polling, so a fresh send lands in its log window).
+/// Base wait before re-sending our PeerEndpoint to a peer whose Ed25519 key is
+/// still unknown (the peer is symmetric-polling, so a fresh send lands in its log
+/// window). Doubles per attempt up to [`ENVELOPE_RESEND_MAX`]: every resend is a
+/// sponsored UserOp, and a peer that never answers (an on-chain orphan whose VM is
+/// gone — this cluster has no removeMember) would otherwise cost 144 ops/day from
+/// every live node, forever (live-found 2026-07: ~1.3k ops/day fleet-wide).
 const ENVELOPE_RESEND: Duration = Duration::from_secs(600);
+/// Resend backoff ceiling: one envelope per day to a peer that never answers.
+const ENVELOPE_RESEND_MAX: Duration = Duration::from_secs(86_400);
 /// How far back the first MessageSent log poll reaches (Base ≈ 2s blocks ≈ 2.2h).
 const LOG_LOOKBACK_BLOCKS: u64 = 4000;
+
+/// Our PeerEndpoint send history toward one peer (drives the resend backoff).
+#[derive(Clone, Copy)]
+struct SendState {
+    at_ms: u64,
+    attempts: u32,
+}
+
+/// Delay before resend attempt `attempts + 1`: `ENVELOPE_RESEND * 2^attempts`,
+/// capped at [`ENVELOPE_RESEND_MAX`].
+fn resend_delay_ms(attempts: u32) -> u64 {
+    let base = ENVELOPE_RESEND.as_millis() as u64;
+    let max = ENVELOPE_RESEND_MAX.as_millis() as u64;
+    base.saturating_mul(1u64 << attempts.min(16)).min(max)
+}
 
 struct Ctx {
     config: Config,
@@ -60,6 +81,10 @@ struct Ctx {
     /// UDP punch upgrader (None when WG_UDP_PUNCH=false). Mesh bring-up and
     /// health never depend on it.
     puncher: Option<Arc<transport::punch::Puncher>>,
+    /// Peer Ed25519 keys learned from PeerEndpoint envelopes, mirrored to the
+    /// dstack sealed store so a restart doesn't forget them (and restart the
+    /// sponsored-UserOp resend loop toward peers that will never reply).
+    learned_keys: Mutex<crate::peer_cache::LearnedKeys>,
 }
 
 fn now_ms() -> u64 {
@@ -118,6 +143,16 @@ pub async fn launch(
         config.gas_policy_id.clone(),
     ));
 
+    // Restart path: keys learned in previous runs short-circuit the envelope
+    // resend loop (each resend is a sponsored UserOp).
+    let learned_keys = crate::peer_cache::load(dstack.as_ref()).await;
+    if !learned_keys.is_empty() {
+        tracing::info!(
+            peers = learned_keys.len(),
+            "loaded persisted peer Ed25519 keys"
+        );
+    }
+
     let self_sni = sni_for(shared.member_contract, config.wg_tcp_port, &gw_domain);
 
     // UDP punch upgrader (udp-transport-upgrade spec). Gateway TCP stays the
@@ -150,6 +185,7 @@ pub async fn launch(
         submit_lock: Mutex::new(()),
         self_sni,
         puncher: puncher.clone(),
+        learned_keys: Mutex::new(learned_keys),
     });
 
     // 1. wg-over-TCP ingress (peers reach us through the gateway).
@@ -223,7 +259,7 @@ async fn reconcile_loop(
     gw_domain: String,
     mut wake: tokio::sync::mpsc::Receiver<()>,
 ) {
-    let mut last_sent: HashMap<[u8; 32], u64> = HashMap::new();
+    let mut last_sent: HashMap<[u8; 32], SendState> = HashMap::new();
     let mut next_from_block: Option<u64> = None;
 
     loop {
@@ -281,7 +317,7 @@ async fn indexer_loop(
 async fn reconcile_once(
     ctx: &Ctx,
     gw_domain: &str,
-    last_sent: &mut HashMap<[u8; 32], u64>,
+    last_sent: &mut HashMap<[u8; 32], SendState>,
     next_from_block: &mut Option<u64>,
 ) -> Result<()> {
     let cluster = ctx.shared.cluster;
@@ -356,8 +392,19 @@ async fn reconcile_once(
             );
         }
 
-        // Envelope exchange: send ours if never sent, or periodically while the
-        // peer's Ed25519 key is still unknown (it polls logs symmetrically).
+        // Restart/late-entry path: apply a persisted (or early-arrived) key to the
+        // peer-table entry the configure block just ensured exists.
+        {
+            let mut peers = ctx.shared.peers.lock().await;
+            if peers.ed25519_of(member_id).is_none() {
+                if let Some(ed) = ctx.learned_keys.lock().await.get(member_id).copied() {
+                    peers.set_ed25519(member_id, ed);
+                }
+            }
+        }
+
+        // Envelope exchange: send ours if never sent, or — with exponential backoff —
+        // while the peer's Ed25519 key is still unknown (it polls logs symmetrically).
         let peer_ed_known = ctx
             .shared
             .peers
@@ -368,15 +415,21 @@ async fn reconcile_once(
         let now = now_ms();
         let due = match last_sent.get(member_id) {
             None => true,
-            Some(at) => {
-                !peer_ed_known && now.saturating_sub(*at) > ENVELOPE_RESEND.as_millis() as u64
-            }
+            Some(s) => !peer_ed_known && now.saturating_sub(s.at_ms) > resend_delay_ms(s.attempts),
         };
         if due {
             match send_peer_endpoint(ctx, *member_id).await {
                 Ok(tx) => {
-                    tracing::info!(peer = %hex::encode(member_id), tx = %tx, "PeerEndpoint envelope sent");
-                    last_sent.insert(*member_id, now);
+                    let attempts = last_sent.get(member_id).map_or(0, |s| s.attempts);
+                    tracing::info!(peer = %hex::encode(member_id), tx = %tx, attempts,
+                        "PeerEndpoint envelope sent");
+                    last_sent.insert(
+                        *member_id,
+                        SendState {
+                            at_ms: now,
+                            attempts: attempts.saturating_add(1),
+                        },
+                    );
                 }
                 Err(e) => tracing::warn!(peer = %hex::encode(member_id), error = ?e,
                     "PeerEndpoint envelope send failed; will retry"),
@@ -384,7 +437,7 @@ async fn reconcile_once(
         }
     }
 
-    poll_envelopes(ctx, next_from_block).await?;
+    poll_envelopes(ctx, next_from_block, last_sent).await?;
 
     if ctx.shared.peers.lock().await.live_count() > 0 || ctx.shared.gates.first_converged() {
         if ctx.shared.gates.healthy() {
@@ -436,7 +489,11 @@ async fn send_peer_endpoint(ctx: &Ctx, peer_id: [u8; 32]) -> Result<B256> {
 
 /// Poll `MessageSent` logs addressed to us and absorb PeerEndpoint envelopes
 /// (chain-authenticated sender: the facet emits the sender's memberId).
-async fn poll_envelopes(ctx: &Ctx, next_from_block: &mut Option<u64>) -> Result<()> {
+async fn poll_envelopes(
+    ctx: &Ctx,
+    next_from_block: &mut Option<u64>,
+    last_sent: &mut HashMap<[u8; 32], SendState>,
+) -> Result<()> {
     use crate::chain::abi::IMessageEvents::MessageSent;
     use alloy::sol_types::SolEvent;
 
@@ -480,10 +537,57 @@ async fn poll_envelopes(ctx: &Ctx, next_from_block: &mut Option<u64>) -> Result<
                 if pe.member_id != sender {
                     continue; // sender-binding mismatch on an internal envelope — drop
                 }
-                let mut peers = ctx.shared.peers.lock().await;
-                if peers.set_ed25519(&sender, pe.ed25519_pub) {
-                    tracing::info!(peer = %hex::encode(sender), host = %pe.host,
-                        "PeerEndpoint envelope absorbed (Ed25519 key learned)");
+                {
+                    let mut peers = ctx.shared.peers.lock().await;
+                    if peers.set_ed25519(&sender, pe.ed25519_pub) {
+                        tracing::info!(peer = %hex::encode(sender), host = %pe.host,
+                            "PeerEndpoint envelope absorbed (Ed25519 key learned)");
+                    }
+                    if let Some(udp) = pe.udp_addr() {
+                        peers.set_advertised_udp(&sender, Some(udp));
+                    }
+                }
+                // Mirror to the sealed store regardless of the table update: the
+                // table entry may not exist yet (envelope raced our configure pass)
+                // — the reconcile loop applies cached keys once it does.
+                {
+                    let mut learned = ctx.learned_keys.lock().await;
+                    if learned.get(&sender) != Some(&pe.ed25519_pub) {
+                        learned.insert(sender, pe.ed25519_pub);
+                        if let Err(e) =
+                            crate::peer_cache::store(ctx.dstack.as_ref(), &learned).await
+                        {
+                            tracing::warn!(error = ?e, "peer-key seal failed (non-fatal)");
+                        }
+                    }
+                }
+                // The sender is announcing because it does not know OUR key (fresh
+                // join, or a restart wiped its memory — it can't ask, it can only
+                // announce). Reply with our own envelope so it converges instead of
+                // resending forever. Replying only when our last send to it is at
+                // least one resend period old makes two live nodes settle after one
+                // round trip instead of ping-ponging.
+                let now = now_ms();
+                let reply_due = last_sent.get(&sender).map_or(true, |s| {
+                    now.saturating_sub(s.at_ms) > ENVELOPE_RESEND.as_millis() as u64
+                });
+                if reply_due {
+                    match send_peer_endpoint(ctx, sender).await {
+                        Ok(tx) => {
+                            let attempts = last_sent.get(&sender).map_or(0, |s| s.attempts);
+                            tracing::info!(peer = %hex::encode(sender), tx = %tx,
+                                "PeerEndpoint reply sent (peer announced itself)");
+                            last_sent.insert(
+                                sender,
+                                SendState {
+                                    at_ms: now,
+                                    attempts: attempts.saturating_add(1),
+                                },
+                            );
+                        }
+                        Err(e) => tracing::warn!(peer = %hex::encode(sender), error = ?e,
+                            "PeerEndpoint reply failed; peer will resend"),
+                    }
                 }
             }
             None => {
@@ -505,9 +609,6 @@ async fn poll_envelopes(ctx: &Ctx, next_from_block: &mut Option<u64>) -> Result<
                         bytes, "app message forwarded to SubscribeMessages");
                 }
             }
-        }
-        if let Some(udp) = pe.udp_addr() {
-            peers.set_advertised_udp(&sender, Some(udp));
         }
     }
     Ok(())
@@ -719,5 +820,23 @@ mod tests {
             "different send instants → different ids"
         );
         assert_ne!(id_at(1).0, base, "salted id differs from the bare kind id");
+    }
+
+    /// Every resend is a sponsored UserOp; the backoff must double per attempt and
+    /// cap at one envelope/day so an on-chain orphan (no removeMember on live
+    /// clusters) can't cost 144 ops/day per live node forever.
+    #[test]
+    fn resend_backoff_doubles_and_caps_at_a_day() {
+        let base = ENVELOPE_RESEND.as_millis() as u64;
+        assert_eq!(resend_delay_ms(0), base);
+        assert_eq!(resend_delay_ms(1), base * 2);
+        assert_eq!(resend_delay_ms(3), base * 8);
+        let day = ENVELOPE_RESEND_MAX.as_millis() as u64;
+        assert_eq!(resend_delay_ms(8), day, "600s * 256 > 24h → capped");
+        assert_eq!(
+            resend_delay_ms(u32::MAX),
+            day,
+            "no overflow at extreme attempts"
+        );
     }
 }
