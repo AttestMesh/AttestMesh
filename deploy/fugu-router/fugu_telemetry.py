@@ -35,20 +35,36 @@ def _as_dict(obj):
 
 
 def _extract_fugu_usage(response_obj):
-    """Pull the orchestration/visible token split out of the raw usage block."""
+    """Pull the orchestration/visible token split out of the raw usage block.
+
+    Observed Fugu shape (live, 2026-07-04): the orchestration counts are NESTED inside
+    the standard OpenAI detail blocks —
+      usage.prompt_tokens_details.orchestration_input_tokens / orchestration_input_cached_tokens
+      usage.completion_tokens_details.orchestration_output_tokens
+    so those blocks must be mined explicitly, not skipped as "known" keys.
+    """
     usage = _as_dict(_as_dict(response_obj).get("usage", {}))
-    extras = {k: v for k, v in usage.items() if k not in _KNOWN_USAGE_KEYS and v not in (None, {}, [])}
-    # Fold nested containers (e.g. "token_details": {"orchestration_tokens": ...}) up a level.
     fugu = {}
-    for k, v in extras.items():
+    # 1. Explicit: any orchestration_*/cached counter inside the details blocks.
+    for block in ("prompt_tokens_details", "completion_tokens_details"):
+        for ik, iv in _as_dict(usage.get(block, {})).items():
+            if isinstance(iv, (int, float)) and ("orchestration" in ik or "cached" in ik):
+                fugu[ik] = iv
+    # 2. Defensive sweep: any non-standard top-level usage keys (future schema drift).
+    for k, v in usage.items():
+        if k in _KNOWN_USAGE_KEYS or v in (None, {}, []):
+            continue
         if isinstance(v, dict):
             fugu.update({f"{k}.{ik}": iv for ik, iv in v.items()})
         else:
             fugu[k] = v
-    orch = next((v for k, v in fugu.items() if "orchestration" in k and isinstance(v, (int, float))), None)
+    orch = sum(v for k, v in fugu.items()
+               if "orchestration" in k and "cached" not in k and isinstance(v, (int, float)))
     total = usage.get("total_tokens")
-    if orch is not None and isinstance(total, (int, float)) and total > 0:
+    if orch and isinstance(total, (int, float)) and total > 0:
+        fugu["orchestration_tokens_total"] = orch
         fugu["orchestration_ratio"] = round(orch / total, 4)
+        fugu["visible_tokens"] = total - orch
     return fugu
 
 
