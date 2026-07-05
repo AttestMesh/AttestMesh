@@ -76,8 +76,9 @@ services:
     # v6 = cluster API bridge: logged-in users see the live C3 members as CVM
     # graph nodes, with the API URL sealed to the dstack bridge listener.
     # Digest-pinned: in-place UpgradeApp rolls never re-pull a same-tag image.
-    # v14 = Deployments track record (table 0012/0014 + org feed) + Apps/Enclaves naming.
-    image: ghcr.io/dmvt/synclave-app:v14@sha256:27fda6aef8768c915b24f2563e4fca20208d681f9abae22453129fdd82f3fbc3
+    # v15 = cluster-network enclave deploys recorded in the Deployments feed (+ orchestrator
+    # job reflection); v14 = Deployments track record + Apps/Enclaves naming.
+    image: ghcr.io/dmvt/synclave-app:v15@sha256:96cfd5016c19bcfb107191a3e43f7f2a4731b653216420cd52eaf124c10ffc41
     environment:
       API_HOST: 0.0.0.0
       API_PORT: 80
