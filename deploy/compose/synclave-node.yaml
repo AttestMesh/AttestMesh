@@ -76,10 +76,10 @@ services:
     # v6 = cluster API bridge: logged-in users see the live C3 members as CVM
     # graph nodes, with the API URL sealed to the dstack bridge listener.
     # Digest-pinned: in-place UpgradeApp rolls never re-pull a same-tag image.
-    # v16 = lattice v2 mesh map (full mesh, gateway/ingress/egress, click→inspect);
-    # v15 = cluster-network enclave deploys recorded in the Deployments feed (+ orchestrator
-    # job reflection); v14 = Deployments track record + Apps/Enclaves naming.
-    image: ghcr.io/dmvt/synclave-app:v16@sha256:253271065afb841d9ae300eda2ed9f7a65f1c26e2c89adc7ac3c8d99c6104bcc
+    # v17 = lattice v3 operator grid (kind bands, honest attestation: seal = on-chain member,
+    # drawer Attestation section, member_kinds 0015); v16 = lattice v2 (full mesh, gateway
+    # scene); v15 = cluster deploys in the Deployments feed; v14 = Deployments + naming.
+    image: ghcr.io/dmvt/synclave-app:v17@sha256:21034242445a79805b835628e851bd89e621669a9c56b1e29b6952d1d2f95959
     environment:
       API_HOST: 0.0.0.0
       API_PORT: 80
