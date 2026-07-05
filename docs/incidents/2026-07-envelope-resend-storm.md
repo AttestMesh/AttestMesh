@@ -58,14 +58,14 @@ Effect: sponsored-gas and KV spend are now **hard-bounded** regardless of fleet 
 | # | Item | Notes |
 |---|---|---|
 | 1 | **Sidecar fleet roll** (the actual root-cause fix in prod) | Needs image rebuild from `d484c8c` + staged roll: **synclave first** (502/day), then **matrix** (151/day), remainder folded into routine updates. Rolls preserve membership/mesh IPs. 🔴 **ssh-node/hermes is frozen — never roll it**; the webhook cap bounds it now and reply-on-receive converges it once its peers are upgraded. Awaiting operator GO. |
-| 2 | **fugu-router restart loop** (separate, active issue) | Observed 2026-07-04 ~00:15 UTC: 4 boots/10 min, each boot announces to all peers → 60 sends/10 min (member `0x78d2ea6d…` / `0xD3e18376…`, registered 07-03 23:18). It will hit the daily cap and see `sender-daily-cap` paymaster declines until UTC midnight — expected containment, not a new bug. In the operator's court (in-flight deploy). |
+| 2 | **fugu-router restart loop** (separate, active issue) | Observed 2026-07-04 ~00:15 UTC: 4 boots/10 min, each boot announces to all peers → 60 sends/10 min (member `0x78d2ea6d…` / `0xD3e18376…`, registered 07-03 23:18). It will hit the daily cap and see `sender-daily-cap` paymaster declines until UTC midnight — expected containment, not a new bug. *Update 07-04/05:* the parallel fugu-router/langfuse-node work landed (r3 pinned, langfuse split, trace-401 resolved) — re-measure its send rate to confirm the loop is gone. |
 | 3 | **Ed25519 key on-chain** (design simplification, milestone-B) | The heartbeat key is public; publishing it at registration (member record field or `WgKeyPublished`-style event) would make bring-up need **zero** member-to-member messages and delete this entire failure class. Contract-facing change → needs a spec + migration plan. The committed fix should be considered transitional. |
 | 4 | Reconcile-interval stretch | Sidecar polls chain every 15s (`listMembers` + `blockNumber` + `getLogs`) even while indexer-subscribed; wake channel already exists. 15s→120s+ when the subscription is healthy ≈ 8× cut on the largest RPC CU line (~280M CU/mo fleet-wide). Not implemented. |
 | 5 | Self-hosted Base RPC node | Pruned op-reth full node (receipts pruned before block 46,868,742), hosted L1 inputs, ~2TB NVMe / 32GB / 8 cores, bare-metal (not in a CVM). Moves indexer+sidecar read traffic off Alchemy; bundler/paymaster stays. Researched, not started. |
 | 6 | Per-service Alchemy API keys | Everything shares one key (`cbplChE…`) — no dashboard attribution. |
 | 7 | Alchemy dashboard confirmation | Pull Gas Manager vs CU split to confirm the cost ranking empirically. |
 | 8 | Orphan cleanup / `removeMember` tombstones on C3 | Exists in milestone-B contracts (indexer-ha PR); C3 predates it. Orphans stay until then; backoff makes them cheap. |
-| 9 | Push `d484c8c` | Committed on `matrix-admin-agent`, not pushed. |
+| 9 | ~~Push `d484c8c`~~ done | Pushed to `origin/matrix-admin-agent` (2026-07-05) along with this report (`d002543`), the mesh-state-api RPC retry/backoff + public-Base-RPC move (`dba9e80` — which also softens items 5/6 for read traffic), and the fugu-router/langfuse split (`0102526`). |
 | 10 | KV plan headroom (optional) | Post-fix traffic fits the free tier; $5 Workers plan is the fallback if not. |
 
 ## 5. Verification / monitoring
