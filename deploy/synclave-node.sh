@@ -300,7 +300,13 @@ update_member() {
   if [ "$allowed" = true ]; then
     log "compose hash already allowlisted"
   else
-    send_seq "synclave-update-addHash-${NODE}" "$CLUSTER" "addComposeHash(bytes32)" "0x$nh"
+    # FATAL on failure: rolling a compose the cluster hasn't allowlisted is the #1 trap —
+    # the KMS refuses keys and the CVM can't unseal (hit live on the v14 roll: RPC 403 here
+    # while the script sailed on to UpgradeApp). Verify on-chain before touching the VM.
+    send_seq "synclave-update-addHash-${NODE}" "$CLUSTER" "addComposeHash(bytes32)" "0x$nh" \
+      || die "addComposeHash failed — NOT proceeding to UpgradeApp (unallowlisted compose bricks the boot)"
+    allowed=$(cast call "$CLUSTER" 'allowedComposeHashes(bytes32)(bool)' "0x$nh" --rpc-url "$RPC_URL" 2>/dev/null)
+    [ "$allowed" = true ] || die "compose hash still not allowlisted after send — aborting before UpgradeApp"
   fi
   out=$(_box_run update "$X" "$VM_ID") || die "in-place update failed"
   echo "$out"
