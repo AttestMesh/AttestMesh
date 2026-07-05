@@ -189,7 +189,7 @@ mesh `/16` per cluster (`MESH_CIDR_IP`).
 - No Matrix users yet (`enable_registration:false`).
 - Reconcile `deploy/matrix-node-runbook.md` with this; commit working-tree changes if desired.
 
-## 7. matrix-admin-agent — on-chain + LLM admin control plane (BUILT 2026-06-19; deploy pending)
+## 7. matrix-admin-agent — on-chain + LLM admin control plane (LIVE + E2E-VERIFIED on C3/W3, 2026-06-20)
 
 Closes the §6 dead-end ("No Matrix users yet / enable_registration:false"): a co-located agent
 administers Synapse from (a) encrypted on-chain member commands via the sidecar app gRPC
@@ -202,16 +202,20 @@ surface via a generic `synapse_request` verb + named convenience verbs. Spec:
   payload to the app via `SubscribeMessages` (it was silently dropped). `classify_internal()` + 2 tests;
   clippy clean. Image `cluster-mesh-agent` (backward-compatible — existing nodes have no app consumer).
 - **Agent (own repo):** config/bootstrap/synapse_admin/commands/executor/ledger + sidecar & Matrix
-  adapters + a ~200-line LLM tool loop. ruff+mypy clean, 75 tests. Authz = sealed `MATRIX_ADMIN_SENDERS`
+  adapters + a ~200-line LLM tool loop. ruff+mypy clean, 82 tests. Authz = sealed `MATRIX_ADMIN_SENDERS`
   (on-chain memberIds) + `MATRIX_ADMIN_MXIDS` (humans). Dedup ledger in the node's Postgres.
 - **Egress firewall** (`deploy/agent-egress-fw/`, image `ghcr.io/attestmesh/agent-egress-fw`): shares the
-  agent netns, default-DROP OUTPUT, allows ONLY Synapse/Postgres/nginx (resolved IPs) + Docker DNS + the
-  pinned LLM host:443. Plain iptables (no ipset — `ip_set` module unproven on the box, same posture as
-  ts-firewall), fail-closed, re-resolves for DNS pinning.
-- **Egress self-check (KEY — §5b: "container logs unreachable from the box"):** the agent itself TCP-probes
-  a non-allowlisted canary at startup; if reachable → egress not locked → logs CRITICAL and EXITS (fail
-  closed). The result folds into `/healthz` (`egress_locked`), exposed on the box loopback (`9100→9102`)
-  like the sidecar — so one `verify-agent` curl confirms bootstrap AND egress lock without exec-ing the TEE.
+  agent netns, default-DROP OUTPUT, allows ONLY Synapse/Postgres/nginx (resolved IPs) + outbound `:53`
+  (DNS — to ANY resolver; see Bug 7) + the pinned LLM host:443 (re-resolved IP(s) + a static CIDR pin).
+  Plain iptables (no ipset — `ip_set` module unproven on the box, same posture as ts-firewall),
+  fail-closed, re-resolves for DNS pinning.
+- **Egress self-check + LLM probe (KEY — §5b: "container logs unreachable from the box"):** the agent
+  TCP-probes a non-allowlisted canary at startup and refuses to serve until it is unreachable; it also
+  probes the LLM (resolve host + `GET /models`). Both fold into `/healthz` (`egress_locked`, `llm_ok` +
+  resolved IP), exposed on the box loopback (`9100→9102`) like the sidecar — so one `verify-agent` curl
+  confirms bootstrap, egress lock, AND LLM reachability without exec-ing the TEE. Fail-closed = HOLD the
+  channels (loop, reporting `phase` on `/healthz`), never crash-loop/exit — an invisible loop in a TEE is
+  undebuggable.
 
 ### Deploy wiring (this repo)
 - `deploy/compose/matrix-node.yaml`: `matrix-admin-agent` + `agent-egress-fw` services; shared `agent-sock`
@@ -222,10 +226,42 @@ surface via a generic `synapse_request` verb + named convenience verbs. Spec:
   (polls `/healthz` for `"status":"ok"`); folded into `all` + `update`.
 - `deploy/workflows/matrix-node.tsx`: `deploy→cluster→patha→prime→bind→verify→agent`.
 
-### To deploy (pending operator creds)
-Sealed: `LLM_BASE_URL`/`LLM_MODEL`/`LLM_API_KEY` (redpill), `BOT_PASSWORD` (or generated),
-`MATRIX_ADMIN_MXIDS` (= `@<localpart>:<app_id>.gateway.attestmesh.xyz`); reuse the §6 TS key. Optional:
-`MATRIX_ADMIN_SENDERS`, `INITIAL_ADMIN`. Flow: throwaway test node (unique BOX_PORTS + mesh /16) → verify
-incl. egress → `matrix-node.sh <node> update` onto C3/W3 (resets the EMPTY Synapse DB; app_id reuse keeps
-membership + CSK originator). Three images must be CI-published first: `cluster-mesh-agent` (sidecar),
-`agent-egress-fw`, `matrix-admin-agent`.
+### Live deploy + bugs fixed (LIVE + E2E-VERIFIED 2026-06-20)
+Rolled onto C3/W3 via `matrix-node.sh matrix-node update` (app_id reuse → membership + CSK originator
+preserved; sealed redpill `LLM_*` + generated `BOT_PASSWORD` + `MATRIX_ADMIN_MXIDS=@lsdan:<app_id>…` +
+`INITIAL_ADMIN=lsdan`; reused the §6 TS key). Three CI images published first: `cluster-mesh-agent`,
+`agent-egress-fw`, `matrix-admin-agent`. `lsdan` is a usable admin — login verified on prod; its bootstrap
+password is the stable `IAPW=` line in `deploy/logs/matrix-node-matrix-node.state` (operator should rotate).
+
+**End-to-end VERIFIED:** `lsdan` DM'd `@admin-agent` "how many users?" → bot called redpill
+(`phala/glm-5.2`) → `list_users` tool → Synapse admin API → replied with the real user table. The full
+human→Matrix→LLM→tool→Synapse loop runs THROUGH the deny-all egress (`egress_locked:true`, `llm_ok:true`).
+Bot also auto-joins DM invites from allowlisted MXIDs.
+
+**7 real-deploy bugs — each surfaced only on the live TEE (invisible to kwarg unit tests), each fixed with a
+regression test:**
+1. **pydantic-settings JSON-decodes `list[str]` env before validators** → `FATAL parsing matrix_admin_mxids`.
+   Fix: `Annotated[list[str], NoDecode]` for `MATRIX_ADMIN_MXIDS/SENDERS` + an env-path regression test.
+2. **`lsdan` landed as `@lsdan:localhost`** (login M_FORBIDDEN) — the agent defaulted `server_name`.
+   Fix: resolve `server_name` from the bot's own MXID via `whoami()` before ensuring admins.
+3. **`cast nonce` reads stale** right after a forge script → prime `addAllowedAppId` "nonce too low".
+   Fix: `send_seq` fetches a fresh nonce + retries.
+4. **Shell greps missed `json.dumps` spacing** (`"status": "ok"`, `"vm_id": "…"`) → false "not ready" + empty
+   `vm=`. Fix: space-tolerant `": *"` greps in `verify-agent` + the vm_id parse.
+5. **Invisible crash-loop** (a config error killed the container; the TEE shows no logs). Fix: start the
+   health server FIRST, retry bootstrap, treat egress-not-locked as a HOLD (never exit). The agent
+   self-reports `phase`/`last_error` on `/healthz` throughout — this is what made every later bug findable.
+6. **Bot returned `APIConnectionError`** on every LLM turn. Chased IPv6 / static-CIDR / timing dead-ends
+   across several rolls; the `/healthz` **LLM probe** (added for exactly this) named the real cause → Bug 7.
+7. **Egress-fw must allow `:53` to ANY resolver, not just Docker DNS `127.0.0.11`.** Docker's embedded DNS
+   answers INTERNAL names locally but forwards EXTERNAL queries out of the agent's OWN locked netns to the
+   upstream — so pinning only `127.0.0.11:53` let Synapse/Postgres resolve while `api.redpill.ai` died with
+   `EAI_AGAIN`. Fix (`c4ba649`): `-A AMX_EGRESS -p udp/tcp --dport 53 -j ACCEPT`. Residual: `:53`-to-any is a
+   low-bandwidth DNS-tunnel surface (data ports stay deny-all; canary :443 still blocked → `egress_locked`
+   holds); tighter follow-up = DNS-locked resolution (dnsmasq). **Lesson: when an egress-locked container
+   can't reach an external host, suspect DNS forwarding from the locked netns BEFORE IP allowlisting — and
+   add an observable probe rather than guessing blind.**
+
+**Data note:** the "update resets the EMPTY Synapse DB" caveat no longer holds — rolls later became in-place
++ data-preserving (UpgradeApp) and CSK-encrypted wal-g→R2 PITR backups were added (see
+`matrix-node-access-journal.md`).
