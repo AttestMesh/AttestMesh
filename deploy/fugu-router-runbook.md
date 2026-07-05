@@ -265,3 +265,29 @@ prefer a fresh-disk roll, or make their output volumes ephemeral so they always 
 **5. Smithers routines not yet authored** for redis-ha / clickhouse-ha / fugu-router (the
 trios are directly runnable and were used for this whole deploy). `deploy/workflows/pg-ha.tsx`
 is the model for the two HA clusters. Follow-up.
+
+---
+
+## Operating the split (2026-07-04)
+
+**Router (Hermes / any OpenAI client).** Base URL `http://10.18.44.199:18410/v1`,
+key = `LITELLM_MASTER_KEY` (~/.attestmesh/fugu-router.env), models `fugu-ultra` (coordinators/
+verifiers) and `fugu` (workers). Mesh-only — reach it from a C3 member or via the ssh-node
+SOCKS jump. Optional trace-tagging headers: `x-agent-id`, `x-agent-role`, `x-session-id`.
+Per-agent virtual keys instead of the master key: `POST :18410/key/generate`.
+
+**Langfuse dashboard.** `https://langfuse-1.tail39cb2e.ts.net` over the tailnet (MagicDNS
+suffix bumps on every fresh-disk roll — `tailscale status | grep langfuse`). Login
+`LANGFUSE_INIT_USER_EMAIL` / `LANGFUSE_INIT_USER_PASSWORD`. Traces land in the `attestmesh`
+org → `fugu-router` project with `fugu_orchestration` metadata + computed cost per generation.
+
+**Dashboard → router (playground / LLM-as-judge / experiments).** Add an LLM Connection:
+adapter OpenAI, **API Base URL `http://sidecar:18410/v1`** (NOT the mesh IP — Langfuse's SSRF
+guard blocks private IPs by address; the `fugu-proxy` forwarder + `LANGFUSE_LLM_CONNECTION_
+WHITELISTED_HOST=sidecar` whitelist the compose-internal hostname instead), key =
+`LITELLM_MASTER_KEY`, disable default models and add custom models `fugu-ultra`, `fugu`.
+
+**Calibration (paper §5).** The first real week of Hermes traffic through `:18410` populates
+Langfuse; use per-account burn + orchestration ratios to set per-deployment TPM ceilings and
+decide whether 2 subscriptions is the right count. Exercise the Sakana training opt-out per
+account before any production traffic.
