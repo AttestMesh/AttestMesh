@@ -76,13 +76,14 @@ services:
     # v6 = cluster API bridge: logged-in users see the live C3 members as CVM
     # graph nodes, with the API URL sealed to the dstack bridge listener.
     # Digest-pinned: in-place UpgradeApp rolls never re-pull a same-tag image.
+    # v25 = v24 rebuilt with VITE_PRIVY_APP_ID baked into the web SPA;
     # v24 = nameserver routes + active deployment visibility + clearer deployment failure state;
     # v23 = v22 plus clearer mesh-registration timeout errors;
     # v22 = v21 plus redacted orchestrator log details;
     # v21 = user-visible orchestrator failure details in enclave deploys;
     # v20 = CLUSTER_NETWORKS-only live mesh config + structured orchestrator errors;
     # v19 = Apps → Sandboxes rename (labels only, wire stays app).
-    image: ghcr.io/dmvt/synclave-app:v24@sha256:d430b584318d8ab03aafcd6cce3d6e2b020b573fec3615375fa62ef56c7a098b
+    image: ghcr.io/dmvt/synclave-app:v25@sha256:9d6fe99dfdb0b406f2e785b0fa6ec6d4de9a6f3cf106c7053a5ed4dce3ebf958
     environment:
       API_HOST: 0.0.0.0
       API_PORT: 80
