@@ -76,14 +76,13 @@ services:
     # v6 = cluster API bridge: logged-in users see the live C3 members as CVM
     # graph nodes, with the API URL sealed to the dstack bridge listener.
     # Digest-pinned: in-place UpgradeApp rolls never re-pull a same-tag image.
-    # v24 = the nameserver (member_names 0016, rename/reset + box-admin ingest routes,
-    # LABELS_WRITE_TOKENS sealed; dead LABELS_API_* dropped);
+    # v24 = nameserver routes + active deployment visibility + clearer deployment failure state;
     # v23 = v22 plus clearer mesh-registration timeout errors;
     # v22 = v21 plus redacted orchestrator log details;
     # v21 = user-visible orchestrator failure details in enclave deploys;
     # v20 = CLUSTER_NETWORKS-only live mesh config + structured orchestrator errors;
     # v19 = Apps → Sandboxes rename (labels only, wire stays app).
-    image: ghcr.io/dmvt/synclave-app:v24@sha256:e871857be71b2a0149b0b0b0b831f6ecb9628f18551136f28785afc917e77f94
+    image: ghcr.io/dmvt/synclave-app:v24@sha256:d430b584318d8ab03aafcd6cce3d6e2b020b573fec3615375fa62ef56c7a098b
     environment:
       API_HOST: 0.0.0.0
       API_PORT: 80
