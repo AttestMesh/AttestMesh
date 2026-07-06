@@ -22,6 +22,7 @@ import { EnvError, parseEnv, type Config, type Env } from "./env.js";
 import { createLogger, type Logger } from "./log.js";
 import { DecodeError, parseWebhookBody } from "./decode.js";
 import { evaluatePolicy } from "./policy.js";
+import { parsePimlicoBody, verifyPimlicoSignature } from "./pimlico.js";
 import { isDeployedCluster, RpcFailureError, type ProvenanceDeps } from "./provenance.js";
 
 function json(body: unknown, status = 200): Response {
@@ -87,6 +88,60 @@ async function handleWebhook(
     sender: body.userOperation.sender,
   });
   return json({ approved: false, reason: decision.reason });
+}
+
+/**
+ * POST /pimlico — Pimlico sponsorship-policy webhook (Standard-Webhooks signed).
+ * Same policy engine as the Alchemy route; reply contract is `{"sponsor": bool}`.
+ * Authentication is the HMAC signature (no `?token=`), so the policy's step-1
+ * token check is satisfied internally after verification.
+ */
+async function handlePimlico(
+  request: Request,
+  config: Config,
+  env: Env,
+  logger: Logger,
+): Promise<Response> {
+  if (!config.pimlicoWebhookSecret) {
+    return json({ error: "pimlico-route-disabled" }, 503);
+  }
+  const rawBody = await request.text();
+  const ok = await verifyPimlicoSignature({
+    secret: config.pimlicoWebhookSecret,
+    headers: request.headers,
+    rawBody,
+    logger,
+  });
+  if (!ok) return json({ error: "bad-signature" }, 401);
+
+  let parsed;
+  try {
+    parsed = parsePimlicoBody(JSON.parse(rawBody));
+  } catch (err) {
+    if (err instanceof DecodeError || err instanceof SyntaxError) {
+      logger.warn("pimlico-bad-body", { reason: String(err) });
+      // Unknown/malformed events are refused sponsorship, not 4xx'd — Pimlico
+      // treats non-200s as transport errors and may retry.
+      return json({ sponsor: false });
+    }
+    throw err;
+  }
+
+  const decision = await evaluatePolicy(
+    {
+      token: config.alchemyWebhookToken, // signature already authenticated the caller
+      chainId: parsed.chainId,
+      userOperation: parsed.userOperation,
+    },
+    config,
+    buildProvenanceDeps(config, env, logger),
+  );
+  logger.info("pimlico-decision", {
+    sponsor: decision.approved,
+    ...(decision.approved ? {} : { reason: decision.reason }),
+    sender: parsed.userOperation.sender,
+  });
+  return json({ sponsor: decision.approved });
 }
 
 /** GET /check?cluster=<addr> — sidecar startup probe (spec §5.2). */
@@ -172,6 +227,9 @@ export default {
     try {
       if (request.method === "POST" && pathname === "/") {
         return await handleWebhook(request, url, config, env, logger);
+      }
+      if (request.method === "POST" && pathname === "/pimlico") {
+        return await handlePimlico(request, config, env, logger);
       }
       if (request.method === "GET" && pathname === "/check") {
         return await handleCheck(url, config, env, logger);
