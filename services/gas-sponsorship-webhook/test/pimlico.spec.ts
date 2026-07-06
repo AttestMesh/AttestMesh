@@ -1,18 +1,20 @@
 import { describe, it, expect } from "vitest";
 
-import { parsePimlicoBody, verifyPimlicoSignature } from "../src/pimlico.js";
+import { parsePimlicoBody, pimlicoHmacKey, verifyPimlicoSignature } from "../src/pimlico.js";
 import { DecodeError } from "../src/decode.js";
 import { createLogger } from "../src/log.js";
 
 const logger = createLogger("error");
 
-const SECRET_BYTES = new TextEncoder().encode("test-secret-key-32-bytes-long!!!");
-const SECRET = "pim_whsec_" + btoa(String.fromCharCode(...SECRET_BYTES));
+// A throwaway Pimlico-format secret (base58-custom of bytes 0x00..0x1f — carries no
+// real credential). Its correct HMAC key is derived via the same non-standard path
+// production uses (base58-custom → hex → base64), so signing here also exercises it.
+const SECRET = "pim_whsec_12oeWzGziAeWhm1Hpi4zvXDz54bzSMCBj3CeCb6rAPV";
 
 async function sign(id: string, timestamp: string, body: string): Promise<string> {
   const key = await crypto.subtle.importKey(
     "raw",
-    SECRET_BYTES,
+    pimlicoHmacKey(SECRET),
     { name: "HMAC", hash: "SHA-256" },
     false,
     ["sign"],
@@ -40,7 +42,7 @@ describe("verifyPimlicoSignature", () => {
       nowSeconds: now,
       logger,
     });
-    expect(ok).toBe(true);
+    expect(ok.ok).toBe(true);
   });
 
   it("accepts when a valid sig appears among rotated ones", async () => {
@@ -53,7 +55,7 @@ describe("verifyPimlicoSignature", () => {
       nowSeconds: now,
       logger,
     });
-    expect(ok).toBe(true);
+    expect(ok.ok).toBe(true);
   });
 
   it("rejects a tampered body", async () => {
@@ -65,7 +67,7 @@ describe("verifyPimlicoSignature", () => {
       nowSeconds: now,
       logger,
     });
-    expect(ok).toBe(false);
+    expect(ok.ok).toBe(false);
   });
 
   it("rejects a stale timestamp (replay guard)", async () => {
@@ -77,7 +79,7 @@ describe("verifyPimlicoSignature", () => {
       nowSeconds: now,
       logger,
     });
-    expect(ok).toBe(false);
+    expect(ok.ok).toBe(false);
   });
 
   it("rejects missing headers", async () => {
@@ -88,7 +90,26 @@ describe("verifyPimlicoSignature", () => {
       nowSeconds: now,
       logger,
     });
-    expect(ok).toBe(false);
+    expect(ok.ok).toBe(false);
+  });
+
+  // Golden vector: pins Pimlico's non-standard key derivation (base58-custom → hex →
+  // base64). This exact (secret, id, ts, body, sig) tuple was produced by the
+  // reference @pimlico/webhook lib; if the derivation regresses to plain base64 this
+  // fails. Regression guard for the live 2026-07-06 all-401 incident.
+  it("verifies a reference @pimlico/webhook signature (golden vector)", async () => {
+    const res = await verifyPimlicoSignature({
+      secret: "pim_whsec_12oeWzGziAeWhm1Hpi4zvXDz54bzSMCBj3CeCb6rAPV",
+      headers: headers(
+        "msg_test",
+        "1783379000",
+        "v1,FegSBwAL3Dulyu7SFiGvw1GCj7N+us7vJohmBsP9cxY=",
+      ),
+      rawBody: '{"type":"user_operation.sponsorship.requested"}',
+      nowSeconds: 1783379000,
+      logger,
+    });
+    expect(res.ok).toBe(true);
   });
 });
 
