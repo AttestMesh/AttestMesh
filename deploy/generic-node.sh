@@ -75,12 +75,34 @@ _box_run() {
     printf 'E_GAS_POLICY_ID=%q\n' "${GAS_POLICY_ID:-}"
     printf 'E_INDEXER_REGISTRY_ADDR=%q\n' "$INDEXER_REGISTRY_ADDR"
     printf 'E_GATEWAY_DOMAIN=%q\n' "$GATEWAY_DOMAIN"
+    printf 'E_CLUSTER=%q\n' "${CLUSTER:-}"
+    printf 'E_MEMBER_IMPL=%q\n' "${MEMBER_IMPL:-}"
     printf 'E_APP_ENV_B64=%q\n' "$APP_ENV_B64"
     printf 'E_DSTACK_DOCKER_USERNAME=%q\n' "${guser:-dmvt}"
     printf 'E_DSTACK_DOCKER_PASSWORD=%q\n' "$gtok"
     printf 'E_DSTACK_DOCKER_REGISTRY=%q\n' "ghcr.io"
   } | ssh_box "sudo BOX_NAME='$NODE' BOX_COMPOSE='/tmp/${NODE}.yaml' BOX_VCPU=$BOX_VCPU BOX_MEM=$BOX_MEM BOX_DISK=$BOX_DISK BOX_PORTS='$BOX_PORTS' BOX_GATEWAY_ENABLED='$BOX_GATEWAY_ENABLED' BOX_NET_MODE='$BOX_NET_MODE' \
     bash -c 'set -a; . /dev/stdin; set +a; exec $BOX_PY /tmp/generic-node-box.py $mode $app_id $vm_id'"
+}
+
+_box_vm_json() {
+  [ -n "${VM_ID:-}" ] || return 0
+  ssh_box "sudo VM_ID='$VM_ID' $BOX_PY - <<'PY'
+import json, os, sys
+sys.path.insert(0, '/opt/dstack-mcp')
+import mcp_dstack as m
+try:
+    resp = m.vmm('GetInfo', {'id': os.environ['VM_ID']})
+    info = resp.get('info') or {}
+    print(json.dumps({
+        'found': bool(resp.get('found')),
+        'status': info.get('status'),
+        'boot_progress': info.get('boot_progress'),
+        'boot_error': info.get('boot_error'),
+    }))
+except Exception as exc:
+    print(json.dumps({'found': None, 'error': str(exc)}))
+PY"
 }
 
 deploy_cvm() {
@@ -138,8 +160,18 @@ SCRIPT
 verify() {
   _load; _require_env
   [ -n "${X:-}" ] && [ -n "${CLUSTER:-}" ] || die "need X+cluster"
-  local i id count
+  local i id count vm found boot_error boot_progress
   for i in $(seq 1 45); do
+    if [ -n "${VM_ID:-}" ]; then
+      vm=$(_box_vm_json || true)
+      found=$(echo "$vm" | jq -r '.found // empty' 2>/dev/null)
+      boot_error=$(echo "$vm" | jq -r '.boot_error // empty' 2>/dev/null)
+      boot_progress=$(echo "$vm" | jq -r '.boot_progress // empty' 2>/dev/null)
+      [ "$found" != false ] || die "enclave VM disappeared from dstack while waiting for mesh registration (vm=$VM_ID)"
+      if [ "$i" -gt 6 ] && [ -n "$boot_error" ] && [ "$boot_error" != null ]; then
+        die "enclave VM boot failed before mesh registration: $boot_error (progress: ${boot_progress:-unknown}, vm=$VM_ID)"
+      fi
+    fi
     id=$(cast call "$CLUSTER" "memberIdOf(address)(bytes32)" "$X" --rpc-url "$RPC_URL" 2>/dev/null)
     count=$(cast call "$CLUSTER" 'memberCount()(uint256)' --rpc-url "$RPC_URL" 2>/dev/null)
     if [ -n "$id" ] && [ "$id" != "$ZERO32" ]; then

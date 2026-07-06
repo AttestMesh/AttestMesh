@@ -8,6 +8,7 @@ import json
 import os
 import re
 import secrets
+import shlex
 import subprocess
 import threading
 import time
@@ -22,6 +23,9 @@ COMPOSES = Path(os.environ.get("ORCHESTRATOR_COMPOSE_DIR", str(ROOT / "deploy/or
 TOKEN = os.environ.get("ORCHESTRATOR_TOKEN", "")
 HOST = os.environ.get("ORCHESTRATOR_HOST", "0.0.0.0")
 PORT = int(os.environ.get("ORCHESTRATOR_PORT", "8789"))
+DEPLOY_RPC_URL = os.environ.get("ORCHESTRATOR_RPC_URL", "https://base-rpc.publicnode.com")
+DEPLOY_BUNDLER_URL = os.environ.get("ORCHESTRATOR_BUNDLER_URL", DEPLOY_RPC_URL)
+DEPLOY_BOX_RPC = os.environ.get("ORCHESTRATOR_BOX_RPC", DEPLOY_RPC_URL)
 
 CATALOG_IMAGES = {
     "postgres": "postgres:16-alpine",
@@ -239,46 +243,75 @@ def compose_for(name: str, image: str, catalog_id: str | None) -> str:
     return generic_compose(name, image, catalog_id)
 
 
+def absorb_state(job: dict[str, Any], node: str) -> None:
+    state_path = ROOT / "deploy/logs" / f"generic-node-{node}.state"
+    if not state_path.exists():
+        return
+    state: dict[str, str] = {}
+    for line in state_path.read_text().splitlines():
+        if "=" in line:
+            k, v = line.split("=", 1)
+            state[k] = v
+    job["appId"] = state.get("X") or None
+    job["vmId"] = state.get("VM_ID") or None
+    job["composeHash"] = state.get("H") or None
+
+
 def run_job(job_id: str) -> None:
     job = load_job(job_id)
     if not job:
         return
+    proc: subprocess.Popen[str] | None = None
     try:
         job["status"] = "running"
         save_job(job)
         node = job["nodeName"]
         log_path = ROOT / "deploy/logs" / f"orchestrator-{node}.log"
+        log_path.parent.mkdir(parents=True, exist_ok=True)
         cmd = [
             "bash",
             "-lc",
             (
                 "set -euo pipefail; "
                 "source deploy/env.sh; "
+                f"RPC_URL={shlex.quote(DEPLOY_RPC_URL)} "
+                f"BUNDLER_URL={shlex.quote(DEPLOY_BUNDLER_URL)} "
+                f"BOX_RPC={shlex.quote(DEPLOY_BOX_RPC)} "
                 f"CLUSTER={job['cluster']} MEMBER_IMPL={job['memberImpl']} "
                 f"COMPOSE={job['composePath']} APP_ENV_B64={job['appEnvB64']} "
                 f"BOX_VCPU={job['box']['vcpu']} BOX_MEM={job['box']['mem']} BOX_DISK={job['box']['disk']} "
                 f"deploy/generic-node.sh {node} all"
             ),
         ]
-        proc = subprocess.run(cmd, cwd=ROOT, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=3600)
-        log_path.write_text(proc.stdout)
-        job["exitCode"] = proc.returncode
+        tail: list[str] = []
+        last_save = 0.0
+        proc = subprocess.Popen(cmd, cwd=ROOT, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, bufsize=1)
+        assert proc.stdout is not None
+        with log_path.open("w") as log:
+            for line in proc.stdout:
+                log.write(line)
+                log.flush()
+                tail.append(line.rstrip("\n"))
+                if len(tail) > 80:
+                    tail = tail[-80:]
+                now = time.monotonic()
+                if now - last_save >= 2:
+                    job["logPath"] = str(log_path)
+                    job["logTail"] = "\n".join(tail[-40:])
+                    absorb_state(job, node)
+                    save_job(job)
+                    last_save = now
+        exit_code = proc.wait(timeout=5)
+        job["exitCode"] = exit_code
         job["logPath"] = str(log_path)
-        job["logTail"] = "\n".join(proc.stdout.splitlines()[-40:])
-        state_path = ROOT / "deploy/logs" / f"generic-node-{node}.state"
-        if state_path.exists():
-            state: dict[str, str] = {}
-            for line in state_path.read_text().splitlines():
-                if "=" in line:
-                    k, v = line.split("=", 1)
-                    state[k] = v
-            job["appId"] = state.get("X") or None
-            job["vmId"] = state.get("VM_ID") or None
-            job["composeHash"] = state.get("H") or None
-        job["status"] = "succeeded" if proc.returncode == 0 else "failed"
-        if proc.returncode != 0:
-            job["error"] = f"generic-node deploy failed with exit code {proc.returncode}"
+        job["logTail"] = "\n".join(tail[-40:])
+        absorb_state(job, node)
+        job["status"] = "succeeded" if exit_code == 0 else "failed"
+        if exit_code != 0:
+            job["error"] = f"generic-node deploy failed with exit code {exit_code}"
     except Exception as exc:
+        if proc and proc.poll() is None:
+            proc.kill()
         job["status"] = "failed"
         job["error"] = str(exc)
     save_job(job)
