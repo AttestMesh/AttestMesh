@@ -45,11 +45,6 @@ CORS_ORIGIN="${CORS_ORIGIN:-https://console.attestmesh.xyz}"
 CONSOLE_HOST="${CONSOLE_HOST:-console.attestmesh.xyz}"
 APP_DOMAIN="${APP_DOMAIN:-app.attestmesh.xyz}"
 GITHUB_OAUTH_CALLBACK_URL="${GITHUB_OAUTH_CALLBACK_URL:-https://console.attestmesh.xyz/api/v1/auth/github/callback}"
-# mesh-state-api runs on the self-hosted box and is reachable from the Synclave
-# CVM via a bridge-only listener on dstack-br0.
-CLUSTER_API_URL="${CLUSTER_API_URL:-http://10.0.100.1:8787}"
-CLUSTER_NETWORK_ID="${CLUSTER_NETWORK_ID:-net_attestmesh_live}"
-CLUSTER_NAME="${CLUSTER_NAME:-AttestMesh C3}"
 # CF app-fronting (non-secret): the attestmesh.xyz zone + the origin the proxied
 # <slug>.app records point at (the box haproxy public IP).
 CLOUDFLARE_ZONE_ID="${CLOUDFLARE_ZONE_ID:-5b276342195bda12c978f20ed38a3757}"
@@ -152,10 +147,6 @@ _box_run() {
     printf 'E_DAEMON_URL=%q\n'               "${DAEMON_URL:-}"
     printf 'E_PUBLIC_BASE_URL=%q\n'          "$PUBLIC_BASE_URL"
     printf 'E_APP_DOMAIN=%q\n'               "$APP_DOMAIN"
-    printf 'E_CLUSTER_API_URL=%q\n'          "$CLUSTER_API_URL"
-    printf 'E_CLUSTER_NETWORK_ID=%q\n'       "$CLUSTER_NETWORK_ID"
-    printf 'E_CLUSTER_NAME=%q\n'             "$CLUSTER_NAME"
-    printf 'E_CLUSTER_SELF_APP_ID=%q\n'      "${CLUSTER_SELF_APP_ID:-${X:-}}"
     printf 'E_CLUSTER_NETWORKS=%q\n'         "${CLUSTER_NETWORKS:-}"
     printf 'E_CLUSTER_ORCHESTRATOR_URL=%q\n' "${CLUSTER_ORCHESTRATOR_URL:-}"
     printf 'E_CLUSTER_ORCHESTRATOR_TOKEN=%q\n' "${CLUSTER_ORCHESTRATOR_TOKEN:-}"
@@ -165,8 +156,7 @@ _box_run() {
     printf 'E_CLOUDFLARE_ZONE_ID=%q\n'       "$CLOUDFLARE_ZONE_ID"
     printf 'E_CLOUDFLARE_ORIGIN_IP=%q\n'     "$CLOUDFLARE_ORIGIN_IP"
     printf 'E_ADMIN_API_KEY=%q\n'            "$ADMIN_API_KEY"
-    printf 'E_LABELS_API_URL=%q\n'           "${LABELS_API_URL:-}"
-    printf 'E_LABELS_API_TOKEN=%q\n'         "${LABELS_API_TOKEN:-}"
+    printf 'E_LABELS_WRITE_TOKENS=%q\n'      "${LABELS_WRITE_TOKENS:-}"
     printf 'E_TLS_FULLCHAIN_B64=%q\n'        "$TLS_FULLCHAIN_B64"
     printf 'E_TLS_KEY_B64=%q\n'              "$TLS_KEY_B64"
     printf 'E_DSTACK_DOCKER_USERNAME=%q\n'   "${guser:-dmvt}"

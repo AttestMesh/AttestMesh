@@ -76,11 +76,14 @@ services:
     # v6 = cluster API bridge: logged-in users see the live C3 members as CVM
     # graph nodes, with the API URL sealed to the dstack bridge listener.
     # Digest-pinned: in-place UpgradeApp rolls never re-pull a same-tag image.
-    # v19 = Apps → Sandboxes rename (labels only, wire stays app); v18 = mesh map
-    # band-collapse fix; v17 = lattice v3 operator grid (kind bands, honest attestation:
-    # seal = on-chain member, drawer Attestation section, member_kinds 0015); v16 =
-    # lattice v2; v15 = cluster deploys in the Deployments feed; v14 = Deployments + naming.
-    image: ghcr.io/dmvt/synclave-app:v19@sha256:763d399993cd3988f9178681b19cbd0ccbe193ab83289d584b99b139a73fed92
+    # v24 = the nameserver (member_names 0016, rename/reset + box-admin ingest routes,
+    # LABELS_WRITE_TOKENS sealed; dead LABELS_API_* dropped);
+    # v23 = v22 plus clearer mesh-registration timeout errors;
+    # v22 = v21 plus redacted orchestrator log details;
+    # v21 = user-visible orchestrator failure details in enclave deploys;
+    # v20 = CLUSTER_NETWORKS-only live mesh config + structured orchestrator errors;
+    # v19 = Apps → Sandboxes rename (labels only, wire stays app).
+    image: ghcr.io/dmvt/synclave-app:v24@sha256:e871857be71b2a0149b0b0b0b831f6ecb9628f18551136f28785afc917e77f94
     environment:
       API_HOST: 0.0.0.0
       API_PORT: 80
@@ -99,10 +102,6 @@ services:
       PLATFORM_ADMIN_EMAILS: ${PLATFORM_ADMIN_EMAILS:-}
       PUBLIC_BASE_URL: ${PUBLIC_BASE_URL}
       APP_DOMAIN: ${APP_DOMAIN}
-      CLUSTER_API_URL: ${CLUSTER_API_URL}
-      CLUSTER_NETWORK_ID: ${CLUSTER_NETWORK_ID}
-      CLUSTER_NAME: ${CLUSTER_NAME}
-      CLUSTER_SELF_APP_ID: ${CLUSTER_SELF_APP_ID}
       CLUSTER_NETWORKS: ${CLUSTER_NETWORKS:-}
       CLUSTER_ORCHESTRATOR_URL: ${CLUSTER_ORCHESTRATOR_URL:-}
       CLUSTER_ORCHESTRATOR_TOKEN: ${CLUSTER_ORCHESTRATOR_TOKEN:-}
@@ -113,8 +112,8 @@ services:
       CLOUDFLARE_ZONE_ID: ${CLOUDFLARE_ZONE_ID}
       CLOUDFLARE_ORIGIN_IP: ${CLOUDFLARE_ORIGIN_IP}
       ADMIN_API_KEY: ${ADMIN_API_KEY}
-      LABELS_API_URL: ${LABELS_API_URL:-}
-      LABELS_API_TOKEN: ${LABELS_API_TOKEN:-}
+      # Nameserver service tokens (member naming ingest/rename for box-admin — spec §G).
+      LABELS_WRITE_TOKENS: ${LABELS_WRITE_TOKENS:-}
     expose:
       - "80"
     depends_on:
