@@ -263,6 +263,11 @@ export default {
         return await handlePimlico(request, config, env, logger);
       }
       if (request.method === "GET" && pathname === "/pimlico-status") {
+        // Token-gated observability into the last webhook decision (TEE blocks the
+        // sidecar's container logs, so this is our window during the fleet roll).
+        if (url.searchParams.get("token") !== config.alchemyWebhookToken) {
+          return json({ error: "unauthorized" }, 401);
+        }
         const v = await env.MEMBER_PROVENANCE_CACHE.get("log:pimlico:last");
         return json(v ? JSON.parse(v) : { empty: true });
       }
