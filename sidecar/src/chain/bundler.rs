@@ -52,6 +52,10 @@ fn detect_mode(url: &str) -> SponsorshipMode {
 pub struct BundlerClient {
     http: reqwest::Client,
     url: String,
+    /// Node RPC for plain chain reads (`eth_call` for EntryPoint.getNonce). Alchemy
+    /// happened to serve both APIs on one URL; Pimlico is bundler+paymaster ONLY, so
+    /// node methods must never go to the bundler endpoint.
+    node_rpc_url: String,
     entry_point: Address,
     chain_id: u64,
     /// Sponsorship policy id: Alchemy Gas Manager `policyId` or Pimlico
@@ -63,6 +67,7 @@ pub struct BundlerClient {
 impl BundlerClient {
     pub fn new(
         url: impl Into<String>,
+        node_rpc_url: impl Into<String>,
         entry_point: Address,
         chain_id: u64,
         gas_policy_id: impl Into<String>,
@@ -72,6 +77,7 @@ impl BundlerClient {
         Self {
             http: reqwest::Client::new(),
             url,
+            node_rpc_url: node_rpc_url.into(),
             entry_point,
             chain_id,
             gas_policy_id: gas_policy_id.into(),
@@ -80,10 +86,14 @@ impl BundlerClient {
     }
 
     async fn rpc(&self, method: &str, params: Value) -> Result<Value> {
+        self.rpc_to(&self.url, method, params).await
+    }
+
+    async fn rpc_to(&self, url: &str, method: &str, params: Value) -> Result<Value> {
         let body = json!({ "jsonrpc": "2.0", "id": 1, "method": method, "params": params });
         let resp: Value = self
             .http
-            .post(&self.url)
+            .post(url)
             .json(&body)
             .send()
             .await
@@ -191,10 +201,13 @@ impl BundlerClient {
     }
 
     /// EIP-4337 account nonce: `EntryPoint.getNonce(sender, key=0)` via `eth_call`
-    /// (there is no bundler RPC for this; the Alchemy endpoint serves both APIs).
+    /// against the NODE RPC (there is no bundler RPC for this; paymaster-only
+    /// providers like Pimlico reject node methods — live-found: this call sent to
+    /// the bundler URL failed before any sponsorship request was ever made).
     async fn get_nonce(&self, sender: Address) -> Result<U256> {
         let r = self
-            .rpc(
+            .rpc_to(
+                &self.node_rpc_url,
                 "eth_call",
                 json!([{"to": self.entry_point, "data": get_nonce_calldata(sender)}, "latest"]),
             )
