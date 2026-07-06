@@ -350,6 +350,7 @@ async fn register_on_chain(
 
     let bundler = bundler::BundlerClient::new(
         config.bundler_url.clone(),
+        config.rpc_url.clone(),
         ENTRY_POINT,
         config.chain_id,
         config.gas_policy_id.clone(),

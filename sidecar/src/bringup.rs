@@ -130,6 +130,7 @@ pub async fn launch(
 
     let bundler = Arc::new(BundlerClient::new(
         config.bundler_url.clone(),
+        config.rpc_url.clone(),
         ENTRY_POINT,
         config.chain_id,
         config.gas_policy_id.clone(),
