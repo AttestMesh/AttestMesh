@@ -79,7 +79,7 @@ services:
     # v17 = lattice v3 operator grid (kind bands, honest attestation: seal = on-chain member,
     # drawer Attestation section, member_kinds 0015); v16 = lattice v2 (full mesh, gateway
     # scene); v15 = cluster deploys in the Deployments feed; v14 = Deployments + naming.
-    image: ghcr.io/dmvt/synclave-app:v17@sha256:21034242445a79805b835628e851bd89e621669a9c56b1e29b6952d1d2f95959
+    image: ghcr.io/dmvt/synclave-app:v18@sha256:ebeee7cfa3d053bb5dcc272c0498cf5f087cc37f8660a52aa2152273249c7b79
     environment:
       API_HOST: 0.0.0.0
       API_PORT: 80
