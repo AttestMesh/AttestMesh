@@ -383,8 +383,19 @@ async fn reconcile_once(
                         SendState { at_ms: now, attempts: attempts.saturating_add(1) },
                     );
                 }
-                Err(e) => tracing::warn!(peer = %hex::encode(member_id), error = ?e,
-                    "PeerEndpoint envelope send failed; will retry"),
+                Err(e) => {
+                    // Failures back off exactly like resends: a systematic bundler/
+                    // paymaster rejection must not retry at reconcile cadence — each
+                    // attempt consumes a sponsorship (live-found: 19 peers x 15s
+                    // burned a 100-op policy counter in ~90s with zero landed ops).
+                    let attempts = last_sent.get(member_id).map_or(0, |s| s.attempts);
+                    last_sent.insert(
+                        *member_id,
+                        SendState { at_ms: now, attempts: attempts.saturating_add(1) },
+                    );
+                    tracing::warn!(peer = %hex::encode(member_id), error = ?e, attempts,
+                        "PeerEndpoint envelope send failed; backing off");
+                }
             }
         }
     }
@@ -526,8 +537,15 @@ async fn poll_envelopes(
                                 SendState { at_ms: now, attempts: attempts.saturating_add(1) },
                             );
                         }
-                        Err(e) => tracing::warn!(peer = %hex::encode(sender), error = ?e,
-                            "PeerEndpoint reply failed; peer will resend"),
+                        Err(e) => {
+                            let attempts = last_sent.get(&sender).map_or(0, |s| s.attempts);
+                            last_sent.insert(
+                                sender,
+                                SendState { at_ms: now, attempts: attempts.saturating_add(1) },
+                            );
+                            tracing::warn!(peer = %hex::encode(sender), error = ?e,
+                                "PeerEndpoint reply failed; backing off");
+                        }
                     }
                 }
             }
