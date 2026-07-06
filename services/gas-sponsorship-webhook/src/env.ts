@@ -27,6 +27,8 @@ export interface Env {
   // Secrets.
   RPC_URL: string;
   ALCHEMY_WEBHOOK_TOKEN: string;
+  /** Standard-Webhooks secret for the Pimlico sponsorship route; route 503s when unset. */
+  PIMLICO_WEBHOOK_SECRET?: string;
 }
 
 /** Validated, normalized configuration derived from {@link Env}. */
@@ -41,6 +43,8 @@ export interface Config {
   negativeCacheTtlSeconds: number;
   /** Per-sender approved-UserOp cap per UTC day; 0 disables (spec §6 step 8, audit M2). */
   maxDailyOpsPerSender: number;
+  /** Present iff the Pimlico route is enabled. */
+  pimlicoWebhookSecret?: string;
   logLevel: LogLevel;
 }
 
@@ -136,6 +140,10 @@ export function parseEnv(env: Env): Config {
     cacheTtlSeconds: cacheTtl,
     negativeCacheTtlSeconds: NEGATIVE_CACHE_TTL_SECONDS,
     maxDailyOpsPerSender: maxDailyOps,
+    pimlicoWebhookSecret:
+      typeof env.PIMLICO_WEBHOOK_SECRET === "string" && env.PIMLICO_WEBHOOK_SECRET.length > 0
+        ? env.PIMLICO_WEBHOOK_SECRET
+        : undefined,
     logLevel: parseLogLevel(env.LOG_LEVEL),
   };
 }
