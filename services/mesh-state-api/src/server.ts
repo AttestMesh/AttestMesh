@@ -3,6 +3,7 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { loadConfig, type Config } from "./config.ts";
 import { TtlCache } from "./cache.ts";
+import { withImagePinning } from "./pinning.ts";
 import {
   deploymentsFromIndex,
   fetchClusterDeployments,
@@ -195,6 +196,19 @@ export function createApp(cfg: Config) {
     };
   };
 
+  // Member-facing views (/mesh/members, /mesh/clusters) additionally carry the
+  // operator-tier imagePinning join; topology/health/timeline do not. No-op when
+  // PINNING_SOURCE_URL is unset (see pinning.ts), so the public instance is
+  // unaffected. Enriches at the response boundary; cached snapshots stay pristine.
+  const getMemberSnapshots = async (): Promise<{
+    deployments: ClusterDeployment[];
+    snapshots: Snapshot[];
+    stale: boolean;
+  }> => {
+    const c = await getSnapshots();
+    return { ...c, snapshots: await withImagePinning(c.snapshots) };
+  };
+
   const getTimelines = async (): Promise<{
     deployments: ClusterDeployment[];
     timelines: Timeline[];
@@ -241,21 +255,21 @@ export function createApp(cfg: Config) {
     try {
       switch (path) {
         case "/mesh/clusters": {
-          const c = await getSnapshots();
+          const c = await getMemberSnapshots();
           json(res, 200, aggregateSnapshots(c.snapshots, c.deployments, c.stale), staleHeaders(c.stale));
           return;
         }
         case "/mesh/members": {
           const clusterParam = url.searchParams.get("cluster");
           if (clusterParam) {
-            const c = await getSnapshots();
+            const c = await getMemberSnapshots();
             const deployment = c.deployments.find((d) => clusterKey(d.cluster) === clusterKey(clusterParam));
             const snapshot = c.snapshots.find((s) => clusterKey(s.cluster) === clusterKey(clusterParam));
             if (!deployment || !snapshot) throw new Error(`unknown cluster ${clusterParam}`);
             json(res, 200, withDeployment({ ...snapshot, stale: c.stale || undefined }, deployment), staleHeaders(c.stale));
             return;
           }
-          const c = await getSnapshots();
+          const c = await getMemberSnapshots();
           json(res, 200, aggregateSnapshots(c.snapshots, c.deployments, c.stale), staleHeaders(c.stale));
           return;
         }
