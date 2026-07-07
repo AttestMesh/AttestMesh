@@ -12,7 +12,9 @@
 //! envelope exchange), heartbeat send/recv, CSK originate-or-pull, the peer-control
 //! gRPC server (mesh-only), and the app-facing agent gRPC server (UDS).
 
-use crate::chain::{bundler::BundlerClient, dstack_facet, message_facet, network_facet, userop, ChainClient};
+use crate::chain::{
+    bundler::BundlerClient, dstack_facet, message_facet, network_facet, userop, ChainClient,
+};
 use crate::config::Config;
 use crate::dstack::DstackRuntime;
 use crate::envelopes::{self, PeerEndpoint};
@@ -406,14 +408,25 @@ async fn reconcile_once(
         // running the new sidecar has published it, so the whole envelope exchange
         // below is skipped. Fall back to the sealed learned-keys cache (envelope-era)
         // only for peers whose key is not yet on chain (old sidecar / pre-cut cluster).
-        if ctx.shared.peers.lock().await.ed25519_of(member_id).is_none() {
+        if ctx
+            .shared
+            .peers
+            .lock()
+            .await
+            .ed25519_of(member_id)
+            .is_none()
+        {
             let on_chain = ctx
                 .chain
                 .ed25519_key_of(cluster, B256::from(*member_id))
                 .await
                 .unwrap_or(B256::ZERO);
             if on_chain != B256::ZERO {
-                ctx.shared.peers.lock().await.set_ed25519(member_id, on_chain.0);
+                ctx.shared
+                    .peers
+                    .lock()
+                    .await
+                    .set_ed25519(member_id, on_chain.0);
             } else if let Some(ed) = ctx.learned_keys.lock().await.get(member_id).copied() {
                 ctx.shared.peers.lock().await.set_ed25519(member_id, ed);
             }
@@ -432,10 +445,13 @@ async fn reconcile_once(
             .ed25519_of(member_id)
             .is_some();
         let now = now_ms();
-        let due = match last_sent.get(member_id) {
-            None => true,
-            Some(s) => !peer_ed_known && now.saturating_sub(s.at_ms) > resend_delay_ms(s.attempts),
-        };
+        let due = ctx.config.peer_envelope_fallback
+            && match last_sent.get(member_id) {
+                None => true,
+                Some(s) => {
+                    !peer_ed_known && now.saturating_sub(s.at_ms) > resend_delay_ms(s.attempts)
+                }
+            };
         if due {
             match send_peer_endpoint(ctx, *member_id).await {
                 Ok(tx) => {
@@ -458,7 +474,10 @@ async fn reconcile_once(
                     let attempts = last_sent.get(member_id).map_or(0, |s| s.attempts);
                     last_sent.insert(
                         *member_id,
-                        SendState { at_ms: now, attempts: attempts.saturating_add(1) },
+                        SendState {
+                            at_ms: now,
+                            attempts: attempts.saturating_add(1),
+                        },
                     );
                     tracing::warn!(peer = %hex::encode(member_id), error = ?e, attempts,
                         "PeerEndpoint envelope send failed; backing off");
@@ -598,9 +617,10 @@ async fn poll_envelopes(
                 // least one resend period old makes two live nodes settle after one
                 // round trip instead of ping-ponging.
                 let now = now_ms();
-                let reply_due = last_sent.get(&sender).map_or(true, |s| {
-                    now.saturating_sub(s.at_ms) > ENVELOPE_RESEND.as_millis() as u64
-                });
+                let reply_due = ctx.config.peer_envelope_fallback
+                    && last_sent.get(&sender).map_or(true, |s| {
+                        now.saturating_sub(s.at_ms) > ENVELOPE_RESEND.as_millis() as u64
+                    });
                 if reply_due {
                     match send_peer_endpoint(ctx, sender).await {
                         Ok(tx) => {
@@ -619,7 +639,10 @@ async fn poll_envelopes(
                             let attempts = last_sent.get(&sender).map_or(0, |s| s.attempts);
                             last_sent.insert(
                                 sender,
-                                SendState { at_ms: now, attempts: attempts.saturating_add(1) },
+                                SendState {
+                                    at_ms: now,
+                                    attempts: attempts.saturating_add(1),
+                                },
                             );
                             tracing::warn!(peer = %hex::encode(sender), error = ?e,
                                 "PeerEndpoint reply failed; backing off");
