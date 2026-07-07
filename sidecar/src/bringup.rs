@@ -384,12 +384,13 @@ async fn reconcile_once(
             .ed25519_of(member_id)
             .is_some();
         let now = now_ms();
-        let due = match last_sent.get(member_id) {
-            None => true,
-            Some(s) => {
-                !peer_ed_known && now.saturating_sub(s.at_ms) > resend_delay_ms(s.attempts)
-            }
-        };
+        let due = ctx.config.peer_envelope_fallback
+            && match last_sent.get(member_id) {
+                None => true,
+                Some(s) => {
+                    !peer_ed_known && now.saturating_sub(s.at_ms) > resend_delay_ms(s.attempts)
+                }
+            };
         if due {
             match send_peer_endpoint(ctx, *member_id).await {
                 Ok(tx) => {
@@ -541,9 +542,10 @@ async fn poll_envelopes(
                 // least one resend period old makes two live nodes settle after one
                 // round trip instead of ping-ponging.
                 let now = now_ms();
-                let reply_due = last_sent.get(&sender).map_or(true, |s| {
-                    now.saturating_sub(s.at_ms) > ENVELOPE_RESEND.as_millis() as u64
-                });
+                let reply_due = ctx.config.peer_envelope_fallback
+                    && last_sent.get(&sender).map_or(true, |s| {
+                        now.saturating_sub(s.at_ms) > ENVELOPE_RESEND.as_millis() as u64
+                    });
                 if reply_due {
                     match send_peer_endpoint(ctx, sender).await {
                         Ok(tx) => {

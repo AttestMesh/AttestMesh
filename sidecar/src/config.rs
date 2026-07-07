@@ -21,6 +21,12 @@ pub struct Config {
     /// ingress hostnames are `<app_id>-<port>s.<domain>`. Unset → mesh bring-up
     /// is skipped (registration-only mode).
     pub gateway_domain: Option<String>,
+    /// Send the sponsored PeerEndpoint envelope to a peer whose Ed25519 key is not
+    /// yet on chain (ed25519-onchain-key transitional fallback). Default OFF: mesh
+    /// key distribution is pure chain reads (peers publish `publishEd25519Key`), so
+    /// no sponsored key-messages fire. Set PEER_ENVELOPE_FALLBACK=true only to
+    /// interoperate with un-upgraded (pre-cut / old-sidecar) peers.
+    pub peer_envelope_fallback: bool,
     /// TCP port of the wg-over-TCP ingress (exposed through the gateway).
     pub wg_tcp_port: u16,
     /// Wireguard outer listen port. Distinct from the in-mesh heartbeat port
@@ -59,6 +65,9 @@ impl Config {
                 Ok(s) if !s.trim().is_empty() => Some(s.trim().to_string()),
                 _ => None,
             },
+            peer_envelope_fallback: opt("PEER_ENVELOPE_FALLBACK", "false")
+                .trim()
+                .eq_ignore_ascii_case("true"),
             wg_tcp_port: opt("WG_TCP_PORT", "51900").parse().context("WG_TCP_PORT")?,
             wg_listen_port: opt("WG_LISTEN_PORT", "51821")
                 .parse()
