@@ -6,7 +6,7 @@
 #   - its own Hindsight bank   (bank_id = agent name, on the Hindsight node)
 #   - its own email mailbox    (Fastmail IMAP/SMTP creds, operator-provisioned)
 #   - its own GitHub identity  (machine-account PAT, operator-provisioned)
-#   - its own model key        (Sakana fugu-ultra by default)
+#   - its own model endpoint   (fugu-router by default, direct custom endpoints allowed)
 #
 # The node joins the ClusterDiamond through the sidecar (Path A), which puts the
 # agent services ON the WireGuard mesh — that is how they reach the Matrix
@@ -148,6 +148,7 @@ services:
       - |
         set -euo pipefail
         install -d -m 700 /root/.hermes /root/.hermes/hindsight
+        provider_slug="$$(printf '%s' "$${MODEL_PROVIDER_NAME:-}" | tr '[:upper:]' '[:lower:]' | tr '_' '-')"
 
         # ── first-boot seeding: sealed env → files, only where missing ──
         if [ ! -s /root/.hermes/.env ]; then
@@ -165,12 +166,34 @@ services:
             [ -n "$$EMAIL_SMTP_HOST" ] && echo "EMAIL_SMTP_HOST=$$EMAIL_SMTP_HOST"
             [ -n "$$EMAIL_HOME_ADDRESS" ] && echo "EMAIL_HOME_ADDRESS=$$EMAIL_HOME_ADDRESS"
             [ -n "$$GITHUB_TOKEN" ] && echo "GH_TOKEN=$$GITHUB_TOKEN"
+            case "$$provider_slug" in
+              fugu-router|fugu|sakana-fugu-router)
+                echo "FUGU_ROUTER_API_KEY=$$MODEL_API_KEY"
+                echo "FUGU_ROUTER_BASE_URL=$$MODEL_BASE_URL"
+                ;;
+            esac
             true
           } > /root/.hermes/.env
         fi
 
         if [ ! -s /root/.hermes/config.yaml ]; then
-          cat > /root/.hermes/config.yaml <<EOF
+          case "$$provider_slug" in
+            fugu-router|fugu|sakana-fugu-router)
+              cat > /root/.hermes/config.yaml <<EOF
+        model:
+          default: $$MODEL_NAME
+          provider: fugu-router
+          base_url: $$MODEL_BASE_URL
+          api_key: $$MODEL_API_KEY
+          api_mode: chat_completions
+        memory:
+          memory_enabled: true
+          user_profile_enabled: true
+          provider: hindsight
+        EOF
+              ;;
+            *)
+              cat > /root/.hermes/config.yaml <<EOF
         model:
           default: $$MODEL_NAME
           provider: custom
@@ -186,6 +209,8 @@ services:
           user_profile_enabled: true
           provider: hindsight
         EOF
+              ;;
+          esac
         fi
 
         if [ ! -s /root/.hermes/hindsight/config.json ]; then

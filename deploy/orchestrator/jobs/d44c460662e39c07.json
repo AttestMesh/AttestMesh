@@ -1,0 +1,36 @@
+{
+  "appEnvB64": "UE9TVEdSRVNfREI9cG9zdGdyZXMKUE9TVEdSRVNfSU5JVERCX0FSR1M9LS1lbmNvZGluZz1VVEY4IC0tbG9jYWxlPUMKUE9TVEdSRVNfUEFTU1dPUkQ9cGdfOWU0YWRhYTY0ZTJiMzRiNjMyMzBkZmJlOTYwYTViNzE1YWY0ClBPU1RHUkVTX1VTRVI9cG9zdGdyZXMK",
+  "appId": "0x3882eAbE05Cb6A7573383541F2be8A48af6080bf",
+  "box": {
+    "disk": "40",
+    "mem": "4096",
+    "vcpu": "2"
+  },
+  "catalogId": "postgres",
+  "cluster": "0x07a0adb8F96EeF2D210A74EeBf2Ae2f4E5Beb273",
+  "composeHash": "7fb03475006855b9c82fa5f20ab7b5bc52561ad471e2c4ca0fca1a51dc647253",
+  "composePath": "/home/ubuntu/teemesh/deploy/orchestrator/compose/net-open-webhost-postgres-d44c46.yaml",
+  "connection": {
+    "database": "postgres",
+    "host": "meshIp",
+    "kind": "postgres",
+    "port": 5432,
+    "user": "postgres"
+  },
+  "createdAt": "2026-07-06T04:57:42Z",
+  "error": "generic-node deploy failed with exit code 1",
+  "exitCode": 1,
+  "flavor": "small",
+  "id": "d44c460662e39c07",
+  "imageRef": "postgres:16-alpine",
+  "logPath": "/home/ubuntu/teemesh/deploy/logs/orchestrator-net-open-webhost-postgres-d44c46.log",
+  "logTail": "[20260706T050020Z] \u2026 generic node not registered yet (7/45, memberCount=2)\n[20260706T050042Z] \u2026 generic node not registered yet (8/45, memberCount=2)\n[20260706T050104Z] \u2026 generic node not registered yet (9/45, memberCount=2)\n[20260706T050124Z] \u2026 generic node not registered yet (10/45, memberCount=2)\n[20260706T050145Z] \u2026 generic node not registered yet (11/45, memberCount=2)\n[20260706T050206Z] \u2026 generic node not registered yet (12/45, memberCount=2)\n[20260706T050226Z] \u2026 generic node not registered yet (13/45, memberCount=2)\n[20260706T050248Z] \u2026 generic node not registered yet (14/45, memberCount=2)\n[20260706T050311Z] \u2026 generic node not registered yet (15/45, memberCount=2)\n[20260706T050332Z] \u2026 generic node not registered yet (16/45, memberCount=2)\n[20260706T050354Z] \u2026 generic node not registered yet (17/45, memberCount=2)\n[20260706T050417Z] \u2026 generic node not registered yet (18/45, memberCount=2)\n[20260706T050437Z] \u2026 generic node not registered yet (19/45, memberCount=2)\n[20260706T050500Z] \u2026 generic node not registered yet (20/45, memberCount=2)\n[20260706T050522Z] \u2026 generic node not registered yet (21/45, memberCount=2)\n[20260706T050543Z] \u2026 generic node not registered yet (22/45, memberCount=2)\n[20260706T050603Z] \u2026 generic node not registered yet (23/45, memberCount=2)\n[20260706T050624Z] \u2026 generic node not registered yet (24/45, memberCount=2)\n[20260706T050645Z] \u2026 generic node not registered yet (25/45, memberCount=2)\n[20260706T050705Z] \u2026 generic node not registered yet (26/45, memberCount=2)\n[20260706T050726Z] \u2026 generic node not registered yet (27/45, memberCount=2)\n[20260706T050749Z] \u2026 generic node not registered yet (28/45, memberCount=2)\n[20260706T050810Z] \u2026 generic node not registered yet (29/45, memberCount=2)\n[20260706T050831Z] \u2026 generic node not registered yet (30/45, memberCount=2)\n[20260706T050853Z] \u2026 generic node not registered yet (31/45, memberCount=2)\n[20260706T050915Z] \u2026 generic node not registered yet (32/45, memberCount=2)\n[20260706T050935Z] \u2026 generic node not registered yet (33/45, memberCount=2)\n[20260706T050956Z] \u2026 generic node not registered yet (34/45, memberCount=2)\n[20260706T051017Z] \u2026 generic node not registered yet (35/45, memberCount=2)\n[20260706T051039Z] \u2026 generic node not registered yet (36/45, memberCount=2)\n[20260706T051100Z] \u2026 generic node not registered yet (37/45, memberCount=2)\n[20260706T051122Z] \u2026 generic node not registered yet (38/45, memberCount=2)\n[20260706T051143Z] \u2026 generic node not registered yet (39/45, memberCount=2)\n[20260706T051204Z] \u2026 generic node not registered yet (40/45, memberCount=2)\n[20260706T051225Z] \u2026 generic node not registered yet (41/45, memberCount=2)\n[20260706T051247Z] \u2026 generic node not registered yet (42/45, memberCount=2)\n[20260706T051308Z] \u2026 generic node not registered yet (43/45, memberCount=2)\n[20260706T051331Z] \u2026 generic node not registered yet (44/45, memberCount=2)\n[20260706T051354Z] \u2026 generic node not registered yet (45/45, memberCount=2)\n[20260706T051414Z] FATAL: generic node did not register",
+  "memberImpl": "0x7d5536a06b5fbe4c51e6995bdb0543b7887b3da4",
+  "name": "postgres",
+  "networkId": "net_open_webhost",
+  "nodeName": "net-open-webhost-postgres-d44c46",
+  "source": "catalog",
+  "status": "failed",
+  "updatedAt": "2026-07-06T05:14:14Z",
+  "vmId": "a709d9cc-a0db-4259-af88-73b06cc0dec7"
+}

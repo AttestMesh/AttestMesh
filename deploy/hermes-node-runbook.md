@@ -34,7 +34,11 @@ Hindsight bank id, and default git user.name).
 3. **GitHub**: create the machine account (human signup; use the agent's new
    email), mint a PAT → fill `GITHUB_TOKEN` (+ `GIT_USER_NAME` if the GitHub
    handle differs from the agent name).
-4. **Model key**: fill `MODEL_API_KEY` (Sakana; `fugu-ultra` is the default).
+4. **Model endpoint**: default is `fugu-router` with `fugu-ultra`; the deploy
+   helper resolves the router URL from `deploy/logs/fugu-router-node-fugu-router.state`
+   and the LiteLLM key from `~/.attestmesh/fugu-router.env`. For direct Sakana,
+   set `MODEL_PROVIDER_NAME=custom`, `MODEL_BASE_URL=https://api.sakana.ai/v1`,
+   and `MODEL_API_KEY=<Sakana key>`.
 5. Optional: persona at `~/.attestmesh/agents/<agent>.soul.md`; workspace repo
    via `WORKSPACE_GIT_URL` (private repos work — the PAT is seeded first).
 

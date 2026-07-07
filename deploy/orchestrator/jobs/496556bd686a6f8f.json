@@ -1,0 +1,44 @@
+{
+  "appEnvB64": "UE9TVEdSRVNfREI9cG9zdGdyZXMKUE9TVEdSRVNfSU5JVERCX0FSR1M9LS1lbmNvZGluZz1VVEY4IC0tbG9jYWxlPUMKUE9TVEdSRVNfUEFTU1dPUkQ9cGdfYWYxM2IwN2QxZDcwZTEzMDE4ZTBlY2QzNWY2NDUzNmY2YjdiClBPU1RHUkVTX1VTRVI9cG9zdGdyZXMK",
+  "appId": "0x9d520D4e3bcB6D88B70f7249DBDaF65cFdaE69cF",
+  "box": {
+    "disk": "40",
+    "mem": "4096",
+    "vcpu": "2"
+  },
+  "catalogId": "postgres",
+  "cleanup": {
+    "exitCode": 0,
+    "forced": false,
+    "logPath": "/home/ubuntu/teemesh/deploy/logs/orchestrator-net-open-webhost-postgres-496556-cleanup.log",
+    "logTail": "env loaded: chain=8453 deployer=0x60b174704AdAf2b0BF87B426B364D6EbD81818E1 org_safe=0x60b174704AdAf2b0BF87B426B364D6EbD81818E1 kms_root=0x52d3cf51c8a37a2ccfc79bbb98c7810d7dd4ce51\n[20260707T064046Z] === generic AttestMesh node: net-open-webhost-postgres-496556 ===\n[20260707T064046Z] \u25b6 cleanup stop VM_ID=d8b75e9c-8621-4f13-b1c3-d322aead0598 force=0\nHTTP Request: POST http://127.0.0.1:9080/prpc/GetInfo?json \"HTTP/1.1 200 OK\"\nHTTP Request: POST http://127.0.0.1:9080/prpc/StopVm?json \"HTTP/1.1 200 OK\"\n{\"vm_id\": \"d8b75e9c-8621-4f13-b1c3-d322aead0598\", \"found\": true, \"stopped\": true}\n[20260707T064047Z] \u2714 cleanup stop completed for vm=d8b75e9c-8621-4f13-b1c3-d322aead0598\n[20260707T064048Z] \u25b6 generic-removeApp-net-open-webhost-postgres-496556: cast send 0x07a0adb8F96EeF2D210A74EeBf2Ae2f4E5Beb273 removeAllowedAppId(address) 0x9d520D4e3bcB6D88B70f7249DBDaF65cFdaE69cF --nonce 1170 --rpc-url https://base-rpc.publicnode.com --private-key <redacted> \n[20260707T064048Z]   \u2514 log: /home/ubuntu/teemesh/deploy/logs/generic-removeApp-net-open-webhost-postgres-496556.20260707T064048Z.log\n[20260707T064052Z] \u2714 generic-removeApp-net-open-webhost-postgres-496556",
+    "status": "succeeded",
+    "updatedAt": "2026-07-07T06:40:52Z"
+  },
+  "cluster": "0x07a0adb8F96EeF2D210A74EeBf2Ae2f4E5Beb273",
+  "composeHash": "b940f29f1a938d94b1f1667a6c9ccc458dd1d33374f277172ad2e1d08768a4ca",
+  "composePath": "/home/ubuntu/teemesh/deploy/orchestrator/compose/net-open-webhost-postgres-496556.yaml",
+  "connection": {
+    "database": "postgres",
+    "host": "meshIp",
+    "kind": "postgres",
+    "port": 5432,
+    "user": "postgres"
+  },
+  "createdAt": "2026-07-07T05:15:53Z",
+  "error": "orchestrator restarted before this job reached a terminal state",
+  "flavor": "small",
+  "id": "496556bd686a6f8f",
+  "imageRef": "postgres:16-alpine",
+  "logPath": "/home/ubuntu/teemesh/deploy/logs/orchestrator-net-open-webhost-postgres-496556.log",
+  "logTail": "[20260707T051606Z]   \u2514 log: /home/ubuntu/teemesh/deploy/logs/generic-addApp-net-open-webhost-postgres-496556.20260707T051606Z.log\n[20260707T051610Z] \u2714 generic-addApp-net-open-webhost-postgres-496556\n[20260707T051610Z] \u25b6 bind generic X=0x9d520D4e3bcB6D88B70f7249DBDaF65cFdaE69cF -> impl 0x7d5536a06b5fbe4c51e6995bdb0543b7887b3da4 (box deployer)\nstatus               1 (success)\ntransactionHash      0xf9072bf0f35d4329c327edd96c99aae4907b43a6e003ffda0fda715f76937825\n[20260707T051613Z] X.cluster()=0x07a0adb8F96EeF2D210A74EeBf2Ae2f4E5Beb273 (expect 0x07a0adb8F96EeF2D210A74EeBf2Ae2f4E5Beb273)\n[20260707T051613Z] \u2714 bound generic node X -> 0x07a0adb8F96EeF2D210A74EeBf2Ae2f4E5Beb273\n[20260707T051613Z] \u25b6 start generic VM vm=d8b75e9c-8621-4f13-b1c3-d322aead0598 after allowlist/bind\nHTTP Request: POST http://127.0.0.1:9080/prpc/StartVm?json \"HTTP/1.1 200 OK\"\nstarted d8b75e9c-8621-4f13-b1c3-d322aead0598\n[20260707T051614Z] \u2714 start requested for generic VM vm=d8b75e9c-8621-4f13-b1c3-d322aead0598\nHTTP Request: POST http://127.0.0.1:9080/prpc/GetInfo?json \"HTTP/1.1 200 OK\"\n[20260707T051617Z] \u2026 generic node not registered yet (1/45, memberCount=2)\nHTTP Request: POST http://127.0.0.1:9080/prpc/GetInfo?json \"HTTP/1.1 200 OK\"\n[20260707T051638Z] \u2026 generic node not registered yet (2/45, memberCount=2)\nHTTP Request: POST http://127.0.0.1:9080/prpc/GetInfo?json \"HTTP/1.1 200 OK\"\n[20260707T051700Z] \u2026 generic node not registered yet (3/45, memberCount=2)\nHTTP Request: POST http://127.0.0.1:9080/prpc/GetInfo?json \"HTTP/1.1 200 OK\"\n[20260707T051722Z] \u2026 generic node not registered yet (4/45, memberCount=2)\nHTTP Request: POST http://127.0.0.1:9080/prpc/GetInfo?json \"HTTP/1.1 200 OK\"\n[20260707T051744Z] \u2026 generic node not registered yet (5/45, memberCount=2)\nHTTP Request: POST http://127.0.0.1:9080/prpc/GetInfo?json \"HTTP/1.1 200 OK\"\n[20260707T051806Z] \u2026 generic node not registered yet (6/45, memberCount=2)\nHTTP Request: POST http://127.0.0.1:9080/prpc/GetInfo?json \"HTTP/1.1 200 OK\"\n[20260707T051828Z] \u2026 generic node not registered yet (7/45, memberCount=2)\nHTTP Request: POST http://127.0.0.1:9080/prpc/GetInfo?json \"HTTP/1.1 200 OK\"\n[20260707T051850Z] \u2026 generic node not registered yet (8/45, memberCount=2)\nHTTP Request: POST http://127.0.0.1:9080/prpc/GetInfo?json \"HTTP/1.1 200 OK\"\n[20260707T051912Z] \u2026 generic node not registered yet (9/45, memberCount=2)\nHTTP Request: POST http://127.0.0.1:9080/prpc/GetInfo?json \"HTTP/1.1 200 OK\"\n[20260707T051934Z] \u2026 generic node not registered yet (10/45, memberCount=2)\nHTTP Request: POST http://127.0.0.1:9080/prpc/GetInfo?json \"HTTP/1.1 200 OK\"\n[20260707T051956Z] \u2026 generic node not registered yet (11/45, memberCount=2)\nHTTP Request: POST http://127.0.0.1:9080/prpc/GetInfo?json \"HTTP/1.1 200 OK\"\n[20260707T052018Z] \u2026 generic node not registered yet (12/45, memberCount=2)\nHTTP Request: POST http://127.0.0.1:9080/prpc/GetInfo?json \"HTTP/1.1 200 OK\"\n[20260707T052039Z] \u2026 generic node not registered yet (13/45, memberCount=2)\nHTTP Request: POST http://127.0.0.1:9080/prpc/GetInfo?json \"HTTP/1.1 200 OK\"\n[20260707T052101Z] \u2026 generic node not registered yet (14/45, memberCount=2)\nHTTP Request: POST http://127.0.0.1:9080/prpc/GetInfo?json \"HTTP/1.1 200 OK\"",
+  "memberImpl": "0x7d5536a06b5fbe4c51e6995bdb0543b7887b3da4",
+  "name": "postgres",
+  "networkId": "net_open_webhost",
+  "nodeName": "net-open-webhost-postgres-496556",
+  "source": "catalog",
+  "statePhase": "cleaned",
+  "status": "cleaned",
+  "updatedAt": "2026-07-07T06:40:52Z",
+  "vmId": "d8b75e9c-8621-4f13-b1c3-d322aead0598"
+}

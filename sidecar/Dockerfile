@@ -11,7 +11,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         pkg-config libssl-dev \
     && rm -rf /var/lib/apt/lists/*
 COPY . .
-RUN cargo build --release --bin cluster-mesh-agent && strip target/release/cluster-mesh-agent
+RUN cargo build --release --bin cluster-mesh-agent --bin attestmesh-registration-calldata \
+    && strip target/release/cluster-mesh-agent target/release/attestmesh-registration-calldata
 
 # Minimal runtime. wireguard-tools + iproute2 for mesh bring-up; libssl3 for TLS reads.
 FROM debian:bookworm-slim
@@ -19,4 +20,5 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates libssl3 wireguard-tools iproute2 \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=builder /build/target/release/cluster-mesh-agent /usr/local/bin/cluster-mesh-agent
+COPY --from=builder /build/target/release/attestmesh-registration-calldata /usr/local/bin/attestmesh-registration-calldata
 ENTRYPOINT ["/usr/local/bin/cluster-mesh-agent"]

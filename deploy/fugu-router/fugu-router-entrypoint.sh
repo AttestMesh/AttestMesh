@@ -2,7 +2,8 @@
 # fugu-router entrypoint: derive the redis-ha client password from the CLUSTER SHARED KEY
 # (sidecar agent UDS, HKDF label attestmesh.redisha.auth.v1 — same recipe as
 # deploy/pg-ha/pgha-common.sh csk_derive), prune model_list deployments whose api_key env
-# var is absent (SAKANA_SUB_3_KEY is optional), then exec litellm.
+# var is absent (SAKANA_SUB_3_KEY is optional), initialize the Fugu credit ledger,
+# then exec litellm.
 # Progress/errors self-report to the status volume — the TEE blocks container logs.
 set -u
 
@@ -16,7 +17,7 @@ _st() { echo "$(date -u +%FT%TZ) fugu-router: $*" >> "$STAT" 2>/dev/null || true
 # Observable failure, no crash-loop storm: report, linger, let restart policy retry.
 _die() { _st "ERROR: $*"; sleep 30; exit 1; }
 
-for v in SAKANA_API_BASE SAKANA_SUB_1_KEY SAKANA_SUB_2_KEY SAKANA_PAYG_KEY \
+for v in SAKANA_API_BASE SAKANA_SUB_1_KEY SAKANA_SUB_2_KEY \
          LITELLM_MASTER_KEY LITELLM_SALT_KEY DATABASE_URL; do
   eval "val=\${$v:-}"
   [ -n "$val" ] || _die "missing required env $v"
@@ -75,6 +76,8 @@ PY
 [ -s "$CONF" ] || _die "runtime config generation failed"
 
 export PYTHONPATH="/app${PYTHONPATH:+:$PYTHONPATH}"  # fugu_telemetry importable by litellm
+_st "initializing fugu credit ledger"
+python3 -m fugu_credit init-db || _die "fugu credit ledger init failed"
 _st "starting litellm proxy on :4000"
 cd /app || _die "cd /app failed"
 exec litellm --config "$CONF" --port 4000

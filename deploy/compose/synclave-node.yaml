@@ -25,7 +25,7 @@
 services:
   # --- AttestMesh sidecar: on-chain self-registration + wg mesh (Path A) --------
   sidecar:
-    image: ghcr.io/attestmesh/cluster-mesh-agent@sha256:db0a74f5cb68aab6441ac187522276999fc45ee760db3ae3dea0240e86d5c1af
+    image: ghcr.io/attestmesh/cluster-mesh-agent@sha256:f455ad9e778573080459eb9e46af269547d72d3624cbcf6d21e4a279c0527284
     restart: unless-stopped
     environment:
       # MEMBER_CONTRACT intentionally unset. Path A upgrades this stock DstackApp
@@ -38,11 +38,13 @@ services:
       - INDEXER_REGISTRY_ADDR=${INDEXER_REGISTRY_ADDR}
       - GATEWAY_DOMAIN=${GATEWAY_DOMAIN}
       - DSTACK_SOCKET=/var/run/dstack.sock
+      - AGENT_GRPC_SOCKET=/var/run/attestmesh/agent.sock
       - HEALTH_HTTP_ADDR=0.0.0.0:9090
       - LOG_FORMAT=pretty
       - LOG_LEVEL=info,cluster_mesh_agent=debug
     volumes:
       - /var/run/dstack.sock:/var/run/dstack.sock
+      - agent-sock:/var/run/attestmesh
     ports:
       - "9090:9090"
       - "51900:51900"
@@ -51,21 +53,83 @@ services:
     devices:
       - /dev/net/tun
 
-  # --- Synclave application stack ------------------------------------------------
-  postgres:
-    image: postgres:16-alpine
-    environment:
-      POSTGRES_USER: synclave
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
-      POSTGRES_DB: synclave
-    volumes:
-      - pgdata:/var/lib/postgresql/data
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U synclave -d synclave"]
-      interval: 3s
-      timeout: 3s
-      retries: 20
+  # --- PG-HA over the AttestMesh WireGuard mesh ---------------------------------
+  # Synclave's product DB lives in the shared pg-ha cluster, not in this compose.
+  # The app container is in the ordinary compose network; these forwarders live in
+  # the sidecar netns so their outbound legs can reach the pg-ha mesh IPs.
+  pg1-proxy:
+    image: alpine/socat:1.8.0.0
     restart: unless-stopped
+    network_mode: service:sidecar
+    depends_on:
+      - sidecar
+    command: ["TCP-LISTEN:15431,fork,reuseaddr,bind=0.0.0.0", "TCP:10.18.147.86:5432"]
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+
+  pg2-proxy:
+    image: alpine/socat:1.8.0.0
+    restart: unless-stopped
+    network_mode: service:sidecar
+    depends_on:
+      - sidecar
+    command: ["TCP-LISTEN:15432,fork,reuseaddr,bind=0.0.0.0", "TCP:10.18.251.71:5432"]
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+
+  pg3-proxy:
+    image: alpine/socat:1.8.0.0
+    restart: unless-stopped
+    network_mode: service:sidecar
+    depends_on:
+      - sidecar
+    command: ["TCP-LISTEN:15433,fork,reuseaddr,bind=0.0.0.0", "TCP:10.18.172.186:5432"]
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+
+  # One-shot: ensure role+database synclave on pg-ha. The pg-ha superuser password
+  # is CSK-derived inside the CVM; POSTGRES_PASSWORD is the sealed Synclave DB role
+  # password. Idempotent: create-if-missing and ALTER to converge the password.
+  pg-provision:
+    image: ghcr.io/attestmesh/pg-ha@sha256:05c6d46c72f6feb444be055e1c12c116ba1334ed6d738e7d649e0ea6e71cabf5
+    restart: on-failure
+    network_mode: service:sidecar
+    depends_on:
+      - sidecar
+    environment:
+      - AGENT_GRPC_SOCKET=/var/run/attestmesh/agent.sock
+      - PGHA_LOG_TAG=pg-provision
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+    volumes:
+      - agent-sock:/var/run/attestmesh
+    entrypoint: ["/bin/bash", "-ec"]
+    command:
+      - |
+        source /usr/local/bin/pgha-common.sh
+        _st "deriving pg-ha superuser credential (waits for CSK)"
+        SUPW="$$(csk_derive attestmesh.pgha.superuser.v1)"
+        HOSTS="10.18.147.86:5432,10.18.251.71:5432,10.18.172.186:5432"
+        _st "ensuring role + database synclave"
+        psql "postgresql://postgres:$${SUPW}@$${HOSTS}/postgres?connect_timeout=5" -v ON_ERROR_STOP=1 -v pw="$$POSTGRES_PASSWORD" <<'SQL'
+        SELECT format('CREATE ROLE synclave LOGIN PASSWORD %L', :'pw')
+        WHERE NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'synclave')
+        \gexec
+        ALTER ROLE synclave WITH LOGIN PASSWORD :'pw';
+        SELECT format('CREATE DATABASE %I OWNER %I', 'synclave', 'synclave')
+        WHERE NOT EXISTS (SELECT FROM pg_database WHERE datname = 'synclave')
+        \gexec
+        SQL
+        psql "postgresql://synclave:$${POSTGRES_PASSWORD}@$${HOSTS}/synclave?connect_timeout=5" -c 'select 1' >/dev/null
+        _st "OK: role + database synclave ensured; login verified"
 
   # NOTE: no tee-daemon here anymore. App-Hosting (the daemon) now runs in the ISOLATED webhost
   # cluster (Cluster 2, webhost-node.yaml). This node is control-plane only: UI + API + auth/
@@ -76,6 +140,10 @@ services:
     # v6 = cluster API bridge: logged-in users see the live C3 members as CVM
     # graph nodes, with the API URL sealed to the dstack bridge listener.
     # Digest-pinned: in-place UpgradeApp rolls never re-pull a same-tag image.
+    # v29 = API-token permission catalog + account settings token management;
+    # v28 = Team menu carries team settings/actions; account menu is account-only;
+    # v27 = team terminology + Vercel-style team/account settings IA;
+    # v26 = team-first onboarding + contextual network setup gate;
     # v25 = v24 rebuilt with VITE_PRIVY_APP_ID baked into the web SPA;
     # v24 = nameserver routes + active deployment visibility + clearer deployment failure state;
     # v23 = v22 plus clearer mesh-registration timeout errors;
@@ -83,7 +151,7 @@ services:
     # v21 = user-visible orchestrator failure details in enclave deploys;
     # v20 = CLUSTER_NETWORKS-only live mesh config + structured orchestrator errors;
     # v19 = Apps → Sandboxes rename (labels only, wire stays app).
-    image: ghcr.io/dmvt/synclave-app:v25@sha256:9d6fe99dfdb0b406f2e785b0fa6ec6d4de9a6f3cf106c7053a5ed4dce3ebf958
+    image: ghcr.io/dmvt/synclave-app:v33@sha256:179f3ba276f517afe85884083e349612cb3d50095d19f3ddb278188c406dd907
     environment:
       API_HOST: 0.0.0.0
       API_PORT: 80
@@ -102,6 +170,7 @@ services:
       PLATFORM_ADMIN_EMAILS: ${PLATFORM_ADMIN_EMAILS:-}
       PUBLIC_BASE_URL: ${PUBLIC_BASE_URL}
       APP_DOMAIN: ${APP_DOMAIN}
+      INDEXER_URL: ${INDEXER_URL}
       CLUSTER_NETWORKS: ${CLUSTER_NETWORKS:-}
       CLUSTER_ORCHESTRATOR_URL: ${CLUSTER_ORCHESTRATOR_URL:-}
       CLUSTER_ORCHESTRATOR_TOKEN: ${CLUSTER_ORCHESTRATOR_TOKEN:-}
@@ -117,8 +186,14 @@ services:
     expose:
       - "80"
     depends_on:
-      postgres:
-        condition: service_healthy
+      pg-provision:
+        condition: service_completed_successfully
+      pg1-proxy:
+        condition: service_started
+      pg2-proxy:
+        condition: service_started
+      pg3-proxy:
+        condition: service_started
     restart: unless-stopped
 
   # Control-plane only: fronts the console host → the app (UI + API). Tenant-app and concierge
@@ -155,6 +230,6 @@ services:
     restart: unless-stopped
 
 volumes:
-  pgdata:
+  agent-sock:
   caddy_data:
   caddy_config:

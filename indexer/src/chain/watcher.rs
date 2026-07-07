@@ -5,27 +5,39 @@
 //! an [`IndexedLog`] carrying the cluster address, position, and the per-member
 //! relevance metadata used by the dispatch loop.
 
-use super::{ClusterDeployed, HttpProvider, MemberRegistered, MessageSent, WgKeyPublished};
+use super::{
+    ClusterDeployed, CskCommitmentSet, HttpProvider, MemberRegistered, MessageSent,
+    WgKeyPublished,
+};
+use crate::query::ClusterDeployment;
 use alloy::primitives::{Address, B256};
 use alloy::providers::Provider;
 use alloy::rpc::types::eth::{Filter, Log};
 use alloy::sol_types::SolEvent;
 use anyhow::{Context, Result};
+use std::time::Duration;
 
 /// Which cluster event a log represents, with the indexed fields needed for the
 /// per-member relevance filter (spec §7.3).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EventKind {
     /// All cluster members care (someone joined).
-    MemberRegistered { member_id: B256 },
+    MemberRegistered {
+        member_id: B256,
+        member_contract: Address,
+        attestor_id: B256,
+        x_pub_key: B256,
+        wg_pub_key: B256,
+    },
     /// All cluster members care (a peer (re)published its wireguard key).
-    WgKeyPublished { member_id: B256 },
+    WgKeyPublished { member_id: B256, wg_pub_key: B256 },
     /// Only the recipient member cares; never leaked to others (spec §7.3).
     MessageSent {
         sender_member_id: B256,
         recipient_member_id: B256,
         envelope_id: B256,
     },
+    CskCommitmentSet { commitment: B256 },
 }
 
 impl EventKind {
@@ -33,7 +45,9 @@ impl EventKind {
     pub fn is_relevant_for(&self, member_id: &B256) -> bool {
         match self {
             // Membership/key events go to every member of the cluster.
-            EventKind::MemberRegistered { .. } | EventKind::WgKeyPublished { .. } => true,
+            EventKind::MemberRegistered { .. }
+            | EventKind::WgKeyPublished { .. }
+            | EventKind::CskCommitmentSet { .. } => true,
             // A message is delivered only to its recipient — the indexer must never
             // leak the existence of a message to a non-recipient member.
             EventKind::MessageSent {
@@ -49,6 +63,7 @@ impl EventKind {
             EventKind::MemberRegistered { .. } => "MemberRegistered",
             EventKind::WgKeyPublished { .. } => "WgKeyPublished",
             EventKind::MessageSent { .. } => "MessageSent",
+            EventKind::CskCommitmentSet { .. } => "CskCommitmentSet",
         }
     }
 }
@@ -79,6 +94,7 @@ pub fn cluster_event_topics() -> Vec<B256> {
         MemberRegistered::SIGNATURE_HASH,
         WgKeyPublished::SIGNATURE_HASH,
         MessageSent::SIGNATURE_HASH,
+        CskCommitmentSet::SIGNATURE_HASH,
     ]
 }
 
@@ -112,11 +128,16 @@ pub fn classify(log: &Log) -> Option<IndexedLog> {
         let ev = MemberRegistered::decode_log_data(log.data(), true).ok()?;
         EventKind::MemberRegistered {
             member_id: ev.memberId,
+            member_contract: ev.memberContract,
+            attestor_id: ev.attestorId,
+            x_pub_key: ev.xPubKey,
+            wg_pub_key: ev.wgPubKey,
         }
     } else if topic0 == WgKeyPublished::SIGNATURE_HASH {
         let ev = WgKeyPublished::decode_log_data(log.data(), true).ok()?;
         EventKind::WgKeyPublished {
             member_id: ev.memberId,
+            wg_pub_key: ev.wgPubKey,
         }
     } else if topic0 == MessageSent::SIGNATURE_HASH {
         let ev = MessageSent::decode_log_data(log.data(), true).ok()?;
@@ -124,6 +145,11 @@ pub fn classify(log: &Log) -> Option<IndexedLog> {
             sender_member_id: ev.senderMemberId,
             recipient_member_id: ev.recipientMemberId,
             envelope_id: ev.envelopeId,
+        }
+    } else if topic0 == CskCommitmentSet::SIGNATURE_HASH {
+        let ev = CskCommitmentSet::decode_log_data(log.data(), true).ok()?;
+        EventKind::CskCommitmentSet {
+            commitment: ev.commitment,
         }
     } else {
         return None;
@@ -140,13 +166,20 @@ pub fn classify(log: &Log) -> Option<IndexedLog> {
     })
 }
 
-/// Decode a `ClusterDeployed` log to its cluster address (spec §7.2).
-pub fn decode_cluster_deployed(log: &Log) -> Option<Address> {
+/// Decode a `ClusterDeployed` log to its deployment metadata (spec §7.2).
+pub fn decode_cluster_deployed(log: &Log) -> Option<ClusterDeployment> {
     if log.topic0().copied()? != ClusterDeployed::SIGNATURE_HASH {
         return None;
     }
     let ev = ClusterDeployed::decode_log_data(log.data(), true).ok()?;
-    Some(ev.cluster)
+    Some(ClusterDeployment {
+        cluster: ev.cluster,
+        cluster_owner: ev.clusterOwner,
+        salt: ev.salt,
+        deployed_at_block: log.block_number?,
+        deployment_tx_hash: log.transaction_hash?,
+        deployment_log_index: log.log_index?,
+    })
 }
 
 /// One catch-up / steady-state poll: fetch and classify logs in `[from_block,
@@ -161,10 +194,7 @@ pub async fn poll_cluster_logs(
         return Ok(Vec::new());
     }
     let filter = cluster_filter(clusters, from_block, to_block);
-    let logs = provider
-        .get_logs(&filter)
-        .await
-        .context("eth_getLogs(clusters)")?;
+    let logs = get_logs_with_retry(provider, filter, "eth_getLogs(clusters)").await?;
     Ok(logs.iter().filter_map(classify).collect())
 }
 
@@ -175,16 +205,37 @@ pub async fn poll_new_clusters(
     factory: Address,
     from_block: u64,
     to_block: u64,
-) -> Result<Vec<Address>> {
+) -> Result<Vec<ClusterDeployment>> {
     if from_block > to_block {
         return Ok(Vec::new());
     }
     let filter = factory_filter(factory, from_block, to_block);
-    let logs = provider
-        .get_logs(&filter)
-        .await
-        .context("eth_getLogs(factory)")?;
+    let logs = get_logs_with_retry(provider, filter, "eth_getLogs(factory)").await?;
     Ok(logs.iter().filter_map(decode_cluster_deployed).collect())
+}
+
+async fn get_logs_with_retry(
+    provider: &HttpProvider,
+    filter: Filter,
+    label: &'static str,
+) -> Result<Vec<Log>> {
+    let mut delay = Duration::from_millis(500);
+    let mut last_error = None;
+    for attempt in 1..=8 {
+        match provider.get_logs(&filter).await {
+            Ok(logs) => return Ok(logs),
+            Err(e) => {
+                last_error = Some(e);
+                if attempt == 8 {
+                    break;
+                }
+                tracing::warn!(label, attempt, error = ?last_error, "RPC read failed; retrying");
+                tokio::time::sleep(delay).await;
+                delay = (delay * 2).min(Duration::from_secs(10));
+            }
+        }
+    }
+    Err(anyhow::Error::new(last_error.expect("retry loop ran"))).context(label)
 }
 
 #[cfg(test)]
@@ -261,7 +312,16 @@ mod tests {
     fn classifies_member_registered() {
         let mid = B256::repeat_byte(0xa1);
         let il = classify(&member_registered_log(mid)).expect("classified");
-        assert_eq!(il.kind, EventKind::MemberRegistered { member_id: mid });
+        assert_eq!(
+            il.kind,
+            EventKind::MemberRegistered {
+                member_id: mid,
+                member_contract: Address::repeat_byte(0x11),
+                attestor_id: B256::repeat_byte(0x22),
+                x_pub_key: B256::repeat_byte(0x33),
+                wg_pub_key: B256::repeat_byte(0x44),
+            }
+        );
         assert_eq!(il.cluster_addr, Address::repeat_byte(0xc1));
         assert_eq!(il.block_number, 100);
         assert_eq!(il.log_index, 0);
@@ -326,6 +386,9 @@ mod tests {
             B256::repeat_byte(0x01).to_vec(),
             0,
         );
-        assert_eq!(decode_cluster_deployed(&l), Some(cluster));
+        let d = decode_cluster_deployed(&l).expect("decoded deployment");
+        assert_eq!(d.cluster, cluster);
+        assert_eq!(d.cluster_owner, owner);
+        assert_eq!(d.salt, B256::repeat_byte(0x01));
     }
 }

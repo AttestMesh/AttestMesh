@@ -1,0 +1,36 @@
+{
+  "appEnvB64": "UE9TVEdSRVNfREI9cG9zdGdyZXMKUE9TVEdSRVNfSU5JVERCX0FSR1M9LS1lbmNvZGluZz1VVEY4IC0tbG9jYWxlPUMKUE9TVEdSRVNfUEFTU1dPUkQ9cGdfYWYxM2IwN2QxZDcwZTEzMDE4ZTBlY2QzNWY2NDUzNmY2YjdiClBPU1RHUkVTX1VTRVI9cG9zdGdyZXMK",
+  "appId": "0xD872e437C182F5956c30D18EF5754256ebAB82eA",
+  "box": {
+    "disk": "160",
+    "mem": "16384",
+    "vcpu": "8"
+  },
+  "catalogId": "postgres",
+  "cluster": "0x07a0adb8F96EeF2D210A74EeBf2Ae2f4E5Beb273",
+  "composeHash": "ca0343ddaf56ff6433fb8be99259470a6d410c32168d335d6d46bbbf0f686206",
+  "composePath": "/home/ubuntu/teemesh/deploy/orchestrator/compose/net-open-webhost-postgres-dec9ca.yaml",
+  "connection": {
+    "database": "postgres",
+    "host": "meshIp",
+    "kind": "postgres",
+    "port": 5432,
+    "user": "postgres"
+  },
+  "createdAt": "2026-07-07T05:28:10Z",
+  "error": "generic-node deploy failed with exit code 1",
+  "exitCode": 1,
+  "flavor": "large",
+  "id": "dec9ca3483874be3",
+  "imageRef": "postgres:16-alpine",
+  "logPath": "/home/ubuntu/teemesh/deploy/logs/orchestrator-net-open-webhost-postgres-dec9ca.log",
+  "logTail": "[20260707T053735Z] \u2026 generic node not registered yet (26/45, memberCount=2)\nHTTP Request: POST http://127.0.0.1:9080/prpc/GetInfo?json \"HTTP/1.1 200 OK\"\n[20260707T053758Z] \u2026 generic node not registered yet (27/45, memberCount=2)\nHTTP Request: POST http://127.0.0.1:9080/prpc/GetInfo?json \"HTTP/1.1 200 OK\"\n[20260707T053819Z] \u2026 generic node not registered yet (28/45, memberCount=2)\nHTTP Request: POST http://127.0.0.1:9080/prpc/GetInfo?json \"HTTP/1.1 200 OK\"\n[20260707T053841Z] \u2026 generic node not registered yet (29/45, memberCount=2)\nHTTP Request: POST http://127.0.0.1:9080/prpc/GetInfo?json \"HTTP/1.1 200 OK\"\n[20260707T053903Z] \u2026 generic node not registered yet (30/45, memberCount=2)\nHTTP Request: POST http://127.0.0.1:9080/prpc/GetInfo?json \"HTTP/1.1 200 OK\"\n[20260707T053925Z] \u2026 generic node not registered yet (31/45, memberCount=2)\nHTTP Request: POST http://127.0.0.1:9080/prpc/GetInfo?json \"HTTP/1.1 200 OK\"\n[20260707T053947Z] \u2026 generic node not registered yet (32/45, memberCount=2)\nHTTP Request: POST http://127.0.0.1:9080/prpc/GetInfo?json \"HTTP/1.1 200 OK\"\n[20260707T054009Z] \u2026 generic node not registered yet (33/45, memberCount=2)\nHTTP Request: POST http://127.0.0.1:9080/prpc/GetInfo?json \"HTTP/1.1 200 OK\"\n[20260707T054031Z] \u2026 generic node not registered yet (34/45, memberCount=2)\nHTTP Request: POST http://127.0.0.1:9080/prpc/GetInfo?json \"HTTP/1.1 200 OK\"\n[20260707T054052Z] \u2026 generic node not registered yet (35/45, memberCount=2)\nHTTP Request: POST http://127.0.0.1:9080/prpc/GetInfo?json \"HTTP/1.1 200 OK\"\n[20260707T054114Z] \u2026 generic node not registered yet (36/45, memberCount=2)\nHTTP Request: POST http://127.0.0.1:9080/prpc/GetInfo?json \"HTTP/1.1 200 OK\"\n[20260707T054136Z] \u2026 generic node not registered yet (37/45, memberCount=2)\nHTTP Request: POST http://127.0.0.1:9080/prpc/GetInfo?json \"HTTP/1.1 200 OK\"\n[20260707T054158Z] \u2026 generic node not registered yet (38/45, memberCount=2)\nHTTP Request: POST http://127.0.0.1:9080/prpc/GetInfo?json \"HTTP/1.1 200 OK\"\n[20260707T054220Z] \u2026 generic node not registered yet (39/45, memberCount=2)\nHTTP Request: POST http://127.0.0.1:9080/prpc/GetInfo?json \"HTTP/1.1 200 OK\"\n[20260707T054242Z] \u2026 generic node not registered yet (40/45, memberCount=2)\nHTTP Request: POST http://127.0.0.1:9080/prpc/GetInfo?json \"HTTP/1.1 200 OK\"\n[20260707T054303Z] \u2026 generic node not registered yet (41/45, memberCount=2)\nHTTP Request: POST http://127.0.0.1:9080/prpc/GetInfo?json \"HTTP/1.1 200 OK\"\n[20260707T054325Z] \u2026 generic node not registered yet (42/45, memberCount=2)\nHTTP Request: POST http://127.0.0.1:9080/prpc/GetInfo?json \"HTTP/1.1 200 OK\"\n[20260707T054347Z] \u2026 generic node not registered yet (43/45, memberCount=2)\nHTTP Request: POST http://127.0.0.1:9080/prpc/GetInfo?json \"HTTP/1.1 200 OK\"\n[20260707T054409Z] \u2026 generic node not registered yet (44/45, memberCount=2)\nHTTP Request: POST http://127.0.0.1:9080/prpc/GetInfo?json \"HTTP/1.1 200 OK\"\n[20260707T054431Z] \u2026 generic node not registered yet (45/45, memberCount=2)\n[20260707T054451Z] FATAL: generic node did not register",
+  "memberImpl": "0x7d5536a06b5fbe4c51e6995bdb0543b7887b3da4",
+  "name": "postgres",
+  "networkId": "net_open_webhost",
+  "nodeName": "net-open-webhost-postgres-dec9ca",
+  "source": "catalog",
+  "status": "failed",
+  "updatedAt": "2026-07-07T05:44:51Z",
+  "vmId": "1676ecc7-fb5c-4705-bd02-a73139a467ee"
+}

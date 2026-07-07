@@ -135,8 +135,33 @@ SAKANA_API_BASE=
 SAKANA_SUB_1_KEY=
 SAKANA_SUB_2_KEY=
 SAKANA_SUB_3_KEY=
-SAKANA_PAYG_KEY=
 SAKANA_CIDRS=
+FUGU_SUB_1_LABEL=Subscription 1
+FUGU_SUB_2_LABEL=Subscription 2
+FUGU_SUB_3_LABEL=Subscription 3
+FUGU_SUB_1_BILLING_PLAN=
+FUGU_SUB_2_BILLING_PLAN=
+FUGU_SUB_3_BILLING_PLAN=
+# ISO timestamps. These accounts can have different billing/reset anchors.
+FUGU_SUB_1_5H_RESET_ANCHOR=
+FUGU_SUB_2_5H_RESET_ANCHOR=
+FUGU_SUB_3_5H_RESET_ANCHOR=
+FUGU_SUB_1_WEEKLY_RESET_ANCHOR=
+FUGU_SUB_2_WEEKLY_RESET_ANCHOR=
+FUGU_SUB_3_WEEKLY_RESET_ANCHOR=
+FUGU_SUB_1_MONTHLY_RESET_ANCHOR=
+FUGU_SUB_2_MONTHLY_RESET_ANCHOR=
+FUGU_SUB_3_MONTHLY_RESET_ANCHOR=
+# Optional calibrated allowances in Fugu input-token-equivalent usage units.
+FUGU_SUB_1_5H_ALLOWANCE_USAGE_UNITS=
+FUGU_SUB_2_5H_ALLOWANCE_USAGE_UNITS=
+FUGU_SUB_3_5H_ALLOWANCE_USAGE_UNITS=
+FUGU_SUB_1_WEEKLY_ALLOWANCE_USAGE_UNITS=
+FUGU_SUB_2_WEEKLY_ALLOWANCE_USAGE_UNITS=
+FUGU_SUB_3_WEEKLY_ALLOWANCE_USAGE_UNITS=
+FUGU_SUB_1_MONTHLY_ALLOWANCE_USAGE_UNITS=
+FUGU_SUB_2_MONTHLY_ALLOWANCE_USAGE_UNITS=
+FUGU_SUB_3_MONTHLY_ALLOWANCE_USAGE_UNITS=
 LITELLM_MASTER_KEY=sk-$(openssl rand -hex 24)
 LITELLM_SALT_KEY=sk-$(openssl rand -hex 24)
 LITELLM_DB_PASSWORD=$(openssl rand -hex 24)
@@ -153,12 +178,12 @@ EOF
 # Hard gate on the way to deploy: Sakana keys must be present (Dan pastes them after
 # completing the training opt-out).
 _require_sakana() {
-  if [ -z "${SAKANA_SUB_1_KEY:-}" ] || [ -z "${SAKANA_PAYG_KEY:-}" ] || [ -z "${SAKANA_API_BASE:-}" ]; then
+  if [ -z "${SAKANA_SUB_1_KEY:-}" ] || [ -z "${SAKANA_SUB_2_KEY:-}" ] || [ -z "${SAKANA_API_BASE:-}" ]; then
     log "──────────────────────────────────────────────────────────────────────"
     log "GATE: Sakana keys missing in $SECRETS_FILE"
     log "  1. Complete the Sakana TRAINING OPT-OUT for every subscription FIRST."
-    log "  2. Paste SAKANA_API_BASE, SAKANA_SUB_1_KEY [, SAKANA_SUB_2/3_KEY],"
-    log "     SAKANA_PAYG_KEY and the narrowest observed SAKANA_CIDRS."
+    log "  2. Paste SAKANA_API_BASE, SAKANA_SUB_1_KEY, SAKANA_SUB_2_KEY [, SAKANA_SUB_3_KEY],"
+    log "     the narrowest observed SAKANA_CIDRS, and optional FUGU_SUB_* reset anchors."
     log "  3. Re-run this action."
     log "──────────────────────────────────────────────────────────────────────"
     die "Sakana keys not provided — refusing to continue toward deploy"
@@ -200,8 +225,8 @@ _box_run() {
   scp -o BatchMode=yes -q "$HERE/fugu-router-node-box.py" "$BOX_HOST:/tmp/fugu-router-node-box.py"
   {
     printf 'E_CHAIN_ID=%q\n' "$CHAIN_ID"
-    printf 'E_RPC_URL=%q\n' "$RPC_URL"
-    printf 'E_BUNDLER_URL=%q\n' "${BUNDLER_URL:-$RPC_URL}"
+    printf 'E_RPC_URL=%q\n' "${CVM_RPC_URL:-$RPC_URL}"
+    printf 'E_BUNDLER_URL=%q\n' "${CVM_BUNDLER_URL:-${BUNDLER_URL:-$RPC_URL}}"
     printf 'E_GAS_POLICY_ID=%q\n' "${GAS_POLICY_ID:-}"
     printf 'E_INDEXER_REGISTRY_ADDR=%q\n' "$INDEXER_REGISTRY_ADDR"
     printf 'E_GATEWAY_DOMAIN=%q\n' "$GATEWAY_DOMAIN"
@@ -213,8 +238,34 @@ _box_run() {
     printf 'E_SAKANA_SUB_1_KEY=%q\n' "${SAKANA_SUB_1_KEY:-}"
     printf 'E_SAKANA_SUB_2_KEY=%q\n' "${SAKANA_SUB_2_KEY:-}"
     printf 'E_SAKANA_SUB_3_KEY=%q\n' "${SAKANA_SUB_3_KEY:-}"
-    printf 'E_SAKANA_PAYG_KEY=%q\n' "${SAKANA_PAYG_KEY:-}"
     printf 'E_SAKANA_CIDRS=%q\n' "${SAKANA_CIDRS:-}"
+    printf 'E_FUGU_SUB_1_ENABLED=%q\n' "true"
+    printf 'E_FUGU_SUB_2_ENABLED=%q\n' "true"
+    printf 'E_FUGU_SUB_3_ENABLED=%q\n' "$([ -n "${SAKANA_SUB_3_KEY:-}" ] && echo true || echo false)"
+    printf 'E_FUGU_SUB_1_LABEL=%q\n' "${FUGU_SUB_1_LABEL:-Subscription 1}"
+    printf 'E_FUGU_SUB_2_LABEL=%q\n' "${FUGU_SUB_2_LABEL:-Subscription 2}"
+    printf 'E_FUGU_SUB_3_LABEL=%q\n' "${FUGU_SUB_3_LABEL:-Subscription 3}"
+    printf 'E_FUGU_SUB_1_BILLING_PLAN=%q\n' "${FUGU_SUB_1_BILLING_PLAN:-}"
+    printf 'E_FUGU_SUB_2_BILLING_PLAN=%q\n' "${FUGU_SUB_2_BILLING_PLAN:-}"
+    printf 'E_FUGU_SUB_3_BILLING_PLAN=%q\n' "${FUGU_SUB_3_BILLING_PLAN:-}"
+    printf 'E_FUGU_SUB_1_5H_RESET_ANCHOR=%q\n' "${FUGU_SUB_1_5H_RESET_ANCHOR:-}"
+    printf 'E_FUGU_SUB_2_5H_RESET_ANCHOR=%q\n' "${FUGU_SUB_2_5H_RESET_ANCHOR:-}"
+    printf 'E_FUGU_SUB_3_5H_RESET_ANCHOR=%q\n' "${FUGU_SUB_3_5H_RESET_ANCHOR:-}"
+    printf 'E_FUGU_SUB_1_WEEKLY_RESET_ANCHOR=%q\n' "${FUGU_SUB_1_WEEKLY_RESET_ANCHOR:-}"
+    printf 'E_FUGU_SUB_2_WEEKLY_RESET_ANCHOR=%q\n' "${FUGU_SUB_2_WEEKLY_RESET_ANCHOR:-}"
+    printf 'E_FUGU_SUB_3_WEEKLY_RESET_ANCHOR=%q\n' "${FUGU_SUB_3_WEEKLY_RESET_ANCHOR:-}"
+    printf 'E_FUGU_SUB_1_MONTHLY_RESET_ANCHOR=%q\n' "${FUGU_SUB_1_MONTHLY_RESET_ANCHOR:-}"
+    printf 'E_FUGU_SUB_2_MONTHLY_RESET_ANCHOR=%q\n' "${FUGU_SUB_2_MONTHLY_RESET_ANCHOR:-}"
+    printf 'E_FUGU_SUB_3_MONTHLY_RESET_ANCHOR=%q\n' "${FUGU_SUB_3_MONTHLY_RESET_ANCHOR:-}"
+    printf 'E_FUGU_SUB_1_5H_ALLOWANCE_USAGE_UNITS=%q\n' "${FUGU_SUB_1_5H_ALLOWANCE_USAGE_UNITS:-}"
+    printf 'E_FUGU_SUB_2_5H_ALLOWANCE_USAGE_UNITS=%q\n' "${FUGU_SUB_2_5H_ALLOWANCE_USAGE_UNITS:-}"
+    printf 'E_FUGU_SUB_3_5H_ALLOWANCE_USAGE_UNITS=%q\n' "${FUGU_SUB_3_5H_ALLOWANCE_USAGE_UNITS:-}"
+    printf 'E_FUGU_SUB_1_WEEKLY_ALLOWANCE_USAGE_UNITS=%q\n' "${FUGU_SUB_1_WEEKLY_ALLOWANCE_USAGE_UNITS:-}"
+    printf 'E_FUGU_SUB_2_WEEKLY_ALLOWANCE_USAGE_UNITS=%q\n' "${FUGU_SUB_2_WEEKLY_ALLOWANCE_USAGE_UNITS:-}"
+    printf 'E_FUGU_SUB_3_WEEKLY_ALLOWANCE_USAGE_UNITS=%q\n' "${FUGU_SUB_3_WEEKLY_ALLOWANCE_USAGE_UNITS:-}"
+    printf 'E_FUGU_SUB_1_MONTHLY_ALLOWANCE_USAGE_UNITS=%q\n' "${FUGU_SUB_1_MONTHLY_ALLOWANCE_USAGE_UNITS:-}"
+    printf 'E_FUGU_SUB_2_MONTHLY_ALLOWANCE_USAGE_UNITS=%q\n' "${FUGU_SUB_2_MONTHLY_ALLOWANCE_USAGE_UNITS:-}"
+    printf 'E_FUGU_SUB_3_MONTHLY_ALLOWANCE_USAGE_UNITS=%q\n' "${FUGU_SUB_3_MONTHLY_ALLOWANCE_USAGE_UNITS:-}"
     printf 'E_LITELLM_MASTER_KEY=%q\n' "${LITELLM_MASTER_KEY:-}"
     printf 'E_LITELLM_SALT_KEY=%q\n' "${LITELLM_SALT_KEY:-}"
     printf 'E_LITELLM_DB_PASSWORD=%q\n' "${LITELLM_DB_PASSWORD:-}"
@@ -231,12 +282,12 @@ _box_run() {
 # (the deploy gate) are missing so orchestration can block on it visibly.
 setup() {
   _ensure_secrets
-  if [ -z "${SAKANA_SUB_1_KEY:-}" ] || [ -z "${SAKANA_PAYG_KEY:-}" ] || [ -z "${SAKANA_API_BASE:-}" ]; then
+  if [ -z "${SAKANA_SUB_1_KEY:-}" ] || [ -z "${SAKANA_SUB_2_KEY:-}" ] || [ -z "${SAKANA_API_BASE:-}" ]; then
     log "setup: $SECRETS_FILE generated/present."
     log "STILL MISSING (fill in before deploy):"
     [ -z "${SAKANA_API_BASE:-}" ]  && log "  - SAKANA_API_BASE"
-    [ -z "${SAKANA_SUB_1_KEY:-}" ] && log "  - SAKANA_SUB_1_KEY (+ optional SUB_2/SUB_3)"
-    [ -z "${SAKANA_PAYG_KEY:-}" ]  && log "  - SAKANA_PAYG_KEY"
+    [ -z "${SAKANA_SUB_1_KEY:-}" ] && log "  - SAKANA_SUB_1_KEY"
+    [ -z "${SAKANA_SUB_2_KEY:-}" ] && log "  - SAKANA_SUB_2_KEY (+ optional SUB_3)"
     [ -z "${SAKANA_CIDRS:-}" ]     && log "  - SAKANA_CIDRS (narrowest observed egress CIDRs)"
     log "REMINDER: complete the Sakana TRAINING OPT-OUT before pasting any key."
     exit 2

@@ -13,6 +13,7 @@ use crate::config::Config;
 use crate::health::Health;
 use crate::identity::Identity;
 use crate::metrics::Metrics;
+use crate::query::{MeshCidr, ReadModel};
 use crate::state::cursor::Cursor;
 use crate::state::IndexerState;
 use alloy::primitives::Address;
@@ -55,6 +56,7 @@ pub struct Runtime {
     pub identity: Arc<Identity>,
     pub metrics: Arc<Metrics>,
     pub health: Arc<Health>,
+    pub read_model: Arc<ReadModel>,
 }
 
 impl Runtime {
@@ -78,11 +80,12 @@ impl Runtime {
                 to,
             )
             .await?;
-            for c in new {
-                self.state.add_cluster(c).await;
+            for d in new {
+                self.add_discovered_cluster(d).await?;
             }
         }
         self.state.set_last_factory_block(head).await;
+        self.read_model.set_scanned_to_block(head).await;
         self.metrics
             .clusters_watched
             .set(self.state.cluster_count().await as i64);
@@ -104,6 +107,7 @@ impl Runtime {
             }
         }
         self.state.set_last_indexed_block(head).await;
+        self.read_model.set_scanned_to_block(head).await;
         self.health.set_head_lag(0);
         tracing::info!(head, "boot catch-up complete");
         Ok(())
@@ -115,16 +119,44 @@ impl Runtime {
     /// subscribe (spec §8.2 step 5).
     async fn ingest_for_cache(&self, logs: &[watcher::IndexedLog]) {
         for log in logs {
-            if let watcher::EventKind::MemberRegistered { member_id } = log.kind {
-                // memberContract is the 2nd indexed topic of MemberRegistered.
-                if let Some(contract_topic) = log.topics.get(2) {
-                    let contract = Address::from_slice(&contract_topic.as_slice()[12..]);
-                    self.state
-                        .record_member(log.cluster_addr, member_id, contract, log.block_number)
-                        .await;
+            let mut registered_at = None;
+            if let watcher::EventKind::MemberRegistered {
+                member_id,
+                member_contract,
+                ..
+            } = log.kind
+            {
+                self.state
+                    .record_member(log.cluster_addr, member_id, member_contract, log.block_number)
+                    .await;
+                match chain::member_registered_at(&self.provider, log.cluster_addr, member_id).await
+                {
+                    Ok(ts) => registered_at = Some(ts),
+                    Err(e) => {
+                        tracing::debug!(
+                            error = %e,
+                            cluster = %log.cluster_addr,
+                            member = %member_id,
+                            "could not read member registeredAt; using block number"
+                        );
+                    }
                 }
             }
+            self.read_model.ingest(log, registered_at).await;
         }
+    }
+
+    async fn add_discovered_cluster(
+        &self,
+        deployment: crate::query::ClusterDeployment,
+    ) -> anyhow::Result<()> {
+        let cluster = deployment.cluster;
+        self.state.add_cluster(cluster).await;
+        let (ip, prefix) = chain::mesh_cidr(&self.provider, cluster).await?;
+        self.read_model
+            .add_cluster(deployment, MeshCidr { ip, prefix })
+            .await;
+        Ok(())
     }
 
     /// The block-watcher loop (spec §7.1) + inline dispatch (§7.3).
@@ -163,7 +195,7 @@ impl Runtime {
         let clusters = self.state.known_clusters().await;
         if !clusters.is_empty() {
             let batch = self.config.block_batch_size.max(1);
-            let mut from = last + 1;
+            let mut from = events_scan_start(last, self.config.start_block);
             while from <= head {
                 let to = (from + batch - 1).min(head);
                 let logs = watcher::poll_cluster_logs(&self.provider, &clusters, from, to).await?;
@@ -226,19 +258,24 @@ impl Runtime {
         let head = chain::block_number(&self.provider).await?;
         let from = self.state.last_factory_block().await.saturating_add(1);
         if from <= head {
-            let new = watcher::poll_new_clusters(
-                &self.provider,
-                self.config.cluster_diamond_factory_addr,
-                from,
-                head,
-            )
-            .await?;
-            for c in new {
-                if self.state.add_cluster(c).await {
-                    tracing::info!(cluster = %c, "discovered new cluster");
+            for (start, end) in scan_ranges(from, head, DISCOVERY_CHUNK) {
+                let new = watcher::poll_new_clusters(
+                    &self.provider,
+                    self.config.cluster_diamond_factory_addr,
+                    start,
+                    end,
+                )
+                .await?;
+                for d in new {
+                    let cluster = d.cluster;
+                    if !self.state.is_known_cluster(cluster).await {
+                        self.add_discovered_cluster(d).await?;
+                        tracing::info!(cluster = %cluster, "discovered new cluster");
+                    }
                 }
             }
             self.state.set_last_factory_block(head).await;
+            self.read_model.set_scanned_to_block(head).await;
             self.metrics
                 .clusters_watched
                 .set(self.state.cluster_count().await as i64);

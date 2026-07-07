@@ -67,6 +67,7 @@ ENV_KEYS = [
     # --- Open webhost application (key NAMES measured into compose_hash, VALUES sealed;
     #     some are non-secret config, still sealed for a single measured surface) ---
     "TEE_DAEMON_TOKEN",
+    "WEBHOST_MCP_TOKEN",
     "GITHUB_ID",
     "GITHUB_SECRET",
     "NEXTAUTH_SECRET",
@@ -126,13 +127,73 @@ def app_compose_and_hash(env_keys: list[str]) -> tuple[str, str]:
         "no_instance_id": False,  # stable per-instance disk (app_id||instance_id)
         "secure_time": False,
     }
-    # Log in to the private registry inside the guest so ghcr.io/dmvt/* +
-    # ghcr.io/attestmesh/* images pull. Creds arrive sealed as DSTACK_DOCKER_*.
-    app_compose["pre_launch_script"] = (
-        'if [ -n "$DSTACK_DOCKER_PASSWORD" ]; then '
-        'echo "$DSTACK_DOCKER_PASSWORD" | docker login "${DSTACK_DOCKER_REGISTRY:-ghcr.io}" '
-        '-u "$DSTACK_DOCKER_USERNAME" --password-stdin; fi'
-    )
+    # Install/register gVisor before Compose starts, then log in to the private
+    # registry so ghcr.io/dmvt/* + ghcr.io/attestmesh/* images pull. Creds
+    # arrive sealed as DSTACK_DOCKER_*.
+    app_compose["pre_launch_script"] = r'''set -euo pipefail
+RUNSC_URL="https://storage.googleapis.com/gvisor/releases/release/20260420.0/x86_64/runsc"
+RUNSC_SHA512="9efeefada7b9a7bcc21dc3a1ad3531d11dfac267808cced45d047aab742f15ecb91b2bb635dea78a4ae36817f76e5ed223b7ad80f3165f15dd24de9b0c95726f"
+INSTALL_DIR="/dstack/persistent/bin"
+RUNSC_BIN="$INSTALL_DIR/runsc"
+
+sha512_file() {
+  if command -v sha512sum >/dev/null 2>&1; then
+    sha512sum "$1" | awk '{print $1}'
+  elif command -v openssl >/dev/null 2>&1; then
+    openssl dgst -sha512 "$1" | awk '{print $NF}'
+  elif command -v python3 >/dev/null 2>&1; then
+    python3 -c 'import hashlib,sys;print(hashlib.sha512(open(sys.argv[1],"rb").read()).hexdigest())' "$1"
+  else
+    echo "no sha512 tool found" >&2
+    return 1
+  fi
+}
+
+mkdir -p "$INSTALL_DIR"
+if [ ! -x "$RUNSC_BIN" ] || [ "$(sha512_file "$RUNSC_BIN" 2>/dev/null || true)" != "$RUNSC_SHA512" ]; then
+  echo "[prelaunch] installing pinned runsc"
+  curl -fsSL -o "$RUNSC_BIN.tmp" "$RUNSC_URL"
+  actual="$(sha512_file "$RUNSC_BIN.tmp")"
+  if [ "$actual" != "$RUNSC_SHA512" ]; then
+    echo "runsc sha512 mismatch: got $actual want $RUNSC_SHA512" >&2
+    exit 1
+  fi
+  mv "$RUNSC_BIN.tmp" "$RUNSC_BIN"
+  chmod +x "$RUNSC_BIN"
+fi
+
+mkdir -p /etc/docker
+if [ -f /etc/docker/daemon.json ] && command -v jq >/dev/null 2>&1; then
+  jq --arg p "$RUNSC_BIN" '.runtimes.runsc = {"path": $p}' \
+    /etc/docker/daemon.json > /etc/docker/daemon.json.new \
+    && mv /etc/docker/daemon.json.new /etc/docker/daemon.json
+else
+  cat > /etc/docker/daemon.json <<JSON
+{
+  "runtimes": {
+    "runsc": {
+      "path": "$RUNSC_BIN"
+    }
+  }
+}
+JSON
+fi
+
+if command -v systemctl >/dev/null 2>&1; then
+  systemctl restart docker
+elif command -v service >/dev/null 2>&1; then
+  service docker restart
+else
+  echo "no docker service manager found" >&2
+  exit 1
+fi
+"$RUNSC_BIN" --version
+docker info 2>/dev/null | grep -iE "runtime" || true
+docker info 2>/dev/null | grep -qi "runsc"
+
+if [ -n "${DSTACK_DOCKER_PASSWORD:-}" ]; then
+  echo "$DSTACK_DOCKER_PASSWORD" | docker login "${DSTACK_DOCKER_REGISTRY:-ghcr.io}" -u "$DSTACK_DOCKER_USERNAME" --password-stdin
+fi'''
     rendered = json.dumps(app_compose, indent=4, ensure_ascii=False)
     return rendered, hashlib.sha256(rendered.encode()).hexdigest()
 

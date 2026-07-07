@@ -1,0 +1,34 @@
+{
+  "appEnvB64": "UE9TVEdSRVNfREI9cG9zdGdyZXMKUE9TVEdSRVNfSU5JVERCX0FSR1M9LS1lbmNvZGluZz1VVEY4IC0tbG9jYWxlPUMKUE9TVEdSRVNfUEFTU1dPUkQ9cGdfMGZlZGU0ZGY5MTg2MmM3ZDk3MjFjZWIwNTRhZjE5ZTEwNjNhClBPU1RHUkVTX1VTRVI9cG9zdGdyZXMK",
+  "appId": "0x4d50fc22B0986Cdab3aFd700719dD986B584c9F1",
+  "box": {
+    "disk": "40",
+    "mem": "4096",
+    "vcpu": "2"
+  },
+  "catalogId": "postgres",
+  "cluster": "0x07a0adb8F96EeF2D210A74EeBf2Ae2f4E5Beb273",
+  "composeHash": "422be257e21f063a21fabf05a0469f35d4b40269afd3d46810205a40045b39dd",
+  "composePath": "/home/ubuntu/teemesh/deploy/orchestrator/compose/net-open-webhost-postgres-d1a693.yaml",
+  "connection": {
+    "database": "postgres",
+    "host": "meshIp",
+    "kind": "postgres",
+    "port": 5432,
+    "user": "postgres"
+  },
+  "createdAt": "2026-07-06T06:02:55Z",
+  "error": "Enclave VM disappeared from dstack while waiting for mesh registration.",
+  "flavor": "small",
+  "id": "d1a69314e3d8d196",
+  "imageRef": "postgres:16-alpine",
+  "memberImpl": "0x7d5536a06b5fbe4c51e6995bdb0543b7887b3da4",
+  "name": "postgres",
+  "networkId": "net_open_webhost",
+  "nodeName": "net-open-webhost-postgres-d1a693",
+  "source": "catalog",
+  "status": "failed",
+  "updatedAt": "2026-07-06T06:08:00Z",
+  "vmId": "e549551d-3f2c-4e9c-a95d-226961bc7512",
+  "logTail": "\nFATAL: enclave VM disappeared from dstack while waiting for mesh registration (vm=e549551d-3f2c-4e9c-a95d-226961bc7512)"
+}

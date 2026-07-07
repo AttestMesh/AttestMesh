@@ -1,0 +1,5 @@
+name: fugu-router
+kind: model-provider
+version: 1.0.0
+description: AttestMesh Fugu subscription router with Hermes session affinity
+author: AttestMesh

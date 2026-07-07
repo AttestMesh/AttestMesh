@@ -34,7 +34,7 @@ GATEWAY_DOMAIN="${GATEWAY_DOMAIN:-gateway.attestmesh.xyz}"
 
 # Secrets file (git-ignored, never committed). Sourced into the shell so its
 # values can be forwarded in-memory as E_* to the box. Expected keys:
-#   POSTGRES_PASSWORD TEE_DAEMON_TOKEN SESSION_SECRET PRIVY_APP_ID PRIVY_APP_SECRET
+#   POSTGRES_PASSWORD (Synclave pg-ha role password) TEE_DAEMON_TOKEN SESSION_SECRET PRIVY_APP_ID PRIVY_APP_SECRET
 #   GITHUB_CLIENT_ID GITHUB_CLIENT_SECRET CLOUDFLARE_API_TOKEN ADMIN_API_KEY
 #   TLS_FULLCHAIN_B64 TLS_KEY_B64   (optional: DATABASE_URL)
 SECRETS_FILE="${SECRETS_FILE:-$HOME/.attestmesh/synclave.env}"
@@ -44,6 +44,7 @@ PUBLIC_BASE_URL="${PUBLIC_BASE_URL:-https://console.attestmesh.xyz}"
 CORS_ORIGIN="${CORS_ORIGIN:-https://console.attestmesh.xyz}"
 CONSOLE_HOST="${CONSOLE_HOST:-console.attestmesh.xyz}"
 APP_DOMAIN="${APP_DOMAIN:-app.attestmesh.xyz}"
+INDEXER_URL="${INDEXER_URL:-http://10.0.100.1:8787}"
 GITHUB_OAUTH_CALLBACK_URL="${GITHUB_OAUTH_CALLBACK_URL:-https://console.attestmesh.xyz/api/v1/auth/github/callback}"
 # CF app-fronting (non-secret): the attestmesh.xyz zone + the origin the proxied
 # <slug>.app records point at (the box haproxy public IP).
@@ -101,8 +102,9 @@ _require_env() {
            TLS_FULLCHAIN_B64 TLS_KEY_B64; do
     [ -n "${!k:-}" ] || die "secret $k not set in $SECRETS_FILE"
   done
-  # DATABASE_URL defaults to the in-compose Postgres unless the secrets file overrides it.
-  DATABASE_URL="${DATABASE_URL:-postgres://synclave:${POSTGRES_PASSWORD}@postgres:5432/synclave}"
+  # Synclave's DB defaults to the C3 pg-ha cluster. The compose exposes pg-ha via
+  # sidecar-netns forwarders because the app container is not itself in the WG netns.
+  DATABASE_URL="${DATABASE_URL:-postgresql://synclave:${POSTGRES_PASSWORD}@sidecar:15431/synclave}"
 }
 
 send_seq() {
@@ -130,8 +132,8 @@ _box_run() {
   scp -o BatchMode=yes -q "$HERE/synclave-node-box.py" "$BOX_HOST:/tmp/synclave-node-box.py"
   {
     printf 'E_CHAIN_ID=%q\n'                 "$CHAIN_ID"
-    printf 'E_RPC_URL=%q\n'                  "$RPC_URL"
-    printf 'E_BUNDLER_URL=%q\n'              "${BUNDLER_URL:-$RPC_URL}"
+    printf 'E_RPC_URL=%q\n'                  "${CVM_RPC_URL:-$RPC_URL}"
+    printf 'E_BUNDLER_URL=%q\n'              "${CVM_BUNDLER_URL:-${BUNDLER_URL:-$RPC_URL}}"
     printf 'E_GAS_POLICY_ID=%q\n'            "${GAS_POLICY_ID:-}"
     printf 'E_INDEXER_REGISTRY_ADDR=%q\n'    "$INDEXER_REGISTRY_ADDR"
     printf 'E_GATEWAY_DOMAIN=%q\n'           "$GATEWAY_DOMAIN"
@@ -147,6 +149,7 @@ _box_run() {
     printf 'E_DAEMON_URL=%q\n'               "${DAEMON_URL:-}"
     printf 'E_PUBLIC_BASE_URL=%q\n'          "$PUBLIC_BASE_URL"
     printf 'E_APP_DOMAIN=%q\n'               "$APP_DOMAIN"
+    printf 'E_INDEXER_URL=%q\n'              "$INDEXER_URL"
     printf 'E_CLUSTER_NETWORKS=%q\n'         "${CLUSTER_NETWORKS:-}"
     printf 'E_CLUSTER_ORCHESTRATOR_URL=%q\n' "${CLUSTER_ORCHESTRATOR_URL:-}"
     printf 'E_CLUSTER_ORCHESTRATOR_TOKEN=%q\n' "${CLUSTER_ORCHESTRATOR_TOKEN:-}"

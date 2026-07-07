@@ -1,0 +1,9 @@
+.git
+**/target
+**/node_modules
+**/.next
+**/.vite
+deploy/logs
+docs/audits
+docs/premortems
+services/mesh-state-api/node_modules

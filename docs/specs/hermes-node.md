@@ -13,7 +13,7 @@ A repeatable AttestMesh node type that runs one [Nous Research Hermes Agent](htt
 | Hindsight memory bank `bank_id=<agent>` | Hindsight node (mesh-only API) | automatic — bank ids are namespaced per agent under the shared tenant key |
 | Email mailbox | Fastmail (family account) | **manual** — operator creates the mailbox + app password |
 | GitHub identity | machine account | **manual** — operator creates the account + PAT (GitHub ToS requires human signup) |
-| Model key | Sakana `fugu-ultra` (default) | operator supplies the key |
+| Model endpoint | `fugu-router` with `fugu-ultra` (default) | resolved from the fugu-router state/secrets, or overridden per agent |
 
 The reference for the node shape is the hand-built agent on the ssh node ("Verity"); that node is **not managed** by this trio and stays untouched.
 
