@@ -11,6 +11,11 @@ library NetworkStorage {
 
     struct Layout {
         mapping(bytes32 memberId => bytes32 wgPubKey) wgPubKeys;
+        // Ed25519 heartbeat verification key, published on chain so mesh bring-up
+        // needs no member-to-member messaging (ed25519-onchain-key spec). Appending
+        // a mapping is slot-safe. No MemberStorage mirror — no one-shot MemberRecord
+        // read needs it, unlike wgPubKeys.
+        mapping(bytes32 memberId => bytes32 ed25519Key) ed25519Keys;
     }
 
     function layout() internal pure returns (Layout storage l) {
