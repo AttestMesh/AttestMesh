@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Generic workload AttestMesh node on the self-hosted dstack box.
-set -uo pipefail
+set -Eeuo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$HERE/.." && pwd)"
@@ -26,11 +26,14 @@ ZERO32=0x0000000000000000000000000000000000000000000000000000000000000000
 _save() {
   umask 077
   cat > "$STATE" <<EOF
+UPDATED_AT=$(ts)
+STATE_PHASE=${STATE_PHASE:-unknown}
 X=${X:-}
 H=${H:-}
 VM_ID=${VM_ID:-}
 CLUSTER=${CLUSTER:-}
 MEMBER_IMPL=${MEMBER_IMPL:-}
+KMS_ROOT=${KMS_ROOT:-}
 GATEWAY_DOMAIN=${GATEWAY_DOMAIN:-}
 EOF
 }
@@ -38,16 +41,40 @@ EOF
 _load() { [ -f "$STATE" ] && source "$STATE" || true; }
 ssh_box() { ssh -o BatchMode=yes -o ConnectTimeout=8 "$BOX_HOST" "$@"; }
 
+_require_tools() {
+  local tool
+  for tool in jq cast ssh scp; do
+    command -v "$tool" >/dev/null 2>&1 || die "missing required tool: $tool"
+  done
+}
+
 _require_env() {
+  _require_tools
   local indexer
   indexer=$(jq -r .indexerRegistry "$ROOT/contracts/script/deployments/${CHAIN_ID}.json" 2>/dev/null)
   INDEXER_REGISTRY_ADDR="${INDEXER_REGISTRY_ADDR:-$indexer}"
-  [ -n "${BUNDLER_URL:-}" ] || BUNDLER_URL="$RPC_URL"
   [ -n "$INDEXER_REGISTRY_ADDR" ] && [ "$INDEXER_REGISTRY_ADDR" != null ] || die "missing INDEXER_REGISTRY_ADDR"
   [ -n "${CLUSTER:-}" ] || die "missing CLUSTER"
   [ -n "${MEMBER_IMPL:-}" ] || die "missing MEMBER_IMPL"
+  [ -n "${KMS_ROOT:-}" ] || die "missing KMS_ROOT"
+  [ -n "${BUNDLER_URL:-}" ] || die "missing BUNDLER_URL (cluster members need an EIP-4337 bundler/paymaster endpoint)"
+  [ -n "${GAS_POLICY_ID:-}" ] || die "missing GAS_POLICY_ID (cluster members need paymaster sponsorship)"
+  [ "${BUNDLER_URL:-}" != "${RPC_URL:-}" ] || log "BUNDLER_URL equals RPC_URL; continuing because some providers multiplex bundler + node RPC"
   [ -s "$COMPOSE" ] || die "missing compose file: $COMPOSE"
   APP_ENV_B64="${APP_ENV_B64:-}"
+}
+
+preflight() {
+  _load; _require_env
+  log "▶ preflight generic node=$NODE compose=$COMPOSE cluster=$CLUSTER"
+  cast chain-id --rpc-url "$RPC_URL" >/dev/null || die "RPC_URL is not reachable"
+  cast code "$CLUSTER" --rpc-url "$RPC_URL" | grep -Eq '^0x[0-9a-fA-F]{4,}$' || die "CLUSTER has no code: $CLUSTER"
+  cast call "$CLUSTER" 'memberCount()(uint256)' --rpc-url "$RPC_URL" >/dev/null || die "CLUSTER does not expose memberCount(): $CLUSTER"
+  cast code "$MEMBER_IMPL" --rpc-url "$RPC_URL" | grep -Eq '^0x[0-9a-fA-F]{4,}$' || die "MEMBER_IMPL has no code: $MEMBER_IMPL"
+  ssh_box "test -x '$BOX_PY' && test -r '$BOX_DEPLOYER_KEY'" >/dev/null || die "box prerequisites missing on $BOX_HOST"
+  _box_run hash >/dev/null || die "box cannot render/hash compose $COMPOSE"
+  STATE_PHASE="preflighted"; _save
+  log "✔ preflight passed for generic node=$NODE"
 }
 
 send_seq() {
@@ -69,11 +96,11 @@ _box_run() {
   scp -o BatchMode=yes -q "$COMPOSE" "$BOX_HOST:/tmp/${NODE}.yaml"
   scp -o BatchMode=yes -q "$HERE/generic-node-box.py" "$BOX_HOST:/tmp/generic-node-box.py"
   {
-    printf 'E_CHAIN_ID=%q\n' "$CHAIN_ID"
-    printf 'E_RPC_URL=%q\n' "$RPC_URL"
-    printf 'E_BUNDLER_URL=%q\n' "${BUNDLER_URL:-$RPC_URL}"
+    printf 'E_CHAIN_ID=%q\n' "${CHAIN_ID:-}"
+    printf 'E_RPC_URL=%q\n' "${RPC_URL:-}"
+    printf 'E_BUNDLER_URL=%q\n' "${BUNDLER_URL:-${RPC_URL:-}}"
     printf 'E_GAS_POLICY_ID=%q\n' "${GAS_POLICY_ID:-}"
-    printf 'E_INDEXER_REGISTRY_ADDR=%q\n' "$INDEXER_REGISTRY_ADDR"
+    printf 'E_INDEXER_REGISTRY_ADDR=%q\n' "${INDEXER_REGISTRY_ADDR:-}"
     printf 'E_GATEWAY_DOMAIN=%q\n' "$GATEWAY_DOMAIN"
     printf 'E_CLUSTER=%q\n' "${CLUSTER:-}"
     printf 'E_MEMBER_IMPL=%q\n' "${MEMBER_IMPL:-}"
@@ -83,6 +110,12 @@ _box_run() {
     printf 'E_DSTACK_DOCKER_REGISTRY=%q\n' "ghcr.io"
   } | ssh_box "sudo BOX_NAME='$NODE' BOX_COMPOSE='/tmp/${NODE}.yaml' BOX_VCPU=$BOX_VCPU BOX_MEM=$BOX_MEM BOX_DISK=$BOX_DISK BOX_PORTS='$BOX_PORTS' BOX_GATEWAY_ENABLED='$BOX_GATEWAY_ENABLED' BOX_NET_MODE='$BOX_NET_MODE' \
     bash -c 'set -a; . /dev/stdin; set +a; exec $BOX_PY /tmp/generic-node-box.py $mode $app_id $vm_id'"
+}
+
+_box_stop_vm() {
+  local vm_id="${1:?vm_id required}"
+  scp -o BatchMode=yes -q "$HERE/generic-node-box.py" "$BOX_HOST:/tmp/generic-node-box.py"
+  ssh_box "sudo BOX_NAME='$NODE' $BOX_PY /tmp/generic-node-box.py stop '$vm_id'"
 }
 
 _box_vm_json() {
@@ -105,10 +138,38 @@ except Exception as exc:
 PY"
 }
 
+_box_boot_detail() {
+  [ -n "${VM_ID:-}" ] || return 0
+  ssh_box "sudo VM_ID='$VM_ID' $BOX_PY - <<'PY'
+import os, sys
+sys.path.insert(0, '/opt/dstack-mcp')
+import mcp_dstack as m
+try:
+    log = m.vm_logs(vm_id=os.environ['VM_ID'], lines=700, channel='serial')
+except Exception as exc:
+    print(f'unable to fetch serial log: {exc}')
+    raise SystemExit(0)
+needles = (
+    'Error response from daemon:',
+    'OCI runtime create failed:',
+    'dependency failed',
+    'unhealthy',
+    'failed to start containers',
+    'Failed to start App Compose Service',
+)
+matches = [line.strip() for line in log.splitlines() if any(n in line for n in needles)]
+print(' | '.join(matches[-4:]))
+PY"
+}
+
 deploy_cvm() {
   _load; _require_env
+  if [ -n "${VM_ID:-}" ]; then
+    log "existing VM_ID in $STATE; deploy is not destructive. Run cleanup first or use update."
+    die "refusing to create a second VM for node=$NODE"
+  fi
   _save
-  log "▶ box deploy_app generic node=$NODE compose=$COMPOSE cluster=$CLUSTER"
+  log "▶ box deploy_app generic node=$NODE compose=$COMPOSE cluster=$CLUSTER (create stopped)"
   local out j
   out=$(_box_run deploy) || die "box deploy failed"
   j=$(echo "$out" | grep '"app_id"' | tail -1)
@@ -116,13 +177,34 @@ deploy_cvm() {
   H=$(echo "$j" | jq -r .compose_hash)
   VM_ID=$(echo "$j" | jq -r .vm_id)
   [ -n "$X" ] && [ "$X" != null ] || die "could not parse app_id from box deploy: $out"
+  STATE_PHASE="deployed-stopped"
   _save
   log "✔ deployed generic node app_id=$X compose_hash=$H vm=$VM_ID"
+}
+
+start_cvm() {
+  _load; _require_env
+  [ -n "${VM_ID:-}" ] || die "need VM_ID (run deploy first)"
+  log "▶ start generic VM vm=$VM_ID after allowlist/bind"
+  ssh_box "sudo VM_ID='$VM_ID' $BOX_PY - <<'PY'
+import os, sys
+sys.path.insert(0, '/opt/dstack-mcp')
+import mcp_dstack as m
+m.vmm('StartVm', {'id': os.environ['VM_ID']})
+print('started ' + os.environ['VM_ID'])
+PY"
+  STATE_PHASE="started"; _save
+  log "✔ start requested for generic VM vm=$VM_ID"
 }
 
 prime_gate() {
   _load; _require_env
   [ -n "${X:-}" ] && [ -n "${H:-}" ] || die "need X/H (run deploy first)"
+  if [ "$(cast call "$CLUSTER" 'allowedKmsRoots(address)(bool)' "$KMS_ROOT" --rpc-url "$RPC_URL" 2>/dev/null)" != true ]; then
+    send_seq "generic-addKmsRoot-${NODE}" "$CLUSTER" "addAllowedKmsRoot(address)" "$KMS_ROOT"
+  else
+    log "KMS root already allowlisted"
+  fi
   if [ "$(cast call "$CLUSTER" 'allowedComposeHashes(bytes32)(bool)' "0x${H#0x}" --rpc-url "$RPC_URL" 2>/dev/null)" != true ]; then
     send_seq "generic-addHash-${NODE}" "$CLUSTER" "addComposeHash(bytes32)" "0x${H#0x}"
   else
@@ -133,6 +215,7 @@ prime_gate() {
   else
     log "app id already allowlisted"
   fi
+  STATE_PHASE="primed"; _save
 }
 
 bind_member() {
@@ -154,13 +237,14 @@ SCRIPT
   done
   log "X.cluster()=$c (expect $CLUSTER)"
   [ "${c,,}" = "${CLUSTER,,}" ] || die "bind did not stick (X.cluster()=$c)"
+  STATE_PHASE="bound"; _save
   log "✔ bound generic node X -> $CLUSTER"
 }
 
 verify() {
   _load; _require_env
   [ -n "${X:-}" ] && [ -n "${CLUSTER:-}" ] || die "need X+cluster"
-  local i id count vm found boot_error boot_progress
+  local i id count vm found boot_error boot_progress owner root_allowed hash_allowed app_allowed
   for i in $(seq 1 45); do
     if [ -n "${VM_ID:-}" ]; then
       vm=$(_box_vm_json || true)
@@ -169,6 +253,11 @@ verify() {
       boot_progress=$(echo "$vm" | jq -r '.boot_progress // empty' 2>/dev/null)
       [ "$found" != false ] || die "enclave VM disappeared from dstack while waiting for mesh registration (vm=$VM_ID)"
       if [ "$i" -gt 6 ] && [ -n "$boot_error" ] && [ "$boot_error" != null ]; then
+        local detail
+        detail=$(_box_boot_detail || true)
+        if [ -n "$detail" ]; then
+          die "enclave VM boot failed before mesh registration: $boot_error (progress: ${boot_progress:-unknown}, vm=$VM_ID; serial: $detail)"
+        fi
         die "enclave VM boot failed before mesh registration: $boot_error (progress: ${boot_progress:-unknown}, vm=$VM_ID)"
       fi
     fi
@@ -176,12 +265,51 @@ verify() {
     count=$(cast call "$CLUSTER" 'memberCount()(uint256)' --rpc-url "$RPC_URL" 2>/dev/null)
     if [ -n "$id" ] && [ "$id" != "$ZERO32" ]; then
       log "✔ generic node registered: memberId=$id memberCount=$count"
+      STATE_PHASE="registered"; _save
       return 0
     fi
     log "… generic node not registered yet ($i/45, memberCount=${count:-?})"
     sleep 20
   done
-  die "generic node did not register"
+  owner=$(cast call "$X" 'owner()(address)' --rpc-url "$RPC_URL" 2>/dev/null || true)
+  root_allowed=$(cast call "$CLUSTER" 'allowedKmsRoots(address)(bool)' "$KMS_ROOT" --rpc-url "$RPC_URL" 2>/dev/null || true)
+  hash_allowed=$(cast call "$CLUSTER" 'allowedComposeHashes(bytes32)(bool)' "0x${H#0x}" --rpc-url "$RPC_URL" 2>/dev/null || true)
+  app_allowed=$(cast call "$CLUSTER" 'allowedAppIds(address)(bool)' "$X" --rpc-url "$RPC_URL" 2>/dev/null || true)
+  die "generic node did not register (owner=${owner:-?}, allowedKmsRoots[$KMS_ROOT]=${root_allowed:-?}, allowedComposeHash=${hash_allowed:-?}, allowedAppId=${app_allowed:-?})"
+}
+
+cleanup() {
+  _load
+  _require_tools
+  local id="" force="${FORCE_CLEANUP:-0}" allowed_app=""
+  if [ -n "${CLUSTER:-}" ] && [ -n "${X:-}" ] && [ -n "${RPC_URL:-}" ]; then
+    id=$(cast call "$CLUSTER" "memberIdOf(address)(bytes32)" "$X" --rpc-url "$RPC_URL" 2>/dev/null || true)
+  fi
+  if [ -n "$id" ] && [ "$id" != "$ZERO32" ] && [ "$force" != "1" ]; then
+    log "cleanup skipped: node is registered (memberId=$id). Set FORCE_CLEANUP=1 to stop the VM anyway."
+    STATE_PHASE="registered"; _save
+    return 0
+  fi
+
+  if [ -n "${VM_ID:-}" ]; then
+    log "▶ cleanup stop VM_ID=$VM_ID force=$force"
+    if _box_stop_vm "$VM_ID"; then
+      log "✔ cleanup stop completed for vm=$VM_ID"
+    else
+      log "cleanup stop reported an error for vm=$VM_ID; keeping state for manual follow-up"
+    fi
+  else
+    log "cleanup no-op: no VM_ID in $STATE"
+  fi
+
+  if [ -n "${CLUSTER:-}" ] && [ -n "${X:-}" ] && [ -n "${RPC_URL:-}" ] && [ -n "${PRIVATE_KEY:-}" ]; then
+    allowed_app=$(cast call "$CLUSTER" 'allowedAppIds(address)(bool)' "$X" --rpc-url "$RPC_URL" 2>/dev/null || true)
+    if [ "$allowed_app" = true ] && { [ -z "$id" ] || [ "$id" = "$ZERO32" ]; }; then
+      send_seq "generic-removeApp-${NODE}" "$CLUSTER" "removeAllowedAppId(address)" "$X" || log "removeAllowedAppId failed; app remains allowlisted"
+    fi
+  fi
+
+  STATE_PHASE="cleaned"; _save
 }
 
 update_member() {
@@ -208,13 +336,21 @@ update_member() {
   log "✔ generic node update complete mode=$mode vm=$VM_ID"
 }
 
+register_direct() {
+  "$HERE/indexer-member-node.sh" "$NODE" register-member-direct
+}
+
 log "=== generic AttestMesh node: $NODE ==="
 case "$ACTION" in
+  preflight) preflight ;;
   deploy) deploy_cvm ;;
+  start) start_cvm ;;
   prime) prime_gate ;;
   bind) bind_member ;;
   verify) verify ;;
+  register-direct) register_direct ;;
   update) update_member ;;
-  all) deploy_cvm; prime_gate; bind_member; verify ;;
-  *) die "usage: generic-node.sh <node-name> [deploy|prime|bind|verify|update|all]" ;;
+  cleanup|stop) cleanup ;;
+  all) preflight; deploy_cvm; prime_gate; bind_member; start_cvm; register_direct; verify ;;
+  *) die "usage: generic-node.sh <node-name> [preflight|deploy|start|prime|bind|verify|register-direct|update|cleanup|stop|all]" ;;
 esac

@@ -1,0 +1,36 @@
+{
+  "appEnvB64": "UE9TVEdSRVNfREI9cG9zdGdyZXMKUE9TVEdSRVNfSU5JVERCX0FSR1M9LS1lbmNvZGluZz1VVEY4IC0tbG9jYWxlPUMKUE9TVEdSRVNfUEFTU1dPUkQ9cGdfZWVkZjRlYzZhYjIzM2U4YzgzNzg1N2U5ZjhmM2Q5YzdhOTk1ClBPU1RHUkVTX1VTRVI9cG9zdGdyZXMK",
+  "appId": "0xEEe80514ce0929a394c0a10e8726B137E26E5C93",
+  "box": {
+    "disk": "40",
+    "mem": "4096",
+    "vcpu": "2"
+  },
+  "catalogId": "postgres",
+  "cluster": "0x07a0adb8F96EeF2D210A74EeBf2Ae2f4E5Beb273",
+  "composeHash": "3a8aa339f1df3676f5293766f3d0c1a53ca7ea1d8f8029afd399976420ea49e6",
+  "composePath": "/home/ubuntu/teemesh/deploy/orchestrator/compose/net-open-webhost-postgres-e42289.yaml",
+  "connection": {
+    "database": "postgres",
+    "host": "meshIp",
+    "kind": "postgres",
+    "port": 5432,
+    "user": "postgres"
+  },
+  "createdAt": "2026-07-06T04:50:44Z",
+  "error": "generic-node deploy failed with exit code 1",
+  "exitCode": 1,
+  "flavor": "small",
+  "id": "e42289a09f9dfc7f",
+  "imageRef": "postgres:16-alpine",
+  "logPath": "/home/ubuntu/teemesh/deploy/logs/orchestrator-net-open-webhost-postgres-e42289.log",
+  "logTail": "[20260706T045054Z] \u21bb generic-addHash-net-open-webhost-postgres-e42289: refetching nonce + retrying\nError: HTTP error 403 with body: {\"jsonrpc\":\"2.0\",\"id\":0,\"error\":{\"code\":-32600,\"message\":\"BASE_MAINNET is not enabled for this app. Visit this page to enable the network: https://dashboard.alchemy.com/apps/l4z5cz88t1dxzkjl/networks\"}}\n\nHTTP diagnostics:\nserver: istio-envoy\n[20260706T045058Z] \u25b6 generic-addHash-net-open-webhost-postgres-e42289-retry: cast send 0x07a0adb8F96EeF2D210A74EeBf2Ae2f4E5Beb273 addComposeHash(bytes32) 0x3a8aa339f1df3676f5293766f3d0c1a53ca7ea1d8f8029afd399976420ea49e6 --nonce  --rpc-url https://base-mainnet.g.alchemy.com/v2/cbplChENPoyRGy9ngUXpt --private-key <redacted> \n[20260706T045058Z]   \u2514 log: /home/ubuntu/teemesh/deploy/logs/generic-addHash-net-open-webhost-postgres-e42289-retry.20260706T045058Z.log\n[20260706T045058Z] \u2717 generic-addHash-net-open-webhost-postgres-e42289-retry FAILED (rc=1). Last 25 lines:\n    | Error: HTTP error 403 with body: {\"jsonrpc\":\"2.0\",\"id\":0,\"error\":{\"code\":-32600,\"message\":\"BASE_MAINNET is not enabled for this app. Visit this page to enable the network: https://dashboard.alchemy.com/apps/l4z5cz88t1dxzkjl/networks\"}}\n    | \n    | HTTP diagnostics:\n    | server: istio-envoy\nError: HTTP error 403 with body: {\"jsonrpc\":\"2.0\",\"id\":0,\"error\":{\"code\":-32600,\"message\":\"BASE_MAINNET is not enabled for this app. Visit this page to enable the network: https://dashboard.alchemy.com/apps/l4z5cz88t1dxzkjl/networks\"}}\n\nHTTP diagnostics:\nserver: istio-envoy\n[20260706T045059Z] \u25b6 generic-addApp-net-open-webhost-postgres-e42289: cast send 0x07a0adb8F96EeF2D210A74EeBf2Ae2f4E5Beb273 addAllowedAppId(address) 0xEEe80514ce0929a394c0a10e8726B137E26E5C93 --nonce  --rpc-url https://base-mainnet.g.alchemy.com/v2/cbplChENPoyRGy9ngUXpt --private-key <redacted> \n[20260706T045059Z]   \u2514 log: /home/ubuntu/teemesh/deploy/logs/generic-addApp-net-open-webhost-postgres-e42289.20260706T045059Z.log\n[20260706T045059Z] \u2717 generic-addApp-net-open-webhost-postgres-e42289 FAILED (rc=1). Last 25 lines:\n    | Error: HTTP error 403 with body: {\"jsonrpc\":\"2.0\",\"id\":0,\"error\":{\"code\":-32600,\"message\":\"BASE_MAINNET is not enabled for this app. Visit this page to enable the network: https://dashboard.alchemy.com/apps/l4z5cz88t1dxzkjl/networks\"}}\n    | \n    | HTTP diagnostics:\n    | server: istio-envoy\n[20260706T045059Z] \u21bb generic-addApp-net-open-webhost-postgres-e42289: refetching nonce + retrying\nError: HTTP error 403 with body: {\"jsonrpc\":\"2.0\",\"id\":0,\"error\":{\"code\":-32600,\"message\":\"BASE_MAINNET is not enabled for this app. Visit this page to enable the network: https://dashboard.alchemy.com/apps/l4z5cz88t1dxzkjl/networks\"}}\n\nHTTP diagnostics:\nserver: istio-envoy\n[20260706T045103Z] \u25b6 generic-addApp-net-open-webhost-postgres-e42289-retry: cast send 0x07a0adb8F96EeF2D210A74EeBf2Ae2f4E5Beb273 addAllowedAppId(address) 0xEEe80514ce0929a394c0a10e8726B137E26E5C93 --nonce  --rpc-url https://base-mainnet.g.alchemy.com/v2/cbplChENPoyRGy9ngUXpt --private-key <redacted> \n[20260706T045103Z]   \u2514 log: /home/ubuntu/teemesh/deploy/logs/generic-addApp-net-open-webhost-postgres-e42289-retry.20260706T045103Z.log\n[20260706T045103Z] \u2717 generic-addApp-net-open-webhost-postgres-e42289-retry FAILED (rc=1). Last 25 lines:\n    | Error: HTTP error 403 with body: {\"jsonrpc\":\"2.0\",\"id\":0,\"error\":{\"code\":-32600,\"message\":\"BASE_MAINNET is not enabled for this app. Visit this page to enable the network: https://dashboard.alchemy.com/apps/l4z5cz88t1dxzkjl/networks\"}}\n    | \n    | HTTP diagnostics:\n    | server: istio-envoy\n[20260706T045103Z] \u25b6 bind generic X=0xEEe80514ce0929a394c0a10e8726B137E26E5C93 -> impl 0x7d5536a06b5fbe4c51e6995bdb0543b7887b3da4 (box deployer)\nstatus               1 (success)\ntransactionHash      0x27345d03a347e689747e0ddbe4d770ea744b49691a38f4e32c01e7e721ca3397\n[20260706T045123Z] X.cluster()= (expect 0x07a0adb8F96EeF2D210A74EeBf2Ae2f4E5Beb273)\n[20260706T045123Z] FATAL: bind did not stick (X.cluster()=)",
+  "memberImpl": "0x7d5536a06b5fbe4c51e6995bdb0543b7887b3da4",
+  "name": "postgres",
+  "networkId": "net_open_webhost",
+  "nodeName": "net-open-webhost-postgres-e42289",
+  "source": "catalog",
+  "status": "failed",
+  "updatedAt": "2026-07-06T04:51:23Z",
+  "vmId": "bd28315a-9dce-40b6-b145-7e39937e2b76"
+}

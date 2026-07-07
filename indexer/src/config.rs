@@ -14,6 +14,7 @@ pub struct Config {
     pub cluster_diamond_factory_addr: Address,
     pub grpc_addr: SocketAddr,
     pub health_http_addr: SocketAddr,
+    pub gateway_domain: Option<String>,
     pub dstack_socket: String,
     pub state_dir: String,
     pub block_poll_interval: Duration,
@@ -53,6 +54,14 @@ impl Config {
             health_http_addr: opt("HEALTH_HTTP_ADDR", "0.0.0.0:9090")
                 .parse()
                 .context("HEALTH_HTTP_ADDR")?,
+            gateway_domain: {
+                let raw = opt("GATEWAY_DOMAIN", "");
+                if raw.trim().is_empty() {
+                    None
+                } else {
+                    Some(raw)
+                }
+            },
             dstack_socket: opt("DSTACK_SOCKET", "/var/run/dstack.sock"),
             state_dir: opt("STATE_DIR", "/var/lib/attestmesh-indexer"),
             block_poll_interval: Duration::from_millis(

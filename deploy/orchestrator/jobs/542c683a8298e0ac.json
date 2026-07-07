@@ -1,0 +1,44 @@
+{
+  "appEnvB64": "UE9TVEdSRVNfREI9cG9zdGdyZXMKUE9TVEdSRVNfSU5JVERCX0FSR1M9LS1lbmNvZGluZz1VVEY4IC0tbG9jYWxlPUMKUE9TVEdSRVNfUEFTU1dPUkQ9cGdfNjYxYTBmZTMwNjA1MjZlNWEzOTE4OGYzZjJhZTNkOGM3ODM3ClBPU1RHUkVTX1VTRVI9cG9zdGdyZXMK",
+  "appId": "0xbaBd37ce25cDFa2137D6846A5018E5d9D76d303f",
+  "box": {
+    "disk": "40",
+    "mem": "4096",
+    "vcpu": "2"
+  },
+  "catalogId": "postgres",
+  "cleanup": {
+    "exitCode": 0,
+    "forced": false,
+    "logPath": "/home/ubuntu/teemesh/deploy/logs/orchestrator-net-open-webhost-postgres-542c68-cleanup.log",
+    "logTail": "env loaded: chain=8453 deployer=0x60b174704AdAf2b0BF87B426B364D6EbD81818E1 org_safe=0x60b174704AdAf2b0BF87B426B364D6EbD81818E1 kms_root=0x52d3cf51c8a37a2ccfc79bbb98c7810d7dd4ce51\n[20260707T064052Z] === generic AttestMesh node: net-open-webhost-postgres-542c68 ===\n[20260707T064052Z] \u25b6 cleanup stop VM_ID=85afbd90-09c7-4d73-a236-03d1f8ee361f force=0\nHTTP Request: POST http://127.0.0.1:9080/prpc/GetInfo?json \"HTTP/1.1 200 OK\"\nHTTP Request: POST http://127.0.0.1:9080/prpc/StopVm?json \"HTTP/1.1 200 OK\"\n{\"vm_id\": \"85afbd90-09c7-4d73-a236-03d1f8ee361f\", \"found\": true, \"stopped\": true}\n[20260707T064054Z] \u2714 cleanup stop completed for vm=85afbd90-09c7-4d73-a236-03d1f8ee361f\n[20260707T064054Z] \u25b6 generic-removeApp-net-open-webhost-postgres-542c68: cast send 0x07a0adb8F96EeF2D210A74EeBf2Ae2f4E5Beb273 removeAllowedAppId(address) 0xbaBd37ce25cDFa2137D6846A5018E5d9D76d303f --nonce 1171 --rpc-url https://base-rpc.publicnode.com --private-key <redacted> \n[20260707T064054Z]   \u2514 log: /home/ubuntu/teemesh/deploy/logs/generic-removeApp-net-open-webhost-postgres-542c68.20260707T064054Z.log\n[20260707T064058Z] \u2714 generic-removeApp-net-open-webhost-postgres-542c68",
+    "status": "succeeded",
+    "updatedAt": "2026-07-07T06:40:58Z"
+  },
+  "cluster": "0x07a0adb8F96EeF2D210A74EeBf2Ae2f4E5Beb273",
+  "composeHash": "67568a27be1e8a06664440090355265d300dc7e450640c694d36053ced622a8b",
+  "composePath": "/home/ubuntu/teemesh/deploy/orchestrator/compose/net-open-webhost-postgres-542c68.yaml",
+  "connection": {
+    "database": "postgres",
+    "host": "meshIp",
+    "kind": "postgres",
+    "port": 5432,
+    "user": "postgres"
+  },
+  "createdAt": "2026-07-06T17:47:59Z",
+  "error": "orchestrator restarted before this job reached a terminal state",
+  "flavor": "small",
+  "id": "542c683a8298e0ac",
+  "imageRef": "postgres:16-alpine",
+  "logPath": "/home/ubuntu/teemesh/deploy/logs/orchestrator-net-open-webhost-postgres-542c68.log",
+  "logTail": "env loaded: chain=8453 deployer=0x60b174704AdAf2b0BF87B426B364D6EbD81818E1 org_safe=0x60b174704AdAf2b0BF87B426B364D6EbD81818E1 kms_root=0x52d3cf51c8a37a2ccfc79bbb98c7810d7dd4ce51\n[20260706T174759Z] === generic AttestMesh node: net-open-webhost-postgres-542c68 ===\n[20260706T174759Z] \u25b6 box deploy_app generic node=net-open-webhost-postgres-542c68 compose=/home/ubuntu/teemesh/deploy/orchestrator/compose/net-open-webhost-postgres-542c68.yaml cluster=0x07a0adb8F96EeF2D210A74EeBf2Ae2f4E5Beb273 (create stopped)\nHTTP Request: POST https://127.0.0.1:9101/prpc/KMS.GetAppEnvEncryptPubKey?json \"HTTP/1.1 200 OK\"\nHTTP Request: POST http://127.0.0.1:9080/prpc/CreateVm?json \"HTTP/1.1 200 OK\"\n[20260706T174807Z] \u2714 deployed generic node app_id=0xbaBd37ce25cDFa2137D6846A5018E5d9D76d303f compose_hash=67568a27be1e8a06664440090355265d300dc7e450640c694d36053ced622a8b vm=85afbd90-09c7-4d73-a236-03d1f8ee361f\n[20260706T174808Z] \u25b6 generic-addHash-net-open-webhost-postgres-542c68: cast send 0x07a0adb8F96EeF2D210A74EeBf2Ae2f4E5Beb273 addComposeHash(bytes32) 0x67568a27be1e8a06664440090355265d300dc7e450640c694d36053ced622a8b --nonce 1103 --rpc-url https://base-rpc.publicnode.com --private-key <redacted> \n[20260706T174808Z]   \u2514 log: /home/ubuntu/teemesh/deploy/logs/generic-addHash-net-open-webhost-postgres-542c68.20260706T174808Z.log\n[20260706T174812Z] \u2714 generic-addHash-net-open-webhost-postgres-542c68\n[20260706T174813Z] \u25b6 generic-addApp-net-open-webhost-postgres-542c68: cast send 0x07a0adb8F96EeF2D210A74EeBf2Ae2f4E5Beb273 addAllowedAppId(address) 0xbaBd37ce25cDFa2137D6846A5018E5d9D76d303f --nonce 1104 --rpc-url https://base-rpc.publicnode.com --private-key <redacted> \n[20260706T174813Z]   \u2514 log: /home/ubuntu/teemesh/deploy/logs/generic-addApp-net-open-webhost-postgres-542c68.20260706T174813Z.log\n[20260706T174815Z] \u2714 generic-addApp-net-open-webhost-postgres-542c68\n[20260706T174815Z] \u25b6 bind generic X=0xbaBd37ce25cDFa2137D6846A5018E5d9D76d303f -> impl 0x7d5536a06b5fbe4c51e6995bdb0543b7887b3da4 (box deployer)\nstatus               1 (success)\ntransactionHash      0x50eb69bd2d75b74c91346baf9703f192471990e28fc1d43c9a1afbb429fdae25\n[20260706T174818Z] X.cluster()=0x07a0adb8F96EeF2D210A74EeBf2Ae2f4E5Beb273 (expect 0x07a0adb8F96EeF2D210A74EeBf2Ae2f4E5Beb273)\n[20260706T174818Z] \u2714 bound generic node X -> 0x07a0adb8F96EeF2D210A74EeBf2Ae2f4E5Beb273\n[20260706T174818Z] \u25b6 start generic VM vm=85afbd90-09c7-4d73-a236-03d1f8ee361f after allowlist/bind\nHTTP Request: POST http://127.0.0.1:9080/prpc/StartVm?json \"HTTP/1.1 200 OK\"\nstarted 85afbd90-09c7-4d73-a236-03d1f8ee361f\n[20260706T174819Z] \u2714 start requested for generic VM vm=85afbd90-09c7-4d73-a236-03d1f8ee361f\nHTTP Request: POST http://127.0.0.1:9080/prpc/GetInfo?json \"HTTP/1.1 200 OK\"\n[20260706T174821Z] \u2026 generic node not registered yet (1/45, memberCount=2)\nHTTP Request: POST http://127.0.0.1:9080/prpc/GetInfo?json \"HTTP/1.1 200 OK\"\n[20260706T174843Z] \u2026 generic node not registered yet (2/45, memberCount=2)\nHTTP Request: POST http://127.0.0.1:9080/prpc/GetInfo?json \"HTTP/1.1 200 OK\"\n[20260706T174905Z] \u2026 generic node not registered yet (3/45, memberCount=2)\nHTTP Request: POST http://127.0.0.1:9080/prpc/GetInfo?json \"HTTP/1.1 200 OK\"\n[20260706T174926Z] \u2026 generic node not registered yet (4/45, memberCount=2)\nHTTP Request: POST http://127.0.0.1:9080/prpc/GetInfo?json \"HTTP/1.1 200 OK\"\n[20260706T174948Z] \u2026 generic node not registered yet (5/45, memberCount=2)\nHTTP Request: POST http://127.0.0.1:9080/prpc/GetInfo?json \"HTTP/1.1 200 OK\"\n[20260706T175010Z] \u2026 generic node not registered yet (6/45, memberCount=2)\nHTTP Request: POST http://127.0.0.1:9080/prpc/GetInfo?json \"HTTP/1.1 200 OK\"\n[20260706T175032Z] \u2026 generic node not registered yet (7/45, memberCount=2)\nHTTP Request: POST http://127.0.0.1:9080/prpc/GetInfo?json \"HTTP/1.1 200 OK\"\n[20260706T175053Z] \u2026 generic node not registered yet (8/45, memberCount=2)\nHTTP Request: POST http://127.0.0.1:9080/prpc/GetInfo?json \"HTTP/1.1 200 OK\"",
+  "memberImpl": "0x7d5536a06b5fbe4c51e6995bdb0543b7887b3da4",
+  "name": "postgres",
+  "networkId": "net-open-webhost",
+  "nodeName": "net-open-webhost-postgres-542c68",
+  "source": "catalog",
+  "statePhase": "cleaned",
+  "status": "cleaned",
+  "updatedAt": "2026-07-07T06:40:58Z",
+  "vmId": "85afbd90-09c7-4d73-a236-03d1f8ee361f"
+}

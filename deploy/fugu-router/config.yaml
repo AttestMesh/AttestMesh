@@ -1,45 +1,48 @@
 # fugu-router LiteLLM proxy config — docs/research/fugu-subscription-pooling.md §3.4.
-# Same-named deployments form one routing pool; PAYG keys are EXCLUDED from the pool and
-# reached only via fallbacks (drain-then-spill, §3.2). The entrypoint prunes any deployment
-# whose api_key env var is unset at runtime (SAKANA_SUB_3_KEY is optional).
+# Public clients should call the fugu_session_router front door with model=fugu or
+# model=fugu-ultra. LiteLLM only exposes account-specific upstream model names so the
+# router can make sticky session assignments and retry a different subscription on
+# quota/rate-limit errors. PAYG is intentionally absent from the serving path.
+# The entrypoint prunes any deployment whose api_key env var is unset at runtime
+# (SAKANA_SUB_3_KEY is optional).
 # Custom Fugu pricing is mandatory: LiteLLM's built-in price table has no Sakana entries,
 # so without model_info costs the computed spend is silently zero (paper §3.4).
 
 model_list:
   # ---- fugu-ultra: coordinator/verifier tier (dated pin — rolling alias drifts, §3.3) ----
-  - model_name: fugu-ultra
+  - model_name: fugu-ultra-sub-1
     litellm_params:
       model: openai/fugu-ultra-20260615
       api_base: os.environ/SAKANA_API_BASE
       api_key: os.environ/SAKANA_SUB_1_KEY
     model_info:
+      id: fugu-ultra-sub-1
+      fugu_account_id: sub1
+      fugu_requested_model: fugu-ultra
       input_cost_per_token: 5e-6 # $5/M (§2.1 rate card; <=272K context)
       output_cost_per_token: 3e-5 # $30/M
       cache_read_input_token_cost: 5e-7 # $0.50/M cached input
-  - model_name: fugu-ultra
+  - model_name: fugu-ultra-sub-2
     litellm_params:
       model: openai/fugu-ultra-20260615
       api_base: os.environ/SAKANA_API_BASE
       api_key: os.environ/SAKANA_SUB_2_KEY
     model_info:
+      id: fugu-ultra-sub-2
+      fugu_account_id: sub2
+      fugu_requested_model: fugu-ultra
       input_cost_per_token: 5e-6
       output_cost_per_token: 3e-5
       cache_read_input_token_cost: 5e-7
-  - model_name: fugu-ultra
+  - model_name: fugu-ultra-sub-3
     litellm_params:
       model: openai/fugu-ultra-20260615
       api_base: os.environ/SAKANA_API_BASE
       api_key: os.environ/SAKANA_SUB_3_KEY # optional; pruned at boot if unset
     model_info:
-      input_cost_per_token: 5e-6
-      output_cost_per_token: 3e-5
-      cache_read_input_token_cost: 5e-7
-  - model_name: fugu-ultra-payg
-    litellm_params:
-      model: openai/fugu-ultra-20260615
-      api_base: os.environ/SAKANA_API_BASE
-      api_key: os.environ/SAKANA_PAYG_KEY
-    model_info:
+      id: fugu-ultra-sub-3
+      fugu_account_id: sub3
+      fugu_requested_model: fugu-ultra
       input_cost_per_token: 5e-6
       output_cost_per_token: 3e-5
       cache_read_input_token_cost: 5e-7
@@ -48,39 +51,43 @@ model_list:
   # No model_info costs: passthrough pricing depends on the underlying model Sakana routes
   # to and is unknown per-request — spend for the standard tier is NOT tracked yet.
   # Reconcile against the Sakana console (§4.3) until a defensible per-token rate exists.
-  - model_name: fugu
+  - model_name: fugu-sub-1
     litellm_params:
       model: openai/fugu
       api_base: os.environ/SAKANA_API_BASE
       api_key: os.environ/SAKANA_SUB_1_KEY
-  - model_name: fugu
+    model_info:
+      id: fugu-sub-1
+      fugu_account_id: sub1
+      fugu_requested_model: fugu
+  - model_name: fugu-sub-2
     litellm_params:
       model: openai/fugu
       api_base: os.environ/SAKANA_API_BASE
       api_key: os.environ/SAKANA_SUB_2_KEY
-  - model_name: fugu
+    model_info:
+      id: fugu-sub-2
+      fugu_account_id: sub2
+      fugu_requested_model: fugu
+  - model_name: fugu-sub-3
     litellm_params:
       model: openai/fugu
       api_base: os.environ/SAKANA_API_BASE
       api_key: os.environ/SAKANA_SUB_3_KEY # optional; pruned at boot if unset
-  - model_name: fugu-payg
-    litellm_params:
-      model: openai/fugu
-      api_base: os.environ/SAKANA_API_BASE
-      api_key: os.environ/SAKANA_PAYG_KEY
+    model_info:
+      id: fugu-sub-3
+      fugu_account_id: sub3
+      fugu_requested_model: fugu
 
 router_settings:
-  # Placement happens in the ACP adapter (§3.2); this strategy governs new-session
-  # placement signals and fallback only — never live-session moves (cache locality).
+  # The fugu_session_router chooses subscription placement. LiteLLM stays single-model
+  # once the upstream account-specific model is selected.
   routing_strategy: usage-based-routing-v2
   # redis-ha via the sidecar-netns socat forwarder (compose sets REDIS_HOST=sidecar,
   # REDIS_PORT=16379); REDIS_PASSWORD is CSK-derived by the entrypoint, never in env files.
   redis_host: os.environ/REDIS_HOST
   redis_port: os.environ/REDIS_PORT
   redis_password: os.environ/REDIS_PASSWORD
-  fallbacks:
-    - fugu-ultra: ["fugu-ultra-payg"]
-    - fugu: ["fugu-payg"]
   cooldown_time: 60 # rate-limit-shaped errors; quota-exhaustion handling refined post-calibration (§5)
 
 litellm_settings:
@@ -89,7 +96,7 @@ litellm_settings:
   # Mixing "langfuse" into `callbacks` silently fails to register the tracer.
   success_callback: ["langfuse"]
   failure_callback: ["langfuse"]
-  callbacks: ["fugu_telemetry.fugu_telemetry_handler"]
+  callbacks: ["fugu_credit.fugu_credit_handler"]
   drop_params: true
 
 general_settings:

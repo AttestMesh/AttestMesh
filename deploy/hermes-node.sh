@@ -8,7 +8,7 @@
 #   Hindsight bank   — bank_id = agent name on the Hindsight node (mesh-only)
 #   email mailbox    — Fastmail (operator creates the account; creds in the env file)
 #   GitHub identity  — machine-account PAT (operator creates; PAT in the env file)
-#   model key        — Sakana fugu-ultra by default
+#   model endpoint   — fugu-router/fugu-ultra by default
 #
 # Per-agent config lives in ~/.attestmesh/agents/<node>.env (+ optional
 # <node>.soul.md persona); `hermes-node.sh <node> init` writes a template.
@@ -40,6 +40,8 @@ BOX_RPC="${BOX_RPC:-https://base-rpc.publicnode.com}"
 COMPOSE="${COMPOSE:-$ROOT/deploy/compose/hermes-node.yaml}"
 MATRIX_STATE="${MATRIX_STATE:-$LOGDIR/matrix-node-matrix-node.state}"
 HINDSIGHT_STATE="${HINDSIGHT_STATE:-$LOGDIR/hindsight-node-hindsight-node.state}"
+FUGU_ROUTER_STATE="${FUGU_ROUTER_STATE:-$LOGDIR/fugu-router-node-fugu-router.state}"
+FUGU_ROUTER_SECRETS="${FUGU_ROUTER_SECRETS:-$HOME/.attestmesh/fugu-router.env}"
 GATEWAY_DOMAIN="${GATEWAY_DOMAIN:-gateway.attestmesh.xyz}"
 MESH_JUMP="${MESH_JUMP:-attestmesh-mesh-node}"   # ssh alias with a foot on the wg mesh
 # Prefer the operator-maintained union file so updates never drop sealed keys.
@@ -78,6 +80,34 @@ _matrix_server() {
   printf '%s.%s' "$(printf '%s' "${mx#0x}" | tr 'A-Z' 'a-z')" "$GATEWAY_DOMAIN"
 }
 
+_provider_slug() {
+  printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | tr '_' '-'
+}
+
+_is_fugu_router_provider() {
+  case "$(_provider_slug "$1")" in
+    fugu-router|fugu|sakana-fugu-router) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+_fugu_router_base_url() {
+  local ip
+  [ -s "$FUGU_ROUTER_STATE" ] || return 0
+  ip=$(grep '^MESH_IP=' "$FUGU_ROUTER_STATE" | cut -d= -f2- | head -1)
+  [ -n "$ip" ] || return 0
+  printf 'http://%s:18410/v1' "$ip"
+}
+
+_fugu_router_master_key() {
+  local value
+  [ -s "$FUGU_ROUTER_SECRETS" ] || return 0
+  value=$(grep '^LITELLM_MASTER_KEY=' "$FUGU_ROUTER_SECRETS" | tail -1 | cut -d= -f2-)
+  value="${value%\"}"; value="${value#\"}"
+  value="${value%\'}"; value="${value#\'}"
+  printf '%s' "$value"
+}
+
 _default_cluster_env() {
   if [ -z "${CLUSTER:-}" ] || [ -z "${MEMBER_IMPL:-}" ]; then
     [ -f "$MATRIX_STATE" ] || die "missing Matrix cluster state: $MATRIX_STATE"
@@ -92,8 +122,16 @@ _load_agent_env() {
   set -a; source "$AGENT_ENV"; set +a
   local server; server=$(_matrix_server)
   AGENT_NAME="${AGENT_NAME:-$NODE}"
-  MODEL_PROVIDER_NAME="${MODEL_PROVIDER_NAME:-Sakana}"
-  MODEL_BASE_URL="${MODEL_BASE_URL:-https://api.sakana.ai/v1}"
+  MODEL_PROVIDER_NAME="${MODEL_PROVIDER_NAME:-fugu-router}"
+  if _is_fugu_router_provider "$MODEL_PROVIDER_NAME"; then
+    MODEL_BASE_URL="${MODEL_BASE_URL:-$(_fugu_router_base_url)}"
+    MODEL_PROVIDER_NAME="fugu-router"
+    if [ -z "${MODEL_API_KEY:-}" ]; then
+      MODEL_API_KEY="$(_fugu_router_master_key)"
+    fi
+  else
+    MODEL_BASE_URL="${MODEL_BASE_URL:-https://api.sakana.ai/v1}"
+  fi
   MODEL_NAME="${MODEL_NAME:-fugu-ultra}"
   MATRIX_HOMESERVER="${MATRIX_HOMESERVER:-http://10.18.196.231:18080}"
   MATRIX_ALLOWED_USERS="${MATRIX_ALLOWED_USERS:-@lsdan:${server},@fran:${server}}"
@@ -124,6 +162,7 @@ _require_env() {
   SSH_AUTHORIZED_KEYS_B64="${SSH_AUTHORIZED_KEYS_B64:-$(base64 -w0 "$AUTHORIZED_KEYS_FILE")}"
   [ -n "$SSH_AUTHORIZED_KEYS_B64" ] || die "could not encode $AUTHORIZED_KEYS_FILE"
   [ -n "${MODEL_API_KEY:-}" ] || die "MODEL_API_KEY missing in $AGENT_ENV"
+  [ -n "${MODEL_BASE_URL:-}" ] || die "MODEL_BASE_URL unresolved (deploy fugu-router first or set MODEL_BASE_URL in $AGENT_ENV)"
   [ -n "${HINDSIGHT_API_KEY:-}" ] || die "HINDSIGHT_API_KEY unresolved (no $HINDSIGHT_STATE?)"
   [ -n "${MATRIX_ACCESS_TOKEN:-}" ] || die "MATRIX_ACCESS_TOKEN missing — run: hermes-node.sh $NODE provision-matrix"
   [ -n "${MATRIX_USER_ID:-}" ] || die "MATRIX_USER_ID missing — run: hermes-node.sh $NODE provision-matrix"
@@ -202,9 +241,17 @@ init_env() {
 # Fill the REQUIRED lines; create the Fastmail mailbox + GitHub machine
 # account by hand first. provision-matrix fills the MATRIX_* lines.
 
-MODEL_API_KEY=              # REQUIRED — Sakana key (fugu-ultra)
-#MODEL_BASE_URL=https://api.sakana.ai/v1
+# Default: fugu-router via deploy/logs/fugu-router-node-fugu-router.state and
+# ~/.attestmesh/fugu-router.env. Uncomment to override or to use direct Sakana.
+#MODEL_PROVIDER_NAME=fugu-router
+#MODEL_API_KEY=             # defaults to fugu-router LITELLM_MASTER_KEY when available
+#MODEL_BASE_URL=            # defaults to http://<fugu-router-mesh-ip>:18410/v1
 #MODEL_NAME=fugu-ultra
+#
+# Direct Sakana fallback:
+#MODEL_PROVIDER_NAME=custom
+#MODEL_API_KEY=             # Sakana key
+#MODEL_BASE_URL=https://api.sakana.ai/v1
 
 EMAIL_ADDRESS=              # Fastmail mailbox for this agent
 EMAIL_PASSWORD=             # Fastmail app password (IMAP/SMTP)

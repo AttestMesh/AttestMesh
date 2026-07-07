@@ -160,6 +160,7 @@ mod tests {
             data: vec![9, 8, 7, 6],
             kind: EventKind::WgKeyPublished {
                 member_id: B256::repeat_byte(0x01),
+                wg_pub_key: B256::repeat_byte(0x02),
             },
         }
     }

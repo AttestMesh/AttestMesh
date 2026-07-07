@@ -38,6 +38,8 @@ ENV_KEYS = [
     "GAS_POLICY_ID",
     "INDEXER_REGISTRY_ADDR",
     "GATEWAY_DOMAIN",
+    "CLUSTER",
+    "MEMBER_IMPL",
     "APP_ENV_B64",
     "DSTACK_DOCKER_USERNAME",
     "DSTACK_DOCKER_PASSWORD",
@@ -83,6 +85,21 @@ def kms_urls() -> list[str]:
     return ["https://10.0.2.2:9101"] if NET_MODE == "bridge" else m.KMS_URLS
 
 
+def stop_vm(vm_id: str) -> dict[str, object]:
+    if not vm_id:
+        raise SystemExit("usage: generic-node-box.py stop <vm_id>")
+    before = m.vmm("GetInfo", {"id": vm_id})
+    found = bool(before.get("found", True))
+    if found:
+        try:
+            m.vmm("StopVm", {"id": vm_id})
+        except Exception as exc:
+            # StopVm is not idempotent on every dstack build. Treat already-gone
+            # or already-stopped VMs as cleanup success, but keep the error text.
+            return {"vm_id": vm_id, "found": found, "stopped": False, "error": str(exc)}
+    return {"vm_id": vm_id, "found": found, "stopped": found}
+
+
 def main() -> None:
     mode = sys.argv[1] if len(sys.argv) > 1 else "hash"
 
@@ -104,7 +121,7 @@ def main() -> None:
                 "ports": [m._parse_port(port) for port in PORTS],
                 "hugepages": False,
                 "pin_numa": False,
-                "stopped": False,
+                "stopped": True,
                 "no_tee": False,
                 "kms_urls": kms_urls(),
                 "networking": {"mode": NET_MODE},
@@ -131,6 +148,11 @@ def main() -> None:
     if mode == "hash":
         _, digest = app_compose_and_hash(ENV_KEYS + ["DSTACK_DOCKER_REGISTRY"])
         print(digest)
+        return
+
+    if mode == "stop":
+        vm_id = sys.argv[2] if len(sys.argv) > 2 else ""
+        print(json.dumps(stop_vm(vm_id)))
         return
 
     if mode == "update":
@@ -193,7 +215,7 @@ def main() -> None:
         )
         return
 
-    raise SystemExit("usage: generic-node-box.py [deploy|hash|update <app_id> <vm_id>]")
+    raise SystemExit("usage: generic-node-box.py [deploy|hash|stop <vm_id>|update <app_id> <vm_id>]")
 
 
 if __name__ == "__main__":

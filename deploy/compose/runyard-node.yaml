@@ -39,7 +39,7 @@
 services:
   # --- AttestMesh sidecar: on-chain self-registration + wg mesh (Path A) --------
   sidecar:
-    image: ghcr.io/attestmesh/cluster-mesh-agent@sha256:db0a74f5cb68aab6441ac187522276999fc45ee760db3ae3dea0240e86d5c1af
+    image: ghcr.io/attestmesh/cluster-mesh-agent@sha256:f455ad9e778573080459eb9e46af269547d72d3624cbcf6d21e4a279c0527284
     restart: unless-stopped
     environment:
       # MEMBER_CONTRACT intentionally unset. Path A upgrades this stock DstackApp
@@ -69,7 +69,7 @@ services:
 
   # --- RunYard application stack -------------------------------------------------
   hub:
-    image: ghcr.io/yolo-maxi/runyard-hub@sha256:6bf33acf307b31a4a99c03578f8fab60fe94cf63a827a9e567553e9ef47e816e
+    image: ghcr.io/yolo-maxi/runyard-hub@sha256:5ab1dd625e103f0618f2c415161dadc606a31e0b05f2f69b3db099cb8e27302e
     environment:
       HOST: 0.0.0.0
       PORT: "80"
@@ -89,7 +89,7 @@ services:
     restart: unless-stopped
 
   runner:
-    image: ghcr.io/yolo-maxi/runyard-runner@sha256:bf957165dd20def4a91a397aadc5be3c23ee37ed7e5dc84e1da9b6b0afcf6c22
+    image: ghcr.io/yolo-maxi/runyard-runner@sha256:1350fbc3a0a0728bafc990241a6aa0a9c9125728ca08c06ff943c468c254c8e6
     environment:
       RUNYARD_HUB_URL: http://hub:80
       RUNYARD_HUB_TOKEN: ${RUNYARD_HUB_TOKEN}
@@ -117,7 +117,7 @@ services:
   # (which carries the full 22-file template set). Re-runs on every roll, so the
   # templates track the hub image if it's ever bumped.
   seed-templates:
-    image: ghcr.io/yolo-maxi/runyard-hub@sha256:6bf33acf307b31a4a99c03578f8fab60fe94cf63a827a9e567553e9ef47e816e
+    image: ghcr.io/yolo-maxi/runyard-hub@sha256:5ab1dd625e103f0618f2c415161dadc606a31e0b05f2f69b3db099cb8e27302e
     restart: "no"
     # Run as root: the hub image's default user is `node` (uid 1000), which can't
     # write the root-owned fresh volume mountpoint. `cp -a` as root preserves the

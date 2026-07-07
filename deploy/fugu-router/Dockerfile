@@ -1,4 +1,4 @@
-# fugu-router — LiteLLM proxy pooling Sakana Fugu subscription keys with PAYG fallback
+# fugu-router — LiteLLM proxy pooling Sakana Fugu subscription keys
 # (docs/research/fugu-subscription-pooling.md §3). Redis auth is HKDF-derived in-CVM from
 # the CLUSTER SHARED KEY (sidecar agent UDS) by the entrypoint — the image holds no secrets.
 # Built/pushed by .github/workflows/build-fugu-router.yml.
@@ -23,13 +23,13 @@ FROM ghcr.io/berriai/litellm:v1.83.14-stable@sha256:c81eb79cd4333c6cfe374c0ec929
 COPY --from=tools /usr/local/bin/grpcurl /usr/local/bin/jq /usr/local/bin/
 # langfuse tracer package for the success_callback. The base image has no `pip` on PATH,
 # so go through the interpreter (ensurepip fallback); no-op if the base already bundles it.
-RUN python3 -c "import langfuse" 2>/dev/null || \
-    python3 -m pip install --no-cache-dir "langfuse<3" || \
-    (python3 -m ensurepip --upgrade && python3 -m pip install --no-cache-dir "langfuse<3"); \
-    python3 -c "import langfuse; print('langfuse', langfuse.__version__)"
+RUN python3 -m pip install --no-cache-dir "langfuse<3" "psycopg[binary]>=3.1" "httpx>=0.27" "fastapi>=0.110" "uvicorn[standard]>=0.27" || \
+    (python3 -m ensurepip --upgrade && python3 -m pip install --no-cache-dir "langfuse<3" "psycopg[binary]>=3.1" "httpx>=0.27" "fastapi>=0.110" "uvicorn[standard]>=0.27"); \
+    python3 -c "import langfuse, psycopg, httpx, fastapi, uvicorn; print('fugu deps ok')"
 
 COPY agent.proto /etc/fugu-router/agent.proto
-COPY config.yaml fugu_telemetry.py /app/
-COPY --chmod=755 fugu-router-entrypoint.sh /usr/local/bin/fugu-router-entrypoint.sh
+COPY config.yaml fugu_telemetry.py fugu_credit.py fugu_session_router.py /app/
+COPY fugu-router-entrypoint.sh /usr/local/bin/fugu-router-entrypoint.sh
+RUN chmod 755 /usr/local/bin/fugu-router-entrypoint.sh
 
 ENTRYPOINT ["/usr/local/bin/fugu-router-entrypoint.sh"]

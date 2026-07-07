@@ -11,7 +11,7 @@
 # ephemeral layer. All agent STATE stays under /root (the compose `workspace`
 # volume): ~/.hermes (config, .env secrets, crypto store), ~/.paseo,
 # ~/dstack-deep-dive. Nothing secret is baked here.
-ARG HERMES_REF=b3bc302370aadeb792ceb0a899cf6a575ed130bb
+ARG HERMES_REF=830165473e0920c2baf8c2a6863976edb0c52943
 ARG PASEO_VERSION=0.1.103
 
 # Node 22 LTS donor (same pin as upstream hermes-agent Dockerfile).
@@ -73,6 +73,8 @@ RUN git clone https://github.com/NousResearch/hermes-agent.git /usr/local/lib/he
       || uv pip install -p venv/bin/python -e ".") \
   && ln -sf /usr/local/lib/hermes-agent/venv/bin/hermes /usr/local/bin/hermes \
   && echo git > .install_method
+
+COPY plugins/model-providers/fugu-router /usr/local/lib/hermes-agent/plugins/model-providers/fugu-router
 
 # Playwright chromium baked into the image (PLAYWRIGHT_BROWSERS_PATH is
 # outside /root so the volume mount doesn't shadow it). Tolerated to fail if

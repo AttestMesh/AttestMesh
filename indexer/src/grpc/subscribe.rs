@@ -66,6 +66,7 @@ mod tests {
             data: vec![1],
             kind: EventKind::WgKeyPublished {
                 member_id: B256::repeat_byte(0x01),
+                wg_pub_key: B256::repeat_byte(0x02),
             },
         };
         envelope::build_envelope(&log, &build_stub(&log))
