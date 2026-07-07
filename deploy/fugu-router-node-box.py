@@ -7,7 +7,7 @@ primitives to register a stock DstackApp on Base, seal the runtime env, and
 CreateVm / UpgradeApp.
 
 fugu-router-specific vs telegram-sync:
-  - Sealed env carries the Sakana subscription/PAYG keys + egress CIDRs, the
+  - Sealed env carries the Sakana subscription keys + egress CIDRs, the
     LiteLLM secrets, the langfuse-node callback project keys, and the redis-ha
     + langfuse-node mesh IPs for the socat forwarders. Key NAMES are measured
     into the compose_hash, VALUES are sealed. The redis-ha / pg-ha superuser
@@ -87,8 +87,35 @@ ENV_KEYS = [
     "SAKANA_SUB_1_KEY",
     "SAKANA_SUB_2_KEY",
     "SAKANA_SUB_3_KEY",
-    "SAKANA_PAYG_KEY",
     "SAKANA_CIDRS",
+    # --- Fugu subscription accounting/routing metadata (different reset dates allowed) ---
+    "FUGU_SUB_1_ENABLED",
+    "FUGU_SUB_2_ENABLED",
+    "FUGU_SUB_3_ENABLED",
+    "FUGU_SUB_1_LABEL",
+    "FUGU_SUB_2_LABEL",
+    "FUGU_SUB_3_LABEL",
+    "FUGU_SUB_1_BILLING_PLAN",
+    "FUGU_SUB_2_BILLING_PLAN",
+    "FUGU_SUB_3_BILLING_PLAN",
+    "FUGU_SUB_1_5H_RESET_ANCHOR",
+    "FUGU_SUB_2_5H_RESET_ANCHOR",
+    "FUGU_SUB_3_5H_RESET_ANCHOR",
+    "FUGU_SUB_1_WEEKLY_RESET_ANCHOR",
+    "FUGU_SUB_2_WEEKLY_RESET_ANCHOR",
+    "FUGU_SUB_3_WEEKLY_RESET_ANCHOR",
+    "FUGU_SUB_1_MONTHLY_RESET_ANCHOR",
+    "FUGU_SUB_2_MONTHLY_RESET_ANCHOR",
+    "FUGU_SUB_3_MONTHLY_RESET_ANCHOR",
+    "FUGU_SUB_1_5H_ALLOWANCE_USAGE_UNITS",
+    "FUGU_SUB_2_5H_ALLOWANCE_USAGE_UNITS",
+    "FUGU_SUB_3_5H_ALLOWANCE_USAGE_UNITS",
+    "FUGU_SUB_1_WEEKLY_ALLOWANCE_USAGE_UNITS",
+    "FUGU_SUB_2_WEEKLY_ALLOWANCE_USAGE_UNITS",
+    "FUGU_SUB_3_WEEKLY_ALLOWANCE_USAGE_UNITS",
+    "FUGU_SUB_1_MONTHLY_ALLOWANCE_USAGE_UNITS",
+    "FUGU_SUB_2_MONTHLY_ALLOWANCE_USAGE_UNITS",
+    "FUGU_SUB_3_MONTHLY_ALLOWANCE_USAGE_UNITS",
     # --- LiteLLM ---
     "LITELLM_MASTER_KEY",
     "LITELLM_SALT_KEY",

@@ -1,0 +1,36 @@
+{
+  "appEnvB64": "UE9TVEdSRVNfREI9cG9zdGdyZXMKUE9TVEdSRVNfSU5JVERCX0FSR1M9LS1lbmNvZGluZz1VVEY4IC0tbG9jYWxlPUMKUE9TVEdSRVNfUEFTU1dPUkQ9cGdfNjYxYTBmZTMwNjA1MjZlNWEzOTE4OGYzZjJhZTNkOGM3ODM3ClBPU1RHUkVTX1VTRVI9cG9zdGdyZXMK",
+  "appId": "0xA8ff45D4DC8934eeC350b33d733e2FdFEa315B6c",
+  "box": {
+    "disk": "40",
+    "mem": "4096",
+    "vcpu": "2"
+  },
+  "catalogId": "postgres",
+  "cluster": "0x07a0adb8F96EeF2D210A74EeBf2Ae2f4E5Beb273",
+  "composeHash": "e2c38c2a067daa8fbef1f2e55775678ff00e89ab7a46911e8f53920ff43be5b5",
+  "composePath": "/home/ubuntu/teemesh/deploy/orchestrator/compose/net-open-webhost-postgres-2b38c7.yaml",
+  "connection": {
+    "database": "postgres",
+    "host": "meshIp",
+    "kind": "postgres",
+    "port": 5432,
+    "user": "postgres"
+  },
+  "createdAt": "2026-07-06T17:17:03Z",
+  "error": "generic-node deploy failed with exit code 1",
+  "exitCode": 1,
+  "flavor": "small",
+  "id": "2b38c761622b3f7e",
+  "imageRef": "postgres:16-alpine",
+  "logPath": "/home/ubuntu/teemesh/deploy/logs/orchestrator-net-open-webhost-postgres-2b38c7.log",
+  "logTail": "env loaded: chain=8453 deployer=0x60b174704AdAf2b0BF87B426B364D6EbD81818E1 org_safe=0x60b174704AdAf2b0BF87B426B364D6EbD81818E1 kms_root=0x52d3cf51c8a37a2ccfc79bbb98c7810d7dd4ce51\n[20260706T171703Z] === generic AttestMesh node: net-open-webhost-postgres-2b38c7 ===\n[20260706T171703Z] \u25b6 box deploy_app generic node=net-open-webhost-postgres-2b38c7 compose=/home/ubuntu/teemesh/deploy/orchestrator/compose/net-open-webhost-postgres-2b38c7.yaml cluster=0x07a0adb8F96EeF2D210A74EeBf2Ae2f4E5Beb273\nHTTP Request: POST https://127.0.0.1:9101/prpc/KMS.GetAppEnvEncryptPubKey?json \"HTTP/1.1 200 OK\"\nHTTP Request: POST http://127.0.0.1:9080/prpc/CreateVm?json \"HTTP/1.1 200 OK\"\n[20260706T171713Z] \u2714 deployed generic node app_id=0xA8ff45D4DC8934eeC350b33d733e2FdFEa315B6c compose_hash=e2c38c2a067daa8fbef1f2e55775678ff00e89ab7a46911e8f53920ff43be5b5 vm=61de7cb9-bd60-44d0-8ba5-98cd90d31383\n[20260706T171713Z] \u25b6 generic-addHash-net-open-webhost-postgres-2b38c7: cast send 0x07a0adb8F96EeF2D210A74EeBf2Ae2f4E5Beb273 addComposeHash(bytes32) 0xe2c38c2a067daa8fbef1f2e55775678ff00e89ab7a46911e8f53920ff43be5b5 --nonce 1095 --rpc-url https://base-rpc.publicnode.com --private-key <redacted> \n[20260706T171713Z]   \u2514 log: /home/ubuntu/teemesh/deploy/logs/generic-addHash-net-open-webhost-postgres-2b38c7.20260706T171713Z.log\n[20260706T171716Z] \u2714 generic-addHash-net-open-webhost-postgres-2b38c7\n[20260706T171716Z] \u25b6 generic-addApp-net-open-webhost-postgres-2b38c7: cast send 0x07a0adb8F96EeF2D210A74EeBf2Ae2f4E5Beb273 addAllowedAppId(address) 0xA8ff45D4DC8934eeC350b33d733e2FdFEa315B6c --nonce 1096 --rpc-url https://base-rpc.publicnode.com --private-key <redacted> \n[20260706T171716Z]   \u2514 log: /home/ubuntu/teemesh/deploy/logs/generic-addApp-net-open-webhost-postgres-2b38c7.20260706T171716Z.log\n[20260706T171720Z] \u2714 generic-addApp-net-open-webhost-postgres-2b38c7\n[20260706T171720Z] \u25b6 bind generic X=0xA8ff45D4DC8934eeC350b33d733e2FdFEa315B6c -> impl 0x7d5536a06b5fbe4c51e6995bdb0543b7887b3da4 (box deployer)\nstatus               1 (success)\ntransactionHash      0x1c90e571b350539a3eec20540325c28bfb66d990cf4ef4cc49980a97adcb4ea2\n[20260706T171723Z] X.cluster()=0x07a0adb8F96EeF2D210A74EeBf2Ae2f4E5Beb273 (expect 0x07a0adb8F96EeF2D210A74EeBf2Ae2f4E5Beb273)\n[20260706T171723Z] \u2714 bound generic node X -> 0x07a0adb8F96EeF2D210A74EeBf2Ae2f4E5Beb273\nHTTP Request: POST http://127.0.0.1:9080/prpc/GetInfo?json \"HTTP/1.1 200 OK\"\n[20260706T171725Z] \u2026 generic node not registered yet (1/45, memberCount=2)\nHTTP Request: POST http://127.0.0.1:9080/prpc/GetInfo?json \"HTTP/1.1 200 OK\"\n[20260706T171747Z] \u2026 generic node not registered yet (2/45, memberCount=2)\nHTTP Request: POST http://127.0.0.1:9080/prpc/GetInfo?json \"HTTP/1.1 200 OK\"\n[20260706T171809Z] \u2026 generic node not registered yet (3/45, memberCount=2)\nHTTP Request: POST http://127.0.0.1:9080/prpc/GetInfo?json \"HTTP/1.1 200 OK\"\n[20260706T171831Z] \u2026 generic node not registered yet (4/45, memberCount=2)\nHTTP Request: POST http://127.0.0.1:9080/prpc/GetInfo?json \"HTTP/1.1 200 OK\"\n[20260706T171852Z] \u2026 generic node not registered yet (5/45, memberCount=2)\nHTTP Request: POST http://127.0.0.1:9080/prpc/GetInfo?json \"HTTP/1.1 200 OK\"\n[20260706T171914Z] \u2026 generic node not registered yet (6/45, memberCount=2)\nHTTP Request: POST http://127.0.0.1:9080/prpc/GetInfo?json \"HTTP/1.1 200 OK\"\n[20260706T171936Z] \u2026 generic node not registered yet (7/45, memberCount=2)\nHTTP Request: POST http://127.0.0.1:9080/prpc/GetInfo?json \"HTTP/1.1 200 OK\"\nHTTP Request: GET http://127.0.0.1:9080/logs?id=61de7cb9-bd60-44d0-8ba5-98cd90d31383&follow=false&ansi=false&lines=700&ch=serial \"HTTP/1.1 200 OK\"\n[20260706T171959Z] FATAL: enclave VM boot failed before mesh registration: Failed to request app keys: Failed to get app keys from KMS: Failed to get app key: Request failed with status=400 Bad Request, error={\n  \"error\": \"App not allowed: Boot denied: missing revert data (action=\\\"call\\\", data=null, reason=null, transaction={ \\\"data\\\": \\\"0x1e0791980000000000000000000000000000000000000000000000000000000000000020000000000000000000000000a8ff45d4dc8934eec350b33d733e2fdfea315b6ce2c38c2a067daa8fbef1f2e55775678ff00e89ab7a46911e8f53920ff43be5b500000000000000000000000025fa2b8db99f62868020028323ba3c2f35c1e9978205ec1b34df54048eb5aebdfc6ad62fa9bed0a1e86b67c29b04213a3a7c55582343f9b9b2f0e9917cfe5da0bbf2960c31aa71ed3cb897187d1aee2a88cac75365bb55074cdbc63c63887c5f5e75420ca2a305693d9b862b961898d9b1281c7cc2aa0186182fe8a404f16d5f3facb334d89be32703b3571c401b114a8b6e700d0000000000000000000000000000000000000000000000000000000000000120000000000000000000000000000000000000000000000000000000000000016000000000000000000000000000000000000000000000000000000000000000085570546f446174650000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000\\\", \\\"to\\\": \\\"0xceb327511ea20da53D809C87D7B316435ae1BCf1\\\" }, invocation=null, revert=null, code=CALL_EXCEPTION, version=6.13.5)\"\n} (progress: requesting app keys, vm=61de7cb9-bd60-44d0-8ba5-98cd90d31383)",
+  "memberImpl": "0x7d5536a06b5fbe4c51e6995bdb0543b7887b3da4",
+  "name": "postgres",
+  "networkId": "net_open_webhost",
+  "nodeName": "net-open-webhost-postgres-2b38c7",
+  "source": "catalog",
+  "status": "failed",
+  "updatedAt": "2026-07-06T17:19:59Z",
+  "vmId": "61de7cb9-bd60-44d0-8ba5-98cd90d31383"
+}

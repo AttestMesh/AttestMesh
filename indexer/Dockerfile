@@ -16,9 +16,20 @@ COPY indexer indexer
 WORKDIR /build/indexer
 RUN cargo build --release --bin attestmesh-indexer && strip target/release/attestmesh-indexer
 
+FROM rust:1-bookworm AS registration-helper
+WORKDIR /build
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        pkg-config libssl-dev protobuf-compiler \
+    && rm -rf /var/lib/apt/lists/*
+COPY sidecar sidecar
+WORKDIR /build/sidecar
+RUN cargo build --release --bin attestmesh-registration-calldata \
+    && strip target/release/attestmesh-registration-calldata
+
 FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates libssl3 \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=builder /build/indexer/target/release/attestmesh-indexer /usr/local/bin/attestmesh-indexer
+COPY --from=registration-helper /build/sidecar/target/release/attestmesh-registration-calldata /usr/local/bin/attestmesh-registration-calldata
 ENTRYPOINT ["/usr/local/bin/attestmesh-indexer"]

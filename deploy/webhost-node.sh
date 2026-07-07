@@ -94,6 +94,7 @@ _ensure_secrets() {
     umask 077
     cat > "$SECRETS_FILE" <<EOF
 TEE_DAEMON_TOKEN=$(openssl rand -hex 32)
+WEBHOST_MCP_TOKEN=$(openssl rand -hex 32)
 NEXTAUTH_SECRET=$(openssl rand -hex 32)
 RUNYARD_CALLBACK_SECRET=$(openssl rand -hex 32)
 GITHUB_ID=$gh_id
@@ -118,7 +119,7 @@ EOF
   # shellcheck disable=SC1090
   source "$SECRETS_FILE"
   local k
-  for k in TEE_DAEMON_TOKEN NEXTAUTH_SECRET GITHUB_ID GITHUB_SECRET CLOUDFLARE_API_TOKEN REDPILL_API_KEY VENICE_API_KEY RUNYARD_CALLBACK_SECRET; do
+  for k in TEE_DAEMON_TOKEN WEBHOST_MCP_TOKEN NEXTAUTH_SECRET GITHUB_ID GITHUB_SECRET CLOUDFLARE_API_TOKEN REDPILL_API_KEY VENICE_API_KEY RUNYARD_CALLBACK_SECRET; do
     [ -n "${!k:-}" ] || die "secret $k not set in $SECRETS_FILE"
   done
 }
@@ -152,12 +153,13 @@ _box_run() {
   scp -o BatchMode=yes -q "$HERE/webhost-node-box.py" "$BOX_HOST:/tmp/webhost-node-box.py"
   {
     printf 'E_CHAIN_ID=%q\n' "$CHAIN_ID"
-    printf 'E_RPC_URL=%q\n' "$RPC_URL"
-    printf 'E_BUNDLER_URL=%q\n' "${BUNDLER_URL:-$RPC_URL}"
+    printf 'E_RPC_URL=%q\n' "${CVM_RPC_URL:-$RPC_URL}"
+    printf 'E_BUNDLER_URL=%q\n' "${CVM_BUNDLER_URL:-${BUNDLER_URL:-$RPC_URL}}"
     printf 'E_GAS_POLICY_ID=%q\n' "${GAS_POLICY_ID:-}"
     printf 'E_INDEXER_REGISTRY_ADDR=%q\n' "$INDEXER_REGISTRY_ADDR"
     printf 'E_GATEWAY_DOMAIN=%q\n' "$GATEWAY_DOMAIN"
     printf 'E_TEE_DAEMON_TOKEN=%q\n' "$TEE_DAEMON_TOKEN"
+    printf 'E_WEBHOST_MCP_TOKEN=%q\n' "$WEBHOST_MCP_TOKEN"
     printf 'E_GITHUB_ID=%q\n' "$GITHUB_ID"
     printf 'E_GITHUB_SECRET=%q\n' "$GITHUB_SECRET"
     printf 'E_NEXTAUTH_SECRET=%q\n' "$NEXTAUTH_SECRET"

@@ -1,0 +1,64 @@
+# confidential-sandboxes daemon, enrolled as a Path-A member of net_open_webhost.
+services:
+  sidecar:
+    image: ghcr.io/attestmesh/cluster-mesh-agent@sha256:f455ad9e778573080459eb9e46af269547d72d3624cbcf6d21e4a279c0527284
+    restart: unless-stopped
+    environment:
+      - CHAIN_ID=${CHAIN_ID}
+      - RPC_URL=${RPC_URL}
+      - BUNDLER_URL=${BUNDLER_URL}
+      - GAS_POLICY_ID=${GAS_POLICY_ID}
+      - INDEXER_REGISTRY_ADDR=${INDEXER_REGISTRY_ADDR}
+      - GATEWAY_DOMAIN=${GATEWAY_DOMAIN}
+      - DSTACK_SOCKET=/var/run/dstack.sock
+      - PEER_ENVELOPE_FALLBACK=true
+      - HEALTH_HTTP_ADDR=0.0.0.0:9090
+      - LOG_FORMAT=pretty
+      - LOG_LEVEL=info,cluster_mesh_agent=debug
+    volumes:
+      - /var/run/dstack.sock:/var/run/dstack.sock
+    ports:
+      - "9090:9090"
+      - "51900:51900"
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun
+
+  sandboxd:
+    image: ghcr.io/dmvt/confidential-sandboxes@sha256:79271b4ca6748f61623c6b1ff2dde39fe1803fa69398170bbfb70ef3f1aa0898
+    restart: unless-stopped
+    environment:
+      SANDBOX_DAEMON_TOKEN: ${SANDBOX_DAEMON_TOKEN:?set in the CVM env; gateway-exposed control API}
+      PUBLIC_BASE_URL: ${PUBLIC_BASE_URL}
+      ONCHAIN_CLUSTER_DIAMOND: ${ONCHAIN_CLUSTER_DIAMOND}
+      DSTACK_SOCKET: /var/run/dstack.sock
+      # Registry creds (CVM-sealed) so the daemon can pull PRIVATE images for runsc workloads.
+      DSTACK_DOCKER_USERNAME: ${DSTACK_DOCKER_USERNAME}
+      DSTACK_DOCKER_PASSWORD: ${DSTACK_DOCKER_PASSWORD}
+      DSTACK_DOCKER_REGISTRY: ${DSTACK_DOCKER_REGISTRY}
+    volumes:
+      - /var/run/dstack.sock:/var/run/dstack.sock:ro
+      - /var/run/docker.sock:/var/run/docker.sock
+    cap_add:
+      - SYS_ADMIN
+    security_opt:
+      - seccomp=unconfined
+      - apparmor=unconfined
+    ports:
+      - "8080:8080"
+
+  registration-calldata:
+    image: ghcr.io/dmvt/attestmesh-indexer@sha256:d99b1d207e0df8bfdf6fbac5b001142307475ac9a5b1b88b730b7edabd4283e5
+    restart: "no"
+    depends_on:
+      - sidecar
+    entrypoint: ["/usr/local/bin/attestmesh-registration-calldata"]
+    environment:
+      - CLUSTER=${CLUSTER}
+      - DSTACK_SOCKET=/var/run/dstack.sock
+      - REGISTRATION_HELPER_ADDR=0.0.0.0:9092
+    ports:
+      - "9092:9092"
+    volumes:
+      - /var/run/dstack.sock:/var/run/dstack.sock

@@ -1,4 +1,4 @@
-# Fugu-router node: LiteLLM proxy pooling Sakana Fugu subscription keys (+ PAYG fallback)
+# Fugu-router node: LiteLLM proxy pooling Sakana Fugu subscription keys
 # as ONE strictly MESH-ONLY AttestMesh node on C3. No tailnet: the LiteLLM Admin UI is
 # unused, and the Langfuse dashboard lives on its own CVM (langfuse-node). Data services
 # are EXTERNAL cluster nodes reached over the wireguard mesh via sidecar-netns socat
@@ -6,7 +6,9 @@
 # OUTBOUND through the :18420 forwarder to the langfuse-node CVM. Gateway OFF, bridge
 # networking; nothing published except sidecar :9090 (health) + :51900 (wg transport).
 #
-# Mesh endpoints:  <mesh-ip>:18410 = LiteLLM API (Hermes base URL, LITELLM_MASTER_KEY auth)
+# Mesh endpoints:  <mesh-ip>:18410 = Fugu session router + LiteLLM-compatible API
+#                                      (Hermes base URL, LITELLM_MASTER_KEY auth)
+#                                      dashboard: /fugu/dashboard
 #                  (:18430 reserved: future ACP adapter)
 # Langfuse:        litellm -> sidecar:18420 -> ${LANGFUSE_NODE_IP}:18420 (langfuse-node).
 #                  The langfuse-specific risks (r2 multipart, presigned media URLs)
@@ -27,7 +29,7 @@
 
 services:
   sidecar:
-    image: ghcr.io/attestmesh/cluster-mesh-agent@sha256:db0a74f5cb68aab6441ac187522276999fc45ee760db3ae3dea0240e86d5c1af
+    image: ghcr.io/attestmesh/cluster-mesh-agent@sha256:f455ad9e778573080459eb9e46af269547d72d3624cbcf6d21e4a279c0527284
     restart: unless-stopped
     environment:
       # MEMBER_CONTRACT intentionally unset: the sidecar self-discovers the app_id.
@@ -193,7 +195,7 @@ services:
   #    Its entrypoint CSK-derives the redis password over the agent gRPC before exec.
   #    DSN is the multi-host pg-ha forwarder path (survives node rolls/failover). ──
   litellm:
-    image: ghcr.io/attestmesh/fugu-router@sha256:b195f4e3082e99d2861fd56b18f458714c938833ce44018fe7ea9493b750fb42 # pinned 2026-07-04 r3 (orchestration extraction)
+    image: ghcr.io/attestmesh/fugu-router@sha256:be9b0b90f408bb3ea59ae9acfdee9f65ad8f914b40d0cdf4942da20cb3435d80 # pinned 2026-07-06 stream ledger capture
     restart: unless-stopped
     depends_on:
       - sidecar
@@ -210,7 +212,34 @@ services:
       - SAKANA_SUB_1_KEY=${SAKANA_SUB_1_KEY}
       - SAKANA_SUB_2_KEY=${SAKANA_SUB_2_KEY}
       - SAKANA_SUB_3_KEY=${SAKANA_SUB_3_KEY}
-      - SAKANA_PAYG_KEY=${SAKANA_PAYG_KEY}
+      - FUGU_ACCOUNT_COUNT=3
+      - FUGU_SUB_1_ENABLED=true
+      - FUGU_SUB_2_ENABLED=true
+      - FUGU_SUB_3_ENABLED=${FUGU_SUB_3_ENABLED}
+      - FUGU_SUB_1_LABEL=${FUGU_SUB_1_LABEL}
+      - FUGU_SUB_2_LABEL=${FUGU_SUB_2_LABEL}
+      - FUGU_SUB_3_LABEL=${FUGU_SUB_3_LABEL}
+      - FUGU_SUB_1_BILLING_PLAN=${FUGU_SUB_1_BILLING_PLAN}
+      - FUGU_SUB_2_BILLING_PLAN=${FUGU_SUB_2_BILLING_PLAN}
+      - FUGU_SUB_3_BILLING_PLAN=${FUGU_SUB_3_BILLING_PLAN}
+      - FUGU_SUB_1_5H_RESET_ANCHOR=${FUGU_SUB_1_5H_RESET_ANCHOR}
+      - FUGU_SUB_2_5H_RESET_ANCHOR=${FUGU_SUB_2_5H_RESET_ANCHOR}
+      - FUGU_SUB_3_5H_RESET_ANCHOR=${FUGU_SUB_3_5H_RESET_ANCHOR}
+      - FUGU_SUB_1_WEEKLY_RESET_ANCHOR=${FUGU_SUB_1_WEEKLY_RESET_ANCHOR}
+      - FUGU_SUB_2_WEEKLY_RESET_ANCHOR=${FUGU_SUB_2_WEEKLY_RESET_ANCHOR}
+      - FUGU_SUB_3_WEEKLY_RESET_ANCHOR=${FUGU_SUB_3_WEEKLY_RESET_ANCHOR}
+      - FUGU_SUB_1_MONTHLY_RESET_ANCHOR=${FUGU_SUB_1_MONTHLY_RESET_ANCHOR}
+      - FUGU_SUB_2_MONTHLY_RESET_ANCHOR=${FUGU_SUB_2_MONTHLY_RESET_ANCHOR}
+      - FUGU_SUB_3_MONTHLY_RESET_ANCHOR=${FUGU_SUB_3_MONTHLY_RESET_ANCHOR}
+      - FUGU_SUB_1_5H_ALLOWANCE_USAGE_UNITS=${FUGU_SUB_1_5H_ALLOWANCE_USAGE_UNITS}
+      - FUGU_SUB_2_5H_ALLOWANCE_USAGE_UNITS=${FUGU_SUB_2_5H_ALLOWANCE_USAGE_UNITS}
+      - FUGU_SUB_3_5H_ALLOWANCE_USAGE_UNITS=${FUGU_SUB_3_5H_ALLOWANCE_USAGE_UNITS}
+      - FUGU_SUB_1_WEEKLY_ALLOWANCE_USAGE_UNITS=${FUGU_SUB_1_WEEKLY_ALLOWANCE_USAGE_UNITS}
+      - FUGU_SUB_2_WEEKLY_ALLOWANCE_USAGE_UNITS=${FUGU_SUB_2_WEEKLY_ALLOWANCE_USAGE_UNITS}
+      - FUGU_SUB_3_WEEKLY_ALLOWANCE_USAGE_UNITS=${FUGU_SUB_3_WEEKLY_ALLOWANCE_USAGE_UNITS}
+      - FUGU_SUB_1_MONTHLY_ALLOWANCE_USAGE_UNITS=${FUGU_SUB_1_MONTHLY_ALLOWANCE_USAGE_UNITS}
+      - FUGU_SUB_2_MONTHLY_ALLOWANCE_USAGE_UNITS=${FUGU_SUB_2_MONTHLY_ALLOWANCE_USAGE_UNITS}
+      - FUGU_SUB_3_MONTHLY_ALLOWANCE_USAGE_UNITS=${FUGU_SUB_3_MONTHLY_ALLOWANCE_USAGE_UNITS}
       # Router state (usage-based-routing-v2): redis-ha via the sidecar forwarders,
       # db 0. Password derived in-CVM by the entrypoint.
       - REDIS_HOST=sidecar
@@ -225,6 +254,55 @@ services:
       - agent-sock:/var/run/attestmesh
     expose:
       - "4000"
+
+  # Front door: OpenAI-compatible API with sticky per-session subscription placement,
+  # quota/rate-limit retry across subscription keys, and the /fugu/dashboard UI. It
+  # shares LiteLLM's network namespace so the egress firewall governs both processes.
+  session-router:
+    image: ghcr.io/attestmesh/fugu-router@sha256:be9b0b90f408bb3ea59ae9acfdee9f65ad8f914b40d0cdf4942da20cb3435d80 # pinned 2026-07-06 stream ledger capture
+    restart: unless-stopped
+    network_mode: service:litellm
+    depends_on:
+      - litellm
+    working_dir: /app
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - |
+        export DATABASE_URL="postgresql://litellm:$${LITELLM_DB_PASSWORD}@sidecar:15431/litellm"
+        exec python3 -m uvicorn fugu_session_router:app --host 0.0.0.0 --port 4010
+    environment:
+      - PYTHONPATH=/app
+      - LITELLM_MASTER_KEY=${LITELLM_MASTER_KEY}
+      - LITELLM_DB_PASSWORD=${LITELLM_DB_PASSWORD}
+      - FUGU_LITELLM_UPSTREAM=http://127.0.0.1:4000
+      - FUGU_ACCOUNT_COUNT=3
+      - FUGU_SUB_1_ENABLED=true
+      - FUGU_SUB_2_ENABLED=true
+      - FUGU_SUB_3_ENABLED=${FUGU_SUB_3_ENABLED}
+      - FUGU_SUB_1_LABEL=${FUGU_SUB_1_LABEL}
+      - FUGU_SUB_2_LABEL=${FUGU_SUB_2_LABEL}
+      - FUGU_SUB_3_LABEL=${FUGU_SUB_3_LABEL}
+      - FUGU_SUB_1_BILLING_PLAN=${FUGU_SUB_1_BILLING_PLAN}
+      - FUGU_SUB_2_BILLING_PLAN=${FUGU_SUB_2_BILLING_PLAN}
+      - FUGU_SUB_3_BILLING_PLAN=${FUGU_SUB_3_BILLING_PLAN}
+      - FUGU_SUB_1_5H_RESET_ANCHOR=${FUGU_SUB_1_5H_RESET_ANCHOR}
+      - FUGU_SUB_2_5H_RESET_ANCHOR=${FUGU_SUB_2_5H_RESET_ANCHOR}
+      - FUGU_SUB_3_5H_RESET_ANCHOR=${FUGU_SUB_3_5H_RESET_ANCHOR}
+      - FUGU_SUB_1_WEEKLY_RESET_ANCHOR=${FUGU_SUB_1_WEEKLY_RESET_ANCHOR}
+      - FUGU_SUB_2_WEEKLY_RESET_ANCHOR=${FUGU_SUB_2_WEEKLY_RESET_ANCHOR}
+      - FUGU_SUB_3_WEEKLY_RESET_ANCHOR=${FUGU_SUB_3_WEEKLY_RESET_ANCHOR}
+      - FUGU_SUB_1_MONTHLY_RESET_ANCHOR=${FUGU_SUB_1_MONTHLY_RESET_ANCHOR}
+      - FUGU_SUB_2_MONTHLY_RESET_ANCHOR=${FUGU_SUB_2_MONTHLY_RESET_ANCHOR}
+      - FUGU_SUB_3_MONTHLY_RESET_ANCHOR=${FUGU_SUB_3_MONTHLY_RESET_ANCHOR}
+      - FUGU_SUB_1_5H_ALLOWANCE_USAGE_UNITS=${FUGU_SUB_1_5H_ALLOWANCE_USAGE_UNITS}
+      - FUGU_SUB_2_5H_ALLOWANCE_USAGE_UNITS=${FUGU_SUB_2_5H_ALLOWANCE_USAGE_UNITS}
+      - FUGU_SUB_3_5H_ALLOWANCE_USAGE_UNITS=${FUGU_SUB_3_5H_ALLOWANCE_USAGE_UNITS}
+      - FUGU_SUB_1_WEEKLY_ALLOWANCE_USAGE_UNITS=${FUGU_SUB_1_WEEKLY_ALLOWANCE_USAGE_UNITS}
+      - FUGU_SUB_2_WEEKLY_ALLOWANCE_USAGE_UNITS=${FUGU_SUB_2_WEEKLY_ALLOWANCE_USAGE_UNITS}
+      - FUGU_SUB_3_WEEKLY_ALLOWANCE_USAGE_UNITS=${FUGU_SUB_3_WEEKLY_ALLOWANCE_USAGE_UNITS}
+      - FUGU_SUB_1_MONTHLY_ALLOWANCE_USAGE_UNITS=${FUGU_SUB_1_MONTHLY_ALLOWANCE_USAGE_UNITS}
+      - FUGU_SUB_2_MONTHLY_ALLOWANCE_USAGE_UNITS=${FUGU_SUB_2_MONTHLY_ALLOWANCE_USAGE_UNITS}
+      - FUGU_SUB_3_MONTHLY_ALLOWANCE_USAGE_UNITS=${FUGU_SUB_3_MONTHLY_ALLOWANCE_USAGE_UNITS}
 
   # LiteLLM egress is deny-by-default: ONLY the resolved Sakana API CIDRs on :443
   # (narrowest observed set, short re-resolve — risk 2), the internal pg/redis/langfuse
@@ -245,7 +323,7 @@ services:
     cap_add:
       - NET_ADMIN
 
-  # ── Mesh-only endpoint, bound to the wireguard IP inside the sidecar netns. ──
+  # Mesh-only endpoint, bound to the wireguard IP inside the sidecar netns.
   mesh-proxy-litellm:
     image: alpine/socat:1.8.0.0
     restart: unless-stopped
@@ -253,6 +331,7 @@ services:
     depends_on:
       - sidecar
       - litellm
+      - session-router
     entrypoint:
       - /bin/sh
       - -ec
@@ -263,7 +342,7 @@ services:
           [ -n "$$ip" ] && break
           sleep 1
         done
-        exec socat TCP-LISTEN:18410,fork,reuseaddr,bind="$${ip}" TCP:litellm:4000
+        exec socat TCP-LISTEN:18410,fork,reuseaddr,bind="$${ip}" TCP:litellm:4010
     read_only: true
     cap_drop:
       - ALL

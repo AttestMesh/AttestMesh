@@ -209,8 +209,8 @@ _box_run() {
   scp -o BatchMode=yes -q "$HERE/telegram-sync-node-box.py" "$BOX_HOST:/tmp/telegram-sync-node-box.py"
   {
     printf 'E_CHAIN_ID=%q\n' "$CHAIN_ID"
-    printf 'E_RPC_URL=%q\n' "$RPC_URL"
-    printf 'E_BUNDLER_URL=%q\n' "${BUNDLER_URL:-$RPC_URL}"
+    printf 'E_RPC_URL=%q\n' "${CVM_RPC_URL:-$RPC_URL}"
+    printf 'E_BUNDLER_URL=%q\n' "${CVM_BUNDLER_URL:-${BUNDLER_URL:-$RPC_URL}}"
     printf 'E_GAS_POLICY_ID=%q\n' "${GAS_POLICY_ID:-}"
     printf 'E_INDEXER_REGISTRY_ADDR=%q\n' "$INDEXER_REGISTRY_ADDR"
     printf 'E_GATEWAY_DOMAIN=%q\n' "$GATEWAY_DOMAIN"

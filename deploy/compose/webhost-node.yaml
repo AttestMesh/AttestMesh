@@ -53,15 +53,16 @@ services:
   # API is gateway-exposed, so TEE_DAEMON_TOKEN is REQUIRED (the image refuses
   # to boot without it). RUNYARD_HUB_TOKEN stays sealed in this cluster.
   tee-daemon:
-    image: ghcr.io/dmvt/webhost-control:v3@sha256:2451013754f1fba604f56c9b426c2fd02bc60e4491f1810e18b03340ce95d3a5
+    image: ghcr.io/dmvt/webhost-control@sha256:546f964ed3724e51d16390d22cc462489d2f73fe45e3365429b9c32c376329f0
     environment:
       TEE_DAEMON_TOKEN: ${TEE_DAEMON_TOKEN}
+      WEBHOST_MCP_TOKEN: ${WEBHOST_MCP_TOKEN}
       DAEMON_VOLUME_NAME: ${DAEMON_VOLUME_NAME:-dstack_daemon_data}
       DAEMON_VOLUME_MOUNT: ${DAEMON_VOLUME_MOUNT:-/var/lib/tee-daemon}
-      # dstack-0.5.11 does not ship Docker's `runsc` runtime yet. Keep the
-      # other tenant hardening controls live, but use Docker's default runtime
-      # until the base image has gVisor configured.
-      DAEMON_CONTAINER_RUNTIME: ""
+      # gVisor is installed and registered by the measured pre_launch_script
+      # in deploy/webhost-node-box.py before Docker Compose starts.
+      DAEMON_CONTAINER_RUNTIME: "runsc"
+      DAEMON_TELEMETRY_DIR: /var/lib/tee-daemon/telemetry
       # Source-privacy brief output (shared RO with concierge) + tree-hash cache.
       BRIEFS_DIR: /data/briefs
       DIGEST_CACHE_DIR: /data/digests
