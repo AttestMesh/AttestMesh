@@ -113,27 +113,7 @@ async function handlePimlico(
     logger,
   });
 
-  // Persist a decision log to KV (readable via GET /pimlico-status); Cloudflare
-  // tail misses these subrequests, so this is our observability into the flow.
-  const record = async (outcome: Record<string, unknown>) => {
-    try {
-      const ptr = { at: new Date().toISOString(), ...outcome };
-      await env.MEMBER_PROVENANCE_CACHE.put("log:pimlico:last", JSON.stringify(ptr), {
-        expirationTtl: 86400,
-      });
-    } catch {
-      /* best-effort */
-    }
-  };
-
   if (!verify.ok) {
-    await record({
-      stage: "verify",
-      ok: false,
-      reason: verify.reason,
-      computedHead: verify.computedHead,
-      receivedHead: verify.receivedHead,
-    });
     return json({ error: "bad-signature", reason: verify.reason }, 401);
   }
 
@@ -143,7 +123,6 @@ async function handlePimlico(
   } catch (err) {
     if (err instanceof DecodeError || err instanceof SyntaxError) {
       logger.warn("pimlico-bad-body", { reason: String(err) });
-      await record({ stage: "parse", ok: false, reason: String(err).slice(0, 80) });
       // Unknown/malformed events are refused sponsorship, not 4xx'd — Pimlico
       // treats non-200s as transport errors and may retry.
       return json({ sponsor: false });
@@ -163,13 +142,6 @@ async function handlePimlico(
   logger.info("pimlico-decision", {
     sponsor: decision.approved,
     ...(decision.approved ? {} : { reason: decision.reason }),
-    sender: parsed.userOperation.sender,
-  });
-  await record({
-    stage: "decision",
-    ok: true,
-    sponsor: decision.approved,
-    denyReason: decision.approved ? undefined : decision.reason,
     sender: parsed.userOperation.sender,
   });
   return json({ sponsor: decision.approved });
@@ -261,15 +233,6 @@ export default {
       }
       if (request.method === "POST" && pathname === "/pimlico") {
         return await handlePimlico(request, config, env, logger);
-      }
-      if (request.method === "GET" && pathname === "/pimlico-status") {
-        // Token-gated observability into the last webhook decision (TEE blocks the
-        // sidecar's container logs, so this is our window during the fleet roll).
-        if (url.searchParams.get("token") !== config.alchemyWebhookToken) {
-          return json({ error: "unauthorized" }, 401);
-        }
-        const v = await env.MEMBER_PROVENANCE_CACHE.get("log:pimlico:last");
-        return json(v ? JSON.parse(v) : { empty: true });
       }
       if (request.method === "GET" && pathname === "/check") {
         return await handleCheck(url, config, env, logger);

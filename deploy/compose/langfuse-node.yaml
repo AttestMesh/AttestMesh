@@ -25,7 +25,7 @@
 
 services:
   sidecar:
-    image: ghcr.io/attestmesh/cluster-mesh-agent@sha256:db0a74f5cb68aab6441ac187522276999fc45ee760db3ae3dea0240e86d5c1af
+    image: ghcr.io/attestmesh/cluster-mesh-agent@sha256:f455ad9e778573080459eb9e46af269547d72d3624cbcf6d21e4a279c0527284
     restart: unless-stopped
     environment:
       # MEMBER_CONTRACT intentionally unset: the sidecar self-discovers the app_id.
