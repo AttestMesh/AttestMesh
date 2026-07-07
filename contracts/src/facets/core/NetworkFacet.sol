@@ -32,4 +32,18 @@ contract NetworkFacet is INetwork, ClusterAccess {
         IAttest(address(this))._setWgMirror(memberId, wgPubKey);
         emit WgKeyPublished(memberId, wgPubKey);
     }
+
+    /// @notice Member publishes / rotates its Ed25519 heartbeat key. Unconditional
+    ///         overwrite (rotation allowed). No MemberStorage mirror — peers read it
+    ///         directly, so mesh bring-up needs no PeerEndpoint envelope
+    ///         (ed25519-onchain-key spec).
+    function publishEd25519Key(bytes32 ed25519Key) external onlyClusterMember {
+        bytes32 memberId = _senderMemberId();
+        NetworkStorage.layout().ed25519Keys[memberId] = ed25519Key;
+        emit Ed25519KeyPublished(memberId, ed25519Key);
+    }
+
+    function ed25519KeyOf(bytes32 memberId) external view returns (bytes32) {
+        return NetworkStorage.layout().ed25519Keys[memberId];
+    }
 }
