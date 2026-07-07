@@ -12,7 +12,7 @@
 //! envelope exchange), heartbeat send/recv, CSK originate-or-pull, the peer-control
 //! gRPC server (mesh-only), and the app-facing agent gRPC server (UDS).
 
-use crate::chain::{bundler::BundlerClient, dstack_facet, message_facet, userop, ChainClient};
+use crate::chain::{bundler::BundlerClient, dstack_facet, message_facet, network_facet, userop, ChainClient};
 use crate::config::Config;
 use crate::dstack::DstackRuntime;
 use crate::envelopes::{self, PeerEndpoint};
@@ -208,6 +208,14 @@ pub async fn launch(
     // 2. heartbeats (verification activates per-peer once its Ed25519 key arrives).
     crate::heartbeat::spawn(shared.clone());
 
+    // 2b. Publish our Ed25519 heartbeat key on chain (ed25519-onchain-key spec) so
+    // peers learn it via a read, not a sponsored envelope. One idempotent op per node
+    // lifetime; retries on paymaster/RPC hiccups, then exits.
+    {
+        let ctx = ctx.clone();
+        tokio::spawn(async move { publish_own_ed25519_loop(ctx).await });
+    }
+
     // Indexer pushes wake the reconcile pass early; polling remains the fallback.
     let (wake_tx, wake_rx) = tokio::sync::mpsc::channel::<()>(8);
 
@@ -393,19 +401,29 @@ async fn reconcile_once(
             );
         }
 
-        // Restart/late-entry path: apply a persisted (or early-arrived) key to the
-        // peer-table entry the configure block just ensured exists.
-        {
-            let mut peers = ctx.shared.peers.lock().await;
-            if peers.ed25519_of(member_id).is_none() {
-                if let Some(ed) = ctx.learned_keys.lock().await.get(member_id).copied() {
-                    peers.set_ed25519(member_id, ed);
-                }
+        // Resolve the peer's Ed25519 heartbeat key. Preferred source is ON CHAIN
+        // (ed25519-onchain-key spec) — a plain read, no sponsored message. A member
+        // running the new sidecar has published it, so the whole envelope exchange
+        // below is skipped. Fall back to the sealed learned-keys cache (envelope-era)
+        // only for peers whose key is not yet on chain (old sidecar / pre-cut cluster).
+        if ctx.shared.peers.lock().await.ed25519_of(member_id).is_none() {
+            let on_chain = ctx
+                .chain
+                .ed25519_key_of(cluster, B256::from(*member_id))
+                .await
+                .unwrap_or(B256::ZERO);
+            if on_chain != B256::ZERO {
+                ctx.shared.peers.lock().await.set_ed25519(member_id, on_chain.0);
+            } else if let Some(ed) = ctx.learned_keys.lock().await.get(member_id).copied() {
+                ctx.shared.peers.lock().await.set_ed25519(member_id, ed);
             }
         }
 
-        // Envelope exchange: send ours if never sent, or — with exponential backoff —
-        // while the peer's Ed25519 key is still unknown (it polls logs symmetrically).
+        // Envelope FALLBACK (mixed fleet only): if the peer's key is still unknown —
+        // i.e. it hasn't published on chain — send ours via the sponsored envelope so
+        // an un-upgraded peer can still learn it. Backed off exponentially. Once every
+        // node is on the new sidecar this branch never fires (peer_ed_known is true
+        // from the chain read above).
         let peer_ed_known = ctx
             .shared
             .peers
@@ -631,6 +649,38 @@ async fn poll_envelopes(
         }
     }
     Ok(())
+}
+
+/// Publish our Ed25519 heartbeat key on chain once, idempotently (ed25519-onchain-key
+/// spec). Skips if already equal; retries with backoff on paymaster/RPC failure, then
+/// exits. One sponsored op per node lifetime — replaces the per-peer envelope storm.
+async fn publish_own_ed25519_loop(ctx: Arc<Ctx>) {
+    let self_id = B256::from(ctx.shared.self_member_id);
+    let want = B256::from(ctx.shared.keys.ed25519_pub);
+    let mut backoff = Duration::from_secs(10);
+    loop {
+        match ctx.chain.ed25519_key_of(ctx.shared.cluster, self_id).await {
+            Ok(cur) if cur == want => {
+                tracing::info!("Ed25519 heartbeat key already published on chain");
+                return;
+            }
+            Ok(_) => match ctx
+                .submit_op(network_facet::build_publish_ed25519_calldata(want))
+                .await
+            {
+                Ok(tx) => {
+                    tracing::info!(tx = %tx, "published Ed25519 heartbeat key on chain");
+                    return;
+                }
+                Err(e) => tracing::warn!(error = ?e, "publishEd25519Key failed; retrying"),
+            },
+            // Revert here means the cluster predates the ed25519 cut — retry slowly in
+            // case the cut lands later; harmless (one read per backoff interval).
+            Err(e) => tracing::warn!(error = ?e, "read ed25519KeyOf(self) failed; retrying"),
+        }
+        tokio::time::sleep(backoff).await;
+        backoff = (backoff * 2).min(Duration::from_secs(300));
+    }
 }
 
 /// CSK lifecycle (master spec §8): restart-unseal, originate (memberIds[0]) or

@@ -22,6 +22,7 @@ sol! {
         function memberCount() external view returns (uint256);
         function cskCommitment() external view returns (bytes32);
         function xPubKeyOf(bytes32 memberId) external view returns (bytes32);
+        function ed25519KeyOf(bytes32 memberId) external view returns (bytes32);
         function listMembers() external view returns (bytes32[] memory);
         function meshCidr() external view returns (uint32 ip, uint8 prefix);
         function meshIpOf(bytes32 memberId) external view returns (uint32);
@@ -76,6 +77,7 @@ sol! {
     ) external returns (bytes32);
 
     function publishWgKey(bytes32 wgPubKey) external;
+    function publishEd25519Key(bytes32 ed25519Key) external;
     function send(bytes32 recipientMemberId, bytes32 envelopeId, bytes ciphertext) external;
     function setCskCommitment(bytes32 commitment) external;
 
