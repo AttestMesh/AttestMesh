@@ -14,13 +14,45 @@ BOX_HOST="${BOX_HOST:-ubuntu@173.231.234.133}"
 BOX_PY="${BOX_PY:-/opt/dstack-mcp/venv/bin/python}"
 BOX_DEPLOYER_KEY="${BOX_DEPLOYER_KEY:-/root/.attestmesh/base-deployer.json}"
 BOX_RPC="${BOX_RPC:-https://base-rpc.publicnode.com}"
-COMPOSE="${COMPOSE:-$ROOT/deploy/compose/generic-node.yaml}"
+COMPOSE="${COMPOSE:-$ROOT/deploy/compose/agent-session-mcp-node.yaml}"
 GATEWAY_DOMAIN="${GATEWAY_DOMAIN:-gateway.attestmesh.xyz}"
 
 export BOX_VCPU="${BOX_VCPU:-2}" BOX_MEM="${BOX_MEM:-4096}" BOX_DISK="${BOX_DISK:-40}"
 export BOX_PORTS="${BOX_PORTS:-[]}" BOX_GATEWAY_ENABLED="${BOX_GATEWAY_ENABLED:-true}" BOX_NET_MODE="${BOX_NET_MODE:-bridge}"
 
-STATE="$LOGDIR/generic-node-${NODE}.state"
+# --- App-tier secrets/config (sealed per-var as ${VAR} in the compose) --------------
+# Auto-create strong app secrets on first run; INGEST_TOKEN must stay stable across rolls.
+SECRETS_FILE="${SECRETS_FILE:-$HOME/.attestmesh/agent-session-mcp.env}"
+REDPILL_KEY_FILE="${REDPILL_KEY_FILE:-$HOME/.attestmesh/redpill-key}"
+HINDSIGHT_STATE="${HINDSIGHT_STATE:-$ROOT/deploy/logs/hindsight-node-hindsight-node.state}"
+if [ ! -s "$SECRETS_FILE" ]; then
+  install -d -m 700 "$(dirname "$SECRETS_FILE")"
+  ( umask 077; printf 'APP_DB_PASSWORD=%s\nINGEST_TOKEN=%s\n' "$(openssl rand -hex 24)" "$(openssl rand -hex 24)" > "$SECRETS_FILE" )
+  log "generated app secrets at $SECRETS_FILE"
+fi
+set -a; source "$SECRETS_FILE"; set +a
+: "${APP_DB_PASSWORD:?set APP_DB_PASSWORD in $SECRETS_FILE}"
+: "${INGEST_TOKEN:?set INGEST_TOKEN in $SECRETS_FILE}"
+EMBEDDING_URL="${EMBEDDING_URL:-https://api.redpill.ai/v1}"
+EMBEDDING_MODEL="${EMBEDDING_MODEL:-qwen/qwen3-embedding-8b}"
+EMBEDDING_DIM="${EMBEDDING_DIM:-1024}"
+if [ -z "${EMBEDDING_API_KEY:-}" ]; then
+  [ -s "$REDPILL_KEY_FILE" ] || die "no EMBEDDING_API_KEY and no RedPill key at $REDPILL_KEY_FILE"
+  EMBEDDING_API_KEY="$(tr -d '[:space:]' < "$REDPILL_KEY_FILE")"
+fi
+ALLOW_BASE_URL="$EMBEDDING_URL"
+HINDSIGHT_URL="${HINDSIGHT_URL:-http://sidecar:18888}"
+HINDSIGHT_BANK="${HINDSIGHT_BANK:-agent-sessions}"
+HINDSIGHT_TOKEN="${HINDSIGHT_TOKEN:-$(grep -E '^TAK=' "$HINDSIGHT_STATE" 2>/dev/null | head -1 | cut -d= -f2-)}"
+[ -n "$HINDSIGHT_TOKEN" ] || die "could not resolve HINDSIGHT_TOKEN (TAK) from $HINDSIGHT_STATE"
+DATABASE_URL="${DATABASE_URL:-postgresql://agent_sessions:${APP_DB_PASSWORD}@sidecar:15431,sidecar:15432,sidecar:15433/agent_sessions?target_session_attrs=read-write&connect_timeout=5}"
+
+# Seed cluster identity from a live C3 state file if not already exported.
+_PGHA_STATE="$ROOT/deploy/logs/pg-ha-pg-ha.state"
+CLUSTER="${CLUSTER:-$(grep -E '^CLUSTER=' "$_PGHA_STATE" 2>/dev/null | head -1 | cut -d= -f2-)}"
+MEMBER_IMPL="${MEMBER_IMPL:-$(grep -E '^MEMBER_IMPL=' "$_PGHA_STATE" 2>/dev/null | head -1 | cut -d= -f2-)}"
+
+STATE="$LOGDIR/agent-session-mcp-node-${NODE}.state"
 ZERO32=0x0000000000000000000000000000000000000000000000000000000000000000
 
 _save() {
@@ -94,7 +126,7 @@ _box_run() {
   gtok=$(grep  -E '^\s*token\s*='    "$HOME/.teesql/ghcr-pull.toml" 2>/dev/null | head -1 | sed -E 's/.*=\s*//' | tr -d "\"' ")
   [ -n "$gtok" ] || die "no ghcr token in ~/.teesql/ghcr-pull.toml"
   scp -o BatchMode=yes -q "$COMPOSE" "$BOX_HOST:/tmp/${NODE}.yaml"
-  scp -o BatchMode=yes -q "$HERE/generic-node-box.py" "$BOX_HOST:/tmp/generic-node-box.py"
+  scp -o BatchMode=yes -q "$HERE/agent-session-mcp-node-box.py" "$BOX_HOST:/tmp/agent-session-mcp-node-box.py"
   {
     printf 'E_CHAIN_ID=%q\n' "${CHAIN_ID:-}"
     printf 'E_RPC_URL=%q\n' "${RPC_URL:-}"
@@ -104,18 +136,28 @@ _box_run() {
     printf 'E_GATEWAY_DOMAIN=%q\n' "$GATEWAY_DOMAIN"
     printf 'E_CLUSTER=%q\n' "${CLUSTER:-}"
     printf 'E_MEMBER_IMPL=%q\n' "${MEMBER_IMPL:-}"
-    printf 'E_APP_ENV_B64=%q\n' "$APP_ENV_B64"
+    printf 'E_APP_DB_PASSWORD=%q\n' "${APP_DB_PASSWORD:-}"
+    printf 'E_DATABASE_URL=%q\n' "${DATABASE_URL:-}"
+    printf 'E_HINDSIGHT_URL=%q\n' "${HINDSIGHT_URL:-}"
+    printf 'E_HINDSIGHT_TOKEN=%q\n' "${HINDSIGHT_TOKEN:-}"
+    printf 'E_HINDSIGHT_BANK=%q\n' "${HINDSIGHT_BANK:-agent-sessions}"
+    printf 'E_INGEST_TOKEN=%q\n' "${INGEST_TOKEN:-}"
+    printf 'E_EMBEDDING_URL=%q\n' "${EMBEDDING_URL:-}"
+    printf 'E_EMBEDDING_API_KEY=%q\n' "${EMBEDDING_API_KEY:-}"
+    printf 'E_EMBEDDING_MODEL=%q\n' "${EMBEDDING_MODEL:-}"
+    printf 'E_EMBEDDING_DIM=%q\n' "${EMBEDDING_DIM:-}"
+    printf 'E_ALLOW_BASE_URL=%q\n' "${ALLOW_BASE_URL:-${EMBEDDING_URL:-}}"
     printf 'E_DSTACK_DOCKER_USERNAME=%q\n' "${guser:-dmvt}"
     printf 'E_DSTACK_DOCKER_PASSWORD=%q\n' "$gtok"
     printf 'E_DSTACK_DOCKER_REGISTRY=%q\n' "ghcr.io"
   } | ssh_box "sudo BOX_NAME='$NODE' BOX_COMPOSE='/tmp/${NODE}.yaml' BOX_VCPU=$BOX_VCPU BOX_MEM=$BOX_MEM BOX_DISK=$BOX_DISK BOX_PORTS='$BOX_PORTS' BOX_GATEWAY_ENABLED='$BOX_GATEWAY_ENABLED' BOX_NET_MODE='$BOX_NET_MODE' \
-    bash -c 'set -a; . /dev/stdin; set +a; exec $BOX_PY /tmp/generic-node-box.py $mode $app_id $vm_id'"
+    bash -c 'set -a; . /dev/stdin; set +a; exec $BOX_PY /tmp/agent-session-mcp-node-box.py $mode $app_id $vm_id'"
 }
 
 _box_stop_vm() {
   local vm_id="${1:?vm_id required}"
-  scp -o BatchMode=yes -q "$HERE/generic-node-box.py" "$BOX_HOST:/tmp/generic-node-box.py"
-  ssh_box "sudo BOX_NAME='$NODE' $BOX_PY /tmp/generic-node-box.py stop '$vm_id'"
+  scp -o BatchMode=yes -q "$HERE/agent-session-mcp-node-box.py" "$BOX_HOST:/tmp/agent-session-mcp-node-box.py"
+  ssh_box "sudo BOX_NAME='$NODE' $BOX_PY /tmp/agent-session-mcp-node-box.py stop '$vm_id'"
 }
 
 _box_vm_json() {
