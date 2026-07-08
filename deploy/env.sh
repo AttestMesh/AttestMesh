@@ -15,8 +15,16 @@ _read() { tr -d '[:space:]' < "$1"; }
 
 export CHAIN_ID=8453
 export ALCHEMY_API_KEY="$(_read "$TEESQL/alchemy-api.key")"
-export RPC_URL="https://base-mainnet.g.alchemy.com/v2/${ALCHEMY_API_KEY}"
-export BUNDLER_URL="$RPC_URL"                       # Alchemy serves bundler RPC on the same endpoint
+export ALCHEMY_RPC_URL="https://base-mainnet.g.alchemy.com/v2/${ALCHEMY_API_KEY}"
+# The Alchemy app has BASE_MAINNET disabled (403 on EVERY method), which breaks the DEPLOYER's own
+# on-chain cast sends/reads — it bricked a live sandboxd roll (addComposeHash 403 while the old
+# script sailed on to UpgradeApp onto an unallowlisted hash). Route the deployer's on-chain ops
+# through a public node so rolls land; the CVM-sealed RPC/bundler stay on Alchemy for now (Alchemy
+# is being retired — that migration is a separate per-node fleet roll, not this file).
+export RPC_URL="${RPC_URL:-https://base-rpc.publicnode.com}"   # deployer host-side cast: nonce/send/call
+export CVM_RPC_URL="${CVM_RPC_URL:-$ALCHEMY_RPC_URL}"          # sealed into CVM sidecars (unchanged)
+export BUNDLER_URL="${BUNDLER_URL:-$ALCHEMY_RPC_URL}"          # AA bundler — Alchemy serves it on the same endpoint
+export CVM_BUNDLER_URL="${CVM_BUNDLER_URL:-$ALCHEMY_RPC_URL}"  # sealed into CVM sidecars (unchanged)
 export GAS_POLICY_ID="$(_read "$TEESQL/alchemy-policy.id")"
 
 export PRIVATE_KEY="$(_read "$TEESQL/global-deployer.key")"

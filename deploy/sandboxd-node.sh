@@ -197,8 +197,16 @@ update_member() {
   [ -n "$nh" ] || die "could not compute new compose_hash"
   log "new compose_hash=0x$nh"
   allowed=$(cast call "$CLUSTER" 'allowedComposeHashes(bytes32)(bool)' "0x$nh" --rpc-url "$RPC_URL" 2>/dev/null)
-  if [ "$allowed" != true ]; then
-    send_seq "sandboxd-update-addHash-${NODE}" "$CLUSTER" "addComposeHash(bytes32)" "0x$nh"
+  if [ "$allowed" = true ]; then
+    log "compose hash already allowlisted"
+  else
+    # FATAL on failure: rolling a compose the cluster hasn't allowlisted bricks the boot — the KMS
+    # refuses keys and the CVM can't unseal (hit live: RPC 403 here while the script sailed on to
+    # UpgradeApp onto an unallowlisted hash → ~3 min downtime). Verify on-chain BEFORE touching the VM.
+    send_seq "sandboxd-update-addHash-${NODE}" "$CLUSTER" "addComposeHash(bytes32)" "0x$nh" \
+      || die "addComposeHash failed — NOT proceeding to UpgradeApp (unallowlisted compose bricks the boot)"
+    allowed=$(cast call "$CLUSTER" 'allowedComposeHashes(bytes32)(bool)' "0x$nh" --rpc-url "$RPC_URL" 2>/dev/null)
+    [ "$allowed" = true ] || die "compose hash still not allowlisted after send — aborting before UpgradeApp"
   fi
   out=$(_box_run update "$X" "$VM_ID") || die "in-place update failed"
   echo "$out"
