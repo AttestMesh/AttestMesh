@@ -26,7 +26,7 @@ services:
       - /dev/net/tun
 
   sandboxd:
-    image: ghcr.io/dmvt/confidential-sandboxes@sha256:79271b4ca6748f61623c6b1ff2dde39fe1803fa69398170bbfb70ef3f1aa0898
+    image: ghcr.io/dmvt/confidential-sandboxes@sha256:c72fdc7b5ed7987e7a1fbe4efa842f3ad19d3779d41cdac7df9a01d81c42232e
     restart: unless-stopped
     environment:
       SANDBOX_DAEMON_TOKEN: ${SANDBOX_DAEMON_TOKEN:?set in the CVM env; gateway-exposed control API}
