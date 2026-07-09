@@ -61,6 +61,7 @@ bash deploy/hermes-node.sh <agent> all
 | bind | box deployer upgrades the DstackApp proxy → ClusterMember | `✔ bound … X -> <cluster>` |
 | verify | waits for on-chain registration | `✔ … memberId=0x… memberCount=N` |
 | verify-ssh | SSH banner through `<app_id>-1022.<gw>:443` | `✔ ssh gateway is reachable` |
+| register-direct | no live 4337 bundler (Alchemy dead): fetches the sidecar helper's calldata (HTTP :9092 via gateway, serial-log fallback) and the deployer sends it, paying gas | `✔` + tx status 1 |
 | verify-hermes | reads `/root/.hermes/gateway_state.json` over ssh | `✔ hermes gateway up, matrix connected` |
 
 ⚠️ **Membership is permanent** (no `removeMember` on C3 yet — see PR #3 /
@@ -95,6 +96,20 @@ bash deploy/hermes-node.sh <agent> all
 - **Sizing**: `BOX_VCPU/BOX_MEM/BOX_DISK` env overrides (defaults 4/16384/60).
 
 ## 5. Troubleshooting
+
+Maiden-deploy (tessera, 2026-07-09) lessons baked into the trio — for awareness:
+
+- **Model keys**: the fugu-router LB (`10.18.133.81:18410`) only accepts LiteLLM
+  `sk-…` virtual keys; the `LITELLM_MASTER_KEY` in `~/.attestmesh/fugu-router.env`
+  can go stale across fugu blue/green rolls. If the agent gets 401s, mint a fresh
+  per-agent virtual key (LiteLLM `/key/generate` with the CURRENT master key) and
+  update both the agent env file and `/root/.hermes/{.env,config.yaml}` on the node.
+- **Never run `hermes gateway`/`hermes gateway restart` from the ssh shells** —
+  it starts a rogue gateway in the WRONG netns (bridge = no mesh routes) that
+  steals the lock from the container gateway; matrix then times out forever
+  while email (public egress) still works. Recovery: kill the rogue in the
+  :1022 shell, `rm /root/.hermes/gateway.lock gateway.pid`, and if the container
+  gateway died, an in-place `update` roll restarts everything cleanly.
 
 - **gateway idles with "no MATRIX_ACCESS_TOKEN yet"** — provisioning was
   skipped/failed; run `provision-matrix`, then either `update` (re-seal) or ssh

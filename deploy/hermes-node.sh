@@ -31,7 +31,7 @@ source "$HERE/lib.sh"
 : "${RPC_URL:?source deploy/env.sh first}"
 require PRIVATE_KEY RPC_URL CHAIN_ID DEPLOYER_ADDR
 
-NODE="${1:?usage: hermes-node.sh <node-name> [init|provision-matrix|deploy|prime|bind|verify|verify-ssh|verify-hermes|update|all|setup]}"
+NODE="${1:?usage: hermes-node.sh <node-name> [init|provision-matrix|deploy|prime|bind|register-direct|verify|verify-ssh|verify-hermes|update|all|setup]}"
 ACTION="${2:-all}"
 BOX_HOST="${BOX_HOST:-ubuntu@173.231.234.133}"
 BOX_PY="${BOX_PY:-/opt/dstack-mcp/venv/bin/python}"
@@ -194,8 +194,11 @@ _box_run() {
     printf "BOX_NAME=%q\nBOX_COMPOSE=%q\n" "$NODE" "/tmp/${NODE}.yaml"
     printf "BOX_VCPU=%q\nBOX_MEM=%q\nBOX_DISK=%q\nBOX_PORTS=%q\n" "$BOX_VCPU" "$BOX_MEM" "$BOX_DISK" "$BOX_PORTS"
     printf "BOX_GATEWAY_ENABLED=%q\nBOX_NET_MODE=%q\nBOX_FRESH_DISK=%q\n" "$BOX_GATEWAY_ENABLED" "$BOX_NET_MODE" "${BOX_FRESH_DISK:-}"
-    printf "E_CHAIN_ID=%q\nE_RPC_URL=%q\nE_BUNDLER_URL=%q\nE_GAS_POLICY_ID=%q\n" "$CHAIN_ID" "$RPC_URL" "${BUNDLER_URL:-$RPC_URL}" "${GAS_POLICY_ID:-}"
-    printf "E_INDEXER_REGISTRY_ADDR=%q\nE_GATEWAY_DOMAIN=%q\n" "$INDEXER_REGISTRY_ADDR" "$GATEWAY_DOMAIN"
+    # CVM_* variants: what the sidecar sees (Alchemy dead → publicnode; a non-bundler
+    # endpoint makes the sidecar fail fast and emit ATTESTMESH_DIRECT_REGISTER,
+    # which register-direct picks up — same pattern as db-ha/pocket-mcp).
+    printf "E_CHAIN_ID=%q\nE_RPC_URL=%q\nE_BUNDLER_URL=%q\nE_GAS_POLICY_ID=%q\n" "$CHAIN_ID" "${CVM_RPC_URL:-$RPC_URL}" "${CVM_BUNDLER_URL:-${BUNDLER_URL:-$RPC_URL}}" "${GAS_POLICY_ID:-}"
+    printf "E_INDEXER_REGISTRY_ADDR=%q\nE_GATEWAY_DOMAIN=%q\nE_CLUSTER=%q\n" "$INDEXER_REGISTRY_ADDR" "$GATEWAY_DOMAIN" "${CLUSTER:-}"
     printf "E_SSH_AUTHORIZED_KEYS_B64=%q\n" "$SSH_AUTHORIZED_KEYS_B64"
     printf "E_AGENT_NAME=%q\n" "$AGENT_NAME"
     printf "E_MODEL_PROVIDER_NAME=%q\nE_MODEL_BASE_URL=%q\nE_MODEL_NAME=%q\nE_MODEL_API_KEY=%q\n" \
@@ -358,6 +361,44 @@ SCRIPT
   log "✔ bound hermes node X -> $CLUSTER"
 }
 
+# Interim registration path while there is no working EIP-4337 bundler
+# (Alchemy dead): the sidecar, on a failing bundler, emits its registration
+# calldata to the console as `ATTESTMESH_DIRECT_REGISTER {member,calldata}`;
+# the deployer sends it directly, paying gas. Same pattern as
+# indexer-member-node.sh / pocket-mcp / db-ha.
+register_direct() {
+  _load; _default_cluster_env
+  [ -n "${X:-}" ] && [ -n "${VM_ID:-}" ] || die "need X/VM_ID in $STATE"
+  local zero id payload member calldata i
+  zero=$ZERO32
+  id=$(cast call "$CLUSTER" "memberIdOf(address)(bytes32)" "$X" --rpc-url "$RPC_URL" 2>/dev/null || true)
+  if [ -n "$id" ] && [ "$id" != "$zero" ]; then
+    log "hermes node already registered: memberId=$id"
+    return 0
+  fi
+  local helper_url
+  helper_url="https://$(printf '%s' "${X#0x}" | tr 'A-Z' 'a-z')-9092.${GATEWAY_DOMAIN}/registration-calldata"
+  for i in $(seq 1 60); do
+    # HTTP first (the helper serves its payload on :9092 via the dstack
+    # gateway; container stdout does NOT reliably reach the box serial log —
+    # proven on the tessera maiden deploy). Serial scrape kept as fallback.
+    payload=$(curl -sfm 8 "$helper_url" 2>/dev/null)
+    [ -n "$payload" ] || payload=$(ssh_box "sudo sed 's/\\x1b\\[[0-9;]*m//g' /srv/data/dstack/vm/$VM_ID/serial.log /srv/data/dstack/vm/$VM_ID/serial.history.log 2>/dev/null" \
+      | grep 'ATTESTMESH_DIRECT_REGISTER ' | sed 's/^.*ATTESTMESH_DIRECT_REGISTER //' | tail -1)
+    if [ -n "$payload" ] && echo "$payload" | jq -e '.calldata and .member' >/dev/null 2>&1; then
+      member=$(echo "$payload" | jq -r .member)
+      calldata=$(echo "$payload" | jq -r .calldata)
+      [ "${member,,}" = "${X,,}" ] || die "registration helper emitted member=$member, expected X=$X"
+      log "▶ direct dstack_register for $NODE member=$member via operator tx"
+      send_seq "direct-dstack-register-${NODE}" "$CLUSTER" --data "$calldata"
+      return 0
+    fi
+    log "… waiting for registration helper calldata ($i/60)"
+    sleep 5
+  done
+  die "registration helper calldata not found in CVM serial logs"
+}
+
 verify() {
   _load; _default_cluster_env
   [ -n "${X:-}" ] && [ -n "${CLUSTER:-}" ] || die "need X+cluster"
@@ -400,7 +441,7 @@ verify_hermes() {
   local i out
   for i in $(seq 1 30); do
     out=$(_node_ssh 'cat /root/.hermes/gateway_state.json 2>/dev/null' 2>/dev/null || true)
-    if printf '%s' "$out" | grep -q '"matrix"' && printf '%s' "$out" | grep -q '"state": *"connected"'; then
+    if printf '%s' "$out" | grep -Eq '"matrix": *\{"state": *"connected"'; then
       log "✔ hermes gateway up, matrix connected"
       printf '%s\n' "$out" | head -c 600; echo
       return 0
@@ -448,7 +489,8 @@ case "$ACTION" in
   verify-ssh) verify_ssh_gateway ;;
   verify-hermes) verify_hermes ;;
   update) update_member ;;
-  setup) provision_matrix; deploy_cvm; prime_gate; bind_member ;;
-  all) provision_matrix; deploy_cvm; prime_gate; bind_member; verify; verify_ssh_gateway; verify_hermes ;;
-  *) die "usage: hermes-node.sh <node-name> [init|provision-matrix|deploy|prime|bind|verify|verify-ssh|verify-hermes|update|all|setup]" ;;
+  register-direct) register_direct ;;
+  setup) provision_matrix; deploy_cvm; prime_gate; bind_member; register_direct ;;
+  all) provision_matrix; deploy_cvm; prime_gate; bind_member; register_direct; verify; verify_ssh_gateway; verify_hermes ;;
+  *) die "usage: hermes-node.sh <node-name> [init|provision-matrix|deploy|prime|bind|register-direct|verify|verify-ssh|verify-hermes|update|all|setup]" ;;
 esac
