@@ -86,6 +86,9 @@ ENV_KEYS = [
     "CONSOLE_HOST",
     # platform superadmins — view-as-user impersonation gate (value sealed, key measured)
     "PLATFORM_ADMIN_EMAILS",
+    # waitlist → Telegram bot (turned-away sign-ups); both optional (unset ⇒ no telegram send)
+    "TELEGRAM_BOT_TOKEN",
+    "TELEGRAM_WAITLIST_CHAT_ID",
     "CLOUDFLARE_API_TOKEN",
     # CF app-fronting: zone for the proxied <slug>.app records + the origin IP
     # (box haproxy) they point at. Non-secret, still sealed (one measured surface).
