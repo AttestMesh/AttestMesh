@@ -164,7 +164,18 @@ services:
             [ -n "$$EMAIL_PASSWORD" ] && echo "EMAIL_PASSWORD=$$EMAIL_PASSWORD"
             [ -n "$$EMAIL_IMAP_HOST" ] && echo "EMAIL_IMAP_HOST=$$EMAIL_IMAP_HOST"
             [ -n "$$EMAIL_SMTP_HOST" ] && echo "EMAIL_SMTP_HOST=$$EMAIL_SMTP_HOST"
-            [ -n "$$EMAIL_HOME_ADDRESS" ] && echo "EMAIL_HOME_ADDRESS=$$EMAIL_HOME_ADDRESS"
+            if [ -n "$$EMAIL_HOME_ADDRESS" ]; then
+              echo "EMAIL_HOME_ADDRESS=$$EMAIL_HOME_ADDRESS"
+              # Operator "home" defaults: digest + allowed senders = the home
+              # address (tune per-agent over ssh afterwards).
+              echo "EMAIL_ALLOWED_USERS=$$EMAIL_HOME_ADDRESS"
+              echo "DIGEST_RECIPIENT_EMAIL=$$EMAIL_HOME_ADDRESS"
+            fi
+            [ -n "$$EMAIL_ADDRESS" ] && {
+              echo "EMAIL_IMAP_PORT=993"
+              echo "EMAIL_SMTP_PORT=587"
+              echo "EMAIL_POLL_INTERVAL=15"
+            }
             [ -n "$$GITHUB_TOKEN" ] && echo "GH_TOKEN=$$GITHUB_TOKEN"
             case "$$provider_slug" in
               fugu-router|fugu|sakana-fugu-router)
@@ -196,6 +207,10 @@ services:
           memory_enabled: true
           user_profile_enabled: true
           provider: hindsight
+          memory_char_limit: 2200
+          user_char_limit: 1375
+          nudge_interval: 10
+          flush_min_turns: 6
         EOF
         fi
 
