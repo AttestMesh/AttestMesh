@@ -39,6 +39,13 @@ GATEWAY_DOMAIN="${GATEWAY_DOMAIN:-gateway.attestmesh.xyz}"
 #   TLS_FULLCHAIN_B64 TLS_KEY_B64   (optional: DATABASE_URL)
 SECRETS_FILE="${SECRETS_FILE:-$HOME/.attestmesh/synclave.env}"
 
+# confidential-sandboxes (sandboxd) wiring for the "Provision sandbox" button. URL/image/plan are
+# non-secret config; the token is the sandboxd daemon secret (reused from its own secrets file).
+SANDBOX_DAEMON_URL="${SANDBOX_DAEMON_URL:-https://2105a8086e4700e611092aaa3efd37e1e302ffd6-8080.gateway.attestmesh.xyz}"
+SANDBOX_DEFAULT_IMAGE="${SANDBOX_DEFAULT_IMAGE:-ghcr.io/dmvt/cs-sandbox-base@sha256:8ccfb22336a73e28b7fd8bef024d355ec5673d70d09a6099ad5094836f65e9d3}"
+SANDBOX_DEFAULT_PLAN="${SANDBOX_DEFAULT_PLAN:-std-1-4-128}"
+SANDBOX_DAEMON_TOKEN="${SANDBOX_DAEMON_TOKEN:-$(sed -nE 's/^SANDBOX_DAEMON_TOKEN=//p' "$HOME/.attestmesh/sandboxd.env" 2>/dev/null)}"
+
 # Non-secret config (overridable), sealed alongside the secrets for one measured surface.
 PUBLIC_BASE_URL="${PUBLIC_BASE_URL:-https://console.attestmesh.xyz}"
 CORS_ORIGIN="${CORS_ORIGIN:-https://console.attestmesh.xyz}"
@@ -102,6 +109,7 @@ _require_env() {
            TLS_FULLCHAIN_B64 TLS_KEY_B64; do
     [ -n "${!k:-}" ] || die "secret $k not set in $SECRETS_FILE"
   done
+  [ -n "${SANDBOX_DAEMON_TOKEN:-}" ] || die "SANDBOX_DAEMON_TOKEN empty (expected in \$HOME/.attestmesh/sandboxd.env); required for the Provision button"
   # Synclave's DB defaults to the C3 pg-ha cluster. The compose exposes pg-ha via
   # sidecar-netns forwarders because the app container is not itself in the WG netns.
   DATABASE_URL="${DATABASE_URL:-postgresql://synclave:${POSTGRES_PASSWORD}@sidecar:15431/synclave}"
@@ -155,6 +163,7 @@ _box_run() {
     printf 'E_CLUSTER_ORCHESTRATOR_TOKEN=%q\n' "${CLUSTER_ORCHESTRATOR_TOKEN:-}"
     printf 'E_CORS_ORIGIN=%q\n'              "$CORS_ORIGIN"
     printf 'E_CONSOLE_HOST=%q\n'             "$CONSOLE_HOST"
+    printf 'E_PLATFORM_ADMIN_EMAILS=%q\n'    "${PLATFORM_ADMIN_EMAILS:-}"
     printf 'E_CLOUDFLARE_API_TOKEN=%q\n'     "$CLOUDFLARE_API_TOKEN"
     printf 'E_CLOUDFLARE_ZONE_ID=%q\n'       "$CLOUDFLARE_ZONE_ID"
     printf 'E_CLOUDFLARE_ORIGIN_IP=%q\n'     "$CLOUDFLARE_ORIGIN_IP"
@@ -162,6 +171,10 @@ _box_run() {
     printf 'E_LABELS_WRITE_TOKENS=%q\n'      "${LABELS_WRITE_TOKENS:-}"
     printf 'E_TLS_FULLCHAIN_B64=%q\n'        "$TLS_FULLCHAIN_B64"
     printf 'E_TLS_KEY_B64=%q\n'              "$TLS_KEY_B64"
+    printf 'E_SANDBOX_DAEMON_URL=%q\n'       "$SANDBOX_DAEMON_URL"
+    printf 'E_SANDBOX_DAEMON_TOKEN=%q\n'     "$SANDBOX_DAEMON_TOKEN"
+    printf 'E_SANDBOX_DEFAULT_IMAGE=%q\n'    "$SANDBOX_DEFAULT_IMAGE"
+    printf 'E_SANDBOX_DEFAULT_PLAN=%q\n'     "$SANDBOX_DEFAULT_PLAN"
     printf 'E_DSTACK_DOCKER_USERNAME=%q\n'   "${guser:-dmvt}"
     printf 'E_DSTACK_DOCKER_PASSWORD=%q\n'   "$gtok"
     printf 'E_DSTACK_DOCKER_REGISTRY=%q\n'   "ghcr.io"

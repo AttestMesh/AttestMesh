@@ -84,6 +84,8 @@ ENV_KEYS = [
     "CLUSTER_ORCHESTRATOR_TOKEN",
     "CORS_ORIGIN",
     "CONSOLE_HOST",
+    # platform superadmins — view-as-user impersonation gate (value sealed, key measured)
+    "PLATFORM_ADMIN_EMAILS",
     "CLOUDFLARE_API_TOKEN",
     # CF app-fronting: zone for the proxied <slug>.app records + the origin IP
     # (box haproxy) they point at. Non-secret, still sealed (one measured surface).
@@ -93,6 +95,11 @@ ENV_KEYS = [
     "LABELS_WRITE_TOKENS",
     "TLS_FULLCHAIN_B64",
     "TLS_KEY_B64",
+    # --- confidential-sandboxes (sandboxd) provisioning ---
+    "SANDBOX_DAEMON_URL",
+    "SANDBOX_DAEMON_TOKEN",
+    "SANDBOX_DEFAULT_IMAGE",
+    "SANDBOX_DEFAULT_PLAN",
     # --- private-registry pull creds (ghcr.io/dmvt/* + attestmesh sidecar) ---
     "DSTACK_DOCKER_USERNAME",
     "DSTACK_DOCKER_PASSWORD",
