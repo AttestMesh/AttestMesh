@@ -140,7 +140,13 @@ services:
     # v6 = cluster API bridge: logged-in users see the live C3 members as CVM
     # graph nodes, with the API URL sealed to the dstack bridge listener.
     # Digest-pinned: in-place UpgradeApp rolls never re-pull a same-tag image.
+    # v41 = fleet-control main b25d38c — Overview dashboard wired to real feeds (was mock) + sandboxes health;
+    # v40 = fleet-control main 4f35fb8 — API tokens + confidential Attested Sandboxes + landing naming + resetDb fix;
+    # v39 = rebuilt from fleet-control main 9ed8065 + API tokens / Agent Runtime merge;
+    # v38 = API tokens + Agent Runtime / Attested Sandboxes merged with landing/nav/Overview main;
     # v29 = API-token permission catalog + account settings token management;
+    # v42 = view-as-user impersonation for platform superadmins + served Fumadocs docs site;
+    #       PLATFORM_ADMIN_EMAILS now forwarded+sealed (box.py ENV_KEYS + synclave-node.sh).
     # v28 = Team menu carries team settings/actions; account menu is account-only;
     # v27 = team terminology + Vercel-style team/account settings IA;
     # v26 = team-first onboarding + contextual network setup gate;
@@ -151,7 +157,7 @@ services:
     # v21 = user-visible orchestrator failure details in enclave deploys;
     # v20 = CLUSTER_NETWORKS-only live mesh config + structured orchestrator errors;
     # v19 = Apps → Sandboxes rename (labels only, wire stays app).
-    image: ghcr.io/dmvt/synclave-app:v33@sha256:179f3ba276f517afe85884083e349612cb3d50095d19f3ddb278188c406dd907
+    image: ghcr.io/dmvt/synclave-app:v42@sha256:11b223f4452e36568d13d2ef31e83657faa54741cdbaabec615d8934768dc42f
     environment:
       API_HOST: 0.0.0.0
       API_PORT: 80
@@ -166,6 +172,12 @@ services:
       # Cluster-2 webhost-control gateway URL (token-gated). Sealed at deploy.
       DAEMON_URL: ${DAEMON_URL}
       TEE_DAEMON_TOKEN: ${TEE_DAEMON_TOKEN}
+      # confidential-sandboxes (sandboxd) — Cluster-2 gateway URL + token-gated control API, plus the
+      # default one-click workload image/plan. Sealed at deploy. Powers the "Provision sandbox" button.
+      SANDBOX_DAEMON_URL: ${SANDBOX_DAEMON_URL}
+      SANDBOX_DAEMON_TOKEN: ${SANDBOX_DAEMON_TOKEN}
+      SANDBOX_DEFAULT_IMAGE: ${SANDBOX_DEFAULT_IMAGE}
+      SANDBOX_DEFAULT_PLAN: ${SANDBOX_DEFAULT_PLAN}
       # Webhost admin panel operators (comma-separated emails).
       PLATFORM_ADMIN_EMAILS: ${PLATFORM_ADMIN_EMAILS:-}
       PUBLIC_BASE_URL: ${PUBLIC_BASE_URL}
@@ -215,7 +227,7 @@ services:
     restart: unless-stopped
 
   tlsproxy:
-    image: ghcr.io/dmvt/synclave-tlsproxy:v3
+    image: ghcr.io/dmvt/synclave-tlsproxy:v4@sha256:2f9686cd836e15aba287e6412a1612145c1658616a581e4b817f65a20042be09
     environment:
       CLOUDFLARE_API_TOKEN: ${CLOUDFLARE_API_TOKEN}
       TLS_FULLCHAIN_B64: ${TLS_FULLCHAIN_B64}
