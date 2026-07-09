@@ -27,7 +27,7 @@
 # ($$ = literal $ for the runtime shell; single $ is compose interpolation.)
 services:
   sidecar:
-    image: ghcr.io/attestmesh/cluster-mesh-agent@sha256:db0a74f5cb68aab6441ac187522276999fc45ee760db3ae3dea0240e86d5c1af
+    image: ghcr.io/attestmesh/cluster-mesh-agent@sha256:f455ad9e778573080459eb9e46af269547d72d3624cbcf6d21e4a279c0527284
     restart: unless-stopped
     environment:
       # MEMBER_CONTRACT intentionally unset. Path A upgrades this stock DstackApp
@@ -177,30 +177,18 @@ services:
         fi
 
         if [ ! -s /root/.hermes/config.yaml ]; then
-          case "$$provider_slug" in
-            fugu-router|fugu|sakana-fugu-router)
-              cat > /root/.hermes/config.yaml <<EOF
-        model:
-          default: $$MODEL_NAME
-          provider: fugu-router
-          base_url: $$MODEL_BASE_URL
-          api_key: $$MODEL_API_KEY
-          api_mode: chat_completions
-        memory:
-          memory_enabled: true
-          user_profile_enabled: true
-          provider: hindsight
-        EOF
-              ;;
-            *)
-              cat > /root/.hermes/config.yaml <<EOF
+          # hermes has no native "fugu-router" provider type — every OpenAI-
+          # compatible endpoint (fugu-router LB included) is provider: custom
+          # with a custom_providers entry (proven on the tessera maiden deploy;
+          # a bare provider: fugu-router fails `hermes doctor` as unknown).
+          cat > /root/.hermes/config.yaml <<EOF
         model:
           default: $$MODEL_NAME
           provider: custom
           base_url: $$MODEL_BASE_URL
           api_key: $$MODEL_API_KEY
         custom_providers:
-          - name: $${MODEL_PROVIDER_NAME:-Sakana}
+          - name: $${MODEL_PROVIDER_NAME:-custom}
             base_url: $$MODEL_BASE_URL
             api_key: $$MODEL_API_KEY
             model: $$MODEL_NAME
@@ -209,8 +197,6 @@ services:
           user_profile_enabled: true
           provider: hindsight
         EOF
-              ;;
-          esac
         fi
 
         if [ ! -s /root/.hermes/hindsight/config.json ]; then
@@ -304,6 +290,26 @@ services:
         EOF
         fi
         exec paseo daemon start --foreground
+
+  # One-shot registration helper (interim, while there is no live EIP-4337
+  # bundler): derives the node's keys + dstack proof and emits the direct
+  # `dstack_register` calldata as `ATTESTMESH_DIRECT_REGISTER {json}` for the
+  # operator to send (deploy/hermes-node.sh register-direct), and serves it on
+  # :9092. Same block as pocket-mcp / db-ha / indexer-member nodes.
+  registration-calldata:
+    image: ghcr.io/dmvt/attestmesh-indexer@sha256:d99b1d207e0df8bfdf6fbac5b001142307475ac9a5b1b88b730b7edabd4283e5
+    restart: "no"
+    depends_on:
+      - sidecar
+    entrypoint: ["/usr/local/bin/attestmesh-registration-calldata"]
+    environment:
+      - CLUSTER=${CLUSTER}
+      - DSTACK_SOCKET=/var/run/dstack.sock
+      - REGISTRATION_HELPER_ADDR=0.0.0.0:9092
+    ports:
+      - "9092:9092"
+    volumes:
+      - /var/run/dstack.sock:/var/run/dstack.sock
 
 volumes:
   # Shared /root for the shells + hermes + paseo (bash history, clones,
