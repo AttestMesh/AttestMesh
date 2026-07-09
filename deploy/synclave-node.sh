@@ -164,6 +164,8 @@ _box_run() {
     printf 'E_CORS_ORIGIN=%q\n'              "$CORS_ORIGIN"
     printf 'E_CONSOLE_HOST=%q\n'             "$CONSOLE_HOST"
     printf 'E_PLATFORM_ADMIN_EMAILS=%q\n'    "${PLATFORM_ADMIN_EMAILS:-}"
+    printf 'E_TELEGRAM_BOT_TOKEN=%q\n'       "${TELEGRAM_BOT_TOKEN:-}"
+    printf 'E_TELEGRAM_WAITLIST_CHAT_ID=%q\n' "${TELEGRAM_WAITLIST_CHAT_ID:-}"
     printf 'E_CLOUDFLARE_API_TOKEN=%q\n'     "$CLOUDFLARE_API_TOKEN"
     printf 'E_CLOUDFLARE_ZONE_ID=%q\n'       "$CLOUDFLARE_ZONE_ID"
     printf 'E_CLOUDFLARE_ORIGIN_IP=%q\n'     "$CLOUDFLARE_ORIGIN_IP"
