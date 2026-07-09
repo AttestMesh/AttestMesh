@@ -213,7 +213,9 @@ services:
           },
           "api_url": "$$HINDSIGHT_API_URL",
           "bank_id": "$$HINDSIGHT_BANK_ID",
-          "recall_budget": "high"
+          "recall_budget": "high",
+          "recall_max_tokens": 12288,
+          "recall_max_input_chars": 2000
         }
         EOF
         fi
