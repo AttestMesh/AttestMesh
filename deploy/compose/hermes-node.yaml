@@ -181,6 +181,11 @@ services:
               fugu-router|fugu|sakana-fugu-router)
                 echo "FUGU_ROUTER_API_KEY=$$MODEL_API_KEY"
                 echo "FUGU_ROUTER_BASE_URL=$$MODEL_BASE_URL"
+                # xai-class tools (web search via grok-4.x) through the router:
+                # API-key mode, NO per-agent xai OAuth and no shared refresh
+                # token. Image gen still needs a grok-imagine route on fugu.
+                echo "XAI_BASE_URL=$$MODEL_BASE_URL"
+                echo "XAI_API_KEY=$$MODEL_API_KEY"
                 ;;
             esac
             true
@@ -212,6 +217,11 @@ services:
           nudge_interval: 10
           flush_min_turns: 6
         EOF
+          case "$$provider_slug" in
+            fugu-router|fugu|sakana-fugu-router)
+              printf 'web:\n  backend: xai\n  use_gateway: false\n' >> /root/.hermes/config.yaml
+              ;;
+          esac
         fi
 
         if [ ! -s /root/.hermes/hindsight/config.json ]; then
