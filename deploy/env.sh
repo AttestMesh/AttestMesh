@@ -19,12 +19,19 @@ export ALCHEMY_RPC_URL="https://base-mainnet.g.alchemy.com/v2/${ALCHEMY_API_KEY}
 # The Alchemy app has BASE_MAINNET disabled (403 on EVERY method), which breaks the DEPLOYER's own
 # on-chain cast sends/reads — it bricked a live sandboxd roll (addComposeHash 403 while the old
 # script sailed on to UpgradeApp onto an unallowlisted hash). Route the deployer's on-chain ops
-# through a public node so rolls land; the CVM-sealed RPC/bundler stay on Alchemy for now (Alchemy
-# is being retired — that migration is a separate per-node fleet roll, not this file).
-export RPC_URL="${RPC_URL:-https://base-rpc.publicnode.com}"   # deployer host-side cast: nonce/send/call
-export CVM_RPC_URL="${CVM_RPC_URL:-$ALCHEMY_RPC_URL}"          # sealed into CVM sidecars (unchanged)
-export BUNDLER_URL="${BUNDLER_URL:-$ALCHEMY_RPC_URL}"          # AA bundler — Alchemy serves it on the same endpoint
-export CVM_BUNDLER_URL="${CVM_BUNDLER_URL:-$ALCHEMY_RPC_URL}"  # sealed into CVM sidecars (unchanged)
+# through a public node so rolls land.
+#
+# UPDATE 2026-07-08: Alchemy is fully dead now, and the CVM-sealed Alchemy RPC took console DOWN —
+# on a full stop/start the sidecar couldn't READ its peers on-chain to re-join the mesh, so
+# pg-provision hung and the app never started (~1.5h outage). So the CVM-sealed RPC is publicnode
+# now too (interim). CAVEAT: publicnode is a plain RPC, NOT an AA bundler. Fine for an EXISTING node
+# whose ed25519 key is already published (one sponsored op per node LIFETIME → boot is reads-only);
+# a NEW node / fresh registration still needs a real bundler (Pimlico, or our own gateway-exposed
+# Base node). Durable plan: our own Base node's RPC via the C3 gateway (box-admin/base-node).
+export RPC_URL="${RPC_URL:-https://base-rpc.publicnode.com}"       # deployer host-side cast: nonce/send/call
+export CVM_RPC_URL="${CVM_RPC_URL:-https://base-rpc.publicnode.com}"       # sealed into CVM sidecars (was Alchemy → dead → outage)
+export BUNDLER_URL="${BUNDLER_URL:-$ALCHEMY_RPC_URL}"              # host-side AA bundler (unused by `update`; Alchemy dead)
+export CVM_BUNDLER_URL="${CVM_BUNDLER_URL:-https://base-rpc.publicnode.com}"  # sealed; interim — NEW-node registration needs a real bundler
 export GAS_POLICY_ID="$(_read "$TEESQL/alchemy-policy.id")"
 
 export PRIVATE_KEY="$(_read "$TEESQL/global-deployer.key")"
