@@ -186,6 +186,13 @@ services:
       # (unset ⇒ the send is a no-op; the email is still captured in the DB).
       TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
       TELEGRAM_WAITLIST_CHAT_ID: ${TELEGRAM_WAITLIST_CHAT_ID:-}
+      # Billing (Stripe) — LIVE-mode keys for prod (config.ts refuses test keys under
+      # NODE_ENV=production unless STRIPE_ALLOW_TEST_MODE=true, and hard-requires the webhook
+      # secret in live mode). Unset ⇒ billing routes stay dark. REQUIRES synclave-app built
+      # from fleet-control ≥ 63bd1b2 (empty string counts as unset; older images crash on "").
+      STRIPE_SECRET_KEY: ${STRIPE_SECRET_KEY:-}
+      STRIPE_WEBHOOK_SECRET: ${STRIPE_WEBHOOK_SECRET:-}
+      STRIPE_ALLOW_TEST_MODE: ${STRIPE_ALLOW_TEST_MODE:-}
       PUBLIC_BASE_URL: ${PUBLIC_BASE_URL}
       APP_DOMAIN: ${APP_DOMAIN}
       INDEXER_URL: ${INDEXER_URL}
