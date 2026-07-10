@@ -89,6 +89,11 @@ ENV_KEYS = [
     # waitlist → Telegram bot (turned-away sign-ups); both optional (unset ⇒ no telegram send)
     "TELEGRAM_BOT_TOKEN",
     "TELEGRAM_WAITLIST_CHAT_ID",
+    # billing (Stripe) — live keys, sealed; app config env-locks mode (live⇔prod). Optional:
+    # unset ⇒ billing dark. Needs synclave-app ≥ fleet-control 63bd1b2 ("" counts as unset).
+    "STRIPE_SECRET_KEY",
+    "STRIPE_WEBHOOK_SECRET",
+    "STRIPE_ALLOW_TEST_MODE",
     "CLOUDFLARE_API_TOKEN",
     # CF app-fronting: zone for the proxied <slug>.app records + the origin IP
     # (box haproxy) they point at. Non-secret, still sealed (one measured surface).
