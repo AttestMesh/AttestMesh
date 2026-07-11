@@ -1,25 +1,23 @@
-//! Learned-peer key persistence (sidecar spec §10.2).
+//! Learned-peer public-key persistence (sidecar spec §10.2).
 //!
-//! A peer's Ed25519 key arrives only inside its PeerEndpoint envelope. Held only in
-//! memory, a restart forgot every learned key and the reconcile loop resumed
-//! re-sending our PeerEndpoint envelope — one sponsored UserOp per peer per resend
-//! tick — while peers that already knew OUR key never replied, so the resends never
-//! converged (live-found 2026-07: ~1.3k sponsored UserOps/day across the fleet).
-//! Sealing the map makes learned keys survive restarts. The entries are peers'
-//! PUBLIC keys; the sealed store is used as the sidecar's one durable surface, not
-//! for secrecy.
+//! New peers publish Ed25519 heartbeat keys on chain, but the cache still supports
+//! mixed-version fleets without re-entering the sponsored envelope resend loop.
+//! These values are public, so they are stored directly (and atomically) in the
+//! sidecar-only durable state directory; unlike the retired dstack Seal API, this
+//! survives an in-place CVM restart.
 
-use crate::dstack::DstackRuntime;
 use anyhow::Result;
 use std::collections::HashMap;
+use std::path::Path;
 
-const SEAL_LABEL: &str = "attestmesh.peer_ed25519.v1";
+const CACHE_FILE: &str = "peer-ed25519.v1";
+const MAX_CACHE_BYTES: u64 = 1024 * 1024;
 
 /// memberId → Ed25519 public key, as learned from PeerEndpoint envelopes.
 pub type LearnedKeys = HashMap<[u8; 32], [u8; 32]>;
 
 /// Fixed-width records (memberId ‖ ed25519_pub), sorted by memberId so identical
-/// contents always seal to identical bytes.
+/// contents always persist to identical bytes.
 fn encode(map: &LearnedKeys) -> Vec<u8> {
     let mut ids: Vec<&[u8; 32]> = map.keys().collect();
     ids.sort();
@@ -48,41 +46,47 @@ fn decode(bytes: &[u8]) -> LearnedKeys {
 
 /// Load the learned-key map on boot. Any failure degrades to an empty map (the
 /// pre-persistence behavior), never blocks bring-up.
-pub async fn load(dstack: &dyn DstackRuntime) -> LearnedKeys {
-    match dstack.unseal(SEAL_LABEL).await {
+pub async fn load(state_dir: Option<&Path>) -> LearnedKeys {
+    match crate::storage::read_optional(state_dir, CACHE_FILE, MAX_CACHE_BYTES).await {
         Ok(Some(bytes)) => decode(&bytes),
         Ok(None) => LearnedKeys::new(),
         Err(e) => {
-            tracing::warn!(error = ?e, "peer-key unseal failed; keys will be re-learned");
+            tracing::warn!(error = ?e, "peer-key cache read failed; keys will be re-learned");
             LearnedKeys::new()
         }
     }
 }
 
-/// Seal the full map (it is small: 64 bytes per cluster peer).
-pub async fn store(dstack: &dyn DstackRuntime, map: &LearnedKeys) -> Result<()> {
-    dstack.seal(SEAL_LABEL, &encode(map)).await
+/// Persist the full map. Unconfigured deployments deliberately remain memory-only.
+pub async fn store(state_dir: Option<&Path>, map: &LearnedKeys) -> Result<()> {
+    let Some(state_dir) = state_dir else {
+        return Ok(());
+    };
+    crate::storage::atomic_write(state_dir, CACHE_FILE, &encode(map)).await?;
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::dstack::MockDstack;
 
     #[tokio::test]
-    async fn roundtrips_through_the_sealed_store() {
-        let d = MockDstack::new([7u8; 32]);
+    async fn roundtrips_through_the_durable_store() {
+        let temp = tempfile::tempdir().unwrap();
         let mut m = LearnedKeys::new();
         m.insert([1u8; 32], [0xaa; 32]);
         m.insert([2u8; 32], [0xbb; 32]);
-        store(&d, &m).await.unwrap();
-        assert_eq!(load(&d).await, m);
+        store(Some(temp.path()), &m).await.unwrap();
+        assert_eq!(load(Some(temp.path())).await, m);
     }
 
     #[tokio::test]
-    async fn empty_store_loads_empty() {
-        let d = MockDstack::new([7u8; 32]);
-        assert!(load(&d).await.is_empty());
+    async fn unset_or_empty_store_loads_empty() {
+        let temp = tempfile::tempdir().unwrap();
+        assert!(load(None).await.is_empty());
+        assert!(load(Some(temp.path())).await.is_empty());
+        let m = LearnedKeys::new();
+        store(None, &m).await.unwrap();
     }
 
     #[test]
@@ -90,7 +94,7 @@ mod tests {
         let mut m = LearnedKeys::new();
         m.insert([3u8; 32], [0xcc; 32]);
         let mut bytes = encode(&m);
-        bytes.extend_from_slice(&[0xde, 0xad]); // partial record
+        bytes.extend_from_slice(&[0xde, 0xad]);
         assert_eq!(decode(&bytes), m);
     }
 

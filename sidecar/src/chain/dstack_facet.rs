@@ -376,12 +376,6 @@ mod tests {
         async fn get_quote(&self, _: [u8; 64]) -> Result<Vec<u8>> {
             Ok(vec![])
         }
-        async fn seal(&self, _: &str, _: &[u8]) -> Result<()> {
-            Ok(())
-        }
-        async fn unseal(&self, _: &str) -> Result<Option<Vec<u8>>> {
-            Ok(None)
-        }
         async fn info(&self) -> Result<crate::dstack::DstackInfo> {
             Ok(crate::dstack::DstackInfo {
                 app_id: self.app_id.to_vec(),
@@ -480,7 +474,11 @@ mod tests {
             ("binding", &proof.messageSignature),
         ] {
             assert_eq!(sig.len(), 65, "{label} signature must be 65 bytes");
-            assert!(sig[64] >= 27, "{label} signature v={} must be an eth recovery id", sig[64]);
+            assert!(
+                sig[64] >= 27,
+                "{label} signature v={} must be an eth recovery id",
+                sig[64]
+            );
         }
     }
 

@@ -111,6 +111,7 @@ async fn recv_loop(shared: Arc<Shared>) -> anyhow::Result<()> {
             }
         }
         if shared.peers.lock().await.set_live(&sender, true) {
+            shared.peer_change.notify_one();
             let _ = shared.peer_event_tx.send(AppPeerEvent::Liveness {
                 member_id: sender,
                 up: true,

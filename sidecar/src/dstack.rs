@@ -1,16 +1,13 @@
 //! dstack guest-agent runtime client (sidecar spec §6, §2.1).
 //!
-//! The real dstack runtime exposes `derive_key`, `seal`, `unseal`, and `get_quote`
-//! over a unix-domain socket. We vendor a small trait here (the `dstack-sdk` crate is
-//! not crates.io-published) with two implementations: a best-effort UDS HTTP client
-//! for production and an in-memory mock for tests. All attestation-method-specific
-//! detail stays behind this boundary.
+//! The deployed dstack runtime exposes deterministic key derivation and attestation
+//! over a unix-domain socket. Durable application data is the caller's responsibility;
+//! the live guest agent has no `Seal` / `Unseal` service. All attestation-method-
+//! specific detail stays behind this boundary.
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use sha3::{Digest, Keccak256};
-use std::collections::HashMap;
-use std::sync::Mutex;
 use zeroize::Zeroizing;
 
 /// A dstack-derived key plus its KMS signature chain (guest-agent `/GetKey`).
@@ -48,12 +45,6 @@ pub trait DstackRuntime: Send + Sync {
     /// Request a TEE quote whose user-data slot commits to `report_data` (64 bytes).
     async fn get_quote(&self, report_data: [u8; 64]) -> Result<Vec<u8>>;
 
-    /// Seal `data` to the node's persistent sealed store under `label`.
-    async fn seal(&self, label: &str, data: &[u8]) -> Result<()>;
-
-    /// Unseal previously sealed bytes, or `None` if nothing was sealed under `label`.
-    async fn unseal(&self, label: &str) -> Result<Option<Vec<u8>>>;
-
     /// Fetch a dstack-derived key + its KMS signature chain (guest-agent `/GetKey`).
     /// This is the registration-proof material: the derived key signs the binding
     /// message, and `signature_chain` carries the app + KMS signatures the on-chain
@@ -69,15 +60,11 @@ pub trait DstackRuntime: Send + Sync {
 /// behavior) while one mock reused across "restarts" is deterministic.
 pub struct MockDstack {
     root_seed: [u8; 32],
-    store: Mutex<HashMap<String, Vec<u8>>>,
 }
 
 impl MockDstack {
     pub fn new(root_seed: [u8; 32]) -> Self {
-        Self {
-            root_seed,
-            store: Mutex::new(HashMap::new()),
-        }
+        Self { root_seed }
     }
 
     pub fn from_label(label: &str) -> Self {
@@ -110,18 +97,6 @@ impl DstackRuntime for MockDstack {
         q.extend_from_slice(b"MOCKQUOTE-v1");
         q.extend_from_slice(&report_data);
         Ok(q)
-    }
-
-    async fn seal(&self, label: &str, data: &[u8]) -> Result<()> {
-        self.store
-            .lock()
-            .unwrap()
-            .insert(label.to_string(), data.to_vec());
-        Ok(())
-    }
-
-    async fn unseal(&self, label: &str) -> Result<Option<Vec<u8>>> {
-        Ok(self.store.lock().unwrap().get(label).cloned())
     }
 
     async fn get_key(&self, path: &str, purpose: &str) -> Result<DstackKey> {
@@ -209,21 +184,6 @@ impl DstackRuntime for UnixSocketDstack {
         Ok(hex::decode(q.trim_start_matches("0x"))?)
     }
 
-    async fn seal(&self, label: &str, data: &[u8]) -> Result<()> {
-        let body = serde_json::json!({ "label": label, "data": hex::encode(data) });
-        self.request("/Seal", &body).await?;
-        Ok(())
-    }
-
-    async fn unseal(&self, label: &str) -> Result<Option<Vec<u8>>> {
-        let body = serde_json::json!({ "label": label });
-        let resp = self.request("/Unseal", &body).await?;
-        match resp.get("data").and_then(|v| v.as_str()) {
-            Some(d) if !d.is_empty() => Ok(Some(hex::decode(d.trim_start_matches("0x"))?)),
-            _ => Ok(None),
-        }
-    }
-
     async fn get_key(&self, path: &str, purpose: &str) -> Result<DstackKey> {
         let body = serde_json::json!({ "path": path, "purpose": purpose });
         let resp = self.request("/GetKey", &body).await?;
@@ -237,8 +197,10 @@ impl DstackRuntime for UnixSocketDstack {
             .get("signature_chain")
             .and_then(|v| v.as_array())
             .with_context(|| {
-                let fields: Vec<&String> =
-                    resp.as_object().map(|o| o.keys().collect()).unwrap_or_default();
+                let fields: Vec<&String> = resp
+                    .as_object()
+                    .map(|o| o.keys().collect())
+                    .unwrap_or_default();
                 format!("GetKey: missing 'signature_chain'; response fields = {fields:?}")
             })?
             .iter()

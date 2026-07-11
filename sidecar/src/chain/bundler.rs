@@ -109,7 +109,10 @@ impl BundlerClient {
 
     /// Build, sponsor, sign, submit, and await inclusion. Returns the underlying tx hash.
     pub async fn submit(&self, signer: &PrivateKeySigner, mut op: UserOperation) -> Result<B256> {
-        op.nonce = self.get_nonce(op.sender).await.context("EntryPoint.getNonce")?;
+        op.nonce = self
+            .get_nonce(op.sender)
+            .await
+            .context("EntryPoint.getNonce")?;
 
         // F2: request gas + paymaster sponsorship and populate the op BEFORE signing.
         self.apply_sponsorship(&mut op).await?;
@@ -233,7 +236,11 @@ impl BundlerClient {
 /// unit test — the live-found failure mode here was silent (a wrong nonce source
 /// fell back to 0 and every post-registration UserOp died with AA25).
 fn get_nonce_calldata(sender: Address) -> String {
-    format!("0x35567e1a{:0>64}{:0>64}", hex::encode(sender.as_slice()), "0")
+    format!(
+        "0x35567e1a{:0>64}{:0>64}",
+        hex::encode(sender.as_slice()),
+        "0"
+    )
 }
 
 /// Populate `op`'s gas + paymaster fields from an `alchemy_requestGasAndPaymasterAndData`
@@ -457,7 +464,11 @@ mod pimlico_tests {
         });
         apply_pimlico_sponsorship_response(&mut op, &resp).unwrap();
         assert_eq!(op.call_gas_limit, U256::from(100_000u64));
-        assert_eq!(op.max_fee_per_gas, U256::from(7u64), "fees set pre-sponsorship survive");
+        assert_eq!(
+            op.max_fee_per_gas,
+            U256::from(7u64),
+            "fees set pre-sponsorship survive"
+        );
         assert!(op.paymaster.is_some());
         assert_eq!(op.paymaster_data.len(), 4);
     }

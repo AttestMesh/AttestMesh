@@ -186,7 +186,8 @@ mod tests {
         // An application payload (e.g. a matrix-admin command) must classify as an
         // app message, NOT the sidecar-internal envelope, so poll_envelopes forwards
         // it to SubscribeMessages instead of consuming it silently.
-        let app = br#"{"v":1,"kind":"attestmesh.matrix-admin.command.v1","verb":"get_server_info"}"#;
+        let app =
+            br#"{"v":1,"kind":"attestmesh.matrix-admin.command.v1","verb":"get_server_info"}"#;
         assert!(classify_internal(app).is_none());
         assert!(classify_internal(b"arbitrary opaque bytes").is_none());
         assert!(classify_internal(&[]).is_none());
