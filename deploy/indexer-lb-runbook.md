@@ -17,6 +17,20 @@ public diagnostics ─────> <lb-app>-9090.gateway.attestmesh.xyz
 
 The LB has no Indexer signing key and never terminates the gRPC protocol. `IndexerRegistry.current()` keeps the stable LB endpoint but always carries the active backend's compose/code ID and Ed25519 signing pubkey.
 
+## Current Base deployment
+
+As of 2026-07-11, the production blue/green pair is:
+
+| Role | App ID | Detail |
+| --- | --- | --- |
+| Stable LB | `0x42B122e37c9805E7C5A7c77aFF0f6C3c80603602` | mesh control `10.18.1.13:50053` |
+| Active blue | `0x0ab50663D241C2A34a57Bb05c50018E680a92a21` | compose/code ID `0xf6e46e33dce5ecb83e5877e7ff519f8e48974af160646c840575f60298edb9df` |
+| Standby green | `0x74C0370C675af3a5a2c89FE8D90dBC433fBDB7d1` | retained as the immediate rollback backend |
+
+The stable gRPC endpoint is `https://42b122e37c9805e7c5a7c77aff0f6c3c80603602-50052.gateway.attestmesh.xyz`; stable HTTP diagnostics use the same host with port `9090`. Both colors run Indexer image `ghcr.io/attestmesh/attestmesh-indexer@sha256:14e9e3f6869ada585642c14e4e2e43bee197978ffc68d146dd6d3cddbc49d2bb`.
+
+Treat the on-chain registry and `active` command as authoritative if this record is stale. Keep green running until the protocol-v2 Sidecar rollout is complete and subscriber/checkpoint diagnostics remain caught up.
+
 ## Why the switch is two-phase
 
 An Indexer backend has an attestation-derived signing key and its own cursor database. A plain HAProxy address change would send reconnecting sidecars to a key that does not match `IndexerRegistry`, and a new backend could otherwise treat them as new subscribers.
