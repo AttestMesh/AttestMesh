@@ -76,9 +76,11 @@ impl ChainClient {
     /// §8.4: `member.cluster()` — find the ClusterDiamond from the member address.
     pub async fn cluster_of(&self) -> Result<Address> {
         let m = abi::IClusterMemberView::new(self.member_contract, &self.provider);
-        Ok(retry_rpc("read member.cluster()", || async { m.cluster().call().await })
-            .await?
-            ._0)
+        Ok(retry_rpc("read member.cluster()", || async {
+            m.cluster().call().await
+        })
+        .await?
+        ._0)
     }
 
     /// §8.4: `AttestFacet.memberOf(memberAddr)` — restart detection.

@@ -464,7 +464,11 @@ mod pimlico_tests {
         });
         apply_pimlico_sponsorship_response(&mut op, &resp).unwrap();
         assert_eq!(op.call_gas_limit, U256::from(100_000u64));
-        assert_eq!(op.max_fee_per_gas, U256::from(7u64), "fees set pre-sponsorship survive");
+        assert_eq!(
+            op.max_fee_per_gas,
+            U256::from(7u64),
+            "fees set pre-sponsorship survive"
+        );
         assert!(op.paymaster.is_some());
         assert_eq!(op.paymaster_data.len(), 4);
     }

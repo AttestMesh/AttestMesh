@@ -21,18 +21,25 @@ use crate::envelopes::{self, PeerEndpoint};
 use crate::proto::peer::peer_control_client::PeerControlClient;
 use crate::proto::peer::CskRequest;
 use crate::state::{AppPeerEvent, Phase, Shared};
-use crate::wg::{cidr, peer::WgPeerConfig, MeshControl};
+use crate::wg::{
+    cidr,
+    peer::{PeerTable, WgPeerConfig},
+    MeshControl,
+};
 use crate::{csk, transport};
 use alloy::primitives::{keccak256, Address, Bytes, B256, U256};
 use alloy::providers::Provider;
 use alloy::rpc::types::Filter;
 use alloy::signers::local::PrivateKeySigner;
 use anyhow::{Context, Result};
-use std::collections::HashMap;
+use rand::Rng;
+use std::collections::{HashMap, VecDeque};
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
+use tokio::task::JoinSet;
+use tonic::transport::Endpoint;
 
 /// Canonical EIP-4337 v0.7 EntryPoint (identical on every chain).
 const ENTRY_POINT: Address =
@@ -40,7 +47,11 @@ const ENTRY_POINT: Address =
 
 pub const PEER_GRPC_PORT: u16 = 50051;
 const RECONCILE_INTERVAL: Duration = Duration::from_secs(15);
-const CSK_RETRY: Duration = Duration::from_secs(10);
+const CSK_CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
+const CSK_RPC_TIMEOUT: Duration = Duration::from_secs(2);
+const CSK_RETRY_MIN: Duration = Duration::from_millis(250);
+const CSK_RETRY_MAX: Duration = Duration::from_secs(2);
+const CSK_PULL_PARALLELISM: usize = 8;
 /// Base wait before re-sending our PeerEndpoint to a peer whose Ed25519 key is
 /// still unknown (the peer is symmetric-polling, so a fresh send lands in its log
 /// window). Doubles per attempt up to [`ENVELOPE_RESEND_MAX`]: every resend is a
@@ -148,7 +159,7 @@ pub async fn launch(
 
     // Restart path: keys learned in previous runs short-circuit the envelope
     // resend loop (each resend is a sponsored UserOp).
-    let learned_keys = crate::peer_cache::load(dstack.as_ref()).await;
+    let learned_keys = crate::peer_cache::load(config.sidecar_state_dir.as_deref()).await;
     if !learned_keys.is_empty() {
         tracing::info!(
             peers = learned_keys.len(),
@@ -333,6 +344,9 @@ async fn reconcile_once(
 ) -> Result<()> {
     let cluster = ctx.shared.cluster;
     let members = ctx.chain.list_members(cluster).await?;
+    if let Some(originator) = members.first() {
+        ctx.shared.set_originator_member_id(originator.0).await;
+    }
     let others: Vec<[u8; 32]> = members
         .iter()
         .map(|m| m.0)
@@ -381,14 +395,17 @@ async fn reconcile_once(
                 })
                 .await
                 .context("wg add_peer")?;
-            {
+            let newly_configured = {
                 let mut peers = ctx.shared.peers.lock().await;
                 peers.ensure_chain(*member_id, mesh_ip, rec.wg_pubkey.0);
                 peers.set_endpoint(member_id, sni.clone());
                 // The bridge address is the punch-upgrade revert target; the
                 // bridge task itself stays alive even while the link rides UDP.
                 peers.set_bridge_addr(member_id, endpoint);
-                peers.mark_configured(member_id);
+                peers.mark_configured(member_id)
+            };
+            if newly_configured {
+                ctx.shared.peer_change.notify_one();
             }
             let _ = ctx.shared.peer_event_tx.send(AppPeerEvent::Joined {
                 member_id: *member_id,
@@ -596,17 +613,20 @@ async fn poll_envelopes(
                         peers.set_advertised_udp(&sender, Some(udp));
                     }
                 }
-                // Mirror to the sealed store regardless of the table update: the
+                // Mirror to durable state regardless of the table update: the
                 // table entry may not exist yet (envelope raced our configure pass)
                 // — the reconcile loop applies cached keys once it does.
                 {
                     let mut learned = ctx.learned_keys.lock().await;
                     if learned.get(&sender) != Some(&pe.ed25519_pub) {
                         learned.insert(sender, pe.ed25519_pub);
-                        if let Err(e) =
-                            crate::peer_cache::store(ctx.dstack.as_ref(), &learned).await
+                        if let Err(e) = crate::peer_cache::store(
+                            ctx.config.sidecar_state_dir.as_deref(),
+                            &learned,
+                        )
+                        .await
                         {
-                            tracing::warn!(error = ?e, "peer-key seal failed (non-fatal)");
+                            tracing::warn!(error = ?e, "peer-key cache write failed (non-fatal)");
                         }
                     }
                 }
@@ -706,116 +726,405 @@ async fn publish_own_ed25519_loop(ctx: Arc<Ctx>) {
     }
 }
 
-/// CSK lifecycle (master spec §8): restart-unseal, originate (memberIds[0]) or
-/// pull from a live peer over the mesh, then hold for peer-pull serving.
-async fn csk_loop(ctx: Arc<Ctx>) {
-    // Restart fast path: the CSK survives in the dstack sealed store.
-    match csk::unseal_from_store(ctx.dstack.as_ref()).await {
-        Ok(Some(c)) => {
-            *ctx.shared.csk.lock().await = Some(*c);
-            ctx.shared.gates.set_csk_acquired();
-            tracing::info!("CSK unsealed from store (restart path)");
-            return;
-        }
-        Ok(None) => {}
-        // Diagnostic, not fatal: the originator re-derives, onboardees re-pull.
-        Err(e) => tracing::warn!(error = ?e, "sealed-store unseal failed (guest agent /Unseal)"),
-    }
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CskCandidate {
+    member_id: [u8; 32],
+    mesh_ip: u32,
+    live: bool,
+    originator: bool,
+}
 
+fn ordered_csk_candidates(
+    peers: &PeerTable,
+    originator_member_id: Option<[u8; 32]>,
+) -> Vec<CskCandidate> {
+    let mut candidates: Vec<CskCandidate> = peers
+        .all()
+        .filter(|peer| peer.configured)
+        .map(|peer| CskCandidate {
+            member_id: peer.member_id,
+            mesh_ip: peer.mesh_ip,
+            live: peer.live,
+            originator: originator_member_id == Some(peer.member_id),
+        })
+        .collect();
+    candidates.sort_by_key(|candidate| {
+        let priority = if candidate.originator {
+            0
+        } else if candidate.live {
+            1
+        } else {
+            2
+        };
+        (priority, candidate.member_id)
+    });
+    candidates
+}
+
+#[derive(Clone, Debug)]
+enum CskProbeResult {
+    Sealed(Vec<u8>),
+    Unavailable,
+    Timeout,
+    Failed(String),
+}
+
+#[async_trait::async_trait]
+trait CskPeerRequester: Send + Sync + 'static {
+    async fn request(
+        &self,
+        candidate: &CskCandidate,
+        requester_member_id: [u8; 32],
+    ) -> CskProbeResult;
+}
+
+struct TonicCskPeerRequester {
+    port: u16,
+    connect_timeout: Duration,
+    rpc_timeout: Duration,
+}
+
+impl Default for TonicCskPeerRequester {
+    fn default() -> Self {
+        Self {
+            port: PEER_GRPC_PORT,
+            connect_timeout: CSK_CONNECT_TIMEOUT,
+            rpc_timeout: CSK_RPC_TIMEOUT,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl CskPeerRequester for TonicCskPeerRequester {
+    async fn request(
+        &self,
+        candidate: &CskCandidate,
+        requester_member_id: [u8; 32],
+    ) -> CskProbeResult {
+        let url = format!("http://{}:{}", cidr::fmt_ipv4(candidate.mesh_ip), self.port);
+        let endpoint = match Endpoint::from_shared(url) {
+            Ok(endpoint) => endpoint
+                .connect_timeout(self.connect_timeout)
+                .timeout(self.rpc_timeout),
+            Err(e) => return CskProbeResult::Failed(format!("invalid endpoint: {e}")),
+        };
+        let channel = match tokio::time::timeout(self.connect_timeout, endpoint.connect()).await {
+            Ok(Ok(channel)) => channel,
+            Ok(Err(e)) => return CskProbeResult::Failed(format!("connect: {e}")),
+            Err(_) => return CskProbeResult::Timeout,
+        };
+        let mut client = PeerControlClient::new(channel);
+        let mut request = tonic::Request::new(CskRequest {
+            requester_member_id: requester_member_id.to_vec(),
+        });
+        request.set_timeout(self.rpc_timeout);
+        match tokio::time::timeout(self.rpc_timeout, client.request_cluster_shared_key(request))
+            .await
+        {
+            Err(_) => CskProbeResult::Timeout,
+            Ok(Ok(response)) => CskProbeResult::Sealed(response.into_inner().sealed_csk),
+            Ok(Err(status)) if status.code() == tonic::Code::Unavailable => {
+                CskProbeResult::Unavailable
+            }
+            Ok(Err(status)) if status.code() == tonic::Code::DeadlineExceeded => {
+                CskProbeResult::Timeout
+            }
+            Ok(Err(status)) => CskProbeResult::Failed(format!("grpc {}", status.code())),
+        }
+    }
+}
+
+#[derive(Default, Debug)]
+struct CskPullStats {
+    candidates: usize,
+    attempts: usize,
+    max_in_flight: usize,
+    timeouts: usize,
+    unavailable: usize,
+    failed: usize,
+    verification_failed: usize,
+    elapsed_ms: u128,
+}
+
+struct CskPullSuccess {
+    csk: zeroize::Zeroizing<[u8; 32]>,
+    candidate: CskCandidate,
+    stats: CskPullStats,
+}
+
+async fn pull_csk_from_candidates(
+    requester: Arc<dyn CskPeerRequester>,
+    candidates: Vec<CskCandidate>,
+    requester_member_id: [u8; 32],
+    requester_xsecret: &crypto_box::SecretKey,
+    requester_xpub: &[u8; 32],
+    expected_commitment: &[u8; 32],
+) -> (Option<CskPullSuccess>, CskPullStats) {
+    let started = Instant::now();
+    let mut stats = CskPullStats {
+        candidates: candidates.len(),
+        ..Default::default()
+    };
+    let mut pending = VecDeque::from(candidates);
+    let mut running = JoinSet::new();
+
+    let start_next = |running: &mut JoinSet<_>,
+                      pending: &mut VecDeque<CskCandidate>,
+                      requester: &Arc<dyn CskPeerRequester>| {
+        if let Some(candidate) = pending.pop_front() {
+            let requester = requester.clone();
+            running.spawn(async move {
+                let result = requester.request(&candidate, requester_member_id).await;
+                (candidate, result)
+            });
+            true
+        } else {
+            false
+        }
+    };
+
+    while running.len() < CSK_PULL_PARALLELISM && start_next(&mut running, &mut pending, &requester)
+    {
+    }
+    stats.max_in_flight = stats.max_in_flight.max(running.len());
+
+    while let Some(joined) = running.join_next().await {
+        match joined {
+            Ok((candidate, result)) => {
+                stats.attempts += 1;
+                match result {
+                    CskProbeResult::Sealed(sealed) => match csk::open_pulled(
+                        &sealed,
+                        requester_xsecret,
+                        requester_xpub,
+                        expected_commitment,
+                    ) {
+                        Ok(csk) => {
+                            running.abort_all();
+                            stats.elapsed_ms = started.elapsed().as_millis();
+                            return (
+                                Some(CskPullSuccess {
+                                    csk,
+                                    candidate,
+                                    stats,
+                                }),
+                                CskPullStats::default(),
+                            );
+                        }
+                        Err(e) => {
+                            stats.verification_failed += 1;
+                            tracing::warn!(
+                                peer = %hex::encode(candidate.member_id),
+                                mesh_ip = %cidr::fmt_ipv4(candidate.mesh_ip),
+                                error = ?e,
+                                "pulled CSK failed verification"
+                            );
+                        }
+                    },
+                    CskProbeResult::Unavailable => stats.unavailable += 1,
+                    CskProbeResult::Timeout => stats.timeouts += 1,
+                    CskProbeResult::Failed(error) => {
+                        stats.failed += 1;
+                        tracing::debug!(
+                            peer = %hex::encode(candidate.member_id),
+                            mesh_ip = %cidr::fmt_ipv4(candidate.mesh_ip),
+                            error,
+                            "CSK peer probe failed"
+                        );
+                    }
+                }
+            }
+            Err(e) => {
+                stats.failed += 1;
+                tracing::warn!(error = ?e, "CSK peer probe task failed");
+            }
+        }
+        while running.len() < CSK_PULL_PARALLELISM
+            && start_next(&mut running, &mut pending, &requester)
+        {}
+        stats.max_in_flight = stats.max_in_flight.max(running.len());
+    }
+    stats.elapsed_ms = started.elapsed().as_millis();
+    (None, stats)
+}
+
+fn jittered_retry(delay: Duration) -> Duration {
+    let percent = rand::thread_rng().gen_range(80u128..=120);
+    Duration::from_millis(((delay.as_millis() * percent) / 100).max(1) as u64)
+        .clamp(CSK_RETRY_MIN, CSK_RETRY_MAX)
+}
+
+async fn hold_csk(ctx: &Ctx, csk: &[u8; 32]) {
+    *ctx.shared.csk.lock().await = Some(*csk);
+    ctx.shared.gates.set_csk_acquired();
+}
+
+async fn persist_and_hold_csk(
+    ctx: &Ctx,
+    csk: &[u8; 32],
+    expected_commitment: &[u8; 32],
+    source: &'static str,
+) {
+    match csk::store_cache(
+        ctx.dstack.as_ref(),
+        ctx.config.sidecar_state_dir.as_deref(),
+        ctx.shared.cluster,
+        ctx.shared.member_contract,
+        expected_commitment,
+        csk,
+    )
+    .await
+    {
+        Ok(true) => tracing::info!(source, "CSK encrypted cache updated"),
+        Ok(false) => tracing::debug!(source, "CSK durable cache is not configured"),
+        Err(e) => tracing::warn!(source, error = ?e, "CSK cache write failed (non-fatal)"),
+    }
+    hold_csk(ctx, csk).await;
+}
+
+async fn resolve_originator(ctx: &Ctx) -> Result<Option<[u8; 32]>> {
+    if let Some(originator) = ctx.shared.get_originator_member_id().await {
+        return Ok(Some(originator));
+    }
+    let members = ctx.chain.list_members(ctx.shared.cluster).await?;
+    if let Some(originator) = members.first() {
+        ctx.shared.set_originator_member_id(originator.0).await;
+        Ok(Some(originator.0))
+    } else {
+        Ok(None)
+    }
+}
+
+/// CSK lifecycle (master spec §8): authenticated cache, deterministic originator
+/// re-derivation, or bounded parallel pull from configured peers.
+async fn csk_loop(ctx: Arc<Ctx>) {
+    let requester: Arc<dyn CskPeerRequester> = Arc::new(TonicCskPeerRequester::default());
+    let mut retry = CSK_RETRY_MIN;
+    let mut cache_checked_for: Option<[u8; 32]> = None;
     loop {
         if ctx.shared.gates.csk_acquired() {
             return;
         }
-        if let Err(e) = csk_once(&ctx).await {
-            tracing::debug!(error = ?e, "csk pass incomplete; retrying");
+        let notified = ctx.shared.peer_change.notified();
+        match csk_once(&ctx, requester.clone(), &mut cache_checked_for).await {
+            Ok(true) => return,
+            Ok(false) => {}
+            Err(e) => tracing::debug!(error = ?e, "CSK pass incomplete; retrying"),
         }
-        tokio::time::sleep(CSK_RETRY).await;
+        tokio::select! {
+            _ = notified => retry = CSK_RETRY_MIN,
+            _ = tokio::time::sleep(jittered_retry(retry)) => {
+                retry = (retry * 2).min(CSK_RETRY_MAX);
+            }
+        }
     }
 }
 
-async fn csk_once(ctx: &Ctx) -> Result<()> {
+async fn csk_once(
+    ctx: &Ctx,
+    requester: Arc<dyn CskPeerRequester>,
+    cache_checked_for: &mut Option<[u8; 32]>,
+) -> Result<bool> {
     let cluster = ctx.shared.cluster;
-    let commitment = ctx.chain.csk_commitment(cluster).await?;
+    let chain_commitment = ctx.chain.csk_commitment(cluster).await?;
 
-    if commitment == B256::ZERO {
-        // Only memberIds[0] may set the commitment (AttestFacet.setCskCommitment).
-        let members = ctx.chain.list_members(cluster).await?;
-        if members.first().map(|m| m.0) != Some(ctx.shared.self_member_id) {
-            return Ok(()); // originator hasn't committed yet; keep waiting
+    if chain_commitment == B256::ZERO {
+        let originator = resolve_originator(ctx).await?;
+        if originator != Some(ctx.shared.self_member_id) {
+            return Ok(false);
         }
-        let c = csk::derive_originator(ctx.dstack.as_ref()).await?;
+        let csk = csk::derive_originator(ctx.dstack.as_ref()).await?;
+        let expected_commitment = csk::commitment(&csk);
         let inner =
-            message_facet::build_set_csk_commitment_calldata(B256::from(csk::commitment(&c)));
+            message_facet::build_set_csk_commitment_calldata(B256::from(expected_commitment));
         let tx = ctx.submit_op(inner).await.context("setCskCommitment")?;
-        // Best-effort: the commitment is on-chain already, and the originator can
-        // always re-derive (deterministic KMS derivation), so a store failure
-        // must not fail the pass here.
-        if let Err(e) = csk::seal_to_store(ctx.dstack.as_ref(), &c).await {
-            tracing::warn!(error = ?e, "CSK seal_to_store failed (non-fatal)");
-        }
-        *ctx.shared.csk.lock().await = Some(*c);
-        ctx.shared.gates.set_csk_acquired();
+        persist_and_hold_csk(ctx, &csk, &expected_commitment, "originated").await;
         tracing::info!(tx = %tx, "CSK originated + commitment set on-chain");
-        return Ok(());
+        return Ok(true);
     }
 
-    // Originator restart path: the CSK is deterministically KMS-derived, so when
-    // the sealed store is lost the originator re-derives and verifies against the
-    // on-chain commitment. Without this, a restarted originator would join every
-    // other empty-handed node in the pull path and the cluster would deadlock
-    // (peer_grpc only serves a held CSK).
-    if let Ok(c) = csk::derive_originator(ctx.dstack.as_ref()).await {
-        if csk::commitment(&c) == commitment.0 {
-            if let Err(e) = csk::seal_to_store(ctx.dstack.as_ref(), &c).await {
-                tracing::warn!(error = ?e, "CSK seal_to_store failed (non-fatal)");
+    if *cache_checked_for != Some(chain_commitment.0) {
+        *cache_checked_for = Some(chain_commitment.0);
+        let started = Instant::now();
+        match csk::load_cache(
+            ctx.dstack.as_ref(),
+            ctx.config.sidecar_state_dir.as_deref(),
+            cluster,
+            ctx.shared.member_contract,
+            &chain_commitment.0,
+        )
+        .await
+        {
+            Ok(Some(csk)) => {
+                hold_csk(ctx, &csk).await;
+                tracing::info!(
+                    elapsed_ms = started.elapsed().as_millis(),
+                    "CSK loaded from authenticated encrypted cache"
+                );
+                return Ok(true);
             }
-            *ctx.shared.csk.lock().await = Some(*c);
-            ctx.shared.gates.set_csk_acquired();
-            tracing::info!(
-                "CSK re-derived + verified against on-chain commitment (originator restart)"
-            );
-            return Ok(());
+            Ok(None) => tracing::debug!("CSK encrypted cache miss"),
+            Err(e) => tracing::warn!(error = ?e, "CSK cache rejected; falling back to peer pull"),
         }
     }
 
-    // Onboardee: pull from any configured peer over the mesh.
+    let originator = resolve_originator(ctx).await?;
+    if originator == Some(ctx.shared.self_member_id) {
+        let csk = csk::derive_originator(ctx.dstack.as_ref()).await?;
+        anyhow::ensure!(
+            csk::commitment(&csk) == chain_commitment.0,
+            "originator-derived CSK does not match on-chain commitment"
+        );
+        persist_and_hold_csk(ctx, &csk, &chain_commitment.0, "originator-rederived").await;
+        tracing::info!(
+            "CSK re-derived + verified against on-chain commitment (originator restart)"
+        );
+        return Ok(true);
+    }
+
     ctx.shared.set_phase(Phase::PullingCsk).await;
-    let targets: Vec<u32> = {
+    let candidates = {
         let peers = ctx.shared.peers.lock().await;
-        peers
-            .all()
-            .filter(|p| p.configured)
-            .map(|p| p.mesh_ip)
-            .collect()
+        ordered_csk_candidates(&peers, originator)
     };
-    for ip in targets {
-        let url = format!("http://{}:{}", cidr::fmt_ipv4(ip), PEER_GRPC_PORT);
-        let Ok(mut client) = PeerControlClient::connect(url.clone()).await else {
-            continue;
-        };
-        let req = CskRequest {
-            requester_member_id: ctx.shared.self_member_id.to_vec(),
-        };
-        let Ok(resp) = client.request_cluster_shared_key(req).await else {
-            continue;
-        };
-        match csk::open_pulled(
-            &resp.into_inner().sealed_csk,
-            &ctx.shared.keys.x_secret,
-            &ctx.shared.keys.x_pub,
-            &commitment.0,
-        ) {
-            Ok(c) => {
-                csk::seal_to_store(ctx.dstack.as_ref(), &c).await?;
-                *ctx.shared.csk.lock().await = Some(*c);
-                ctx.shared.gates.set_csk_acquired();
-                tracing::info!(from = %url, "CSK pulled + verified against on-chain commitment");
-                return Ok(());
-            }
-            Err(e) => tracing::warn!(from = %url, error = ?e, "pulled CSK failed verification"),
-        }
+    let (success, stats) = pull_csk_from_candidates(
+        requester,
+        candidates,
+        ctx.shared.self_member_id,
+        &ctx.shared.keys.x_secret,
+        &ctx.shared.keys.x_pub,
+        &chain_commitment.0,
+    )
+    .await;
+    if let Some(success) = success {
+        persist_and_hold_csk(ctx, &success.csk, &chain_commitment.0, "peer-pull").await;
+        tracing::info!(
+            from = %format!("http://{}:{}", cidr::fmt_ipv4(success.candidate.mesh_ip), PEER_GRPC_PORT),
+            peer = %hex::encode(success.candidate.member_id),
+            candidates = success.stats.candidates,
+            attempts = success.stats.attempts,
+            max_in_flight = success.stats.max_in_flight,
+            timeouts = success.stats.timeouts,
+            unavailable = success.stats.unavailable,
+            failed = success.stats.failed,
+            verification_failed = success.stats.verification_failed,
+            elapsed_ms = success.stats.elapsed_ms,
+            "CSK pulled + verified against on-chain commitment"
+        );
+        return Ok(true);
     }
-    anyhow::bail!("no peer served the CSK yet")
+    tracing::debug!(
+        candidates = stats.candidates,
+        attempts = stats.attempts,
+        max_in_flight = stats.max_in_flight,
+        timeouts = stats.timeouts,
+        unavailable = stats.unavailable,
+        failed = stats.failed,
+        verification_failed = stats.verification_failed,
+        elapsed_ms = stats.elapsed_ms,
+        "CSK peer pull round incomplete"
+    );
+    Ok(false)
 }
 
 async fn serve_peer_grpc(
@@ -878,6 +1187,8 @@ async fn serve_agent_grpc(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rand::rngs::OsRng;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// The peer ingress hostname derives purely from chain state + config — the
     /// gateway's TLS-passthrough route needs the `s` suffix (a plain route is
@@ -930,5 +1241,277 @@ mod tests {
             day,
             "no overflow at extreme attempts"
         );
+    }
+
+    fn peer_id(n: u8) -> [u8; 32] {
+        let mut id = [0u8; 32];
+        id[31] = n;
+        id
+    }
+
+    #[test]
+    fn csk_candidates_prioritize_originator_then_live_then_member_id() {
+        let mut peers = PeerTable::new();
+        for n in [3u8, 1, 2, 4] {
+            peers.ensure_chain(peer_id(n), u32::from(n), [n; 32]);
+            peers.mark_configured(&peer_id(n));
+        }
+        peers.set_live(&peer_id(2), true);
+        peers.set_live(&peer_id(4), true);
+
+        let ordered = ordered_csk_candidates(&peers, Some(peer_id(3)));
+        assert_eq!(
+            ordered.iter().map(|c| c.member_id).collect::<Vec<_>>(),
+            vec![peer_id(3), peer_id(2), peer_id(4), peer_id(1)]
+        );
+    }
+
+    #[derive(Clone)]
+    struct FakePlan {
+        delay: Duration,
+        result: CskProbeResult,
+    }
+
+    struct FakeRequester {
+        plans: HashMap<u32, FakePlan>,
+        total_attempts: AtomicUsize,
+        in_flight: AtomicUsize,
+        max_in_flight: AtomicUsize,
+    }
+
+    impl FakeRequester {
+        fn new(plans: HashMap<u32, FakePlan>) -> Self {
+            Self {
+                plans,
+                total_attempts: AtomicUsize::new(0),
+                in_flight: AtomicUsize::new(0),
+                max_in_flight: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    struct InFlightGuard<'a>(&'a AtomicUsize);
+
+    impl Drop for InFlightGuard<'_> {
+        fn drop(&mut self) {
+            self.0.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl CskPeerRequester for FakeRequester {
+        async fn request(
+            &self,
+            candidate: &CskCandidate,
+            _requester_member_id: [u8; 32],
+        ) -> CskProbeResult {
+            self.total_attempts.fetch_add(1, Ordering::SeqCst);
+            let current = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+            self.max_in_flight.fetch_max(current, Ordering::SeqCst);
+            let _guard = InFlightGuard(&self.in_flight);
+            let Some(plan) = self.plans.get(&candidate.mesh_ip).cloned() else {
+                return CskProbeResult::Failed("missing fake plan".into());
+            };
+            tokio::time::sleep(plan.delay).await;
+            plan.result
+        }
+    }
+
+    fn candidate(n: u8) -> CskCandidate {
+        CskCandidate {
+            member_id: peer_id(n),
+            mesh_ip: u32::from(n),
+            live: true,
+            originator: n == 1,
+        }
+    }
+
+    #[tokio::test]
+    async fn first_valid_csk_cancels_slow_dead_peers() {
+        let xsecret = crypto_box::SecretKey::generate(&mut OsRng);
+        let xpub = *xsecret.public_key().as_bytes();
+        let key = [42u8; 32];
+        let expected = csk::commitment(&key);
+        let sealed = csk::seal_for_peer(&key, &xpub).unwrap();
+        let fake = Arc::new(FakeRequester::new(HashMap::from([
+            (
+                1,
+                FakePlan {
+                    delay: Duration::from_millis(500),
+                    result: CskProbeResult::Timeout,
+                },
+            ),
+            (
+                2,
+                FakePlan {
+                    delay: Duration::from_millis(20),
+                    result: CskProbeResult::Sealed(sealed),
+                },
+            ),
+        ])));
+        let started = Instant::now();
+        let (success, _) = pull_csk_from_candidates(
+            fake.clone(),
+            vec![candidate(1), candidate(2)],
+            peer_id(99),
+            &xsecret,
+            &xpub,
+            &expected,
+        )
+        .await;
+        assert_eq!(*success.unwrap().csk, key);
+        assert!(started.elapsed() < Duration::from_millis(200));
+        tokio::task::yield_now().await;
+        assert_eq!(fake.in_flight.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn csk_pull_caps_parallelism_and_accounts_for_unavailable_peers() {
+        let xsecret = crypto_box::SecretKey::generate(&mut OsRng);
+        let xpub = *xsecret.public_key().as_bytes();
+        let mut plans = HashMap::new();
+        let mut candidates = Vec::new();
+        for n in 1u8..=20 {
+            plans.insert(
+                u32::from(n),
+                FakePlan {
+                    delay: Duration::from_millis(10),
+                    result: CskProbeResult::Unavailable,
+                },
+            );
+            candidates.push(candidate(n));
+        }
+        let fake = Arc::new(FakeRequester::new(plans));
+        let (success, stats) = pull_csk_from_candidates(
+            fake.clone(),
+            candidates,
+            peer_id(99),
+            &xsecret,
+            &xpub,
+            &csk::commitment(&[1u8; 32]),
+        )
+        .await;
+        assert!(success.is_none());
+        assert_eq!(stats.attempts, 20);
+        assert_eq!(stats.unavailable, 20);
+        assert_eq!(stats.max_in_flight, CSK_PULL_PARALLELISM);
+        assert_eq!(
+            fake.max_in_flight.load(Ordering::SeqCst),
+            CSK_PULL_PARALLELISM
+        );
+    }
+
+    #[tokio::test]
+    async fn all_unavailable_candidates_can_be_retried_in_later_rounds() {
+        let xsecret = crypto_box::SecretKey::generate(&mut OsRng);
+        let xpub = *xsecret.public_key().as_bytes();
+        let fake = Arc::new(FakeRequester::new(HashMap::from([
+            (
+                1,
+                FakePlan {
+                    delay: Duration::from_millis(1),
+                    result: CskProbeResult::Unavailable,
+                },
+            ),
+            (
+                2,
+                FakePlan {
+                    delay: Duration::from_millis(1),
+                    result: CskProbeResult::Unavailable,
+                },
+            ),
+        ])));
+
+        for _ in 0..2 {
+            let (success, stats) = pull_csk_from_candidates(
+                fake.clone(),
+                vec![candidate(1), candidate(2)],
+                peer_id(99),
+                &xsecret,
+                &xpub,
+                &csk::commitment(&[1u8; 32]),
+            )
+            .await;
+            assert!(success.is_none());
+            assert_eq!(stats.unavailable, 2);
+        }
+        assert_eq!(fake.total_attempts.load(Ordering::SeqCst), 4);
+    }
+
+    #[tokio::test]
+    async fn bogus_response_is_rejected_while_another_peer_can_succeed() {
+        let xsecret = crypto_box::SecretKey::generate(&mut OsRng);
+        let xpub = *xsecret.public_key().as_bytes();
+        let real_key = [17u8; 32];
+        let expected = csk::commitment(&real_key);
+        let fake = Arc::new(FakeRequester::new(HashMap::from([
+            (
+                1,
+                FakePlan {
+                    delay: Duration::from_millis(1),
+                    result: CskProbeResult::Sealed(csk::seal_for_peer(&[99u8; 32], &xpub).unwrap()),
+                },
+            ),
+            (
+                2,
+                FakePlan {
+                    delay: Duration::from_millis(20),
+                    result: CskProbeResult::Sealed(csk::seal_for_peer(&real_key, &xpub).unwrap()),
+                },
+            ),
+        ])));
+        let (success, _) = pull_csk_from_candidates(
+            fake,
+            vec![candidate(1), candidate(2)],
+            peer_id(99),
+            &xsecret,
+            &xpub,
+            &expected,
+        )
+        .await;
+        let success = success.unwrap();
+        assert_eq!(*success.csk, real_key);
+        assert_eq!(success.stats.verification_failed, 1);
+    }
+
+    #[tokio::test]
+    async fn tonic_requester_bounds_a_hung_peer() {
+        let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let (_stream, _) = listener.accept().await.unwrap();
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        });
+        let requester = TonicCskPeerRequester {
+            port,
+            connect_timeout: Duration::from_millis(100),
+            rpc_timeout: Duration::from_millis(100),
+        };
+        let candidate = CskCandidate {
+            member_id: peer_id(1),
+            mesh_ip: u32::from(Ipv4Addr::LOCALHOST),
+            live: true,
+            originator: true,
+        };
+        let started = Instant::now();
+        let result = requester.request(&candidate, peer_id(99)).await;
+        assert!(
+            matches!(result, CskProbeResult::Timeout | CskProbeResult::Failed(_)),
+            "unexpected probe result: {result:?}"
+        );
+        assert!(started.elapsed() < Duration::from_millis(500));
+        server.abort();
+    }
+
+    #[test]
+    fn csk_retry_jitter_stays_within_twenty_percent() {
+        for _ in 0..100 {
+            let delay = jittered_retry(Duration::from_millis(1000));
+            assert!((Duration::from_millis(800)..=Duration::from_millis(1200)).contains(&delay));
+            assert!(jittered_retry(CSK_RETRY_MIN) >= CSK_RETRY_MIN);
+            assert!(jittered_retry(CSK_RETRY_MAX) <= CSK_RETRY_MAX);
+        }
     }
 }

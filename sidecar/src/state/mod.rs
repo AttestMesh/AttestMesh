@@ -30,7 +30,7 @@ const CLUSTER_DISCOVERY_MAX_ATTEMPTS: u32 = 90; // ~15 min
 const REGISTRATION_MAX_ATTEMPTS: u32 = 60; // ~10 min
 use gates::Gates;
 use std::sync::Arc;
-use tokio::sync::{broadcast, Mutex};
+use tokio::sync::{broadcast, Mutex, Notify};
 
 pub const DSTACK_ATTESTOR_ID: &[u8] = b"attestmesh.attestor.dstack";
 
@@ -113,6 +113,10 @@ pub struct Shared {
     pub phase: Mutex<Phase>,
     pub gates: Gates,
     pub punch_metrics: PunchMetrics,
+    pub originator_member_id: Mutex<Option<[u8; 32]>>,
+    /// Coalescing wake-up for the single CSK pull loop. Peer configuration and
+    /// liveness changes should trigger an immediate retry instead of a fixed sleep.
+    pub peer_change: Notify,
 
     pub incoming_tx: broadcast::Sender<AppIncoming>,
     pub peer_event_tx: broadcast::Sender<AppPeerEvent>,
@@ -153,6 +157,8 @@ impl Shared {
             phase: Mutex::new(Phase::Booting),
             gates: Gates::new(),
             punch_metrics: PunchMetrics::default(),
+            originator_member_id: Mutex::new(None),
+            peer_change: Notify::new(),
             incoming_tx,
             peer_event_tx,
         })
@@ -176,6 +182,19 @@ impl Shared {
 
     pub fn mesh_ip_for(&self, member_id: &[u8; 32]) -> u32 {
         wg::cidr::derive_ip(member_id, self.mesh_cidr_ip, self.mesh_cidr_prefix)
+    }
+
+    pub async fn set_originator_member_id(&self, member_id: [u8; 32]) {
+        let mut current = self.originator_member_id.lock().await;
+        if *current != Some(member_id) {
+            *current = Some(member_id);
+            drop(current);
+            self.peer_change.notify_one();
+        }
+    }
+
+    pub async fn get_originator_member_id(&self) -> Option<[u8; 32]> {
+        *self.originator_member_id.lock().await
     }
 }
 
@@ -226,8 +245,10 @@ pub async fn run(config: Config) -> Result<()> {
     };
     tracing::info!(%cluster, "discovered cluster diamond");
 
-    let (mesh_cidr_ip, mesh_cidr_prefix) =
-        chain.mesh_cidr(cluster).await.context("read cluster mesh CIDR")?;
+    let (mesh_cidr_ip, mesh_cidr_prefix) = chain
+        .mesh_cidr(cluster)
+        .await
+        .context("read cluster mesh CIDR")?;
     tracing::info!(
         mesh_cidr = %format!("{}/{}", wg::cidr::fmt_ipv4(mesh_cidr_ip), mesh_cidr_prefix),
         "discovered cluster mesh CIDR"
