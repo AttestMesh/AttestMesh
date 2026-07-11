@@ -564,6 +564,12 @@ def startup() -> None:
     ensure_db()
 
 
+@app.get("/health/process")
+async def process_health() -> JSONResponse:
+    """Process-only LB contract; deliberately independent of providers and Postgres."""
+    return JSONResponse({"status": "router-alive"})
+
+
 @app.get("/health/liveliness")
 async def health() -> Response:
     try:

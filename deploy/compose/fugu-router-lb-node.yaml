@@ -220,6 +220,13 @@ services:
             # Cutovers are gated by an authenticated, database-backed request.
             # `/health/liveliness` is upstream-provider-coupled and can report
             # 503 while the router and its PostgreSQL path are fully usable.
+            process_url = f"http://{ip}:18410/health/process"
+            with urllib.request.urlopen(process_url, timeout=10) as process_resp:
+                process_body = process_resp.read(4096).decode("utf-8", errors="replace")
+                if process_resp.status != 200 or "router-alive" not in process_body:
+                    raise RuntimeError(
+                        f"process health returned HTTP {process_resp.status}: {process_body[:200]}"
+                    )
             url = f"http://{ip}:18410/fugu/api/summary?window=5h&model=grok-4.5"
             req = urllib.request.Request(
                 url,

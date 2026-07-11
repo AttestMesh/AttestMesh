@@ -638,6 +638,7 @@ echo "\$models" | grep -q '"grok-4.3"' || { echo "PROXY: FAIL - /v1/models missi
 echo "\$models" | grep -q '"grok-imagine-image-quality"' || { echo "PROXY: FAIL - /v1/models missing grok-imagine-image-quality: \$models"; exit 2; }
 echo "\$models" | grep -q '"grok-imagine-image"' || { echo "PROXY: FAIL - /v1/models missing grok-imagine-image: \$models"; exit 2; }
 curl -fsS --max-time 10 "\$BASE_URL/health/liveliness" >/dev/null 2>&1 || { echo "PROXY: FAIL - liveliness"; exit 3; }
+curl -fsS --max-time 10 "\$BASE_URL/health/process" >/dev/null 2>&1 || { echo "PROXY: FAIL - process health"; exit 3; }
 fugu_comp=\$(curl -fsS --max-time 120 -H "Authorization: Bearer ${LITELLM_MASTER_KEY}" -H 'Content-Type: application/json' \
   -X POST "\$BASE_URL/v1/chat/completions" \
   -d '{"model":"fugu-ultra","messages":[{"role":"user","content":"Say OK."}],"max_tokens":16,"metadata":{"tags":["verify-proxy"]}}' 2>&1)
@@ -692,6 +693,7 @@ echo "\$models" | grep -q '"grok-4.3"' || { echo "PROXY: FAIL - /v1/models missi
 echo "\$models" | grep -q '"grok-imagine-image-quality"' || { echo "PROXY: FAIL - /v1/models missing grok-imagine-image-quality: \$models"; exit 2; }
 echo "\$models" | grep -q '"grok-imagine-image"' || { echo "PROXY: FAIL - /v1/models missing grok-imagine-image: \$models"; exit 2; }
 curl -fsS --max-time 10 "\$BASE_URL/health/liveliness" >/dev/null 2>&1 || { echo "PROXY: FAIL - liveliness"; exit 3; }
+curl -fsS --max-time 10 "\$BASE_URL/health/process" >/dev/null 2>&1 || { echo "PROXY: FAIL - process health"; exit 3; }
 fugu_comp=\$(curl -fsS --max-time 120 -H "Authorization: Bearer ${LITELLM_MASTER_KEY}" -H 'Content-Type: application/json' \
   -X POST "\$BASE_URL/v1/chat/completions" \
   -d '{"model":"fugu-ultra","messages":[{"role":"user","content":"Say OK."}],"max_tokens":16,"metadata":{"tags":["verify-proxy"]}}' 2>&1)
