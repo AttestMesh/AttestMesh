@@ -18,6 +18,12 @@ import time
 sys.path.insert(0, "/opt/dstack-mcp")
 import mcp_dstack as m  # noqa: E402
 
+# The box MCP defaults to PublicNode, but a saturated/read-only endpoint must not
+# strand on-chain app deployment. The host driver can select a separate transaction
+# RPC without sealing that operator-only value into the guest.
+if box_rpc := os.environ.get("E_BOX_RPC", "").strip():
+    m.RPC = box_rpc
+
 NAME = os.environ.get("BOX_NAME", "generic-node")
 COMPOSE_PATH = os.environ.get("BOX_COMPOSE", "/tmp/generic-node.yaml")
 VCPU = int(os.environ.get("BOX_VCPU", "2"))

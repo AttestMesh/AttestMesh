@@ -97,6 +97,7 @@ _box_run() {
   scp -o BatchMode=yes -q "$HERE/generic-node-box.py" "$BOX_HOST:/tmp/generic-node-box.py"
   {
     printf 'E_CHAIN_ID=%q\n' "${CHAIN_ID:-}"
+    printf 'E_BOX_RPC=%q\n' "${BOX_RPC:-}"
     printf 'E_RPC_URL=%q\n' "${RPC_URL:-}"
     printf 'E_BUNDLER_URL=%q\n' "${BUNDLER_URL:-${RPC_URL:-}}"
     printf 'E_GAS_POLICY_ID=%q\n' "${GAS_POLICY_ID:-}"
