@@ -205,6 +205,7 @@ services:
         import hmac
         import json
         import os
+        import time
         import urllib.error
         import urllib.request
         from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -215,8 +216,15 @@ services:
         BIND = PEERS[NODE]
         PATRONI = "http://127.0.0.1:8008"
 
-        def json_request(url, *, data=None, headers=None):
-            request = urllib.request.Request(url, data=data, headers=headers or {})
+        SWITCHOVER_LOOP_WAIT = 2
+
+        def json_request(url, *, data=None, headers=None, method=None):
+            request = urllib.request.Request(
+                url,
+                data=data,
+                headers=headers or {},
+                method=method,
+            )
             with urllib.request.urlopen(request, timeout=20) as response:
                 body = response.read(1024 * 1024)
                 return response.status, body
@@ -274,18 +282,36 @@ services:
                     leader = leaders[0]["name"]
                     password = open("/pgha-secrets/patroni-api", encoding="utf-8").read()
                     basic = base64.b64encode(("patroni:" + password).encode()).decode()
+                    auth_headers = {
+                        "Authorization": "Basic " + basic,
+                        "Content-Type": "application/json",
+                    }
+                    _, config_body = json_request(PATRONI + "/config")
+                    config = json.loads(config_body)
+                    previous_loop_wait = int(config.get("loop_wait", 10))
+                    if previous_loop_wait != SWITCHOVER_LOOP_WAIT:
+                        _, config_body = json_request(
+                            PATRONI + "/config",
+                            data=json.dumps({"loop_wait": SWITCHOVER_LOOP_WAIT}).encode(),
+                            headers=auth_headers,
+                            method="PATCH",
+                        )
+                        config = json.loads(config_body)
+                        if int(config.get("loop_wait", 0)) != SWITCHOVER_LOOP_WAIT:
+                            raise RuntimeError("Patroni rejected the switchover loop cadence")
+                        # Dynamic configuration is cluster-wide. Give every member one
+                        # complete old-cadence cycle to observe it before demotion.
+                        time.sleep(min(previous_loop_wait + 1, 15))
                     payload = json.dumps({"leader": leader, "candidate": candidate}).encode()
                     status, patroni_body = json_request(
                         PATRONI + "/switchover",
                         data=payload,
-                        headers={
-                            "Authorization": "Basic " + basic,
-                            "Content-Type": "application/json",
-                        },
+                        headers=auth_headers,
                     )
                     self.send_json(200, {
                         "candidate": candidate,
                         "leader": leader,
+                        "loop_wait": SWITCHOVER_LOOP_WAIT,
                         "patroni_status": status,
                         "patroni_response": patroni_body.decode(errors="replace")[:500],
                     })
