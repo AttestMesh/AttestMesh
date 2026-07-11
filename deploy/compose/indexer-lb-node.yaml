@@ -67,15 +67,17 @@ services:
     network_mode: service:sidecar
     depends_on:
       - sidecar
-    env_file:
-      - /tmp/attestmesh-workload.env
     volumes:
+      - /tmp/attestmesh-workload.env:/run/secrets/indexer-lb.env:ro
       - haproxy-run:/indexer-lb-run
       - indexer-lb-state:/indexer-lb-state
     entrypoint: ["/bin/sh", "-ec"]
     command:
       - |
         set -u
+        set -a
+        . /run/secrets/indexer-lb.env
+        set +a
         mkdir -p /indexer-lb-run /indexer-lb-state
         rm -f /indexer-lb-run/admin.sock
         active="$${INDEXER_LB_INITIAL_BACKEND:-}"
@@ -135,14 +137,16 @@ services:
     depends_on:
       - sidecar
       - haproxy
-    env_file:
-      - /tmp/attestmesh-workload.env
     volumes:
+      - /tmp/attestmesh-workload.env:/run/secrets/indexer-lb.env:ro
       - haproxy-run:/indexer-lb-run
       - indexer-lb-state:/indexer-lb-state
     entrypoint: ["/bin/sh", "-ec"]
     command:
       - |
+        set -a
+        . /run/secrets/indexer-lb.env
+        set +a
         cat >/tmp/indexer_lb_controller.py <<'PY'
         import fcntl
         import hmac
