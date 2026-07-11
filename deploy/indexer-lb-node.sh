@@ -190,7 +190,8 @@ _backend_http() {
 }
 
 _backend_metadata() {
-  local target="$1" ip="$2" state status health
+  local target="$1" ip="$2" state status health min_clusters
+  min_clusters="${INDEXER_MIN_CLUSTER_COUNT:-1}"
   health="$(_backend_http "$ip" /healthz)" || die "candidate $target is not healthy at $ip:9090"
   echo "$health" | jq -e '.status == "ok"' >/dev/null \
     || die "candidate health is not ok: $health"
@@ -200,6 +201,9 @@ _backend_metadata() {
     || die "candidate returned invalid pubKey: ${BACKEND_PUBKEY:-<empty>}"
   echo "$status" | jq -e '.health.ok == true' >/dev/null \
     || die "candidate /status reports unhealthy: $status"
+  echo "$status" | jq -e --argjson min "$min_clusters" \
+    '.readModel.clusterCount >= $min and (.readModel.atBlock | type == "number")' >/dev/null \
+    || die "candidate read model is not caught up or has fewer than $min_clusters cluster(s): $status"
   if [[ "$target" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
     BACKEND_CODE_ID="${INDEXER_BACKEND_CODE_ID:-}"
     [ -n "$BACKEND_CODE_ID" ] || die "literal backend IP requires INDEXER_BACKEND_CODE_ID"
