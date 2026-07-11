@@ -152,7 +152,10 @@ verify_http() {
     min_clusters="$(_current_registry_cluster_count || true)"
     min_clusters="${min_clusters:-1}"
   fi
-  attempts="${INDEXER_VERIFY_ATTEMPTS:-90}"
+  # A fresh blue/green color may need a full factory + cluster-history scan.
+  # Keep the deployment gate alive for that cold pre-warm; warm upgrades pass
+  # immediately once the durable cursor is caught up.
+  attempts="${INDEXER_VERIFY_ATTEMPTS:-180}"
   for i in $(seq 1 "$attempts"); do
     body=$(curl -fsm 8 "https://${host}/mesh/health" 2>/dev/null || true)
     status=$(curl -fsm 8 "https://${host}/status" 2>/dev/null || true)
