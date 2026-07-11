@@ -442,8 +442,11 @@ for i in $(seq 1 60); do
   c="$(curl -fsS --max-time 5 "http://$FIRST:8008/cluster" 2>/dev/null || true)"
   leaders=$(jq -r '[.members[]? | select(.role == "leader")] | length' <<<"$c" 2>/dev/null || echo 0)
   streaming=$(jq -r '[.members[]? | select(.state == "streaming")] | length' <<<"$c" 2>/dev/null || echo 0)
-  if [ "${leaders:-0}" = 1 ] && [ "${streaming:-0}" -ge $((EXPECT - 1)) ]; then ok=1; break; fi
-  echo "  … ($i/60) leaders=${leaders:-?} streaming=${streaming:-?}"
+  zero_lag=$(jq -r '[.members[]? | select(.role == "replica" and .state == "streaming" and ((.lag // 0) == 0))] | length' <<<"$c" 2>/dev/null || echo 0)
+  if [ "${leaders:-0}" = 1 ] \
+     && [ "${streaming:-0}" -ge $((EXPECT - 1)) ] \
+     && [ "${zero_lag:-0}" -ge $((EXPECT - 1)) ]; then ok=1; break; fi
+  echo "  … ($i/60) leaders=${leaders:-?} streaming=${streaming:-?} zero_lag=${zero_lag:-?}"
   sleep 15
 done
 [ -n "$ok" ] || { echo "HA: FAIL - cluster never converged"; exit 2; }

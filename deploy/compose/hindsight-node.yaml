@@ -99,7 +99,7 @@ services:
           bind 0.0.0.0:15431
           option httpchk GET /primary
           http-check expect status 200
-          default-server inter 1s fall 2 rise 1 on-marked-down shutdown-sessions
+          default-server inter 200ms fastinter 100ms downinter 500ms fall 1 rise 1 on-marked-down shutdown-sessions
           server pg1 ${HINDSIGHT_PGHA_IP_1}:5434 check port 8008
           server pg2 ${HINDSIGHT_PGHA_IP_2}:5434 check port 8008
           server pg3 ${HINDSIGHT_PGHA_IP_3}:5434 check port 8008
