@@ -95,7 +95,11 @@ _router_target_ip() {
   fi
   f="$LOGDIR/fugu-router-node-${target}.state"
   [ -f "$f" ] || die "missing router state for target '$target': $f"
-  if [ "${FUGU_LB_BACKEND_MODE:-bridge}" = bridge ]; then
+  # The LB and router listeners share the AttestMesh WireGuard plane.  Host
+  # bridge addresses are not reachable from the LB guest and can also be stale
+  # after a restart, so mesh routing is the production default.  Keep the
+  # bridge lookup only as an explicit diagnostics override.
+  if [ "${FUGU_LB_BACKEND_MODE:-mesh}" = bridge ]; then
     ip=$(_router_target_bridge_ip "$f" 2>/dev/null || true)
     if [ -n "$ip" ]; then
       echo "$ip"
