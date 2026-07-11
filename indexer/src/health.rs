@@ -252,8 +252,10 @@ async fn mesh_timeline(State(s): State<HttpState>) -> Response {
         .iter()
         .flat_map(|t| {
             t.events.iter().cloned().map(|mut e| {
-                e.args
-                    .insert("cluster".into(), serde_json::Value::String(t.cluster.clone()));
+                e.args.insert(
+                    "cluster".into(),
+                    serde_json::Value::String(t.cluster.clone()),
+                );
                 e
             })
         })

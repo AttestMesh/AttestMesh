@@ -94,18 +94,27 @@ impl CursorStore for SledCursorStore {
 
     fn advance(&self, cluster: Address, member_id: B256, cursor: Cursor) -> Result<()> {
         let key = cursor_key(cluster, member_id);
-        // Compare-and-set monotonically: only write if strictly advancing.
-        let existing = self.db.get(&key).context("sled get cursor")?;
-        let proceed = match existing.as_deref().and_then(Cursor::from_value) {
-            Some(cur) => cursor > cur,
-            None => true,
-        };
-        if proceed {
-            self.db
-                .insert(&key, &cursor.to_value())
-                .context("sled insert cursor")?;
+        // A reconnect can briefly overlap the prior session's Ack task. Use a real
+        // CAS loop so a late lower Ack cannot win a get-then-insert race and rewind
+        // the persisted tuple.
+        loop {
+            let existing = self.db.get(&key).context("sled get cursor")?;
+            if existing
+                .as_deref()
+                .and_then(Cursor::from_value)
+                .is_some_and(|current| cursor <= current)
+            {
+                return Ok(());
+            }
+            match self
+                .db
+                .compare_and_swap(&key, existing, Some(cursor.to_value().to_vec()))
+                .context("sled compare-and-swap cursor")?
+            {
+                Ok(()) => return Ok(()),
+                Err(_) => continue,
+            }
         }
-        Ok(())
     }
 
     fn flush(&self) -> Result<()> {
@@ -117,6 +126,7 @@ impl CursorStore for SledCursorStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
     use tempfile::TempDir;
 
     fn store(dir: &TempDir) -> SledCursorStore {
@@ -152,6 +162,34 @@ mod tests {
         // Higher block advances regardless of logIndex.
         s.advance(cluster, member, Cursor::new(11, 0)).unwrap();
         assert_eq!(s.load(cluster, member).unwrap(), Some(Cursor::new(11, 0)));
+    }
+
+    #[test]
+    fn concurrent_advances_cannot_rewind() {
+        let dir = TempDir::new().unwrap();
+        let store = Arc::new(SledCursorStore::open(dir.path().to_str().unwrap()).unwrap());
+        let cluster = Address::repeat_byte(0xc1);
+        let member = B256::repeat_byte(0xa1);
+        let barrier = Arc::new(std::sync::Barrier::new(33));
+        let mut workers = Vec::new();
+        for log_index in 0..32 {
+            let store = store.clone();
+            let barrier = barrier.clone();
+            workers.push(std::thread::spawn(move || {
+                barrier.wait();
+                store
+                    .advance(cluster, member, Cursor::new(10, log_index))
+                    .unwrap();
+            }));
+        }
+        barrier.wait();
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        assert_eq!(
+            store.load(cluster, member).unwrap(),
+            Some(Cursor::new(10, 31))
+        );
     }
 
     #[test]

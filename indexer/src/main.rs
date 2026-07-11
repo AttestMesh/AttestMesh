@@ -108,7 +108,8 @@ async fn main() -> Result<()> {
     // gRPC listener (spec §8). Built with the provider for subscribe-time catch-up.
     let svc = IndexerService::new(state.clone(), identity.clone(), metrics.clone())
         .with_provider(provider.clone())
-        .with_expected_code_id(code_id);
+        .with_expected_code_id(code_id)
+        .with_catchup_batch_size(config.block_batch_size);
     healthstate.set_grpc_accepting(true);
 
     // Runtime loops (spec §7).

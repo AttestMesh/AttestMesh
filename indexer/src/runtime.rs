@@ -94,7 +94,12 @@ impl Runtime {
         let clusters = self.state.known_clusters().await;
         let start = events_scan_start(self.state.last_indexed_block().await, floor);
         let batch = self.config.block_batch_size.max(1);
-        tracing::info!(clusters = clusters.len(), start, head, "boot catch-up: paging cluster events");
+        tracing::info!(
+            clusters = clusters.len(),
+            start,
+            head,
+            "boot catch-up: paging cluster events"
+        );
         let mut batches = 0u64;
         if !clusters.is_empty() {
             for (from, to) in scan_ranges(start, head, batch) {
@@ -127,7 +132,12 @@ impl Runtime {
             } = log.kind
             {
                 self.state
-                    .record_member(log.cluster_addr, member_id, member_contract, log.block_number)
+                    .record_member(
+                        log.cluster_addr,
+                        member_id,
+                        member_contract,
+                        log.block_number,
+                    )
                     .await;
                 match chain::member_registered_at(&self.provider, log.cluster_addr, member_id).await
                 {
@@ -200,7 +210,11 @@ impl Runtime {
                 let to = (from + batch - 1).min(head);
                 let logs = watcher::poll_cluster_logs(&self.provider, &clusters, from, to).await?;
                 self.ingest_for_cache(&logs).await;
-                self.dispatch(&logs).await;
+                // Publish the indexed watermark before delivery. A subscription that
+                // races this batch may replay duplicates, but exact cursor filtering
+                // makes duplicates harmless and prevents a missed prefix.
+                self.state.set_last_indexed_block(to).await;
+                self.dispatch(&logs, &clusters, to).await;
                 from = to + 1;
             }
         }
@@ -210,7 +224,12 @@ impl Runtime {
     }
 
     /// Fan a chain-ordered batch of logs out to every relevant subscriber (spec §7.3).
-    async fn dispatch(&self, logs: &[watcher::IndexedLog]) {
+    async fn dispatch(
+        &self,
+        logs: &[watcher::IndexedLog],
+        clusters: &[Address],
+        indexed_through: u64,
+    ) {
         for log in logs {
             let subs = self
                 .state
@@ -230,14 +249,29 @@ impl Runtime {
                 // are per-session, but the signature bytes are identical across
                 // sessions for the same envelope — the attestation differs).
                 let env = sub.finalize(&self.identity, base.clone());
-                if sub.try_send(env) {
+                if sub.send_live(env).await {
                     self.metrics.inc_pushed(log.cluster_addr, log.kind.label());
                 } else {
                     self.metrics.inc_dropped(log.cluster_addr, sub.member_id);
                     tracing::warn!(
                         cluster = %log.cluster_addr, member = %sub.member_id,
-                        "subscriber channel full; dropped envelope (will replay on reconnect)"
+                        "subscriber channel unavailable; closing stream for replay"
                     );
+                }
+            }
+        }
+
+        // A signed checkpoint advances cursors across blocks with no relevant logs.
+        // It is queued after every event in this indexed page for each v2 subscriber.
+        for cluster in clusters {
+            let subs = self.state.subscribers().subscribers_of(*cluster).await;
+            for sub in subs.into_iter().filter(|sub| sub.supports_checkpoints()) {
+                let checkpoint = crate::grpc::envelope::build_checkpoint(*cluster, indexed_through);
+                let checkpoint = sub.finalize(&self.identity, checkpoint);
+                if sub.send_live(checkpoint).await {
+                    self.metrics.inc_pushed(*cluster, "Checkpoint");
+                } else {
+                    self.metrics.inc_dropped(*cluster, sub.member_id);
                 }
             }
         }
@@ -322,13 +356,20 @@ mod tests {
     #[test]
     fn scan_ranges_single_block_and_empty() {
         assert_eq!(scan_ranges(5, 5, 10).collect::<Vec<_>>(), vec![(5, 5)]);
-        assert_eq!(scan_ranges(6, 5, 10).count(), 0, "start past head scans nothing");
+        assert_eq!(
+            scan_ranges(6, 5, 10).count(),
+            0,
+            "start past head scans nothing"
+        );
     }
 
     #[test]
     fn scan_ranges_tolerate_zero_chunk() {
         // A misconfigured chunk must not loop forever on the same block.
-        assert_eq!(scan_ranges(1, 3, 0).collect::<Vec<_>>(), vec![(1, 1), (2, 2), (3, 3)]);
+        assert_eq!(
+            scan_ranges(1, 3, 0).collect::<Vec<_>>(),
+            vec![(1, 1), (2, 2), (3, 3)]
+        );
     }
 
     /// Regression (live bug 8 in docs/deployment.md): with the factory-deploy floor
@@ -347,8 +388,16 @@ mod tests {
 
     #[test]
     fn events_scan_start_resumes_past_cursor_but_not_below_floor() {
-        assert_eq!(events_scan_start(0, 500), 500, "fresh store starts at the floor");
-        assert_eq!(events_scan_start(700, 500), 701, "persisted cursor wins past the floor");
+        assert_eq!(
+            events_scan_start(0, 500),
+            500,
+            "fresh store starts at the floor"
+        );
+        assert_eq!(
+            events_scan_start(700, 500),
+            701,
+            "persisted cursor wins past the floor"
+        );
         assert_eq!(events_scan_start(u64::MAX, 0), u64::MAX, "no overflow");
     }
 }

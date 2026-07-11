@@ -118,7 +118,7 @@ impl PeerEndpoint {
 /// Classify a decrypted `MessageFacet` plaintext. Returns `Some(PeerEndpoint)` if
 /// it is the sidecar-internal peer-endpoint envelope (it decodes *and* carries the
 /// reserved kind); otherwise `None`, meaning it is an opaque application payload
-/// that `poll_envelopes` forwards to the app over `SubscribeMessages` (sidecar spec
+/// that the Indexer event dispatcher forwards over `SubscribeMessages` (sidecar spec
 /// §12.3). Detection is structural — the sidecar never parses application protocols.
 pub fn classify_internal(plaintext: &[u8]) -> Option<PeerEndpoint> {
     match PeerEndpoint::decode(plaintext) {
@@ -184,7 +184,7 @@ mod tests {
     #[test]
     fn app_payload_is_not_a_peer_endpoint() {
         // An application payload (e.g. a matrix-admin command) must classify as an
-        // app message, NOT the sidecar-internal envelope, so poll_envelopes forwards
+        // app message, NOT the sidecar-internal envelope, so the dispatcher forwards
         // it to SubscribeMessages instead of consuming it silently.
         let app =
             br#"{"v":1,"kind":"attestmesh.matrix-admin.command.v1","verb":"get_server_info"}"#;

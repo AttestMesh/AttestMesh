@@ -22,7 +22,13 @@ message Hello {
   bytes cluster_addr = 1; // 20-byte ClusterDiamond address
   bytes member_id = 2;    // 32-byte memberId
   bytes attestation = 3;  // reserved for milestone B re-verification; v1 indexer ignores
-  uint64 from_block = 4;  // resume cursor; 0 means "from this member's MemberRegistered"
+  // Zero on a genuinely fresh sidecar. Reconnects send the last handled block so a
+  // newly selected Indexer can replay the boundary block without sharing cursors.
+  uint64 from_block = 4;
+  // Version 2 opts into signed catch-up checkpoints. When no durable server cursor
+  // exists and from_block is zero, a v2 subscription starts at the Indexer's current
+  // indexed head instead of replaying pre-upgrade history from MemberRegistered.
+  uint32 protocol_version = 5;
 }
 
 message Ack {
@@ -40,6 +46,10 @@ message PushEnvelope {
   bytes indexer_signature = 7;   // Ed25519 over the envelope-signing view (see below)
   IndexerAttestation indexer_attestation = 8; // present on first push of a session only
 }
+
+// Protocol-v2 checkpoint convention (keeps the response wire type additive):
+// event_data/tx_hash empty, rpc_repro absent, block_number = indexed-through block,
+// log_index = uint64::MAX. The normal envelope signature authenticates all fields.
 
 message RpcReproStub {
   string method = 1;       // "eth_getLogs"

@@ -21,12 +21,16 @@ pub async fn serve(shared: Arc<Shared>, addr: String) -> anyhow::Result<()> {
 
 async fn healthz(State(shared): State<Arc<Shared>>) -> (StatusCode, Json<serde_json::Value>) {
     let phase = shared.current_phase().await;
+    let indexer = shared.get_indexer_status().await;
     let healthy = shared.gates.healthy();
     let body = serde_json::json!({
         "phase": phase.as_str(),
         "first_converged": shared.gates.first_converged(),
         "csk_acquired": shared.gates.csk_acquired(),
         "live_peers": shared.peers.lock().await.live_count(),
+        "indexer_connected": indexer.connected,
+        "indexer_caught_up": indexer.caught_up,
+        "indexer_cursor_block": indexer.cursor_block,
     });
     let code = if healthy {
         StatusCode::OK

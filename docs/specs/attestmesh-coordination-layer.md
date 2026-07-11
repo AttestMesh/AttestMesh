@@ -1,6 +1,6 @@
 # AttestMesh — Coordination Layer Master Spec
 
-**Status**: Implemented v1 — **fully live on Base mainnet (8453)**; see §11 and [`docs/deployment.md`](../deployment.md)
+**Status**: Implemented v1; protocol-v2 authoritative Indexer delivery awaits Base canary rollout
 **Authors**: LSDan
 **Last updated**: 2026-07-11
 
@@ -246,12 +246,7 @@ The Indexer's attestation commits to its code. Members trust the Indexer for:
 - **Liveness** of event delivery (the Indexer is online and pushing).
 - **Completeness** of event delivery within its subscription window (no event is silently dropped).
 
-Members do **not** have to trust the Indexer for:
-
-- **Correctness** of event data (the RPC repro stub lets them verify any push against any RPC provider).
-- **Confidentiality** of message contents (`MessageSent` ciphertext is sealed-boxed to the recipient; the Indexer sees the ciphertext but cannot decrypt).
-
-A member sidecar may sample pushes — issuing the repro stub against an independent RPC provider on (say) 1 in N events — without changing its steady-state cost much. The repro stub is generated on every push so this verification path is always available; v1's default sidecar policy is to skip sampling (always trust the Indexer signature), with sampling cadence tunable in milestone B. The Indexer can therefore be operated by a third party with no loss of trust-minimization on data correctness.
+Members do **not** trust the Indexer for confidentiality of message contents: `MessageSent` ciphertext is sealed-boxed to the recipient, so the Indexer cannot decrypt it. Correctness is independently checkable through the signed RPC repro stub, but protocol-v2 sidecars deliberately trust the registry-pinned Indexer signature and do not execute that stub. Configurable sampling remains deferred.
 
 ### 6.3 Discovery
 
@@ -267,15 +262,15 @@ Member sidecar → Indexer over a long-lived bidirectional connection (gRPC bidi
 
 1. Member opens a connection and presents `(memberId, clusterAddress, attestationProof)`.
 2. Indexer verifies that `memberId` exists in `clusterAddress`'s AttestFacet `MemberStorage` and that the attestation matches the recorded attestation-bound pubkeys. (The Indexer is essentially re-running the same verification the attestor facet did at registration time — but it can do so as an off-chain read since the cluster diamond is authoritative.)
-3. On success, Indexer adds the member to the cluster's subscriber set, records the highest delivered `blockNumber` for that member, and begins streaming events.
+3. On success, Indexer adds the member to the cluster's subscriber set and begins streaming events. Its cursor advances only when the sidecar Ack arrives after handling.
 4. Each event is delivered as a signed envelope: `{event_data, cluster_addr, block_number, tx_hash, log_index, rpc_repro, indexer_signature, indexer_attestation}` (proto field names — see indexer spec §8.1 and sidecar spec §9.1 for the full message definition).
 5. Member verifies the signature against the Indexer's pubkey from IndexerRegistry. On signature mismatch (or attestation mismatch on the Indexer's first push of the session), the member tears down the subscription and re-discovers.
 
-Subscriptions are stateful: the Indexer remembers per-member delivery cursors so a reconnecting member catches up cleanly rather than losing events.
+Subscriptions are stateful: an Indexer remembers exact per-member delivery cursors. The sidecar also persists the last signed checkpoint block and supplies it on reconnect, allowing a newly selected blue/green backend with no local cursor to replay the boundary block safely.
 
 ### 6.5 Indexer infrastructure (v1)
 
-For v1 the Indexer ships as a single node image, run by AttestMesh org. It is **shared infrastructure: one Indexer instance serves every cluster on the chains it watches** — an Indexer is chain-scoped, never deployed per-cluster. Whether milestone B's HA Indexer eats its own dog food (Indexer replicas as members of an AttestMesh cluster, coordinating cursor leadership via MessageFacet) or runs as a standalone primitive is deferred — both are open; dog-fooding is the preferred direction but neither shape is committed. v1's single-instance Indexer is built to be portable into either model.
+The Indexer is **shared infrastructure: one active Indexer serves every cluster on the chains it watches** — it is chain-scoped, never deployed per customer cluster. Production uses a stable HAProxy gateway plus verified blue/green C3-member candidates. The switch updates the registry-pinned candidate key/code ID and forces checkpoint-based reconnect; it is single-active deployment HA, not milestone-B active-active identity. Dog-fooded multi-replica identity remains the later stage described in the Indexer HA spec.
 
 ---
 
@@ -285,7 +280,7 @@ A Rust binary (target: `cluster-mesh-agent`) shipped as an OCI image and include
 
 ### 7.1 Boot sequence
 
-> **v1 as built (live on Base mainnet):** dstack CVMs have no inbound UDP, so the mesh transport bootstraps as **wireguard over length-prefixed UDP-over-TCP** through the dstack gateway's TLS-passthrough route (`<app_id>-<port>s.<GATEWAY_DOMAIN>`); peer ingress hostnames are derived from chain state + `GATEWAY_DOMAIN`, keeping the chain the sole coordination layer. Two-sided simultaneous UDP hole-punching was verified live (including hairpin), so upgrading established links to pure punched UDP is deferred work, not a research risk. The Indexer subscription (step 6) is wired as a latency optimization that wakes a chain-read reconcile pass — the sidecar also polls `MessageSent` logs directly over RPC, so the mesh comes up even with no Indexer registered. See sidecar spec §9–§10 and `docs/deployment.md`.
+> **Current implementation:** dstack CVMs bootstrap wireguard over length-prefixed UDP-over-TCP through the gateway. Peer hostnames and current membership/key state still derive from on-chain views, but all cluster-event ingestion is authoritative through the signed Indexer stream. The former per-sidecar `MessageSent` lookback scan and direct-log outage fallback are removed.
 
 1. **Discover cluster address.** The sidecar reads its own member contract address from a `MEMBER_CONTRACT` env var or a file mounted from the dstack runtime. It calls `member.cluster()` to get the ClusterDiamond address.
 2. **Derive identity keys.** Using the attestation-bound seed, produce a single Curve25519 root from a known purpose string (e.g. `attestmesh.identity.v1`), then derive:
@@ -323,7 +318,7 @@ A Rust binary (target: `cluster-mesh-agent`) shipped as an OCI image and include
 ### 7.2 Failure modes
 
 - **Pattern revoked mid-flight.** If the cluster owner removes the attestation pattern between step 4 and the application coming up, no member already registered is forcibly removed (no on-chain eviction in v1); but new joiners cannot register, and a future re-register attempt (e.g. after a CVM restart) will fail. v1 punts cluster-driven eviction to a later spec.
-- **Indexer down.** The sidecar reconnects with backoff; as built, the chain-read reconcile poll keeps bring-up and steady-state progressing in the meantime (the sidecar polls `MessageSent` logs directly over RPC, with Indexer pushes as the latency cut), so boot does not block on the Indexer.
+- **Indexer down.** The sidecar reconnects with backoff and pauses cluster-event delivery; it never starts a direct `eth_getLogs` fallback. Current-view peer reconciliation continues, and Indexer connectivity is reported diagnostically without changing the convergence+CSK health result.
 - **Indexer signature/attestation mismatch.** Treated as adversarial: the sidecar tears down the subscription, re-reads IndexerRegistry, and retries. If the pubkey on chain has been rotated (legitimate operator action), the new subscription succeeds. If not, the sidecar fails closed and stays unhealthy.
 - **Message channel poisoned.** A malicious member could spam another member's channel with garbage. Decryption failures are silently dropped; the sidecar logs at debug only. Rate-limiting is not enforced on chain in v1.
 - **First-convergence deadlock.** If the network is partitioned at startup such that no convergence is possible, a *joining* sidecar stays unhealthy indefinitely. This is intentional — degraded boot of an unmeshed mesh is worse than visible failure. Already-healthy sidecars elsewhere in the cluster are unaffected; the gate fires once per process.

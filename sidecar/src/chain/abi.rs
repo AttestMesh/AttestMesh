@@ -33,7 +33,7 @@ sol! {
         function cluster() external view returns (address);
     }
 
-    // MessageFacet event, decoded from `eth_getLogs` during mesh bring-up.
+    // MessageFacet event, decoded from the Indexer's signed RLP log payload.
     #[sol(rpc)]
     #[derive(Debug)]
     interface IMessageEvents {

@@ -108,7 +108,10 @@ mod tests {
     fn set_required() {
         std::env::set_var("CHAIN_ID", "8453");
         std::env::set_var("RPC_URL", "http://rpc.example");
-        std::env::set_var("INDEXER_REGISTRY_ADDR", "0xbC003686943fB957100E517D3CEf66c52B5CDdBf");
+        std::env::set_var(
+            "INDEXER_REGISTRY_ADDR",
+            "0xbC003686943fB957100E517D3CEf66c52B5CDdBf",
+        );
         std::env::set_var(
             "CLUSTER_DIAMOND_FACTORY_ADDR",
             "0xf6E85fD138E3208d3AAE63ce4E2A33f20e82b9fb",
@@ -124,14 +127,20 @@ mod tests {
 
         let c = Config::from_env().expect("required set");
         assert_eq!(c.chain_id, 8453);
-        assert_eq!(c.start_block, 0, "default floor is genesis (deploy routine overrides)");
+        assert_eq!(
+            c.start_block, 0,
+            "default floor is genesis (deploy routine overrides)"
+        );
         assert_eq!(c.block_batch_size, 200);
         assert_eq!(c.grpc_addr.port(), 50051);
         assert_eq!(c.state_dir, "/var/lib/attestmesh-indexer");
 
         std::env::set_var("INDEXER_START_BLOCK", "46868742");
         let c = Config::from_env().unwrap();
-        assert_eq!(c.start_block, 46_868_742, "the live Base factory deploy block");
+        assert_eq!(
+            c.start_block, 46_868_742,
+            "the live Base factory deploy block"
+        );
         std::env::remove_var("INDEXER_START_BLOCK");
     }
 
