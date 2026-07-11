@@ -199,7 +199,7 @@ services:
   # pgvector column as vector(EMBEDDING_DIM) and the width is fixed at table creation. Egress
   # is unlocked here, but init_db only runs DDL — no recording text or embeddings flow.
   init:
-    image: ghcr.io/attestmesh/pocket-mcp@sha256:69e7c5ad18849b36015302b63791993c9c2b7656c52a3ba71218c081d708cc3a
+    image: ghcr.io/attestmesh/pocket-mcp@sha256:471a99c04123ae6461d5f177fc570d5457bf4411309c4bab3ad0b5e90f75d1e4
     restart: on-failure
     network_mode: service:sidecar
     depends_on:
@@ -225,7 +225,7 @@ services:
   # and metered Qwen via sidecar:18889. MCP_AUTH_TOKEN is optional
   # (empty = mesh membership is the trust boundary in v1).
   mcp:
-    image: ghcr.io/attestmesh/pocket-mcp@sha256:69e7c5ad18849b36015302b63791993c9c2b7656c52a3ba71218c081d708cc3a
+    image: ghcr.io/attestmesh/pocket-mcp@sha256:471a99c04123ae6461d5f177fc570d5457bf4411309c4bab3ad0b5e90f75d1e4
     restart: unless-stopped
     depends_on:
       init:
@@ -253,7 +253,7 @@ services:
   # Pocket API (external :443), pg via sidecar:1543N, metered Qwen via sidecar:18889, and Hindsight via
   # sidecar:18888 (synchronization remains disabled during recovery).
   poller:
-    image: ghcr.io/attestmesh/pocket-mcp@sha256:69e7c5ad18849b36015302b63791993c9c2b7656c52a3ba71218c081d708cc3a
+    image: ghcr.io/attestmesh/pocket-mcp@sha256:471a99c04123ae6461d5f177fc570d5457bf4411309c4bab3ad0b5e90f75d1e4
     restart: unless-stopped
     network_mode: service:mcp
     depends_on:
@@ -280,7 +280,7 @@ services:
   # worker adopts active jobs, caps in-flight documents at eight, and never
   # automatically retries failed/ambiguous submissions.
   hindsight-outbox:
-    image: ghcr.io/attestmesh/pocket-mcp@sha256:69e7c5ad18849b36015302b63791993c9c2b7656c52a3ba71218c081d708cc3a
+    image: ghcr.io/attestmesh/pocket-mcp@sha256:471a99c04123ae6461d5f177fc570d5457bf4411309c4bab3ad0b5e90f75d1e4
     restart: unless-stopped
     network_mode: service:mcp
     depends_on:
