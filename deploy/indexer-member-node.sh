@@ -46,6 +46,15 @@ _app_host_prefix() {
   printf '%s' "${X#0x}" | tr 'A-Z' 'a-z'
 }
 
+_current_registry_cluster_count() {
+  local endpoint status
+  endpoint=$(cast call "$REGISTRY" 'current()(string,bytes32,bytes32,uint64)' \
+    --json --rpc-url "$RPC_URL" 2>/dev/null | jq -er '.[0] | select(length > 0)') || return 1
+  status=$(curl -fsS --max-time 12 "${endpoint/-50052./-9090.}/status" 2>/dev/null) \
+    || return 1
+  echo "$status" | jq -er '.readModel.clusterCount | select(type == "number" and . > 0)'
+}
+
 send_seq() {
   local label="$1"; shift
   local nonce
@@ -138,7 +147,11 @@ verify_http() {
   _load_state
   local host i body status min_clusters attempts
   host="$(_app_host_prefix)-9090.${GATEWAY_DOMAIN}"
-  min_clusters="${INDEXER_MIN_CLUSTER_COUNT:-1}"
+  min_clusters="${INDEXER_MIN_CLUSTER_COUNT:-}"
+  if [ -z "$min_clusters" ]; then
+    min_clusters="$(_current_registry_cluster_count || true)"
+    min_clusters="${min_clusters:-1}"
+  fi
   attempts="${INDEXER_VERIFY_ATTEMPTS:-90}"
   for i in $(seq 1 "$attempts"); do
     body=$(curl -fsm 8 "https://${host}/mesh/health" 2>/dev/null || true)
