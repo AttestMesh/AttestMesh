@@ -67,16 +67,18 @@ services:
     network_mode: service:sidecar
     depends_on:
       - sidecar
+    environment:
+      - APP_ENV_B64=${APP_ENV_B64}
     volumes:
-      - /tmp/attestmesh-workload.env:/run/secrets/indexer-lb.env:ro
       - haproxy-run:/indexer-lb-run
       - indexer-lb-state:/indexer-lb-state
     entrypoint: ["/bin/sh", "-ec"]
     command:
       - |
         set -u
+        printf '%s' "$${APP_ENV_B64:-}" | base64 -d > /tmp/indexer-lb.env
         set -a
-        . /run/secrets/indexer-lb.env
+        . /tmp/indexer-lb.env
         set +a
         mkdir -p /indexer-lb-run /indexer-lb-state
         rm -f /indexer-lb-run/admin.sock
@@ -137,15 +139,17 @@ services:
     depends_on:
       - sidecar
       - haproxy
+    environment:
+      - APP_ENV_B64=${APP_ENV_B64}
     volumes:
-      - /tmp/attestmesh-workload.env:/run/secrets/indexer-lb.env:ro
       - haproxy-run:/indexer-lb-run
       - indexer-lb-state:/indexer-lb-state
     entrypoint: ["/bin/sh", "-ec"]
     command:
       - |
+        printf '%s' "$${APP_ENV_B64:-}" | base64 -d > /tmp/indexer-lb.env
         set -a
-        . /run/secrets/indexer-lb.env
+        . /tmp/indexer-lb.env
         set +a
         cat >/tmp/indexer_lb_controller.py <<'PY'
         import fcntl
