@@ -119,7 +119,7 @@ register_member_direct() {
   fi
 
   for i in $(seq 1 60); do
-    payload="$(_direct_register_payload)"
+    payload="$(_direct_register_payload || true)"
     if [ -n "$payload" ] && echo "$payload" | jq -e '.calldata and .member' >/dev/null 2>&1; then
       member=$(echo "$payload" | jq -r .member)
       calldata=$(echo "$payload" | jq -r .calldata)
