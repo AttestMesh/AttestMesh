@@ -13,7 +13,7 @@
 
 services:
   sidecar:
-    image: ghcr.io/dmvt/cluster-mesh-agent@sha256:e0d0b2c6d088bca121e4e58ab01a04b50dd46ba6b877ca50979884349d9b6dab
+    image: ghcr.io/attestmesh/cluster-mesh-agent@sha256:e3d53442aa6e52d47227fb3528c1141302ad4fc63c4b3fb6dc38df7ce907d486
     restart: unless-stopped
     environment:
       - CHAIN_ID=${CHAIN_ID}
@@ -46,7 +46,7 @@ services:
       - /dev/net/tun
 
   registration-calldata:
-    image: ghcr.io/dmvt/cluster-mesh-agent@sha256:e0d0b2c6d088bca121e4e58ab01a04b50dd46ba6b877ca50979884349d9b6dab
+    image: ghcr.io/attestmesh/cluster-mesh-agent@sha256:e3d53442aa6e52d47227fb3528c1141302ad4fc63c4b3fb6dc38df7ce907d486
     restart: "no"
     depends_on:
       - sidecar

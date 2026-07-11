@@ -7,7 +7,7 @@
 # mesh peer-control gRPC on :50051, so the indexer uses :50052.
 services:
   sidecar:
-    image: ghcr.io/attestmesh/cluster-mesh-agent@sha256:b9e0ae107d9db015c22059c9fecdc28f2b35e09b257eabb4739bd4e46d96f641
+    image: ghcr.io/attestmesh/cluster-mesh-agent@sha256:e3d53442aa6e52d47227fb3528c1141302ad4fc63c4b3fb6dc38df7ce907d486
     restart: unless-stopped
     environment:
       # MEMBER_CONTRACT intentionally unset. Path A upgrades this stock DstackApp
@@ -41,7 +41,7 @@ services:
       - /dev/net/tun
 
   indexer:
-    image: ghcr.io/dmvt/attestmesh-indexer@sha256:d99b1d207e0df8bfdf6fbac5b001142307475ac9a5b1b88b730b7edabd4283e5
+    image: ghcr.io/attestmesh/attestmesh-indexer@sha256:6e9f53ceeec8517b045baac3994e1d466421957ad19b051ce2a5ab0aa2c5e4ab
     restart: unless-stopped
     network_mode: service:sidecar
     depends_on:
@@ -67,7 +67,7 @@ services:
       - indexer-state:/data/indexer-state
 
   registration-calldata:
-    image: ghcr.io/dmvt/attestmesh-indexer@sha256:d99b1d207e0df8bfdf6fbac5b001142307475ac9a5b1b88b730b7edabd4283e5
+    image: ghcr.io/attestmesh/attestmesh-indexer@sha256:6e9f53ceeec8517b045baac3994e1d466421957ad19b051ce2a5ab0aa2c5e4ab
     restart: "no"
     depends_on:
       - sidecar
