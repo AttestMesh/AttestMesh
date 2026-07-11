@@ -11,7 +11,7 @@
 # The stable registry endpoint is the LB app gateway on :50052. The control API is
 # mesh-only on :50053. Existing gRPC streams continue during prepare/registry update;
 # commit swaps the backend and closes them so sidecars re-read the new registry key.
-set -uo pipefail
+set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$HERE/.." && pwd)"
