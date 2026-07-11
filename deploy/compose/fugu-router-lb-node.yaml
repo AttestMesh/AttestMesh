@@ -1,0 +1,295 @@
+# Fugu-router mesh load balancer / blue-green cutover node.
+#
+# This CVM is intentionally small and state-light. It joins C3 like the router
+# does, binds one stable mesh endpoint on <lb-mesh-ip>:18410, and forwards all
+# traffic to exactly one active fugu-router backend. Operators switch that active
+# backend through the mesh-only authenticated control API on <lb-mesh-ip>:18411.
+#
+# The dstack gateway exposes only the sidecar's authenticated WireGuard-over-TLS
+# transport on 51900. Router and control HTTP ports remain mesh-only; there is no
+# tailnet and this CVM holds no provider key.
+
+services:
+  sidecar:
+    image: ghcr.io/attestmesh/cluster-mesh-agent@sha256:e3d53442aa6e52d47227fb3528c1141302ad4fc63c4b3fb6dc38df7ce907d486
+    restart: unless-stopped
+    environment:
+      - MEMBER_CONTRACT=${APP_ID}
+      - CHAIN_ID=${CHAIN_ID}
+      - RPC_URL=${RPC_URL}
+      - BUNDLER_URL=${BUNDLER_URL}
+      - GAS_POLICY_ID=${GAS_POLICY_ID}
+      - INDEXER_REGISTRY_ADDR=${INDEXER_REGISTRY_ADDR}
+      - GATEWAY_DOMAIN=${GATEWAY_DOMAIN}
+      - DSTACK_SOCKET=/var/run/dstack.sock
+      - SIDECAR_STATE_DIR=/var/lib/attestmesh
+      - AGENT_GRPC_SOCKET=/var/run/attestmesh/agent.sock
+      - HEALTH_HTTP_ADDR=0.0.0.0:9090
+      - LOG_FORMAT=pretty
+      - LOG_LEVEL=info,cluster_mesh_agent=debug
+    volumes:
+      - /var/run/dstack.sock:/var/run/dstack.sock
+      - sidecar-state:/var/lib/attestmesh
+      - agent-sock:/var/run/attestmesh
+      - sidecar-log:/sidecar-log
+    ports:
+      - "9090:9090"
+      - "51900:51900"
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - |
+        mkdir -p /sidecar-log
+        {
+          echo "diag: sidecar wrapper starting at $$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          echo "diag: MEMBER_CONTRACT=$${MEMBER_CONTRACT:-}"
+          echo "diag: CHAIN_ID=$${CHAIN_ID:-}"
+          redacted_rpc="$$(printf '%s' "$${RPC_URL:-}" | sed -E 's#(https?://[^/]+/)[0-9a-f]{32}#\1<redacted>#g; s#(v2/)[A-Za-z0-9_-]+#\1<redacted>#g; s#([?&]apikey=)[^&]+#\1<redacted>#g')"
+          echo "diag: RPC_URL=$$redacted_rpc"
+          redacted_bundler="$$(printf '%s' "$${BUNDLER_URL:-}" | sed -E 's/([?&]apikey=)[^&]+/\1<redacted>/g; s#(v2/)[A-Za-z0-9_-]+#\1<redacted>#g')"
+          echo "diag: BUNDLER_URL=$$redacted_bundler"
+          echo "diag: GAS_POLICY_ID=$${GAS_POLICY_ID:+set}"
+          echo "diag: INDEXER_REGISTRY_ADDR=$${INDEXER_REGISTRY_ADDR:-}"
+          echo "diag: GATEWAY_DOMAIN=$${GATEWAY_DOMAIN:-}"
+          echo "diag: dstack socket:"
+          ls -l /var/run/dstack.sock || true
+          echo "diag: agent socket dir:"
+          ls -ld /var/run/attestmesh || true
+          echo "diag: tun device:"
+          ls -l /dev/net/tun || true
+          echo "diag: launching cluster-mesh-agent"
+          /usr/local/bin/cluster-mesh-agent
+          rc=$$?
+          echo "diag: cluster-mesh-agent exited rc=$$rc at $$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+        } > /sidecar-log/sidecar.log 2>&1
+        sleep infinity
+
+  sidecar-log-server:
+    image: python:3.11-alpine
+    restart: unless-stopped
+    volumes:
+      - sidecar-log:/sidecar-log:ro
+    ports:
+      - "19090:19090"
+    working_dir: /sidecar-log
+    command: ["python3", "-m", "http.server", "19090", "--bind", "0.0.0.0"]
+
+  haproxy:
+    image: haproxy:3.0-alpine
+    restart: unless-stopped
+    user: "0:0"
+    network_mode: service:sidecar
+    depends_on:
+      - sidecar
+    environment:
+      - FUGU_LB_INITIAL_BACKEND=${FUGU_LB_INITIAL_BACKEND}
+    volumes:
+      - haproxy-run:/fugu-lb-run
+      - fugu-lb-state:/fugu-lb-state
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - |
+        set -u
+        mkdir -p /fugu-lb-run /fugu-lb-state
+        rm -f /fugu-lb-run/admin.sock
+        while :; do
+          my_ip="$$(ip -4 -o addr show dev attestmesh0 2>/dev/null | awk '{print $$4}' | cut -d/ -f1)"
+          [ -n "$$my_ip" ] && break
+          sleep 1
+        done
+        active="$${FUGU_LB_INITIAL_BACKEND:-}"
+        if [ -s /fugu-lb-state/active_backend ]; then
+          active="$$(cat /fugu-lb-state/active_backend)"
+        fi
+        if echo "$$active" | grep -Eq '^([0-9]{1,3}\.){3}[0-9]{1,3}$$'; then
+          server_line="server active $${active}:18410 check"
+        else
+          server_line="server active 127.0.0.1:1 check disabled"
+        fi
+        cat >/tmp/fugu-lb-haproxy.cfg <<CFG
+        global
+          maxconn 2000
+          stats socket /fugu-lb-run/admin.sock mode 660 level admin expose-fd listeners
+          stats timeout 30s
+
+        defaults
+          mode http
+          option http-keep-alive
+          timeout connect 10s
+          timeout client 15m
+          timeout server 15m
+          timeout tunnel 1h
+          timeout http-request 60s
+          timeout check 10s
+
+        frontend fugu_router
+          bind $$my_ip:18410
+          default_backend fugu_router_active
+
+        backend fugu_router_active
+          # Check the router process only. The upstream-coupled /health/liveliness
+          # can transiently return 503 while LiteLLM is starting or saturated; using
+          # it here previously marked the sole backend down and reset every active
+          # long-running inference connection.
+          option httpchk GET /health/process
+          http-check expect status 200
+          default-server inter 3s fall 5 rise 2
+          $$server_line
+        CFG
+        exec haproxy -f /tmp/fugu-lb-haproxy.cfg -db
+
+  controller:
+    image: python:3.11-alpine
+    restart: unless-stopped
+    network_mode: service:sidecar
+    depends_on:
+      - sidecar
+      - haproxy
+    environment:
+      - FUGU_LB_ADMIN_KEY=${FUGU_LB_ADMIN_KEY}
+    volumes:
+      - haproxy-run:/fugu-lb-run
+      - fugu-lb-state:/fugu-lb-state
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - |
+        cat >/tmp/fugu_lb_controller.py <<'PY'
+        import ipaddress
+        import json
+        import os
+        import socket
+        import subprocess
+        import time
+        import urllib.request
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+        ADMIN_KEY = os.environ.get("FUGU_LB_ADMIN_KEY", "")
+        SOCKET_PATH = "/fugu-lb-run/admin.sock"
+        STATE_PATH = "/fugu-lb-state/active_backend"
+
+        def mesh_ip() -> str:
+            while True:
+                try:
+                    out = subprocess.check_output(
+                        ["ip", "-4", "-o", "addr", "show", "dev", "attestmesh0"],
+                        text=True,
+                    )
+                    for line in out.splitlines():
+                        parts = line.split()
+                        if len(parts) >= 4 and "/" in parts[3]:
+                            return parts[3].split("/", 1)[0]
+                except Exception:
+                    pass
+                time.sleep(1)
+
+        def active_backend() -> str:
+            try:
+                with open(STATE_PATH, "r", encoding="utf-8") as fh:
+                    return fh.read().strip()
+            except FileNotFoundError:
+                return ""
+
+        def haproxy_cmd(command: str) -> str:
+            sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            sock.settimeout(10)
+            sock.connect(SOCKET_PATH)
+            sock.sendall((command.rstrip() + "\n").encode("utf-8"))
+            sock.shutdown(socket.SHUT_WR)
+            chunks = []
+            while True:
+                chunk = sock.recv(4096)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+            sock.close()
+            return b"".join(chunks).decode("utf-8", errors="replace")
+
+        def validate_backend(value: str) -> str:
+            try:
+                ip = ipaddress.IPv4Address(value)
+            except Exception as exc:
+                raise ValueError("backend must be an IPv4 mesh address") from exc
+            if not str(ip).startswith("10."):
+                raise ValueError("backend must be a 10.x mesh address")
+            return str(ip)
+
+        def probe_backend(ip: str) -> dict:
+            url = f"http://{ip}:18410/health/liveliness"
+            with urllib.request.urlopen(url, timeout=10) as resp:
+                body = resp.read(2048).decode("utf-8", errors="replace")
+                if resp.status != 200:
+                    raise RuntimeError(f"health probe returned HTTP {resp.status}: {body[:200]}")
+                return {"status": resp.status, "body": body[:500]}
+
+        def write_active(ip: str) -> None:
+            tmp = STATE_PATH + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as fh:
+                fh.write(ip + "\n")
+            os.replace(tmp, STATE_PATH)
+
+        class Handler(BaseHTTPRequestHandler):
+            def _json(self, status: int, payload: dict) -> None:
+                data = json.dumps(payload, sort_keys=True).encode("utf-8")
+                self.send_response(status)
+                self.send_header("content-type", "application/json")
+                self.send_header("content-length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+
+            def _authorized(self) -> bool:
+                return bool(ADMIN_KEY) and self.headers.get("authorization", "") == f"Bearer {ADMIN_KEY}"
+
+            def do_GET(self) -> None:
+                if self.path not in ("/healthz", "/active"):
+                    self._json(404, {"error": "not found"})
+                    return
+                socket_ok = os.path.exists(SOCKET_PATH)
+                state = ""
+                if socket_ok:
+                    try:
+                        state = haproxy_cmd("show servers state")[:4000]
+                    except Exception as exc:
+                        state = f"error: {type(exc).__name__}: {exc}"
+                self._json(200, {"active_backend": active_backend(), "haproxy_socket": socket_ok, "haproxy_state": state})
+
+            def do_POST(self) -> None:
+                if self.path != "/switch":
+                    self._json(404, {"error": "not found"})
+                    return
+                if not self._authorized():
+                    self._json(401, {"error": "unauthorized"})
+                    return
+                length = min(int(self.headers.get("content-length", "0") or 0), 4096)
+                try:
+                    body = json.loads(self.rfile.read(length).decode("utf-8") or "{}")
+                    backend = validate_backend(str(body.get("backend", "")).strip())
+                    probe = probe_backend(backend)
+                    set_out = haproxy_cmd(f"set server fugu_router_active/active addr {backend} port 18410")
+                    enable_out = haproxy_cmd("enable server fugu_router_active/active")
+                    write_active(backend)
+                    self._json(200, {"active_backend": backend, "probe": probe, "haproxy": {"set": set_out, "enable": enable_out}})
+                except Exception as exc:
+                    self._json(400, {"error": f"{type(exc).__name__}: {exc}"})
+
+            def log_message(self, fmt: str, *args) -> None:
+                print(f"fugu-lb-controller: {self.address_string()} {fmt % args}", flush=True)
+
+        for _ in range(120):
+            if os.path.exists(SOCKET_PATH):
+                break
+            time.sleep(1)
+        ip = mesh_ip()
+        print(f"fugu-lb-controller: listening on {ip}:18411", flush=True)
+        ThreadingHTTPServer((ip, 18411), Handler).serve_forever()
+        PY
+        exec python3 /tmp/fugu_lb_controller.py
+
+volumes:
+  sidecar-state:
+  agent-sock:
+  haproxy-run:
+  fugu-lb-state:
+  sidecar-log:

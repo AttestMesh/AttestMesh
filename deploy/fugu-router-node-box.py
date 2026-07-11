@@ -12,8 +12,8 @@ fugu-router-specific vs telegram-sync:
     + langfuse-node mesh IPs for the socat forwarders. Key NAMES are measured
     into the compose_hash, VALUES are sealed. The redis-ha / pg-ha superuser
     passwords are NOT sealed — they are CSK-derived in-CVM.
-  - gateway_enabled: False + no_instance_id: True — strictly mesh-only node
-    (no tailnet; the Langfuse stack lives on the langfuse-node CVM).
+  - gateway_enabled: False + no_instance_id: False — strictly mesh-only node
+    while preserving the instance identity path the sidecar expects.
 
 Three modes:
   deploy          — register a stock DstackApp + seal env + bridge CreateVm.
@@ -21,6 +21,8 @@ Three modes:
   hash            — print only the measured compose_hash (no secrets, no chain). Used to
                     allowlist a new hash BEFORE an update, and as the pre-bind check
                     (C3 membership is permanent).
+  start|stop <vm_id>
+                  — start/stop the current VM without touching the DstackApp contract.
   update <app_id> <vm_id>
                   — roll a new compose/env onto an existing app. Default = IN-PLACE
                     UpgradeApp (StopVm -> UpgradeApp same vm_id -> StartVm). With
@@ -61,8 +63,8 @@ GATEWAY_ENABLED = os.environ.get("BOX_GATEWAY_ENABLED", "false").strip().lower()
     "yes",
     "on",
 }
-# no_instance_id: app-bound disk key (see module docstring).
-NO_INSTANCE_ID = os.environ.get("BOX_NO_INSTANCE_ID", "true").strip().lower() in {
+# no_instance_id=false is the known-good sidecar registration path for this node family.
+NO_INSTANCE_ID = os.environ.get("BOX_NO_INSTANCE_ID", "false").strip().lower() in {
     "1",
     "true",
     "yes",
@@ -77,6 +79,7 @@ ENV_KEYS = [
     "GAS_POLICY_ID",
     "INDEXER_REGISTRY_ADDR",
     "GATEWAY_DOMAIN",
+    "CLUSTER",
     # --- external node mesh IPs (socat forwarder targets) ---
     "REDIS_HA_IP_1",
     "REDIS_HA_IP_2",
@@ -88,6 +91,14 @@ ENV_KEYS = [
     "SAKANA_SUB_2_KEY",
     "SAKANA_SUB_3_KEY",
     "SAKANA_CIDRS",
+    # --- RedPill direct models + egress pin ---
+    "REDPILL_API_BASE",
+    "REDPILL_API_KEY",
+    "REDPILL_CIDRS",
+    # --- xAI Grok direct models + egress pin ---
+    "XAI_API_BASE",
+    "XAI_API_KEY",
+    "XAI_CIDRS",
     # --- Fugu subscription accounting/routing metadata (different reset dates allowed) ---
     "FUGU_SUB_1_ENABLED",
     "FUGU_SUB_2_ENABLED",
@@ -168,6 +179,33 @@ def kms_urls() -> list[str]:
     return ["https://10.0.2.2:9101"] if NET_MODE == "bridge" else m.KMS_URLS
 
 
+def stop_vm(vm_id: str) -> dict[str, object]:
+    if not vm_id:
+        raise SystemExit("usage: fugu-router-node-box.py stop <vm_id>")
+    before = m.vmm("GetInfo", {"id": vm_id})
+    found = bool(before.get("found", True))
+    if found:
+        try:
+            m.vmm("StopVm", {"id": vm_id})
+        except Exception as exc:
+            return {"vm_id": vm_id, "found": found, "stopped": False, "error": str(exc)}
+    return {"vm_id": vm_id, "found": found, "stopped": found}
+
+
+def start_vm(vm_id: str) -> dict[str, object]:
+    if not vm_id:
+        raise SystemExit("usage: fugu-router-node-box.py start <vm_id>")
+    before = m.vmm("GetInfo", {"id": vm_id})
+    found = bool(before.get("found", True))
+    if found:
+        status = str((before.get("info") or {}).get("status") or "").lower()
+        if status.startswith("run"):
+            return {"vm_id": vm_id, "found": found, "started": True, "already_running": True}
+        result = m.vmm("StartVm", {"id": vm_id})
+        return {"vm_id": vm_id, "found": found, "started": True, "result": result}
+    return {"vm_id": vm_id, "found": found, "started": False}
+
+
 def main() -> None:
     mode = sys.argv[1] if len(sys.argv) > 1 else "hash"
 
@@ -216,6 +254,16 @@ def main() -> None:
     if mode == "hash":
         _, digest = app_compose_and_hash(ENV_KEYS)
         print(digest)
+        return
+
+    if mode == "start":
+        vm_id = sys.argv[2] if len(sys.argv) > 2 else ""
+        print(json.dumps(start_vm(vm_id)))
+        return
+
+    if mode == "stop":
+        vm_id = sys.argv[2] if len(sys.argv) > 2 else ""
+        print(json.dumps(stop_vm(vm_id)))
         return
 
     if mode == "update":
@@ -326,7 +374,7 @@ def main() -> None:
         )
         return
 
-    raise SystemExit("usage: fugu-router-node-box.py [deploy|hash|update <app_id> <vm_id>]")
+    raise SystemExit("usage: fugu-router-node-box.py [deploy|hash|start <vm_id>|stop <vm_id>|update <app_id> <vm_id>]")
 
 
 if __name__ == "__main__":

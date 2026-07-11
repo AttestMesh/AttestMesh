@@ -29,10 +29,10 @@
 
 services:
   sidecar:
-    image: ghcr.io/attestmesh/cluster-mesh-agent@sha256:b9e0ae107d9db015c22059c9fecdc28f2b35e09b257eabb4739bd4e46d96f641
+    image: ghcr.io/attestmesh/cluster-mesh-agent@sha256:e3d53442aa6e52d47227fb3528c1141302ad4fc63c4b3fb6dc38df7ce907d486
     restart: unless-stopped
     environment:
-      # MEMBER_CONTRACT intentionally unset: the sidecar self-discovers the app_id.
+      - MEMBER_CONTRACT=${APP_ID}
       - CHAIN_ID=${CHAIN_ID}
       - RPC_URL=${RPC_URL}
       - BUNDLER_URL=${BUNDLER_URL}
@@ -49,23 +49,136 @@ services:
       - /var/run/dstack.sock:/var/run/dstack.sock
       - sidecar-state:/var/lib/attestmesh
       - agent-sock:/var/run/attestmesh
+      - sidecar-log:/sidecar-log
     ports:
       - "9090:9090"
       - "51900:51900"
+      - "18410:18410"
     cap_add:
       - NET_ADMIN
     devices:
       - /dev/net/tun
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - |
+        mkdir -p /sidecar-log
+        {
+          echo "diag: sidecar wrapper starting at $$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          echo "diag: MEMBER_CONTRACT=$${MEMBER_CONTRACT:-}"
+          echo "diag: CHAIN_ID=$${CHAIN_ID:-}"
+          redacted_rpc="$$(printf '%s' "$${RPC_URL:-}" | sed -E 's#(https?://[^/]+/)[0-9a-f]{32}#\1<redacted>#g; s#(v2/)[A-Za-z0-9_-]+#\1<redacted>#g; s#([?&]apikey=)[^&]+#\1<redacted>#g')"
+          echo "diag: RPC_URL=$$redacted_rpc"
+          redacted_bundler="$$(printf '%s' "$${BUNDLER_URL:-}" | sed -E 's/([?&]apikey=)[^&]+/\1<redacted>/g; s#(v2/)[A-Za-z0-9_-]+#\1<redacted>#g')"
+          echo "diag: BUNDLER_URL=$$redacted_bundler"
+          echo "diag: GAS_POLICY_ID=$${GAS_POLICY_ID:+set}"
+          echo "diag: INDEXER_REGISTRY_ADDR=$${INDEXER_REGISTRY_ADDR:-}"
+          echo "diag: GATEWAY_DOMAIN=$${GATEWAY_DOMAIN:-}"
+          echo "diag: dstack socket:"
+          ls -l /var/run/dstack.sock || true
+          echo "diag: agent socket dir:"
+          ls -ld /var/run/attestmesh || true
+          echo "diag: tun device:"
+          ls -l /dev/net/tun || true
+          echo "diag: launching cluster-mesh-agent"
+          /usr/local/bin/cluster-mesh-agent
+          rc=$$?
+          echo "diag: cluster-mesh-agent exited rc=$$rc at $$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+        } > /sidecar-log/sidecar.log 2>&1
+        sleep infinity
 
-  # ── pg-ha forwarders: :15431-3 -> each pg node's HAProxy :5432 (current primary). ──
-  pg1-proxy:
-    image: alpine/socat:1.8.0.0
+  sidecar-log-server:
+    image: python:3.11-alpine
+    restart: unless-stopped
+    volumes:
+      - sidecar-log:/logs/sidecar:ro
+      - docker-diag:/logs/docker-diag:ro
+    ports:
+      - "19090:19090"
+    working_dir: /logs
+    command: ["python3", "-m", "http.server", "19090", "--bind", "0.0.0.0"]
+
+  docker-diag-server:
+    image: docker:27-cli
+    restart: unless-stopped
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - docker-diag:/docker-diag
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - |
+        mkdir -p /docker-diag
+        (
+          while :; do
+            date -u +%Y-%m-%dT%H:%M:%SZ > /docker-diag/last-snapshot.txt
+            docker ps -a --no-trunc > /docker-diag/docker-ps.txt 2>&1 || true
+            for service in \
+              sidecar \
+              sidecar-log-server \
+              registration-calldata \
+              pg-provision \
+              litellm \
+              session-router \
+              litellm-egress-fw \
+              mesh-proxy-litellm \
+              bridge-proxy-litellm; do
+              docker logs --tail 500 "dstack-$${service}-1" > "/docker-diag/$${service}.log" 2>&1 || true
+            done
+            sleep 5
+          done
+        ) &
+        exec tail -f /dev/null
+
+  # One-shot registration helper for environments where the EIP-4337 bundler is
+  # unavailable: emits dstack_register calldata for operator submission.
+  registration-calldata:
+    image: ghcr.io/dmvt/attestmesh-indexer@sha256:d99b1d207e0df8bfdf6fbac5b001142307475ac9a5b1b88b730b7edabd4283e5
+    restart: "no"
+    depends_on:
+      - sidecar
+    entrypoint: ["/usr/local/bin/attestmesh-registration-calldata"]
+    environment:
+      - CLUSTER=${CLUSTER}
+      - DSTACK_SOCKET=/var/run/dstack.sock
+      - REGISTRATION_HELPER_ADDR=0.0.0.0:9092
+    ports:
+      - "9092:9092"
+    volumes:
+      - /var/run/dstack.sock:/var/run/dstack.sock
+
+  # ── :15431 follows Patroni's writable primary; :15432/3 remain node fallbacks. ──
+  pg-primary-router:
+    image: haproxy:3.0-alpine@sha256:dee54db8b27cd6c21519ea4f0ba0604f3742e8e7369bc16fb5b69133dec3f47f
     restart: unless-stopped
     network_mode: service:sidecar
     depends_on:
       - sidecar
-    command: ["TCP-LISTEN:15431,fork,reuseaddr,bind=0.0.0.0", "TCP:10.18.147.86:5432"]
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - |
+        cat >/tmp/pg-primary-router.cfg <<'CFG'
+        global
+          maxconn 400
+        defaults
+          mode tcp
+          timeout connect 2s
+          timeout client 30m
+          timeout server 30m
+          timeout check 2s
+          retries 2
+          option redispatch
+        listen primary
+          bind 0.0.0.0:15431
+          option httpchk GET /primary
+          http-check expect status 200
+          default-server inter 1s fall 2 rise 1 on-marked-down shutdown-sessions
+          server pg1 10.18.147.86:5434 check port 8008
+          server pg2 10.18.251.71:5434 check port 8008
+          server pg3 10.18.172.186:5434 check port 8008
+        CFG
+        exec haproxy -f /tmp/pg-primary-router.cfg -db
     read_only: true
+    tmpfs:
+      - /tmp
     cap_drop:
       - ALL
     security_opt:
@@ -197,7 +310,7 @@ services:
   #    Its entrypoint CSK-derives the redis password over the agent gRPC before exec.
   #    DSN is the multi-host pg-ha forwarder path (survives node rolls/failover). ──
   litellm:
-    image: ghcr.io/attestmesh/fugu-router@sha256:be9b0b90f408bb3ea59ae9acfdee9f65ad8f914b40d0cdf4942da20cb3435d80 # pinned 2026-07-06 stream ledger capture
+    image: ghcr.io/attestmesh/fugu-router@sha256:8b5e4baf271c1c86633e191f9705636e15d2ac9aac480de9912dae2c968f4e53 # pinned 2026-07-11 GPT-OSS-120B + direct-model telemetry
     restart: unless-stopped
     depends_on:
       - sidecar
@@ -214,6 +327,10 @@ services:
       - SAKANA_SUB_1_KEY=${SAKANA_SUB_1_KEY}
       - SAKANA_SUB_2_KEY=${SAKANA_SUB_2_KEY}
       - SAKANA_SUB_3_KEY=${SAKANA_SUB_3_KEY}
+      - REDPILL_API_BASE=${REDPILL_API_BASE}
+      - REDPILL_API_KEY=${REDPILL_API_KEY}
+      - XAI_API_BASE=${XAI_API_BASE}
+      - XAI_API_KEY=${XAI_API_KEY}
       - FUGU_ACCOUNT_COUNT=3
       - FUGU_SUB_1_ENABLED=true
       - FUGU_SUB_2_ENABLED=true
@@ -261,7 +378,7 @@ services:
   # quota/rate-limit retry across subscription keys, and the /fugu/dashboard UI. It
   # shares LiteLLM's network namespace so the egress firewall governs both processes.
   session-router:
-    image: ghcr.io/attestmesh/fugu-router@sha256:be9b0b90f408bb3ea59ae9acfdee9f65ad8f914b40d0cdf4942da20cb3435d80 # pinned 2026-07-06 stream ledger capture
+    image: ghcr.io/attestmesh/fugu-router@sha256:8b5e4baf271c1c86633e191f9705636e15d2ac9aac480de9912dae2c968f4e53 # pinned 2026-07-11 GPT-OSS-120B + direct-model telemetry
     restart: unless-stopped
     network_mode: service:litellm
     depends_on:
@@ -306,9 +423,9 @@ services:
       - FUGU_SUB_2_MONTHLY_ALLOWANCE_USAGE_UNITS=${FUGU_SUB_2_MONTHLY_ALLOWANCE_USAGE_UNITS}
       - FUGU_SUB_3_MONTHLY_ALLOWANCE_USAGE_UNITS=${FUGU_SUB_3_MONTHLY_ALLOWANCE_USAGE_UNITS}
 
-  # LiteLLM egress is deny-by-default: ONLY the resolved Sakana API CIDRs on :443
-  # (narrowest observed set, short re-resolve — risk 2), the internal pg/redis/langfuse
-  # forwarders, and Docker DNS.
+  # LiteLLM egress is deny-by-default: ONLY the dynamically resolved xAI API
+  # host, static Sakana/RedPill/xAI API CIDRs on :443, the internal
+  # pg/redis/langfuse forwarders, and Docker DNS.
   litellm-egress-fw:
     image: ghcr.io/attestmesh/agent-egress-fw@sha256:c6c00d1fc5e73dde050c1a8cf2fef43a93cc9cd0dc0f5f368e7c763f1f1c242c
     restart: unless-stopped
@@ -316,7 +433,8 @@ services:
     depends_on:
       - litellm
     environment:
-      - ALLOW_CIDRS=${SAKANA_CIDRS}
+      - ALLOW_BASE_URL=${XAI_API_BASE}
+      - ALLOW_CIDRS=${SAKANA_CIDRS} ${REDPILL_CIDRS} ${XAI_CIDRS}
       - ALLOW_PORT=443
       - INTERNAL_HOSTS=
       - INTERNAL_HOST_PORTS=sidecar:15431 sidecar:15432 sidecar:15433 sidecar:16379 sidecar:16380 sidecar:16381 sidecar:18420
@@ -351,6 +469,35 @@ services:
     security_opt:
       - no-new-privileges:true
 
+  # Same-host LB backend path: publish the router on the CVM bridge IP only.
+  # HAProxy can use this when gateway TCP transport for router peers is unavailable.
+  bridge-proxy-litellm:
+    image: alpine/socat:1.8.0.0
+    restart: unless-stopped
+    network_mode: service:sidecar
+    depends_on:
+      - sidecar
+      - litellm
+      - session-router
+    entrypoint:
+      - /bin/sh
+      - -ec
+    command:
+      - |
+        while :; do
+          ip="$(ip -4 -o addr show dev eth0 2>/dev/null | awk '{print $$4}' | cut -d/ -f1)"
+          [ -n "$$ip" ] && break
+          sleep 1
+        done
+        exec socat TCP-LISTEN:18410,fork,reuseaddr,bind="$${ip}" TCP:litellm:4010
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+
 volumes:
   sidecar-state:
   agent-sock:
+  sidecar-log:
+  docker-diag:

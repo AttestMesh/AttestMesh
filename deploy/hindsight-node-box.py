@@ -68,8 +68,40 @@ ENV_KEYS = [
     "HINDSIGHT_API_LLM_BASE_URL",
     "HINDSIGHT_API_LLM_MODEL",
     "HINDSIGHT_API_LLM_API_KEY",
+    "HINDSIGHT_API_LLM_REASONING_EFFORT",
+    "HINDSIGHT_API_LLM_EXTRA_BODY",
+    "HINDSIGHT_API_LLM_STRICT_SCHEMA",
+    "HINDSIGHT_API_LLM_MAX_COMPLETION_TOKENS",
+    # --- local budget proxy / provider guard ---
+    "HINDSIGHT_ROUTER_MESH_IP",
+    "HINDSIGHT_PROVIDER_BASE_URL",
+    "HINDSIGHT_PROVIDER_API_KEY",
+    "HINDSIGHT_PROXY_API_KEY",
+    "HINDSIGHT_PROVIDER_EGRESS_ENABLED",
+    "HINDSIGHT_PROVIDER_TOTAL_LIMIT_USD",
+    "HINDSIGHT_PROVIDER_SAFETY_MARGIN_USD",
+    "HINDSIGHT_BUDGET_PHASE",
+    "HINDSIGHT_BACKFILL_LIMIT_USD",
+    "HINDSIGHT_MONTHLY_LIMIT_USD",
+    "QWEN_MONTHLY_LIMIT_USD",
+    "HINDSIGHT_PROXY_RPM_LIMIT",
+    "HINDSIGHT_PROXY_TPM_LIMIT",
+    "GPT_OSS_120B_INPUT_USD_PER_M",
+    "GPT_OSS_120B_OUTPUT_USD_PER_M",
+    "QWEN_INPUT_USD_PER_M",
+    "QWEN_OUTPUT_USD_PER_M",
+    "HINDSIGHT_INITIAL_PROVIDER_SPEND_USD",
+    "HINDSIGHT_BANK_CLEANUP_ENABLED",
+    "HINDSIGHT_RECONCILE_AMBIGUOUS_ENABLED",
     "HINDSIGHT_API_TENANT_API_KEY",
     "HINDSIGHT_CP_ACCESS_KEY",
+    "HINDSIGHT_PGHA_ENABLED",
+    "HINDSIGHT_DB_PASSWORD",
+    "HINDSIGHT_PGHA_IP_1",
+    "HINDSIGHT_PGHA_IP_2",
+    "HINDSIGHT_PGHA_IP_3",
+    "HINDSIGHT_API_DATABASE_URL",
+    "HINDSIGHT_API_MIGRATION_DATABASE_URL",
     # --- private-registry pull creds (attestmesh sidecar + egress-fw images) ---
     "DSTACK_DOCKER_USERNAME",
     "DSTACK_DOCKER_PASSWORD",
@@ -197,7 +229,7 @@ def main() -> None:
                     break
                 info = gi.get("info") or {}
                 status = str(info.get("status") or "").lower()
-                if status.startswith("stop") or status.startswith("exit"):
+                if status == "stopped" or status.startswith("exit"):
                     stopped = True
                     break
             except Exception:

@@ -1,10 +1,5 @@
 #!/usr/bin/env python3
-"""Box-side deploy helper for deploy/generic-node.sh.
-
-Deploys a generic AttestMesh workload CVM: cluster-mesh-agent sidecar plus one
-operator-supplied workload image. User environment is sealed as APP_ENV_B64 and
-decoded by pre_launch_script into an env_file consumed by docker compose.
-"""
+"""Box-side deploy helper for deploy/fugu-router-lb-node.sh."""
 
 from __future__ import annotations
 
@@ -17,14 +12,20 @@ import time
 sys.path.insert(0, "/opt/dstack-mcp")
 import mcp_dstack as m  # noqa: E402
 
-NAME = os.environ.get("BOX_NAME", "generic-node")
-COMPOSE_PATH = os.environ.get("BOX_COMPOSE", "/tmp/generic-node.yaml")
-VCPU = int(os.environ.get("BOX_VCPU", "2"))
-MEM = int(os.environ.get("BOX_MEM", "4096"))
-DISK = int(os.environ.get("BOX_DISK", "40"))
+NAME = os.environ.get("BOX_NAME", "fugu-router-lb-node")
+COMPOSE_PATH = os.environ.get("BOX_COMPOSE", "/tmp/fugu-router-lb-node.yaml")
+VCPU = int(os.environ.get("BOX_VCPU", "1"))
+MEM = int(os.environ.get("BOX_MEM", "1024"))
+DISK = int(os.environ.get("BOX_DISK", "10"))
 PORTS = json.loads(os.environ.get("BOX_PORTS", "[]"))
 NET_MODE = (os.environ.get("BOX_NET_MODE", "bridge").strip().lower() or "bridge")
-GATEWAY_ENABLED = os.environ.get("BOX_GATEWAY_ENABLED", "true").strip().lower() in {
+GATEWAY_ENABLED = os.environ.get("BOX_GATEWAY_ENABLED", "false").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+NO_INSTANCE_ID = os.environ.get("BOX_NO_INSTANCE_ID", "false").strip().lower() in {
     "1",
     "true",
     "yes",
@@ -38,27 +39,8 @@ ENV_KEYS = [
     "GAS_POLICY_ID",
     "INDEXER_REGISTRY_ADDR",
     "GATEWAY_DOMAIN",
-    "CLUSTER",
-    "MEMBER_IMPL",
-    # App-tier secrets/config — sealed per-var and referenced as ${VAR} in the compose
-    # (the proven pattern; env_file is NOT supported by dstack app-compose).
-    "APP_DB_PASSWORD",
-    "DATABASE_URL",
-    "HINDSIGHT_URL",
-    "HINDSIGHT_MESH_IP",
-    "HINDSIGHT_TOKEN",
-    "HINDSIGHT_BANK",
-    "HINDSIGHT_SYNC_ENABLED",
-    "HINDSIGHT_OUTBOX_MAX_IN_FLIGHT",
-    "HINDSIGHT_OUTBOX_TICK_SECONDS",
-    "HINDSIGHT_OUTBOX_RUN_LIMIT",
-    "RECALL_BACKEND",
-    "INGEST_TOKEN",
-    "EMBEDDING_URL",
-    "EMBEDDING_API_KEY",
-    "EMBEDDING_MODEL",
-    "EMBEDDING_DIM",
-    "ALLOW_BASE_URL",
+    "FUGU_LB_ADMIN_KEY",
+    "FUGU_LB_INITIAL_BACKEND",
     "DSTACK_DOCKER_USERNAME",
     "DSTACK_DOCKER_PASSWORD",
     "DSTACK_DOCKER_REGISTRY",
@@ -84,7 +66,7 @@ def app_compose_and_hash(env_keys: list[str]) -> tuple[str, str]:
         "public_logs": True,
         "public_sysinfo": True,
         "allowed_envs": sorted(set(env_keys) | {"APP_ID"}),
-        "no_instance_id": False,
+        "no_instance_id": NO_INSTANCE_ID,
         "secure_time": False,
     }
     app_compose["pre_launch_script"] = (
@@ -102,17 +84,54 @@ def kms_urls() -> list[str]:
 
 def stop_vm(vm_id: str) -> dict[str, object]:
     if not vm_id:
-        raise SystemExit("usage: generic-node-box.py stop <vm_id>")
+        raise SystemExit("usage: fugu-router-lb-node-box.py stop <vm_id>")
     before = m.vmm("GetInfo", {"id": vm_id})
     found = bool(before.get("found", True))
     if found:
         try:
             m.vmm("StopVm", {"id": vm_id})
         except Exception as exc:
-            # StopVm is not idempotent on every dstack build. Treat already-gone
-            # or already-stopped VMs as cleanup success, but keep the error text.
             return {"vm_id": vm_id, "found": found, "stopped": False, "error": str(exc)}
     return {"vm_id": vm_id, "found": found, "stopped": found}
+
+
+def start_vm(vm_id: str) -> dict[str, object]:
+    if not vm_id:
+        raise SystemExit("usage: fugu-router-lb-node-box.py start <vm_id>")
+    before = m.vmm("GetInfo", {"id": vm_id})
+    found = bool(before.get("found", True))
+    if found:
+        status = str((before.get("info") or {}).get("status") or "").lower()
+        if status.startswith("run"):
+            return {"vm_id": vm_id, "found": found, "started": True, "already_running": True}
+        result = m.vmm("StartVm", {"id": vm_id})
+        return {"vm_id": vm_id, "found": found, "started": True, "result": result}
+    return {"vm_id": vm_id, "found": found, "started": False}
+
+
+def create_vm(app_id: str, compose_file: str, env: dict[str, str]) -> dict[str, object]:
+    return m.vmm(
+        "CreateVm",
+        {
+            "name": NAME,
+            "image": "dstack-0.5.11",
+            "compose_file": compose_file,
+            "vcpu": VCPU,
+            "memory": MEM,
+            "disk_size": DISK,
+            "app_id": app_id,
+            "user_config": "",
+            "ports": [m._parse_port(port) for port in PORTS],
+            "hugepages": False,
+            "pin_numa": False,
+            "stopped": False,
+            "no_tee": False,
+            "kms_urls": kms_urls(),
+            "networking": {"mode": NET_MODE},
+            "gateway_urls": [m.GATEWAY_RPC] if GATEWAY_ENABLED else [],
+            "encrypted_env": m._seal_env(env, m._app_env_encrypt_pubkey(app_id)),
+        },
+    )
 
 
 def main() -> None:
@@ -122,47 +141,27 @@ def main() -> None:
         env = build_env()
         compose_file, compose_hash = app_compose_and_hash(list(env.keys()))
         app_id = m._deploy_app_contract(compose_hash)
-        result = m.vmm(
-            "CreateVm",
-            {
-                "name": NAME,
-                "image": "dstack-0.5.11",
-                "compose_file": compose_file,
-                "vcpu": VCPU,
-                "memory": MEM,
-                "disk_size": DISK,
-                "app_id": app_id,
-                "user_config": "",
-                "ports": [m._parse_port(port) for port in PORTS],
-                "hugepages": False,
-                "pin_numa": False,
-                "stopped": True,
-                "no_tee": False,
-                "kms_urls": kms_urls(),
-                "networking": {"mode": NET_MODE},
-                "gateway_urls": [m.GATEWAY_RPC] if GATEWAY_ENABLED else [],
-                "encrypted_env": m._seal_env(env, m._app_env_encrypt_pubkey(app_id)),
-            },
-        )
+        result = create_vm(app_id, compose_file, env)
         print(
             json.dumps(
                 {
                     "app_id": app_id,
                     "compose_hash": compose_hash,
                     "vm_id": result.get("id"),
-                    "gateway_url": (
-                        f"https://{app_id[2:].lower()}.gateway.attestmesh.xyz"
-                        if GATEWAY_ENABLED
-                        else None
-                    ),
+                    "gateway_url": None,
                 }
             )
         )
         return
 
     if mode == "hash":
-        _, digest = app_compose_and_hash(ENV_KEYS + ["DSTACK_DOCKER_REGISTRY"])
+        _, digest = app_compose_and_hash(ENV_KEYS)
         print(digest)
+        return
+
+    if mode == "start":
+        vm_id = sys.argv[2] if len(sys.argv) > 2 else ""
+        print(json.dumps(start_vm(vm_id)))
         return
 
     if mode == "stop":
@@ -174,12 +173,19 @@ def main() -> None:
         app_id = sys.argv[2] if len(sys.argv) > 2 else ""
         vm_id = sys.argv[3] if len(sys.argv) > 3 else ""
         if not app_id or not vm_id:
-            raise SystemExit("usage: generic-node-box.py update <app_id> <vm_id>")
+            raise SystemExit("usage: fugu-router-lb-node-box.py update <app_id> <vm_id>")
 
         env = build_env()
         compose_file, compose_hash = app_compose_and_hash(list(env.keys()))
         sealed = dict(env)
         sealed["APP_ID"] = app_id
+        fresh = os.environ.get("BOX_FRESH_DISK", "").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+
         try:
             m.vmm("StopVm", {"id": vm_id})
         except Exception:
@@ -199,6 +205,21 @@ def main() -> None:
                 stopped = True
                 break
             time.sleep(2)
+
+        if fresh:
+            result = create_vm(app_id, compose_file, sealed)
+            print(
+                json.dumps(
+                    {
+                        "app_id": app_id,
+                        "compose_hash": compose_hash,
+                        "vm_id": result.get("id"),
+                        "mode": "createvm",
+                        "stopped": stopped,
+                    }
+                )
+            )
+            return
 
         upgrade = m.vmm(
             "UpgradeApp",
@@ -230,7 +251,7 @@ def main() -> None:
         )
         return
 
-    raise SystemExit("usage: generic-node-box.py [deploy|hash|stop <vm_id>|update <app_id> <vm_id>]")
+    raise SystemExit("usage: fugu-router-lb-node-box.py [deploy|hash|start <vm_id>|stop <vm_id>|update <app_id> <vm_id>]")
 
 
 if __name__ == "__main__":

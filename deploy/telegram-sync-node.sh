@@ -176,14 +176,17 @@ _require_env() {
   MATRIX_USER_ID="${MATRIX_USER_ID:-@${BOT_LOCALPART}:${server_name}}"
   MATRIX_ADMIN_MXIDS="${MATRIX_ADMIN_MXIDS:-@lsdan:${server_name}}"
   [ -n "${MATRIX_ROOM_ID:-}" ] || die "MATRIX_ROOM_ID is empty — run '$0 $NODE provision-matrix' first (the room id is sealed into the CVM)"
-  DATABASE_URL="postgresql://telegram_sync:${TG_DB_PASSWORD}@sidecar:15431,sidecar:15432,sidecar:15433/telegram_sync"
+  # asyncpg does not implement libpq's connect_timeout DSN keyword; it treats
+  # unknown query keys as PostgreSQL server settings.  Connection setup is
+  # bounded with asyncpg's timeout= argument in the two application images.
+  DATABASE_URL="postgresql://telegram_sync:${TG_DB_PASSWORD}@sidecar:15431,sidecar:15432,sidecar:15433/telegram_sync?target_session_attrs=read-write"
   # Image understanding: route xAI's OpenAI-compatible vision API through redpill
   # (reuses the redpill key + tight 66.220.6.0/24 egress; avoids Cloudflare-fronted api.x.ai).
   XAI_API_KEY="${XAI_API_KEY:-$LLM_API_KEY}"
   XAI_BASE_URL="${XAI_BASE_URL:-https://api.redpill.ai/v1}"
   XAI_MODEL="${XAI_MODEL:-x-ai/grok-4.1-fast}"
   # Read-only DSN for the FTS MCP server (telegram_search role, created at boot by pg-provision).
-  SEARCH_DATABASE_URL="postgresql://telegram_search:${SEARCH_DB_PASSWORD}@sidecar:15431,sidecar:15432,sidecar:15433/telegram_sync"
+  SEARCH_DATABASE_URL="postgresql://telegram_search:${SEARCH_DB_PASSWORD}@sidecar:15431,sidecar:15432,sidecar:15433/telegram_sync?target_session_attrs=read-write"
 }
 
 send_seq() {
@@ -534,6 +537,7 @@ update_member() {
     log "compose hash already allowlisted"
   else
     send_seq "tgsync-update-addHash-${NODE}" "$CLUSTER" "addComposeHash(bytes32)" "0x$nh"
+    settle_compose_hash_for_kms "$CLUSTER" "$nh"
   fi
   out=$(_box_run update "$X" "$VM_ID") || die "in-place update failed"
   echo "$out"

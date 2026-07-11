@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Box-side deploy helper for deploy/generic-node.sh.
+"""Box-side deploy helper for deploy/pocket-mcp-node.sh.
 
-Deploys a generic AttestMesh workload CVM: cluster-mesh-agent sidecar plus one
-operator-supplied workload image. User environment is sealed as APP_ENV_B64 and
-decoded by pre_launch_script into an env_file consumed by docker compose.
+Deploys the pocket-mcp app-tier CVM: cluster-mesh-agent sidecar + pg-provision one-shot +
+the pocket-mcp image (init / mcp / poller) + socat forwarders + egress firewall. Each
+app secret/config value is sealed individually as an encrypted env (dstack app-compose does
+NOT support env_file) and referenced as ${VAR} in compose/pocket-mcp-node.yaml.
 """
 
 from __future__ import annotations
@@ -17,8 +18,8 @@ import time
 sys.path.insert(0, "/opt/dstack-mcp")
 import mcp_dstack as m  # noqa: E402
 
-NAME = os.environ.get("BOX_NAME", "generic-node")
-COMPOSE_PATH = os.environ.get("BOX_COMPOSE", "/tmp/generic-node.yaml")
+NAME = os.environ.get("BOX_NAME", "pocket-mcp")
+COMPOSE_PATH = os.environ.get("BOX_COMPOSE", "/tmp/pocket-mcp.yaml")
 VCPU = int(os.environ.get("BOX_VCPU", "2"))
 MEM = int(os.environ.get("BOX_MEM", "4096"))
 DISK = int(os.environ.get("BOX_DISK", "40"))
@@ -53,12 +54,14 @@ ENV_KEYS = [
     "HINDSIGHT_OUTBOX_TICK_SECONDS",
     "HINDSIGHT_OUTBOX_RUN_LIMIT",
     "RECALL_BACKEND",
-    "INGEST_TOKEN",
     "EMBEDDING_URL",
     "EMBEDDING_API_KEY",
     "EMBEDDING_MODEL",
     "EMBEDDING_DIM",
-    "ALLOW_BASE_URL",
+    "POCKET_API_KEY",
+    "POCKET_API_BASE",
+    "POCKET_API_CIDRS",
+    "MCP_AUTH_TOKEN",
     "DSTACK_DOCKER_USERNAME",
     "DSTACK_DOCKER_PASSWORD",
     "DSTACK_DOCKER_REGISTRY",
@@ -102,7 +105,7 @@ def kms_urls() -> list[str]:
 
 def stop_vm(vm_id: str) -> dict[str, object]:
     if not vm_id:
-        raise SystemExit("usage: generic-node-box.py stop <vm_id>")
+        raise SystemExit("usage: pocket-mcp-node-box.py stop <vm_id>")
     before = m.vmm("GetInfo", {"id": vm_id})
     found = bool(before.get("found", True))
     if found:
@@ -174,7 +177,7 @@ def main() -> None:
         app_id = sys.argv[2] if len(sys.argv) > 2 else ""
         vm_id = sys.argv[3] if len(sys.argv) > 3 else ""
         if not app_id or not vm_id:
-            raise SystemExit("usage: generic-node-box.py update <app_id> <vm_id>")
+            raise SystemExit("usage: pocket-mcp-node-box.py update <app_id> <vm_id>")
 
         env = build_env()
         compose_file, compose_hash = app_compose_and_hash(list(env.keys()))
@@ -230,7 +233,7 @@ def main() -> None:
         )
         return
 
-    raise SystemExit("usage: generic-node-box.py [deploy|hash|stop <vm_id>|update <app_id> <vm_id>]")
+    raise SystemExit("usage: pocket-mcp-node-box.py [deploy|hash|stop <vm_id>|update <app_id> <vm_id>]")
 
 
 if __name__ == "__main__":

@@ -25,7 +25,7 @@
 services:
   # --- AttestMesh sidecar: on-chain self-registration + wg mesh (Path A) --------
   sidecar:
-    image: ghcr.io/attestmesh/cluster-mesh-agent@sha256:b9e0ae107d9db015c22059c9fecdc28f2b35e09b257eabb4739bd4e46d96f641
+    image: ghcr.io/attestmesh/cluster-mesh-agent@sha256:e3d53442aa6e52d47227fb3528c1141302ad4fc63c4b3fb6dc38df7ce907d486
     restart: unless-stopped
     environment:
       # MEMBER_CONTRACT intentionally unset. Path A upgrades this stock DstackApp
@@ -56,17 +56,41 @@ services:
       - /dev/net/tun
 
   # --- PG-HA over the AttestMesh WireGuard mesh ---------------------------------
-  # Synclave's product DB lives in the shared pg-ha cluster, not in this compose.
-  # The app container is in the ordinary compose network; these forwarders live in
-  # the sidecar netns so their outbound legs can reach the pg-ha mesh IPs.
-  pg1-proxy:
-    image: alpine/socat:1.8.0.0
+  # Synclave's product DB lives in the shared pg-ha cluster. :15431 routes
+  # directly to Patroni's writable primary; :15432/3 remain node fallbacks.
+  pg-primary-router:
+    image: haproxy:3.0-alpine@sha256:dee54db8b27cd6c21519ea4f0ba0604f3742e8e7369bc16fb5b69133dec3f47f
     restart: unless-stopped
     network_mode: service:sidecar
     depends_on:
       - sidecar
-    command: ["TCP-LISTEN:15431,fork,reuseaddr,bind=0.0.0.0", "TCP:10.18.147.86:5432"]
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - |
+        cat >/tmp/pg-primary-router.cfg <<'CFG'
+        global
+          maxconn 400
+        defaults
+          mode tcp
+          timeout connect 2s
+          timeout client 30m
+          timeout server 30m
+          timeout check 2s
+          retries 2
+          option redispatch
+        listen primary
+          bind 0.0.0.0:15431
+          option httpchk GET /primary
+          http-check expect status 200
+          default-server inter 1s fall 2 rise 1 on-marked-down shutdown-sessions
+          server pg1 10.18.147.86:5434 check port 8008
+          server pg2 10.18.251.71:5434 check port 8008
+          server pg3 10.18.172.186:5434 check port 8008
+        CFG
+        exec haproxy -f /tmp/pg-primary-router.cfg -db
     read_only: true
+    tmpfs:
+      - /tmp
     cap_drop:
       - ALL
     security_opt:
@@ -161,7 +185,7 @@ services:
     # v21 = user-visible orchestrator failure details in enclave deploys;
     # v20 = CLUSTER_NETWORKS-only live mesh config + structured orchestrator errors;
     # v19 = Apps → Sandboxes rename (labels only, wire stays app).
-    image: ghcr.io/dmvt/synclave-app:v43@sha256:f382da88f4194316b330ccb447996d8569ded5655016566fd5d2e923eddbe853
+    image: ghcr.io/dmvt/synclave-app:v43-pg-failover-20260711@sha256:a62b1cb741dcef5bff3fb9583ce93f44e4f87b99fe1a8c63fed4e0b164f1d1b6
     environment:
       API_HOST: 0.0.0.0
       API_PORT: 80
@@ -215,7 +239,7 @@ services:
     depends_on:
       pg-provision:
         condition: service_completed_successfully
-      pg1-proxy:
+      pg-primary-router:
         condition: service_started
       pg2-proxy:
         condition: service_started

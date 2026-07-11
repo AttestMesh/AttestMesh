@@ -9,6 +9,8 @@ split so the driver can precompute every node's mesh IP BEFORE any CVM boots
   create <app_id>     -> CreateVm for a previously registered app with sealed env
   hash                -> print the measured compose hash (no chain, no secrets)
   update <app_id> <vm_id> -> disk-preserving StopVm/UpgradeApp/StartVm (BOX_FRESH_DISK=1 recreates)
+  resize <vm_id>      -> resource-only ResizeVm; VM must already be stopped
+  info <vm_id>        -> status/resource readback plus recent data-disk boot evidence
   stop <vm_id> / start <vm_id> -> power controls (used by verify-failover)
 
 The compose hash is identical for every pg node: only sealed env VALUES differ per node,
@@ -179,6 +181,76 @@ def main() -> None:
         print(json.dumps({"vm_id": vm_id, "mode": mode, "result": result}))
         return
 
+    if mode == "info":
+        vm_id = sys.argv[2] if len(sys.argv) > 2 else ""
+        if not vm_id:
+            raise SystemExit("usage: pg-ha-node-box.py info <vm_id>")
+        response = m.vmm("GetInfo", {"id": vm_id})
+        info = response.get("info") or {}
+        config = info.get("configuration") or {}
+        compose_file = str(config.get("compose_file") or "")
+        try:
+            serial = m.vm_logs(vm_id=vm_id, lines=1500, channel="serial")
+        except Exception:
+            serial = ""
+        disk_lines = [
+            line.strip()
+            for line in serial.splitlines()
+            if "/var/volatile/dstack/persistent" in line
+            or "Trying to resize filesystem" in line
+            or "zpool online -e" in line
+        ]
+        print(
+            json.dumps(
+                {
+                    "vm_id": vm_id,
+                    "found": bool(response.get("found")),
+                    "name": config.get("name"),
+                    "app_id": config.get("app_id") or info.get("app_id"),
+                    "instance_id": info.get("instance_id"),
+                    "compose_hash": hashlib.sha256(compose_file.encode()).hexdigest(),
+                    "status": info.get("status"),
+                    "boot_progress": info.get("boot_progress"),
+                    "boot_error": info.get("boot_error"),
+                    "vcpu": config.get("vcpu"),
+                    "memory": config.get("memory"),
+                    "disk_size": config.get("disk_size"),
+                    "image": config.get("image"),
+                    "disk_boot_evidence": disk_lines[-6:],
+                }
+            )
+        )
+        return
+
+    if mode == "resize":
+        vm_id = sys.argv[2] if len(sys.argv) > 2 else ""
+        if not vm_id:
+            raise SystemExit("usage: pg-ha-node-box.py resize <vm_id>")
+        response = m.vmm("GetInfo", {"id": vm_id})
+        info = response.get("info") or {}
+        if not response.get("found"):
+            raise SystemExit(f"VM not found: {vm_id}")
+        status = str(info.get("status") or "").lower()
+        if status not in {"stopped", "exited"}:
+            raise SystemExit(f"VM must be stopped before resize: {vm_id} is {status or 'unknown'}")
+        config = info.get("configuration") or {}
+        current = {
+            "vcpu": int(config.get("vcpu") or 0),
+            "memory": int(config.get("memory") or 0),
+            "disk_size": int(config.get("disk_size") or 0),
+        }
+        target = {"vcpu": VCPU, "memory": MEM, "disk_size": DISK}
+        for key, value in target.items():
+            if value < current[key]:
+                raise SystemExit(f"refusing to shrink {key}: current={current[key]} target={value}")
+        result = m.vmm("ResizeVm", {"id": vm_id, **target})
+        after = (m.vmm("GetInfo", {"id": vm_id}).get("info") or {}).get("configuration") or {}
+        readback = {key: int(after.get(key) or 0) for key in target}
+        if readback != target:
+            raise SystemExit(f"resize readback mismatch: target={target} readback={readback}")
+        print(json.dumps({"vm_id": vm_id, "before": current, "target": target, "result": result}))
+        return
+
     if mode == "update":
         app_id = sys.argv[2] if len(sys.argv) > 2 else ""
         vm_id = sys.argv[3] if len(sys.argv) > 3 else ""
@@ -202,7 +274,7 @@ def main() -> None:
             try:
                 info = m.vmm("GetInfo", {"id": vm_id}).get("info") or {}
                 status = str(info.get("status") or "").lower()
-                if status.startswith("stop") or status.startswith("exit"):
+                if status == "stopped" or status.startswith("exit"):
                     stopped = True
                     break
             except Exception:
@@ -255,7 +327,7 @@ def main() -> None:
         return
 
     raise SystemExit(
-        "usage: pg-ha-node-box.py [register|create <app_id>|hash|update <app_id> <vm_id>|stop <vm_id>|start <vm_id>]"
+        "usage: pg-ha-node-box.py [register|create <app_id>|hash|update <app_id> <vm_id>|resize <vm_id>|info <vm_id>|stop <vm_id>|start <vm_id>]"
     )
 
 

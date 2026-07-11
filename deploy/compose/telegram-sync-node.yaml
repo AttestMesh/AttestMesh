@@ -22,7 +22,7 @@
 
 services:
   sidecar:
-    image: ghcr.io/attestmesh/cluster-mesh-agent@sha256:b9e0ae107d9db015c22059c9fecdc28f2b35e09b257eabb4739bd4e46d96f641
+    image: ghcr.io/attestmesh/cluster-mesh-agent@sha256:e3d53442aa6e52d47227fb3528c1141302ad4fc63c4b3fb6dc38df7ce907d486
     restart: unless-stopped
     environment:
       # MEMBER_CONTRACT intentionally unset: the sidecar self-discovers the app_id.
@@ -114,17 +114,41 @@ services:
         psql "postgresql://telegram_sync:$${TG_DB_PASSWORD}@$${HOSTS}/telegram_sync?connect_timeout=5" -c 'select 1' >/dev/null
         _st "OK: roles telegram_sync + telegram_search (read-only) ensured; login verified"
 
-  # Forwarders to each pg-ha node's HAProxy :5432 (current-primary port). They live
-  # in the sidecar netns because only it has the wireguard mesh interface; apps in
-  # their own netns reach them at sidecar:1543N via the compose network.
-  pg1-proxy:
-    image: alpine/socat:1.8.0.0
+  # :15431 routes directly to Patroni's writable primary; :15432/3 retain
+  # node-specific HAProxy fallbacks for libpq/asyncpg multi-host reconnects.
+  pg-primary-router:
+    image: haproxy:3.0-alpine@sha256:dee54db8b27cd6c21519ea4f0ba0604f3742e8e7369bc16fb5b69133dec3f47f
     restart: unless-stopped
     network_mode: service:sidecar
     depends_on:
       - sidecar
-    command: ["TCP-LISTEN:15431,fork,reuseaddr,bind=0.0.0.0", "TCP:10.18.147.86:5432"]
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - |
+        cat >/tmp/pg-primary-router.cfg <<'CFG'
+        global
+          maxconn 400
+        defaults
+          mode tcp
+          timeout connect 2s
+          timeout client 30m
+          timeout server 30m
+          timeout check 2s
+          retries 2
+          option redispatch
+        listen primary
+          bind 0.0.0.0:15431
+          option httpchk GET /primary
+          http-check expect status 200
+          default-server inter 1s fall 2 rise 1 on-marked-down shutdown-sessions
+          server pg1 10.18.147.86:5434 check port 8008
+          server pg2 10.18.251.71:5434 check port 8008
+          server pg3 10.18.172.186:5434 check port 8008
+        CFG
+        exec haproxy -f /tmp/pg-primary-router.cfg -db
     read_only: true
+    tmpfs:
+      - /tmp
     cap_drop:
       - ALL
     security_opt:
@@ -223,7 +247,7 @@ services:
   # unauthorized session (normal until the admin agent completes a login) — backs off
   # instead of crash-looping so the shared session file stays mostly free.
   telegram-sync:
-    image: ghcr.io/attestmesh/telegram-sync@sha256:a5cbf8386a99004ff930578ab16fb10dd594a190985db48147eb8cac8c747ef0
+    image: ghcr.io/attestmesh/telegram-sync@sha256:b2d5940f4d50edc2a80645aaee01f95ff7f4931518f9709acde16fceb05c695d
     restart: unless-stopped
     user: "10001:10001"
     depends_on:
@@ -356,7 +380,7 @@ services:
   # forwarders as the READ-ONLY telegram_search role. Reachable by cluster members at
   # <mesh-ip>:18085/mcp via mcp-mesh-proxy; nothing published.
   telegram-fts-mcp:
-    image: ghcr.io/attestmesh/telegram-fts-mcp@sha256:52259a2af2d1d61d8b22fe72a89bad72407670217b6879bfc11b352c1cbcfb13
+    image: ghcr.io/attestmesh/telegram-fts-mcp@sha256:a8fcfd204ed72f91bd2e65995519332fc87dce8a96c61c9bb2c70296ff6cc169
     restart: unless-stopped
     depends_on:
       - sidecar

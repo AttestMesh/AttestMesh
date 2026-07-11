@@ -318,6 +318,7 @@ update_member() {
       || die "addComposeHash failed — NOT proceeding to UpgradeApp (unallowlisted compose bricks the boot)"
     allowed=$(cast call "$CLUSTER" 'allowedComposeHashes(bytes32)(bool)' "0x$nh" --rpc-url "$RPC_URL" 2>/dev/null)
     [ "$allowed" = true ] || die "compose hash still not allowlisted after send — aborting before UpgradeApp"
+    settle_compose_hash_for_kms "$CLUSTER" "$nh"
   fi
   out=$(_box_run update "$X" "$VM_ID") || die "in-place update failed"
   echo "$out"
