@@ -316,13 +316,20 @@ cleanup() {
 update_member() {
   _load; _require_env
   [ -n "${X:-}" ] && [ -n "${VM_ID:-}" ] && [ -n "${CLUSTER:-}" ] || die "need X/VM_ID/CLUSTER in $STATE"
-  local nh allowed out j mode
+  local nh allowed out j mode settle_seconds
   nh=$(_box_run hash | grep -oE '^[0-9a-f]{64}$' | tail -1)
   [ -n "$nh" ] || die "could not compute new compose_hash"
   log "new compose_hash=0x$nh"
   allowed=$(cast call "$CLUSTER" 'allowedComposeHashes(bytes32)(bool)' "0x$nh" --rpc-url "$RPC_URL" 2>/dev/null)
   if [ "$allowed" != true ]; then
     send_seq "generic-update-addHash-${NODE}" "$CLUSTER" "addComposeHash(bytes32)" "0x$nh"
+    # The running sidecar reconciles the allowlist asynchronously. Give it time
+    # to observe the new hash before UpgradeApp asks the guest gate to admit it.
+    settle_seconds="${GENERIC_ALLOWLIST_SETTLE_SECONDS:-75}"
+    if [ "$settle_seconds" -gt 0 ]; then
+      log "waiting ${settle_seconds}s for the member allowlist reconciler"
+      sleep "$settle_seconds"
+    fi
   else
     log "compose hash already allowlisted"
   fi
