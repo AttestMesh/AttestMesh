@@ -357,20 +357,27 @@ verify_lb() {
 switch_backend() {
   _load; _ensure_lb_secrets
   _discover_mesh_ip || die "LB node not registered with a mesh IP"
-  local target="${1:-${TARGET:-}}" backend out
+  local target="${1:-${TARGET:-}}" backend out response_json
   [ -n "$target" ] || die "usage: fugu-router-lb-node.sh $NODE switch <router-node-or-ip>"
   _default_cluster_env
   backend="$(_router_target_ip "$target")"
   log "▶ switching fugu-router-lb $NODE to backend $target ($backend)"
   out=$(ssh_mesh "FUGU_LB_ADMIN_KEY=$(printf '%q' "$FUGU_LB_ADMIN_KEY") BACKEND=$(printf '%q' "$backend") MESH_IP=$(printf '%q' "$MESH_IP") bash -s" <<'SCRIPT' 2>&1
 payload="{\"backend\":\"$BACKEND\"}"
-curl -fsS --max-time 30 \
+response=$(curl -sS --max-time 30 -w '\n%{http_code}' \
   -H "Authorization: Bearer $FUGU_LB_ADMIN_KEY" \
   -H "Content-Type: application/json" \
   --data-binary "$payload" \
-  "http://$MESH_IP:18411/switch"
+  "http://$MESH_IP:18411/switch")
+code=${response##*$'\n'}
+body=${response%$'\n'*}
+printf '%s\n' "$body"
+[ "$code" = 200 ]
 SCRIPT
 ) || die "switch failed: $out"
+  response_json=$(printf '%s\n' "$out" | grep -E '^\{' | tail -1)
+  jq -e --arg backend "$backend" '.active_backend == $backend' <<<"$response_json" >/dev/null \
+    || die "switch response did not confirm backend $backend: $response_json"
   ACTIVE_BACKEND="$backend"; _save
   echo "$out" | tee "$LOGDIR/fugu-lb-switch-${NODE}.$(ts).log" >&2
   log "✔ fugu-router-lb active backend is now $backend"
