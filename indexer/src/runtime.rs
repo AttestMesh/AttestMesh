@@ -65,6 +65,14 @@ async fn record_discovered_cluster(
     inserted
 }
 
+async fn cluster_needs_hydration(
+    state: &IndexerState,
+    read_model: &ReadModel,
+    cluster: Address,
+) -> bool {
+    !state.is_known_cluster(cluster).await || !read_model.contains_cluster(cluster).await
+}
+
 /// Shared handles passed to the loops.
 #[derive(Clone)]
 pub struct Runtime {
@@ -189,6 +197,45 @@ impl Runtime {
             MeshCidr { ip, prefix },
         )
         .await)
+    }
+
+    /// Hydrate a cluster found by the background discovery loop before making it
+    /// visible to the global watcher. The global event cursor may already be at head,
+    /// so a newly discovered cluster needs its own historical backfill or its members
+    /// and prior messages would be skipped forever.
+    async fn hydrate_discovered_cluster(
+        &self,
+        deployment: crate::query::ClusterDeployment,
+        indexed_through: u64,
+    ) -> anyhow::Result<bool> {
+        let cluster = deployment.cluster;
+        if !cluster_needs_hydration(&self.state, &self.read_model, cluster).await {
+            return Ok(false);
+        }
+
+        let (ip, prefix) = chain::mesh_cidr(&self.provider, cluster).await?;
+        let start = deployment.deployed_at_block.max(self.config.start_block);
+        let batch = self.config.block_batch_size.max(1);
+        let mut history = Vec::new();
+        for (from, to) in scan_ranges(start, indexed_through, batch) {
+            history.extend(watcher::poll_cluster_logs(&self.provider, &[cluster], from, to).await?);
+        }
+
+        let inserted = record_discovered_cluster(
+            &self.state,
+            &self.read_model,
+            deployment,
+            MeshCidr { ip, prefix },
+        )
+        .await;
+        self.ingest_for_cache(&history).await;
+        tracing::info!(
+            cluster = %cluster,
+            events = history.len(),
+            indexed_through,
+            "hydrated discovered cluster history"
+        );
+        Ok(inserted)
     }
 
     /// The block-watcher loop (spec §7.1) + inline dispatch (§7.3).
@@ -327,10 +374,7 @@ impl Runtime {
                 .await?;
                 for d in new {
                     let cluster = d.cluster;
-                    // Always hydrate the in-memory read model. A prior process may
-                    // have persisted the cluster set and then exited before the
-                    // ephemeral read model was populated.
-                    if self.add_discovered_cluster(d).await? {
+                    if self.hydrate_discovered_cluster(d, head).await? {
                         tracing::info!(cluster = %cluster, "discovered new cluster");
                     }
                 }
@@ -465,5 +509,40 @@ mod tests {
 
         assert!(!inserted, "the durable cluster set was already populated");
         assert_eq!(read_model.snapshots(8453, None).await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn hydration_is_required_until_state_and_read_model_agree() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let cursors = Arc::new(
+            crate::state::cursor::SledCursorStore::open(dir.path().to_str().unwrap()).unwrap(),
+        );
+        let state = IndexerState::new(cursors);
+        let read_model = ReadModel::new();
+        let cluster = Address::repeat_byte(0x55);
+
+        assert!(cluster_needs_hydration(&state, &read_model, cluster).await);
+        state.add_cluster(cluster).await;
+        assert!(
+            cluster_needs_hydration(&state, &read_model, cluster).await,
+            "known state alone must not suppress read-model recovery"
+        );
+        read_model
+            .add_cluster(
+                crate::query::ClusterDeployment {
+                    cluster,
+                    cluster_owner: Address::ZERO,
+                    salt: alloy::primitives::B256::ZERO,
+                    deployed_at_block: 1,
+                    deployment_tx_hash: alloy::primitives::B256::ZERO,
+                    deployment_log_index: 0,
+                },
+                MeshCidr {
+                    ip: u32::from_be_bytes([10, 18, 0, 0]),
+                    prefix: 16,
+                },
+            )
+            .await;
+        assert!(!cluster_needs_hydration(&state, &read_model, cluster).await);
     }
 }

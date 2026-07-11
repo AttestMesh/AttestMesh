@@ -129,6 +129,10 @@ impl ReadModel {
         true
     }
 
+    pub async fn contains_cluster(&self, cluster: Address) -> bool {
+        self.inner.read().await.clusters.contains_key(&cluster)
+    }
+
     pub async fn ingest(
         &self,
         log: &crate::chain::watcher::IndexedLog,
