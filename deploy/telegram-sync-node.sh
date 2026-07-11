@@ -537,8 +537,8 @@ update_member() {
     log "compose hash already allowlisted"
   else
     send_seq "tgsync-update-addHash-${NODE}" "$CLUSTER" "addComposeHash(bytes32)" "0x$nh"
-    settle_compose_hash_for_kms "$CLUSTER" "$nh"
   fi
+  settle_compose_hash_for_kms "$CLUSTER" "$nh"
   out=$(_box_run update "$X" "$VM_ID") || die "in-place update failed"
   echo "$out"
   j=$(echo "$out" | grep '"app_id"' | tail -1)

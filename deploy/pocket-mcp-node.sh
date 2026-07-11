@@ -455,10 +455,10 @@ update_member() {
   allowed=$(cast call "$CLUSTER" 'allowedComposeHashes(bytes32)(bool)' "0x$nh" --rpc-url "$RPC_URL" 2>/dev/null)
   if [ "$allowed" != true ]; then
     send_seq "pocket-update-addHash-${NODE}" "$CLUSTER" "addComposeHash(bytes32)" "0x$nh"
-    settle_compose_hash_for_kms "$CLUSTER" "$nh"
   else
     log "compose hash already allowlisted"
   fi
+  settle_compose_hash_for_kms "$CLUSTER" "$nh"
   out=$(_box_run update "$X" "$VM_ID") || die "in-place update failed"
   echo "$out"
   j=$(echo "$out" | grep '"app_id"' | tail -1)

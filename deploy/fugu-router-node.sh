@@ -795,8 +795,8 @@ update_member() {
   else
     send_seq "fugu-update-addHash-${NODE}" "$CLUSTER" "addComposeHash(bytes32)" "0x$nh" \
       || die "failed to allowlist compose hash 0x$nh"
-    settle_compose_hash_for_kms "$CLUSTER" "$nh"
   fi
+  settle_compose_hash_for_kms "$CLUSTER" "$nh"
   out=$(_box_run update "$X" "$VM_ID") || die "in-place update failed"
   echo "$out"
   j=$(echo "$out" | grep '"app_id"' | tail -1)

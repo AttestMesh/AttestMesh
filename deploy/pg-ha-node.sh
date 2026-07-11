@@ -756,8 +756,8 @@ update_member() {
     log "compose hash already allowlisted"
   else
     send_seq "pgha-update-addHash-${NODE}" "$CLUSTER" "addComposeHash(bytes32)" "0x$nh"
-    settle_compose_hash_for_kms "$CLUSTER" "$nh"
   fi
+  settle_compose_hash_for_kms "$CLUSTER" "$nh"
   # BOOTSTRAP=join is safe on every roll: a preserved data dir short-circuits it, and a
   # fresh disk (BOX_FRESH_DISK=1) must re-join the established quorum anyway.
   out=$(NODE_BOOTSTRAP=join _box_run update "$n" "$X" "$VM_ID") || die "in-place update failed for $n"
