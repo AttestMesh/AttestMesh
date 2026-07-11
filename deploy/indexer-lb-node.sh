@@ -328,8 +328,13 @@ switch_backend() {
 verify_sidecar_health() {
   _load_generic
   local bridge i body
-  bridge="$(_bridge_ip_for_vm "$VM_ID")" || die "could not resolve LB bridge IP"
   for i in $(seq 1 40); do
+    bridge="$(_bridge_ip_for_vm "$VM_ID" 2>/dev/null || true)"
+    if [ -z "$bridge" ]; then
+      log "… waiting for Indexer LB bridge neighbor after VM start ($i/40)"
+      sleep 10
+      continue
+    fi
     # A long-lived v1 cluster can contain permanently registered, dead test
     # members. A brand-new member may therefore never latch full convergence even
     # though its mesh route and CSK are ready. The authenticated control request in

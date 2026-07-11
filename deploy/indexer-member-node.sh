@@ -136,10 +136,11 @@ register_member_direct() {
 
 verify_http() {
   _load_state
-  local host i body status min_clusters
+  local host i body status min_clusters attempts
   host="$(_app_host_prefix)-9090.${GATEWAY_DOMAIN}"
   min_clusters="${INDEXER_MIN_CLUSTER_COUNT:-1}"
-  for i in $(seq 1 45); do
+  attempts="${INDEXER_VERIFY_ATTEMPTS:-90}"
+  for i in $(seq 1 "$attempts"); do
     body=$(curl -fsm 8 "https://${host}/mesh/health" 2>/dev/null || true)
     status=$(curl -fsm 8 "https://${host}/status" 2>/dev/null || true)
     if [ -n "$body" ] && echo "$status" | jq -e \
@@ -150,7 +151,7 @@ verify_http() {
       printf '%s\n' "$body" | jq '{clusterCount, memberCount, atBlock}' 2>/dev/null || true
       return 0
     fi
-    log "… indexer HTTP/read model not ready ($i/45)"
+    log "… indexer HTTP/read model not ready ($i/$attempts)"
     sleep 10
   done
   die "indexer did not become healthy with at least $min_clusters indexed cluster(s)"
