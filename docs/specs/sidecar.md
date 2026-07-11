@@ -4,7 +4,7 @@
 **Parent spec**: [`attestmesh-coordination-layer.md`](./attestmesh-coordination-layer.md) (especially §7, §8)
 **Component**: `sidecar/`
 **Binary**: `cluster-mesh-agent`
-**Last updated**: 2026-06-10
+**Last updated**: 2026-07-11
 
 ---
 
@@ -34,9 +34,10 @@ The sidecar is the per-node process that turns "a CVM running in dstack" into "a
 | `alloy-rpc-types-bundler` (or hand-rolled wrappers if upstream isn't ready) | EIP-4337 v0.7 bundler RPC (`eth_sendUserOperation`, `eth_estimateUserOperationGas`, `eth_getUserOperationReceipt`; nonces come from `EntryPoint.getNonce` via `eth_call` — `eth_getUserOperationNonce` is not a real bundler method, see §8.2) |
 | `dalek-cryptography` family (`x25519-dalek`, `ed25519-dalek`) | Curve25519 ops |
 | `crypto_box` | NaCl sealed-box (x25519 + XSalsa20-Poly1305) |
+| `chacha20poly1305` | XChaCha20-Poly1305 encryption for the durable CSK envelope |
 | `zeroize` | zero-on-drop key material |
 | `defguard_wireguard_rs` | userspace wireguard control via `WG_QUICK`-equivalent netlink |
-| `dstack-sdk` (vendored if not crates.io-published) | dstack runtime client (`/GetKey`, `/Info`, `/Seal` — dstack 0.5.x removed `/DeriveKey`) |
+| `dstack-sdk` (vendored if not crates.io-published) | dstack runtime client (`/GetKey`, `/Info`, `/GetQuote` — dstack 0.5.x removed `/DeriveKey` and does not expose application `Seal`/`Unseal`) |
 | `tracing` + `tracing-subscriber` (json output) | structured logging |
 | `prometheus` + `axum` | metrics endpoint (milestone B; v1 wires the crate in but exposes minimal counters) |
 
@@ -55,11 +56,11 @@ One process per node. Runs as a docker-compose service named `mesh-agent`. The a
 
 Capabilities:
 - `NET_ADMIN` — wireguard interface management.
-- `SYS_ADMIN` — only if the dstack `seal`/`get_quote` syscalls require it; verified at build-time, dropped otherwise.
 
 No `--privileged`. The sidecar mounts:
 - A unix domain socket directory shared with the app container (for the app facade gRPC).
 - The dstack guest-agent socket (`/var/run/dstack.sock` or whatever the dstack runtime exposes).
+- A sidecar-only named volume at `/var/lib/attestmesh` when durable state is enabled.
 
 Restart policy: `unless-stopped`. The sidecar crashing post-convergence brings down its healthcheck; existing wireguard peers remain reachable to the application until the sidecar comes back, but the app cannot send messages or learn about new members during the gap.
 
@@ -78,7 +79,7 @@ sidecar/
 ├── src/
 │   ├── main.rs                      # entry, arg parsing, tokio runtime spawn
 │   ├── config.rs                    # env-var schema + load
-│   ├── dstack.rs                    # dstack runtime client wrappers (derive, seal, get_quote)
+│   ├── dstack.rs                    # dstack runtime client wrappers (GetKey, Info, GetQuote)
 │   ├── keys.rs                      # all key derivation + zeroize wrappers
 │   ├── chain/
 │   │   ├── mod.rs                   # RPC provider + bundler client + signer setup
@@ -98,7 +99,8 @@ sidecar/
 │   │   ├── mod.rs                   # send/receive loops
 │   │   ├── packet.rs                # wire format + ed25519 sign/verify
 │   │   └── liveness.rs              # the rolling view + convergence calc
-│   ├── csk.rs                       # origination + commitment publish, peer pull (request + serve), sealed storage
+│   ├── csk.rs                       # origination, peer pull, commitment verification, encrypted cache
+│   ├── storage.rs                   # private atomic durable-state writes
 │   ├── envelopes.rs                 # PeerEndpoint (de)serialize + sealed-box
 │   ├── state/
 │   │   ├── mod.rs                   # the bring-up state machine
@@ -129,6 +131,7 @@ All configuration is via environment variables (no config files). The sidecar fa
 | `WG_TCP_PORT` | no | `51900` | TCP port of the wg-over-TCP ingress, exposed through the gateway (§10) |
 | `WG_LISTEN_PORT` | no | `51821` | wireguard outer listen port. Distinct from the in-mesh heartbeat port `51820` (§11.1) because kernel wg owns its UDP socket — the two must not collide |
 | `DSTACK_SOCKET` | no | `/var/run/dstack.sock` | path to dstack guest-agent socket |
+| `SIDECAR_STATE_DIR` | no | — | sidecar-only durable directory for the KMS-wrapped CSK and public peer-key cache. Production mounts `/var/lib/attestmesh` from the `sidecar-state` named volume; unset preserves network-only restart behavior. |
 | `AGENT_GRPC_SOCKET` | no | `/var/run/attestmesh/agent.sock` | path the app facade listens on |
 | `HEALTH_HTTP_ADDR` | no | `127.0.0.1:9090` | HTTP /healthz endpoint (for docker-compose healthcheck) |
 | `LOG_FORMAT` | no | `json` | `json` or `pretty` |
@@ -140,7 +143,9 @@ No secrets in env vars. All key material is derived from the attestation-bound s
 
 ## 6. Key derivation
 
-All key material is provided by the node's attestation method (on dstack: the guest agent's `/GetKey(path, purpose)` — dstack 0.5.x removed the older `/DeriveKey` endpoint; the master spec's `derive_key` maps to this call) and never persisted in plaintext outside the sidecar's process memory + the dstack sealed store.
+All key material is provided by the node's attestation method (on dstack: the guest agent's `/GetKey(path, purpose)` — dstack 0.5.x removed the older `/DeriveKey` endpoint; the master spec's `derive_key` maps to this call). Secret plaintext is held only in zeroizing sidecar memory; durable CSK state is encrypted with a distinct KMS-derived wrapping key.
+
+This uses dstack's supported application-key surface: [`/GetKey` is intended for deriving keys that encrypt application data](https://docs.phala.network/dstack/local-development). The sidecar does not call nonexistent guest-agent `Seal`/`Unseal` services.
 
 | Purpose string | Algo | Used for |
 |---|---|---|
@@ -148,6 +153,7 @@ All key material is provided by the node's attestation method (on dstack: the gu
 | `attestmesh.wireguard.v1` | curve25519 | wireguard private key (Curve25519 scalar) |
 | `attestmesh.binding.v1` | k256 | secp256k1 derived key whose address becomes the ClusterMember's `owner` after first registration. Signs (a) the one-shot dstack_register binding signature (master spec §4.2), and (b) every subsequent UserOpHash. One key, two recoverable signing surfaces. |
 | `attestmesh.cluster-shared.v1` (purpose) / `csk-v1` (version) | aes-256 raw bytes | Cluster Shared Key. **Only derived by the originator.** Onboardees never call this. |
+| `attestmesh.csk-cache.v1` (purpose) / `wrap-v1` (version) | 256-bit raw bytes | Per-member XChaCha20-Poly1305 key-encryption key for the durable CSK envelope. |
 
 All keys are wrapped in `zeroize::Zeroizing` containers and zeroed on drop. Cargo-deny is configured to reject any dependency that prints derived key material.
 
@@ -171,7 +177,7 @@ States:
   FreshRegister → DetermineCskRole → (Originator | Onboardee)
   Restart → ReuseMember → SkipToPublishWg
   LostState → Exit(non-zero)
-  Originator → DeriveCsk → SealCsk → PublishCskCommitment → PublishWg
+  Originator → DeriveCsk → PublishCskCommitment → PersistEncryptedCsk → PublishWg
   Onboardee → SubscribeIndexer (parallel with PublishWg)
   PublishWg → SubscribeIndexer (if not already)
   SubscribeIndexer → WaitPeerEndpoints
@@ -206,8 +212,8 @@ The 12 numbered steps from master spec §7.1 map onto modules as follows. This i
 **PeerEndpoint resend rules.** Every send is a sponsored UserOp, so re-announcing is bounded on three fronts (live-found 2026-07: the unbounded 600s resend burned ~1.3k sponsored ops/day fleet-wide):
 
 - *Backoff*: while a peer's Ed25519 key is unknown, resends start at 600s and double per attempt, capped at 24h — an on-chain orphan (dead VM, no `removeMember` on live clusters) costs one envelope/day instead of 144.
-- *Persistence*: learned peer Ed25519 keys are mirrored to the dstack sealed store (`peer_cache`, label `attestmesh.peer_ed25519.v1`) and reloaded at bring-up, so a restart doesn't forget peers and re-enter the resend loop.
-- *Reply-on-receive*: receiving a peer's PeerEndpoint triggers one reply (suppressed if we sent to that peer within the last 600s, which prevents ping-pong) even when its key is already known — a peer that restarted without its sealed store can re-learn our key from its first announce instead of resending forever.
+- *Persistence*: learned peer Ed25519 keys are public and atomically mirrored to `SIDECAR_STATE_DIR/peer-ed25519.v1`, so a restart doesn't forget peers and re-enter the resend loop.
+- *Reply-on-receive*: receiving a peer's PeerEndpoint triggers one reply (suppressed if we sent to that peer within the last 600s, which prevents ping-pong) even when its key is already known — a peer that restarted without its durable cache can re-learn our key from its first announce instead of resending forever.
 
 ### 7.2 State transitions are observable
 
@@ -515,15 +521,14 @@ Semantics:
 
 Per master spec §8.
 
-- **Originator path** (§8.1): derive via `dstack.derive_key("attestmesh.cluster-shared.v1", "csk-v1") → [u8;32]`. Seal via `dstack.seal("attestmesh.csk.v1", csk)`. Cache in process memory. Mark `csk_acquired = true`. Then publish the commitment once: `AttestFacet.setCskCommitment(keccak256(csk))` (master §8.1). The CSK itself never goes on chain — only the commitment does.
+- **Originator path** (§8.1): derive via `dstack.derive_key("attestmesh.cluster-shared.v1", "csk-v1") → [u8;32]`, publish `AttestFacet.setCskCommitment(keccak256(csk))`, persist the authenticated encrypted cache, and mark `csk_acquired = true`. The CSK itself never goes on chain — only the commitment does.
 - **Onboardee path** (§8.3, peer pull): once the onboardee has ≥1 live wireguard tunnel to a member, it pulls the CSK over the mesh rather than waiting for any on-chain envelope:
-  1. Pick a connected peer and call `PeerControl.RequestClusterSharedKey(CskRequest { requester_member_id: self.memberId })` on its peer-control endpoint (the responder's mesh IP — see §12.5).
-  2. If the responder returns gRPC `Unavailable` (it doesn't hold the CSK yet), try another connected peer.
+  1. Order configured peers as originator → live peers → remaining peers and call `PeerControl.RequestClusterSharedKey(CskRequest { requester_member_id: self.memberId })` with at most eight probes in flight.
+  2. Each probe has a 1s connect deadline and 2s RPC deadline. `Unavailable`, timeout, or connection failure advances the bounded queue; the first commitment-valid response cancels the rest.
   3. On a `SealedCsk { sealed_csk }` response: sealed-box open with this node's x25519 private key → verify `keccak256(csk) == AttestFacet.cskCommitment()` (a direct on-chain view read, like the `memberCount()` read in §8.4). On mismatch, discard and try another connected peer.
-  4. On success: `dstack.seal("attestmesh.csk.v1", csk)`, cache in process memory, mark `csk_acquired = true`.
-- **Restart path** (§7.1 step 4): `dstack.unseal("attestmesh.csk.v1") → csk` → cache → mark `csk_acquired = true`.
-
-  **Live caveat:** dstack `/Seal` data did **not** survive container recreation on the live fleet, so the sealed store cannot be relied on across restarts. As wired: the **originator** re-derives the CSK deterministically (it is a KMS-derived key) and verifies it against the on-chain `cskCommitment` before falling back to the peer-pull path; **onboardees** simply re-pull over the mesh on every restart (fine while ≥1 originator-derivable node is up). Store writes are best-effort.
+  4. On success: write `SIDECAR_STATE_DIR/csk.v1` atomically, cache in process memory, and mark `csk_acquired = true`. Failed durable writes are non-fatal.
+- **Restart path** (§7.1 step 4): read the versioned envelope; require matching cluster, member contract, and current on-chain commitment; derive `GetKey("attestmesh.csk-cache.v1", "wrap-v1")`; authenticate/decrypt with XChaCha20-Poly1305; independently re-check `keccak256(csk)`. Missing, corrupt, stale, or undecryptable state falls back to originator re-derivation or peer pull.
+- **Retry scheduling:** peer configured/live events wake the pull loop immediately. Otherwise retries use ±20% jittered exponential backoff from 250ms to 2s, avoiding both the old fixed 10s startup penalty and a cold-cluster busy loop.
 - **Serving a peer's pull** (steady-state, master spec §8.2): a member that already holds the CSK answers `PeerControl.RequestClusterSharedKey` from a peer over the mesh:
   1. Verify the requester is a current cluster member — its `xPubKey` exists in `AttestFacet` for `requester_member_id`.
   2. Sealed-box-encrypt the CSK to that `xPubKey` and return it as `SealedCsk { sealed_csk }`. No `MessageFacet.send`, no on-chain transaction, no `[0,500]ms` backoff, no `DuplicateEnvelope` handling.
@@ -570,7 +575,8 @@ Phases reported (`MeshStatus.phase`):
 - `envelopes::{seal,open}` round-trip.
 - `heartbeat::packet::{sign,verify}` round-trip; malformed sig rejection.
 - `heartbeat::liveness::compute` against fixture views.
-- `csk::{originator_derive, onboardee_pull, serve_pull}` against a mock peer-control endpoint + a mock `cskCommitment()` read.
+- CSK candidate priority, eight-request concurrency cap, deadlines, first-valid cancellation, unavailable-peer retry, and bogus-response rejection.
+- CSK cache round-trip/replacement, KMS/cluster/member/commitment binding, corruption/version rejection, optional-state behavior, and private atomic storage permissions.
 
 ### 16.2 Integration
 

@@ -17,7 +17,7 @@ services:
 
   # ── AttestMesh node sidecar (cluster-mesh-agent): registers this CVM into the cluster ──
   sidecar:
-    image: ghcr.io/attestmesh/cluster-mesh-agent@sha256:f455ad9e778573080459eb9e46af269547d72d3624cbcf6d21e4a279c0527284
+    image: ghcr.io/attestmesh/cluster-mesh-agent@sha256:b9e0ae107d9db015c22059c9fecdc28f2b35e09b257eabb4739bd4e46d96f641
     restart: unless-stopped
     environment:
       - CHAIN_ID=8453
@@ -27,6 +27,7 @@ services:
       - BUNDLER_URL=${BUNDLER_URL}
       - GAS_POLICY_ID=${GAS_POLICY_ID}
       - DSTACK_SOCKET=/var/run/dstack.sock
+      - SIDECAR_STATE_DIR=/var/lib/attestmesh
       - AGENT_GRPC_SOCKET=/var/run/attestmesh/agent.sock
       - HEALTH_HTTP_ADDR=0.0.0.0:9090
       - LOG_FORMAT=pretty
@@ -34,6 +35,7 @@ services:
       - ROLL_ID=20260630T0106Z
     volumes:
       - /var/run/dstack.sock:/var/run/dstack.sock
+      - sidecar-state:/var/lib/attestmesh
       - agent-sock:/var/run/attestmesh          # app-facing gRPC UDS, shared with matrix-admin-agent
     ports:
       - "51900:51900"
@@ -573,6 +575,7 @@ services:
         done
 
 volumes:
+  sidecar-state:
   pgdata:
   synapse-data:
   wellknown:
