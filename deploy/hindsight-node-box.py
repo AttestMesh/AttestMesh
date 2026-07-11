@@ -131,9 +131,16 @@ def app_compose_and_hash(env_keys: list[str]) -> tuple[str, str]:
         "no_instance_id": False,  # stable per-instance disk (app_id||instance_id)
         "secure_time": False,
     }
-    # Log in to the private registry inside the guest so ghcr.io/attestmesh/*
-    # images pull (hindsight itself is public). Creds arrive sealed as DSTACK_DOCKER_*.
+    # A killed compose recreation can leave a stopped container under Compose's
+    # temporary <id>_dstack-<service>-1 name.  Prune only stopped/created
+    # containers from this app's project before `app-compose` runs, otherwise a
+    # subsequent disk-preserving roll can fail on a container-name conflict.
+    # Volumes and running containers are deliberately untouched.  Then log in to
+    # the private registry so ghcr.io/attestmesh/* images can pull.
     app_compose["pre_launch_script"] = (
+        'docker ps -aq --filter label=com.docker.compose.project=dstack '
+        '--filter status=created --filter status=exited '
+        '| xargs -r docker rm -f >/dev/null; '
         'if [ -n "$DSTACK_DOCKER_PASSWORD" ]; then '
         'echo "$DSTACK_DOCKER_PASSWORD" | docker login "${DSTACK_DOCKER_REGISTRY:-ghcr.io}" '
         '-u "$DSTACK_DOCKER_USERNAME" --password-stdin; fi'

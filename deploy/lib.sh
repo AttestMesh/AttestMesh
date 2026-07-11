@@ -42,11 +42,13 @@ run_step() {
 
 # A successful addComposeHash receipt can become visible through the public RPC
 # before the KMS chain watcher has consumed the block.  Keep the live VM on its
-# old compose until the on-chain readback succeeds and the watcher has had one
-# full polling interval to catch up.
+# old compose until the on-chain readback succeeds and the KMS policy reader has
+# had time to catch up.  Live Base-mainnet evidence on 2026-07-11 showed a newly
+# mined hash taking roughly six minutes to become boot-eligible at the KMS, so
+# the default deliberately leaves additional margin.
 settle_compose_hash_for_kms() {
   local cluster="${1:?cluster required}" compose_hash="${2#0x}"
-  local settle_seconds="${COMPOSE_ALLOWLIST_SETTLE_SECONDS:-75}"
+  local settle_seconds="${COMPOSE_ALLOWLIST_SETTLE_SECONDS:-600}"
   local allowed="" elapsed=0 step
 
   for _ in $(seq 1 30); do
