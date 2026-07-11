@@ -277,9 +277,8 @@ services:
     command: ["python", "-m", "poller"]
 
   # Sole Hindsight writer; starts in a hard-disabled Postgres-only mode.  The
-  # worker adopts active jobs, caps this bank at two documents (plus agent
-  # sessions' six = eight globally), and never automatically retries
-  # failed/ambiguous submissions.
+  # worker adopts active jobs, caps in-flight documents at eight, and never
+  # automatically retries failed/ambiguous submissions.
   hindsight-outbox:
     image: ghcr.io/attestmesh/pocket-mcp@sha256:69e7c5ad18849b36015302b63791993c9c2b7656c52a3ba71218c081d708cc3a
     restart: unless-stopped

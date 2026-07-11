@@ -275,8 +275,7 @@ services:
 
   # The sole Hindsight writer.  It is deployed disabled during Postgres-only recovery;
   # when explicitly enabled it uses the transactional outbox, a bank advisory lock,
-  # a six-document cap (plus Pocket's two = eight globally), and a 30-second tick.
-  # Failed work requires explicit retry.
+  # an eight-document cap, and a 30-second tick. Failed work requires explicit retry.
   hindsight-outbox:
     image: ghcr.io/attestmesh/agent-session-mcp@sha256:9725db2c265211e349729212fd8df2738d99af100496dab8f8f46b688b948fe2
     restart: unless-stopped
