@@ -189,9 +189,23 @@ _backend_http() {
   ssh_mesh "curl -fsS --max-time 12 'http://$ip:9090$path'"
 }
 
+_current_registry_cluster_count() {
+  local value endpoint status
+  value=$(cast call "$REGISTRY" 'current()(string,bytes32,bytes32,uint64)' \
+    --json --rpc-url "$RPC_URL" 2>/dev/null) || return 1
+  endpoint=$(echo "$value" | jq -er '.[0] | select(length > 0)') || return 1
+  status=$(curl -fsS --max-time 12 "${endpoint/-50052./-9090.}/status" 2>/dev/null) \
+    || return 1
+  echo "$status" | jq -er '.readModel.clusterCount | select(type == "number" and . > 0)'
+}
+
 _backend_metadata() {
   local target="$1" ip="$2" state status health min_clusters
-  min_clusters="${INDEXER_MIN_CLUSTER_COUNT:-1}"
+  min_clusters="${INDEXER_MIN_CLUSTER_COUNT:-}"
+  if [ -z "$min_clusters" ]; then
+    min_clusters="$(_current_registry_cluster_count || true)"
+    min_clusters="${min_clusters:-1}"
+  fi
   health="$(_backend_http "$ip" /healthz)" || die "candidate $target is not healthy at $ip:9090"
   echo "$health" | jq -e '.status == "ok"' >/dev/null \
     || die "candidate health is not ok: $health"
