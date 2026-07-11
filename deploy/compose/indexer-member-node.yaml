@@ -55,7 +55,9 @@ services:
       - CLUSTER_DIAMOND_FACTORY_ADDR=0xf6E85fD138E3208d3AAE63ce4E2A33f20e82b9fb
       - INDEXER_CODE_ID=
       - INDEXER_START_BLOCK=46868742
-      - BLOCK_BATCH_SIZE=10000
+      # The box-local RPC backend answers 5k multi-cluster log pages below its
+      # retry timeout; 10k pages routinely cross it and double catch-up time.
+      - BLOCK_BATCH_SIZE=5000
       - INDEXER_GRPC_ADDR=0.0.0.0:50052
       - HEALTH_HTTP_ADDR=0.0.0.0:9090
       - GATEWAY_DOMAIN=${GATEWAY_DOMAIN}
