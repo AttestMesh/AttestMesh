@@ -146,7 +146,10 @@ case "$ACTION" in
     sleep 5
     "$HERE/pg-ha-node.sh" pg-ha switchover "$CANDIDATE"
     "$HERE/pg-ha-node.sh" pg-ha cycle-replica "$former_leader"
-    wait "$probe_pid"
+    if ! wait "$probe_pid"; then
+      probe_pid=""
+      die "client failover gate violated the recovery SLO; probe log: $log_file"
+    fi
     probe_pid=""
     log "✔ client failover gate passed; probe log: $log_file"
     ;;
