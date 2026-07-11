@@ -33,7 +33,7 @@ export BOX_PORTS="${BOX_PORTS:-[]}" BOX_GATEWAY_ENABLED="${BOX_GATEWAY_ENABLED:-
 SECRETS_FILE="${SECRETS_FILE:-$HOME/.attestmesh/pocket-mcp.env}"
 POCKET_KEY_FILE="${POCKET_KEY_FILE:-$HOME/.attestmesh/dans-pocket.key}"
 REDPILL_KEY_FILE="${REDPILL_KEY_FILE:-$HOME/.attestmesh/redpill-key}"
-HINDSIGHT_STATE="${HINDSIGHT_STATE:-$ROOT/deploy/logs/hindsight-node-hindsight-node.state}"
+HINDSIGHT_STATE="${HINDSIGHT_STATE:-$LOGDIR/hindsight-node-hindsight-node.state}"
 if [ ! -s "$SECRETS_FILE" ]; then
   install -d -m 700 "$(dirname "$SECRETS_FILE")"
   ( umask 077; printf 'APP_DB_PASSWORD=%s\nMCP_AUTH_TOKEN=%s\n' "$(openssl rand -hex 24)" "" > "$SECRETS_FILE" )
@@ -96,7 +96,7 @@ POCKET_API_CIDRS="${POCKET_API_CIDRS:-3.19.247.64/32 3.21.239.100/32}"
 DATABASE_URL="${DATABASE_URL:-postgresql://pocket:${APP_DB_PASSWORD}@sidecar:15431,sidecar:15432,sidecar:15433/pocket?target_session_attrs=read-write&connect_timeout=5}"
 
 # Seed cluster identity from a live C3 state file if not already exported.
-_PGHA_STATE="$ROOT/deploy/logs/pg-ha-pg-ha.state"
+_PGHA_STATE="$LOGDIR/pg-ha-pg-ha.state"
 CLUSTER="${CLUSTER:-$(grep -E '^CLUSTER=' "$_PGHA_STATE" 2>/dev/null | head -1 | cut -d= -f2-)}"
 MEMBER_IMPL="${MEMBER_IMPL:-$(grep -E '^MEMBER_IMPL=' "$_PGHA_STATE" 2>/dev/null | head -1 | cut -d= -f2-)}"
 

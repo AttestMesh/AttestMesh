@@ -25,7 +25,7 @@ export BOX_PORTS="${BOX_PORTS:-[]}" BOX_GATEWAY_ENABLED="${BOX_GATEWAY_ENABLED:-
 # Auto-create strong app secrets on first run; INGEST_TOKEN must stay stable across rolls.
 SECRETS_FILE="${SECRETS_FILE:-$HOME/.attestmesh/agent-session-mcp.env}"
 REDPILL_KEY_FILE="${REDPILL_KEY_FILE:-$HOME/.attestmesh/redpill-key}"
-HINDSIGHT_STATE="${HINDSIGHT_STATE:-$ROOT/deploy/logs/hindsight-node-hindsight-node.state}"
+HINDSIGHT_STATE="${HINDSIGHT_STATE:-$LOGDIR/hindsight-node-hindsight-node.state}"
 if [ ! -s "$SECRETS_FILE" ]; then
   install -d -m 700 "$(dirname "$SECRETS_FILE")"
   ( umask 077; printf 'APP_DB_PASSWORD=%s\nINGEST_TOKEN=%s\n' "$(openssl rand -hex 24)" "$(openssl rand -hex 24)" > "$SECRETS_FILE" )
@@ -70,7 +70,7 @@ RECALL_BACKEND="${RECALL_BACKEND:-postgres}"
 DATABASE_URL="${DATABASE_URL:-postgresql://agent_sessions:${APP_DB_PASSWORD}@sidecar:15431,sidecar:15432,sidecar:15433/agent_sessions?target_session_attrs=read-write&connect_timeout=5}"
 
 # Seed cluster identity from a live C3 state file if not already exported.
-_PGHA_STATE="$ROOT/deploy/logs/pg-ha-pg-ha.state"
+_PGHA_STATE="$LOGDIR/pg-ha-pg-ha.state"
 CLUSTER="${CLUSTER:-$(grep -E '^CLUSTER=' "$_PGHA_STATE" 2>/dev/null | head -1 | cut -d= -f2-)}"
 MEMBER_IMPL="${MEMBER_IMPL:-$(grep -E '^MEMBER_IMPL=' "$_PGHA_STATE" 2>/dev/null | head -1 | cut -d= -f2-)}"
 
