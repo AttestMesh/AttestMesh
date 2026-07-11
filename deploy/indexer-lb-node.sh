@@ -330,15 +330,20 @@ verify_sidecar_health() {
   local bridge i body
   bridge="$(_bridge_ip_for_vm "$VM_ID")" || die "could not resolve LB bridge IP"
   for i in $(seq 1 40); do
-    body=$(ssh_box "curl -fsS --max-time 8 'http://$bridge:9091/healthz'" 2>/dev/null || true)
-    if echo "$body" | grep -q '"phase"'; then
-      log "✔ Indexer LB sidecar health: $body"
+    # A long-lived v1 cluster can contain permanently registered, dead test
+    # members. A brand-new member may therefore never latch full convergence even
+    # though its mesh route and CSK are ready. The authenticated control request in
+    # `switch_backend` is the end-to-end mesh proof; here require its prerequisites
+    # without treating an intentional HTTP 503 as an absent response.
+    body=$(ssh_box "curl -sS --max-time 8 'http://$bridge:9091/healthz'" 2>/dev/null || true)
+    if echo "$body" | jq -e '.csk_acquired == true and (.live_peers // 0) > 0' >/dev/null 2>&1; then
+      log "✔ Indexer LB sidecar mesh-ready (health remains convergence+CSK): $body"
       return 0
     fi
-    log "… Indexer LB sidecar health unavailable ($i/40)"
+    log "… Indexer LB sidecar mesh prerequisites unavailable ($i/40)"
     sleep 10
   done
-  die "Indexer LB sidecar health never became reachable"
+  die "Indexer LB sidecar never acquired its CSK and a live mesh peer"
 }
 
 verify_lb() {
