@@ -83,8 +83,13 @@ mod tests {
         );
         // Never dialed in these tests — both paths below return before any RPC.
         let chain = Arc::new(
-            ChainClient::new("http://127.0.0.1:1", 8453, Address::repeat_byte(0x11), &keys)
-                .unwrap(),
+            ChainClient::new(
+                "http://127.0.0.1:1",
+                8453,
+                Address::repeat_byte(0x11),
+                &keys,
+            )
+            .unwrap(),
         );
         PeerControlService::new(shared, chain)
     }

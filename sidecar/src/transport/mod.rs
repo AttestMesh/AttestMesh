@@ -118,7 +118,11 @@ pub async fn serve_ingress(tcp_port: u16, wg_listen_port: u16) -> Result<()> {
                     return;
                 }
             };
-            if udp.connect((Ipv4Addr::LOCALHOST, wg_listen_port)).await.is_err() {
+            if udp
+                .connect((Ipv4Addr::LOCALHOST, wg_listen_port))
+                .await
+                .is_err()
+            {
                 return;
             }
             tracing::debug!(%from, "ingress stream up");
@@ -143,10 +147,8 @@ impl tokio_rustls::rustls::client::danger::ServerCertVerifier for NoVerify {
         _server_name: &ServerName<'_>,
         _ocsp: &[u8],
         _now: tokio_rustls::rustls::pki_types::UnixTime,
-    ) -> Result<
-        tokio_rustls::rustls::client::danger::ServerCertVerified,
-        tokio_rustls::rustls::Error,
-    > {
+    ) -> Result<tokio_rustls::rustls::client::danger::ServerCertVerified, tokio_rustls::rustls::Error>
+    {
         Ok(tokio_rustls::rustls::client::danger::ServerCertVerified::assertion())
     }
 
@@ -223,8 +225,12 @@ pub async fn spawn_peer_bridge(
     tokio::spawn(async move {
         loop {
             match bridge_once(&sni_host, tls_port, udp.clone()).await {
-                Ok(()) => tracing::debug!(host = %sni_host, "peer bridge stream closed; reconnecting"),
-                Err(e) => tracing::debug!(host = %sni_host, error = %e, "peer bridge failed; reconnecting"),
+                Ok(()) => {
+                    tracing::debug!(host = %sni_host, "peer bridge stream closed; reconnecting")
+                }
+                Err(e) => {
+                    tracing::debug!(host = %sni_host, error = %e, "peer bridge failed; reconnecting")
+                }
             }
             tokio::time::sleep(RECONNECT_DELAY).await;
         }

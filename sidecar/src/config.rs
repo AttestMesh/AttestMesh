@@ -4,6 +4,7 @@
 
 use alloy::primitives::Address;
 use anyhow::{Context, Result};
+use std::path::PathBuf;
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -33,6 +34,9 @@ pub struct Config {
     /// (51820): kernel wg owns its UDP socket, so they must not collide.
     pub wg_listen_port: u16,
     pub dstack_socket: String,
+    /// Optional durable sidecar-only storage. Unset keeps the legacy network-only
+    /// restart behavior; production composes mount a named volume here.
+    pub sidecar_state_dir: Option<PathBuf>,
     pub agent_grpc_socket: String,
     pub health_http_addr: String,
     pub log_format: String,
@@ -73,6 +77,10 @@ impl Config {
                 .parse()
                 .context("WG_LISTEN_PORT")?,
             dstack_socket: opt("DSTACK_SOCKET", "/var/run/dstack.sock"),
+            sidecar_state_dir: match std::env::var("SIDECAR_STATE_DIR") {
+                Ok(s) if !s.trim().is_empty() => Some(PathBuf::from(s.trim())),
+                _ => None,
+            },
             agent_grpc_socket: opt("AGENT_GRPC_SOCKET", "/var/run/attestmesh/agent.sock"),
             health_http_addr: opt("HEALTH_HTTP_ADDR", "127.0.0.1:9090"),
             log_format: opt("LOG_FORMAT", "json"),
@@ -93,7 +101,10 @@ mod tests {
         std::env::set_var("CHAIN_ID", "8453");
         std::env::set_var("RPC_URL", "http://rpc.example");
         std::env::set_var("BUNDLER_URL", "http://bundler.example");
-        std::env::set_var("INDEXER_REGISTRY_ADDR", "0xbC003686943fB957100E517D3CEf66c52B5CDdBf");
+        std::env::set_var(
+            "INDEXER_REGISTRY_ADDR",
+            "0xbC003686943fB957100E517D3CEf66c52B5CDdBf",
+        );
     }
 
     fn clear_optional() {
@@ -104,6 +115,7 @@ mod tests {
             "WG_TCP_PORT",
             "WG_LISTEN_PORT",
             "DSTACK_SOCKET",
+            "SIDECAR_STATE_DIR",
             "AGENT_GRPC_SOCKET",
             "HEALTH_HTTP_ADDR",
             "LOG_FORMAT",
@@ -121,7 +133,10 @@ mod tests {
 
         let c = Config::from_env().expect("required set");
         assert_eq!(c.chain_id, 8453);
-        assert_eq!(c.member_contract, None, "Path A: self-discovered at runtime");
+        assert_eq!(
+            c.member_contract, None,
+            "Path A: self-discovered at runtime"
+        );
         assert_eq!(c.gateway_domain, None, "unset → registration-only mode");
         assert_eq!(c.wg_tcp_port, 51900);
         assert_eq!(
@@ -129,6 +144,7 @@ mod tests {
             "outer wg port must differ from the in-mesh heartbeat port 51820"
         );
         assert_eq!(c.dstack_socket, "/var/run/dstack.sock");
+        assert_eq!(c.sidecar_state_dir, None);
         assert_eq!(c.health_http_addr, "127.0.0.1:9090");
     }
 
@@ -143,7 +159,10 @@ mod tests {
 
         std::env::set_var("GATEWAY_DOMAIN", "dstack-base-prod5.phala.network");
         let c = Config::from_env().unwrap();
-        assert_eq!(c.gateway_domain.as_deref(), Some("dstack-base-prod5.phala.network"));
+        assert_eq!(
+            c.gateway_domain.as_deref(),
+            Some("dstack-base-prod5.phala.network")
+        );
         std::env::remove_var("GATEWAY_DOMAIN");
     }
 
@@ -154,5 +173,22 @@ mod tests {
         std::env::remove_var("RPC_URL");
         assert!(Config::from_env().is_err());
         set_required(); // restore for whoever runs next
+    }
+
+    #[test]
+    fn sidecar_state_dir_is_opt_in_and_blank_disables_it() {
+        let _g = ENV_LOCK.lock().unwrap();
+        set_required();
+        clear_optional();
+
+        std::env::set_var("SIDECAR_STATE_DIR", "   ");
+        assert_eq!(Config::from_env().unwrap().sidecar_state_dir, None);
+
+        std::env::set_var("SIDECAR_STATE_DIR", "/var/lib/attestmesh");
+        assert_eq!(
+            Config::from_env().unwrap().sidecar_state_dir,
+            Some(PathBuf::from("/var/lib/attestmesh"))
+        );
+        std::env::remove_var("SIDECAR_STATE_DIR");
     }
 }

@@ -12,5 +12,10 @@ pub fn build_publish_wg_calldata(wg_pub: B256) -> Bytes {
 /// so peers read it instead of exchanging a sponsored PeerEndpoint envelope
 /// (ed25519-onchain-key spec).
 pub fn build_publish_ed25519_calldata(ed25519_pub: B256) -> Bytes {
-    Bytes::from(abi::publishEd25519KeyCall { ed25519Key: ed25519_pub }.abi_encode())
+    Bytes::from(
+        abi::publishEd25519KeyCall {
+            ed25519Key: ed25519_pub,
+        }
+        .abi_encode(),
+    )
 }
