@@ -3,7 +3,7 @@
 # self-hosted dstack box. `candidate` leaves IndexerRegistry unchanged so the node
 # can be verified before an Indexer-LB blue/green cutover; `all` retains the legacy
 # direct-registration behavior.
-set -uo pipefail
+set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$HERE/.." && pwd)"
