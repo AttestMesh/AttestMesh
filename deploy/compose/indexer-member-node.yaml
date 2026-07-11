@@ -48,8 +48,9 @@ services:
       - sidecar
     environment:
       - CHAIN_ID=8453
-      # Intentionally public Base RPC for now; replace when we have a better shared RPC.
-      - RPC_URL=https://mainnet.base.org
+      # The deployer keeps its transaction RPC separate; the encrypted guest value
+      # is normally the box-local proxyd endpoint supplied through CVM_RPC_URL.
+      - RPC_URL=${RPC_URL}
       - INDEXER_REGISTRY_ADDR=${INDEXER_REGISTRY_ADDR}
       - CLUSTER_DIAMOND_FACTORY_ADDR=0xf6E85fD138E3208d3AAE63ce4E2A33f20e82b9fb
       - INDEXER_CODE_ID=
