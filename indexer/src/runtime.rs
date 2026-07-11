@@ -47,6 +47,24 @@ fn events_scan_start(last_indexed: u64, floor: u64) -> u64 {
     last_indexed.saturating_add(1).max(floor)
 }
 
+/// Factory discovery uses the same cursor rule as event indexing. In particular, a
+/// failed boot discovery must retry from the configured factory-deploy floor rather
+/// than accidentally scanning from genesis while `last_factory_block` is still zero.
+fn discovery_scan_start(last_scanned: u64, floor: u64) -> u64 {
+    last_scanned.saturating_add(1).max(floor)
+}
+
+async fn record_discovered_cluster(
+    state: &IndexerState,
+    read_model: &ReadModel,
+    deployment: crate::query::ClusterDeployment,
+    cidr: MeshCidr,
+) -> bool {
+    let inserted = state.add_cluster(deployment.cluster).await;
+    read_model.add_cluster(deployment, cidr).await;
+    inserted
+}
+
 /// Shared handles passed to the loops.
 #[derive(Clone)]
 pub struct Runtime {
@@ -159,14 +177,18 @@ impl Runtime {
     async fn add_discovered_cluster(
         &self,
         deployment: crate::query::ClusterDeployment,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<bool> {
         let cluster = deployment.cluster;
-        self.state.add_cluster(cluster).await;
+        // Resolve metadata before mutating the known-cluster set. If this read fails,
+        // the next discovery pass must be able to retry the complete operation.
         let (ip, prefix) = chain::mesh_cidr(&self.provider, cluster).await?;
-        self.read_model
-            .add_cluster(deployment, MeshCidr { ip, prefix })
-            .await;
-        Ok(())
+        Ok(record_discovered_cluster(
+            &self.state,
+            &self.read_model,
+            deployment,
+            MeshCidr { ip, prefix },
+        )
+        .await)
     }
 
     /// The block-watcher loop (spec §7.1) + inline dispatch (§7.3).
@@ -290,7 +312,10 @@ impl Runtime {
 
     async fn discovery_tick(&self) -> anyhow::Result<()> {
         let head = chain::block_number(&self.provider).await?;
-        let from = self.state.last_factory_block().await.saturating_add(1);
+        let from = discovery_scan_start(
+            self.state.last_factory_block().await,
+            self.config.start_block,
+        );
         if from <= head {
             for (start, end) in scan_ranges(from, head, DISCOVERY_CHUNK) {
                 let new = watcher::poll_new_clusters(
@@ -302,8 +327,10 @@ impl Runtime {
                 .await?;
                 for d in new {
                     let cluster = d.cluster;
-                    if !self.state.is_known_cluster(cluster).await {
-                        self.add_discovered_cluster(d).await?;
+                    // Always hydrate the in-memory read model. A prior process may
+                    // have persisted the cluster set and then exited before the
+                    // ephemeral read model was populated.
+                    if self.add_discovered_cluster(d).await? {
                         tracing::info!(cluster = %cluster, "discovered new cluster");
                     }
                 }
@@ -399,5 +426,44 @@ mod tests {
             "persisted cursor wins past the floor"
         );
         assert_eq!(events_scan_start(u64::MAX, 0), u64::MAX, "no overflow");
+    }
+
+    #[test]
+    fn discovery_retry_never_scans_before_factory_floor() {
+        assert_eq!(discovery_scan_start(0, 46_868_742), 46_868_742);
+        assert_eq!(discovery_scan_start(46_900_000, 46_868_742), 46_900_001);
+    }
+
+    #[tokio::test]
+    async fn known_cluster_is_rehydrated_into_a_fresh_read_model() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let cursors = Arc::new(
+            crate::state::cursor::SledCursorStore::open(dir.path().to_str().unwrap()).unwrap(),
+        );
+        let state = IndexerState::new(cursors);
+        let read_model = ReadModel::new();
+        let cluster = Address::repeat_byte(0x42);
+        state.add_cluster(cluster).await;
+
+        let inserted = record_discovered_cluster(
+            &state,
+            &read_model,
+            crate::query::ClusterDeployment {
+                cluster,
+                cluster_owner: Address::repeat_byte(0x11),
+                salt: alloy::primitives::B256::repeat_byte(0x22),
+                deployed_at_block: 123,
+                deployment_tx_hash: alloy::primitives::B256::repeat_byte(0x33),
+                deployment_log_index: 4,
+            },
+            MeshCidr {
+                ip: u32::from_be_bytes([10, 18, 0, 0]),
+                prefix: 16,
+            },
+        )
+        .await;
+
+        assert!(!inserted, "the durable cluster set was already populated");
+        assert_eq!(read_model.snapshots(8453, None).await.len(), 1);
     }
 }
