@@ -21,6 +21,10 @@ message MeshStatus {
   bool first_converged = 2;
   bool csk_acquired = 3;
   uint32 live_peer_count = 4;
+  // Diagnostic only: these fields do not participate in sidecar health gating.
+  bool indexer_connected = 5;
+  bool indexer_caught_up = 6;
+  uint64 indexer_cursor_block = 7;
 }
 
 message SelfInfo {

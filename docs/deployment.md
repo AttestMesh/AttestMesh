@@ -31,7 +31,9 @@ B. Gas-sponsorship webhook       ── ready ──►  needs A (factory addr)
       Alchemy Gas Manager policy at the webhook URL.
 
 C. Indexer                       ── ready ──►  needs A (IndexerRegistry)
-   C1 run attestmesh-indexer (RPC, registry addr, identity); C2 register endpoint+pubkey.
+   C1 run verified blue/green Indexer candidates; C2 keep IndexerRegistry on the stable
+      Indexer-LB gateway endpoint; C3 rotate backend codeId+pubkey with the LB's
+      prepare/registry-update/commit cutover.
 
 D. Node (dstack CVM via Phala)   ── MILESTONE-A WORK ──►  needs A,B,C
    The sidecar bring-up is built+unit-tested but NOT wired (docs/specs/sidecar.md §1.1).
@@ -76,6 +78,12 @@ Standardized two layers deep:
     the boot-derived Ed25519 pubkey from the CVM logs + the compose hash and calls
     `IndexerRegistry.setIndexer`; `ensure` no-ops when the registry already has an endpoint —
     that is the per-cluster workflow entry.
+  - `deploy/indexer-member-node.sh <name> candidate` — deploys and fully verifies a C3 Indexer
+    candidate without changing `IndexerRegistry`.
+  - `deploy/indexer-lb-node.sh <name>` — stable public gRPC/HTTP front door with a mesh-only
+    authenticated control API. `switch <candidate>` coordinates HAProxy prepare/commit around
+    the registry-pinned signing-key update and rolls back the registry if commit fails. See
+    [`deploy/indexer-lb-runbook.md`](../deploy/indexer-lb-runbook.md).
   - `deploy/node.sh` — the legacy `--custom-app-id` flow (unsupported on base KMS; kept for
     reference / a future custom-app-id KMS).
 - **A durable smithers workflow** (`deploy/workflows/deploy.tsx`, `attestmesh-deploy-full`)
@@ -115,6 +123,9 @@ deploy/
 ├── onchain.sh                     # contracts, cluster, Path A facet, app-id allowlist
 ├── webhook.sh                     # Cloudflare Worker deploy + gas-webhook route repair
 ├── indexer.sh                     # shared Phala indexer deploy/register/update
+├── indexer-member-node.sh         # self-hosted C3 Indexer candidate deploy/verify
+├── indexer-lb-node.sh             # stable Indexer HAProxy + registry cutover driver
+├── indexer-lb-runbook.md          # blue/green migration and day-2 operations
 ├── node-pathA.sh                  # Phala base-KMS cluster node deploy/update
 ├── node.sh                        # legacy custom-app-id node path, kept for reference
 ├── matrix-node.sh                 # self-hosted box Matrix node driver
@@ -138,6 +149,8 @@ deploy/
 ├── compose/
 │   ├── node-1.yaml                # sidecar-only cluster member on Phala
 │   ├── indexer-1.yaml             # attested shared indexer CVM
+│   ├── indexer-member-node.yaml   # C3 Indexer backend candidate
+│   ├── indexer-lb-node.yaml       # stable public gRPC/HTTP LB + mesh control API
 │   ├── matrix-node.yaml           # Matrix homeserver + sidecar + agents + metrics
 │   ├── postgres-node.yaml         # Postgres service node + sidecar + admin agent
 │   ├── pg-ha-node.yaml            # one Postgres HA node: sidecar-netns Patroni/etcd/HAProxy + admin agent
@@ -186,6 +199,8 @@ step can be re-run without rediscovering app IDs or VM IDs.
 | `onchain.sh` | Track A on-chain deployment. | `preflight`, `infra`, `cluster [name]`, `patha-upgrade <cluster>`, `seed-appid <cluster> <member>`, `all`. Generates cluster config JSON under `contracts/script/clusters/`. |
 | `webhook.sh` | Gas-sponsorship worker deployment. | `deploy` runs Wrangler from `services/gas-sponsorship-webhook` and ensures `gas-webhook.teesql.com/*` points at the current worker; `route` repairs only the route. |
 | `indexer.sh` | Shared attested indexer deployment. | `ensure` no-ops if `IndexerRegistry.current()` is already set; otherwise `deploy -> register -> verify`. Also supports `env-file`, `update`, and direct substeps. |
+| `indexer-member-node.sh` | C3 Indexer backend candidate. | `candidate` deploys, registers as a cluster member, catches up, and verifies HTTP without touching `IndexerRegistry`; legacy `all` still registers its direct gateway endpoint. |
+| `indexer-lb-node.sh` | Stable Indexer blue/green front door. | Deploys the LB once; `switch <candidate>` probes the candidate, pauses new accepts, updates the registry key/code ID, commits both HAProxy backends, and forces cursor-based subscriber reconnect. |
 | `node-pathA.sh` | Phala base-KMS cluster member deployment. | `deploy -> prime -> upgrade -> verify`; `setup` skips the long verify poll, `update` allowlists a new compose hash before rolling, `restart` re-pulls images, `mesh-verify` polls `phase=healthy`. |
 | `node.sh` | Legacy custom-app-id flow. | Kept as a reference for a future KMS that supports `--custom-app-id`; the Base KMS path uses `node-pathA.sh`. |
 | `matrix-node.sh` | Private Matrix homeserver on the self-hosted dstack box. | `deploy -> cluster -> patha -> prime -> bind -> verify -> verify-agent -> verify-client -> verify-isolation`; `update` is disk-preserving by default, `restore` is a deliberate fresh-disk WAL-G recovery, `backup-status` checks R2. |
@@ -217,6 +232,8 @@ CVM boots.
 |---|---|
 | `compose/node-1.yaml` | Minimal Phala member node: the `cluster-mesh-agent` sidecar with gateway-exposed sidecar ports. Used by `node-pathA.sh` for generic cluster members. |
 | `compose/indexer-1.yaml` | Attested indexer service plus a small state volume. It is a stock dstack app, not a cluster member. |
+| `compose/indexer-member-node.yaml` | C3 sidecar plus an Indexer backend on `:50052`/`:9090`, with an independent cursor volume. |
+| `compose/indexer-lb-node.yaml` | C3 sidecar plus HAProxy stable frontends (`:50052` gRPC, `:9090` HTTP) and an authenticated mesh-only two-phase switch API on `:50053`. |
 | `compose/matrix-node.yaml` | Full private Matrix stack: sidecar, mesh proxy, WAL-G-enabled Postgres, Synapse init, Synapse, nginx, Tailscale serve, matrix-admin-agent, egress firewalls, Prometheus, node-exporter, cAdvisor, and persistent volumes. The Matrix HTTP path stays tailnet-only; the host-isolation checks assert private ports are not reachable from the box. |
 | `compose/postgres-node.yaml` | Standalone Postgres service node: sidecar, mesh proxies to Matrix/Postgres, Postgres, postgres-admin-agent, egress firewalls, Prometheus, node-exporter, cAdvisor, and persistent volumes. It has no Tailscale; Matrix control traffic goes over the AttestMesh mesh. |
 | `compose/pg-ha-node.yaml` | One Postgres HA node: sidecar, then Patroni/etcd/HAProxy sharing the SIDECAR netns (they bind the mesh IP directly — clients hit any node's mesh IP `:5432` for the primary, `:5433` for replicas; Postgres itself is on `:5434`), a mesh-only `:8009` status page, the Matrix mesh proxy, the Patroni-aware postgres-admin-agent + egress firewall, and the observability trio. All shared credentials are HKDF-derived from the CSK at boot. |
@@ -278,7 +295,7 @@ The per-node docs under `deploy/` are part of the operator record:
 Generated state is intentionally local:
 
 - `deploy/logs/` holds timestamped command logs and state files like
-  `node-pathA-<name>.state`, `indexer-<name>.state`, `matrix-node-<name>.state`, and
+  `node-pathA-<name>.state`, `indexer-<name>.state`, `indexer-lb-node-<name>.state`, `matrix-node-<name>.state`, and
   `postgres-node-<name>.state` / `ssh-node-<name>.state` / `hindsight-node-<name>.state`
   (the matrix and hindsight state files hold live credentials — IAPW/PGPW and the Hindsight
   tenant + UI access keys respectively — treat them as secrets). The pg-ha driver keeps one cluster

@@ -69,6 +69,14 @@ pub struct AppIncoming {
     pub block_number: u64,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct IndexerStatus {
+    pub connected: bool,
+    pub caught_up: bool,
+    pub cursor_block: u64,
+    pub cursor_log_index: u64,
+}
+
 /// Peer lifecycle event for the app stream.
 #[derive(Clone, Debug)]
 pub enum AppPeerEvent {
@@ -95,6 +103,9 @@ pub struct Shared {
     /// Coalescing wake-up for the single CSK pull loop. Peer configuration and
     /// liveness changes should trigger an immediate retry instead of a fixed sleep.
     pub peer_change: Notify,
+    /// Indexer connectivity/progress is diagnostic only; Gates remains the complete
+    /// health contract so an event-stream outage does not restart a healthy app.
+    pub indexer_status: Mutex<IndexerStatus>,
 
     pub incoming_tx: broadcast::Sender<AppIncoming>,
     pub peer_event_tx: broadcast::Sender<AppPeerEvent>,
@@ -136,6 +147,7 @@ impl Shared {
             gates: Gates::new(),
             originator_member_id: Mutex::new(None),
             peer_change: Notify::new(),
+            indexer_status: Mutex::new(IndexerStatus::default()),
             incoming_tx,
             peer_event_tx,
         })
@@ -172,6 +184,27 @@ impl Shared {
 
     pub async fn get_originator_member_id(&self) -> Option<[u8; 32]> {
         *self.originator_member_id.lock().await
+    }
+
+    pub async fn set_indexer_connected(&self, connected: bool) {
+        let mut status = self.indexer_status.lock().await;
+        status.connected = connected;
+        if connected {
+            status.caught_up = false;
+        }
+    }
+
+    pub async fn set_indexer_progress(&self, block: u64, log_index: u64, caught_up: bool) {
+        let mut status = self.indexer_status.lock().await;
+        if (block, log_index) >= (status.cursor_block, status.cursor_log_index) {
+            status.cursor_block = block;
+            status.cursor_log_index = log_index;
+        }
+        status.caught_up |= caught_up;
+    }
+
+    pub async fn get_indexer_status(&self) -> IndexerStatus {
+        *self.indexer_status.lock().await
     }
 }
 

@@ -3,7 +3,7 @@
 **Status:** APPROVED
 **Author:** LSDan
 **Created:** 2026-06-10
-**Last Updated:** 2026-06-10
+**Last Updated:** 2026-07-11
 **Parent spec:** [`attestmesh-coordination-layer.md`](./attestmesh-coordination-layer.md) §6, [`indexer.md`](./indexer.md) §3/§9
 **Components:** `indexer/`, `sidecar/`, `contracts/` (IndexerRegistry), `deploy/`
 
@@ -11,10 +11,10 @@
 
 The live Indexer is a single attested CVM — one process, one attestation-bound signing
 key, one `IndexerRegistry` record. If it dies, every cluster on the chain loses event
-push until an operator intervenes. Members keep functioning (the sidecar's chain-read
-reconcile poll is the authoritative path; indexer pushes are a latency cut — master
-spec §7.2), but the latency tier is a single point of failure and `setIndexer` rotation
-churns every subscriber.
+push until an operator intervenes. Protocol-v2 sidecars keep current-state peer
+reconciliation and their existing health result, but event delivery pauses because
+there is deliberately no direct-log fallback. The event tier is therefore a single
+point of failure and `setIndexer` rotation churns every subscriber.
 
 Milestone B makes the Indexer **a customer of its own product**: N replicas form an
 AttestMesh cluster (the "indexer cluster"), and the two hard HA problems fall out of
@@ -34,9 +34,10 @@ primitives we already shipped:
    layer (CRITICAL directive).
 
 The supposed circular dependency ("the indexer cluster needs an indexer") does not
-exist: sidecar bring-up has no indexer dependency — registration, peer exchange, mesh
-convergence, and CSK distribution all run off direct RPC polling, with indexer
-subscription as a non-gating optimization. The indexer cluster bootstraps itself cold.
+block mesh bootstrap: registration, peer enumeration/key reads, mesh convergence, and
+CSK distribution use current contract views and peer RPCs. The signed Indexer is the
+sole historical event/message source, but its connectivity is diagnostic rather than a
+sidecar health gate, so a dedicated indexer cluster can still bootstrap itself cold.
 
 ## Requirements
 
@@ -70,6 +71,11 @@ subscription as a non-gating optimization. The indexer cluster bootstraps itself
 - [ ] Dedup stays where it is: subscribers already drop duplicate `(blockNumber,
       logIndex)` — receiving overlapping pushes from two replicas during failover is
       harmless by construction; an integration test must prove it.
+- [x] A stable single-active front door is available as the first rollout stage:
+      `deploy/indexer-lb-node.sh` coordinates HAProxy prepare/commit with the
+      registry-pinned backend key, while sidecars persist signed checkpoints and
+      supply the last handled block to a newly selected backend. This does not yet
+      provide active-active replica identity; it provides safe blue/green deployment.
 - [ ] The indexer cluster is deployed/joined via the existing `deploy/indexer.sh` +
       smithers workflow, extended to `ensure` the indexer *cluster* (per the standing
       rule: shared topology, never per-cluster deployments; one indexer cluster serves

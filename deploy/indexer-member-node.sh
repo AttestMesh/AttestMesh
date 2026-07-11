@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
-# Deploy the shared AttestMesh indexer as a member of the main C3 cluster on the
-# self-hosted dstack box, then point IndexerRegistry at its gateway gRPC endpoint.
+# Deploy an AttestMesh Indexer candidate as a member of the main C3 cluster on the
+# self-hosted dstack box. `candidate` leaves IndexerRegistry unchanged so the node
+# can be verified before an Indexer-LB blue/green cutover; `all` retains the legacy
+# direct-registration behavior.
 set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -158,31 +160,38 @@ generic() {
   "$HERE/generic-node.sh" "$NODE" "$1"
 }
 
+candidate() {
+  generic deploy
+  generic prime
+  generic bind
+  generic start
+  register_member_direct
+  generic verify
+  verify_http
+}
+
 log "=== C3 AttestMesh indexer member: $NODE ==="
 case "$ACTION" in
-  deploy|prime|bind|verify|update) generic "$ACTION" ;;
+  deploy|prime|bind|start|verify|update|stop) generic "$ACTION" ;;
   register-member-direct) register_member_direct ;;
   register) register_indexer ;;
   verify-http) verify_http ;;
   verify-registry) verify_registry ;;
+  candidate) candidate ;;
   all)
-    generic deploy
-    generic prime
-    generic bind
-    register_member_direct
-    generic verify
+    candidate
     register_indexer
     verify_registry
-    verify_http
     ;;
   setup)
     generic deploy
     generic prime
     generic bind
+    generic start
     register_member_direct
     generic verify
     register_indexer
     verify_registry
     ;;
-  *) die "usage: indexer-member-node.sh [name] [deploy|prime|bind|verify|update|register-member-direct|register|verify-http|verify-registry|setup|all]" ;;
+  *) die "usage: indexer-member-node.sh [name] [deploy|prime|bind|start|verify|update|stop|register-member-direct|register|verify-http|verify-registry|candidate|setup|all]" ;;
 esac
