@@ -41,7 +41,7 @@ services:
       - /dev/net/tun
 
   indexer:
-    image: ghcr.io/attestmesh/attestmesh-indexer@sha256:16943c89a4dcc270fce232d7b284b34ed8c879682f1e115e60a5d6563cec820b
+    image: ghcr.io/attestmesh/attestmesh-indexer@sha256:14e9e3f6869ada585642c14e4e2e43bee197978ffc68d146dd6d3cddbc49d2bb
     restart: unless-stopped
     network_mode: service:sidecar
     depends_on:
@@ -67,7 +67,7 @@ services:
       - indexer-state:/data/indexer-state
 
   registration-calldata:
-    image: ghcr.io/attestmesh/attestmesh-indexer@sha256:16943c89a4dcc270fce232d7b284b34ed8c879682f1e115e60a5d6563cec820b
+    image: ghcr.io/attestmesh/attestmesh-indexer@sha256:14e9e3f6869ada585642c14e4e2e43bee197978ffc68d146dd6d3cddbc49d2bb
     restart: "no"
     depends_on:
       - sidecar
