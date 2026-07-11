@@ -136,19 +136,24 @@ register_member_direct() {
 
 verify_http() {
   _load_state
-  local host i body
+  local host i body status min_clusters
   host="$(_app_host_prefix)-9090.${GATEWAY_DOMAIN}"
+  min_clusters="${INDEXER_MIN_CLUSTER_COUNT:-1}"
   for i in $(seq 1 45); do
     body=$(curl -fsm 8 "https://${host}/mesh/health" 2>/dev/null || true)
-    if [ -n "$body" ]; then
-      log "✔ indexer HTTP query endpoint reachable: https://${host}/mesh/health"
+    status=$(curl -fsm 8 "https://${host}/status" 2>/dev/null || true)
+    if [ -n "$body" ] && echo "$status" | jq -e \
+      --argjson min "$min_clusters" \
+      '.health.ok == true and .readModel.clusterCount >= $min and (.readModel.atBlock | type == "number")' \
+      >/dev/null 2>&1; then
+      log "✔ indexer caught up with a populated read model: https://${host}/status"
       printf '%s\n' "$body" | jq '{clusterCount, memberCount, atBlock}' 2>/dev/null || true
       return 0
     fi
-    log "… indexer HTTP query endpoint not ready ($i/45)"
+    log "… indexer HTTP/read model not ready ($i/45)"
     sleep 10
   done
-  die "indexer HTTP query endpoint did not become reachable"
+  die "indexer did not become healthy with at least $min_clusters indexed cluster(s)"
 }
 
 verify_registry() {
