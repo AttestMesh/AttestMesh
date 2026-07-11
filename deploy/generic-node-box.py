@@ -3,7 +3,8 @@
 
 Deploys a generic AttestMesh workload CVM: cluster-mesh-agent sidecar plus one
 operator-supplied workload image. User environment is sealed as APP_ENV_B64 and
-decoded by pre_launch_script into an env_file consumed by docker compose.
+decoded by pre_launch_script for a workload to bind-mount and source. dstack's
+app-compose renderer does not support the Compose `env_file` key.
 """
 
 from __future__ import annotations
