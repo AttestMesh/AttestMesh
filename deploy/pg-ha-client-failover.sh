@@ -144,8 +144,12 @@ case "$ACTION" in
     run_probes 150 >"$log_file" 2>&1 &
     probe_pid=$!
     sleep 5
-    "$HERE/pg-ha-node.sh" pg-ha switchover "$CANDIDATE"
-    "$HERE/pg-ha-node.sh" pg-ha cycle-replica "$former_leader"
+    if ! "$HERE/pg-ha-node.sh" pg-ha switchover "$CANDIDATE"; then
+      die "controlled switchover did not reach the requested topology"
+    fi
+    if ! "$HERE/pg-ha-node.sh" pg-ha cycle-replica "$former_leader"; then
+      die "former leader did not complete its guarded replica cycle"
+    fi
     if ! wait "$probe_pid"; then
       probe_pid=""
       die "client failover gate violated the recovery SLO; probe log: $log_file"

@@ -675,7 +675,7 @@ verify_agent() {
 }
 
 switchover() {
-  local candidate="${1:?usage: pg-ha-node.sh <name> switchover <pgN>}" first_ip control_ip topology leader eligible response pair
+  local candidate="${1:?usage: pg-ha-node.sh <name> switchover <pgN>}" first_ip control_ip topology leader eligible response pair request_ok
   local -a pairs
   _load_cluster
   case " $(_nodes | tr '\n' ' ') " in
@@ -701,6 +701,7 @@ switchover() {
   [ -n "$control_ip" ] || die "could not resolve mesh IP for candidate $candidate"
 
   log "▶ controlled Patroni switchover: leader=$leader candidate=$candidate"
+  request_ok=1
   response=$(
     {
       printf 'TOKEN=%q\nCANDIDATE=%q\nCONTROL=%q\n' "$PGHA_VERIFY_PASSWORD" "$candidate" "$control_ip"
@@ -713,10 +714,17 @@ curl -fsS --max-time 30 -X POST \
   "http://$CONTROL:8010/switchover"
 RSCRIPT
     } | _mesh_ssh "bash -s"
-  ) || die "controlled Patroni switchover request failed"
-  jq -e --arg candidate "$candidate" '.candidate == $candidate' <<<"$response" >/dev/null \
-    || die "Patroni control response did not confirm candidate $candidate: $response"
-  log "Patroni switchover accepted by the mesh control plane"
+  ) || request_ok=0
+  if [ "$request_ok" = 1 ]; then
+    jq -e --arg candidate "$candidate" '.candidate == $candidate' <<<"$response" >/dev/null \
+      || die "Patroni control response did not confirm candidate $candidate: $response"
+    log "Patroni switchover accepted by the mesh control plane"
+  else
+    # Patroni may finish a safe demotion/promotion after the controller's HTTP
+    # deadline. Never retry the mutation blindly: prove the requested topology
+    # below and accept only the exact requested candidate as leader.
+    log "Patroni control request was not acknowledged; proving topology before continuing"
+  fi
 
   for i in $(seq 1 30); do
     leader=$(_mesh_ssh "curl -fsS --max-time 5 http://${first_ip}:8008/cluster" 2>/dev/null \

@@ -235,7 +235,13 @@ def _conn():
         raise RuntimeError("psycopg is not installed")
     if not DATABASE_URL:
         raise RuntimeError("DATABASE_URL is empty")
-    return psycopg.connect(DATABASE_URL, autocommit=True, row_factory=dict_row)
+    return psycopg.connect(
+        DATABASE_URL,
+        autocommit=True,
+        row_factory=dict_row,
+        connect_timeout=3,
+        options="-c statement_timeout=5000 -c lock_timeout=3000",
+    )
 
 
 def init_schema(conn) -> None:

@@ -8,6 +8,7 @@ serves a small mesh-only dashboard backed by the fugu credit ledger.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import re
@@ -34,7 +35,13 @@ app = FastAPI(title="fugu-session-router", docs_url=None, redoc_url=None)
 
 
 def _conn():
-    return psycopg.connect(DATABASE_URL, autocommit=True, row_factory=dict_row)
+    return psycopg.connect(
+        DATABASE_URL,
+        autocommit=True,
+        row_factory=dict_row,
+        connect_timeout=3,
+        options="-c statement_timeout=5000 -c lock_timeout=3000",
+    )
 
 
 def _utcnow() -> datetime:
@@ -347,6 +354,24 @@ def _upsert_assignment(session_key: str, requested_model: str, account_id: str, 
         )
 
 
+def _mark_failover_assignment(
+    session_key: str,
+    requested_model: str,
+    account_id: str,
+    upstream: str,
+) -> None:
+    _upsert_assignment(session_key, requested_model, account_id, upstream, "limit-failover")
+    with _conn() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            UPDATE fugu_session_assignments
+            SET failover_count = failover_count + 1
+            WHERE session_key = %s AND requested_model = %s
+            """,
+            (session_key, requested_model),
+        )
+
+
 def _record_decision(
     session_key: str,
     requested_model: str,
@@ -564,7 +589,7 @@ async def dashboard() -> HTMLResponse:
 
 
 @app.get("/fugu/api/summary")
-async def summary(request: Request, window: str = "5h", model: str = "all") -> JSONResponse:
+def summary(request: Request, window: str = "5h", model: str = "all") -> JSONResponse:
     denied = _require_admin(request)
     if denied:
         return denied
@@ -753,7 +778,13 @@ async def _forward_once(
                     consume_sse(b"\n")
                 if stream_complete:
                     try:
-                        stream_complete(_stream_response_obj(stream_events), resp.status_code, passthrough_headers, _utcnow())
+                        await asyncio.to_thread(
+                            stream_complete,
+                            _stream_response_obj(stream_events),
+                            resp.status_code,
+                            passthrough_headers,
+                            _utcnow(),
+                        )
                     except Exception as exc:
                         print(f"fugu_session_router: stream ledger write failed: {type(exc).__name__}: {exc}", flush=True)
                 await resp.aclose()
@@ -855,7 +886,11 @@ async def proxy(path: str, request: Request) -> Response:
         return await _forward_once(request, path, raw, bool(body.get("stream")))
 
     session_key = _session_key(request, body)
-    account_id, selected_upstream, candidates, reason = _assignment(session_key, requested_model)
+    account_id, selected_upstream, candidates, reason = await asyncio.to_thread(
+        _assignment,
+        session_key,
+        requested_model,
+    )
     attempts = []
     seen = set()
     for candidate in ([{"account_id": account_id, "upstream_model": selected_upstream}] + candidates):
@@ -917,27 +952,35 @@ async def proxy(path: str, request: Request) -> Response:
         )
         ended_at = _utcnow()
         try:
-            _record_proxy_ledger(request, path, requested_model, candidate, meta, response, started_at, ended_at)
+            await asyncio.to_thread(
+                _record_proxy_ledger,
+                request,
+                path,
+                requested_model,
+                candidate,
+                meta,
+                response,
+                started_at,
+                ended_at,
+            )
         except Exception as exc:
             print(f"fugu_session_router: ledger write failed: {type(exc).__name__}: {exc}", flush=True)
         if response.status_code < 400:
             if attempt_index > 0 or candidate["account_id"] != account_id:
-                _upsert_assignment(session_key, requested_model, candidate["account_id"], candidate["upstream_model"], "limit-failover")
-                with _conn() as conn, conn.cursor() as cur:
-                    cur.execute(
-                        """
-                        UPDATE fugu_session_assignments
-                        SET failover_count = failover_count + 1
-                        WHERE session_key = %s AND requested_model = %s
-                        """,
-                        (session_key, requested_model),
-                    )
+                await asyncio.to_thread(
+                    _mark_failover_assignment,
+                    session_key,
+                    requested_model,
+                    candidate["account_id"],
+                    candidate["upstream_model"],
+                )
             return response
         text = response.body.decode("utf-8", errors="replace") if hasattr(response, "body") else ""
         last_response = response
         if not _limit_error(response.status_code, text):
             return response
-        _cooldown(
+        await asyncio.to_thread(
+            _cooldown,
             candidate["account_id"],
             requested_model,
             f"upstream status {response.status_code}",
