@@ -161,6 +161,7 @@ generic() {
 }
 
 candidate() {
+  generic preflight
   generic deploy
   generic prime
   generic bind
@@ -172,7 +173,7 @@ candidate() {
 
 log "=== C3 AttestMesh indexer member: $NODE ==="
 case "$ACTION" in
-  deploy|prime|bind|start|verify|update|stop) generic "$ACTION" ;;
+  preflight|deploy|prime|bind|start|verify|update|stop) generic "$ACTION" ;;
   register-member-direct) register_member_direct ;;
   register) register_indexer ;;
   verify-http) verify_http ;;
@@ -193,5 +194,5 @@ case "$ACTION" in
     register_indexer
     verify_registry
     ;;
-  *) die "usage: indexer-member-node.sh [name] [deploy|prime|bind|start|verify|update|stop|register-member-direct|register|verify-http|verify-registry|candidate|setup|all]" ;;
+  *) die "usage: indexer-member-node.sh [name] [preflight|deploy|prime|bind|start|verify|update|stop|register-member-direct|register|verify-http|verify-registry|candidate|setup|all]" ;;
 esac
