@@ -41,7 +41,7 @@ FLAVORS = {
     "large": {"vcpu": "8", "mem": "16384", "disk": "160"},
 }
 
-SIDECAR_IMAGE = "ghcr.io/dmvt/cluster-mesh-agent@sha256:1f7ac9c51ec86a9076a1cabac8a8aef2d7cd2cea43c8fe8052b20af1730e31c3"
+SIDECAR_IMAGE = "ghcr.io/attestmesh/cluster-mesh-agent@sha256:b9e0ae107d9db015c22059c9fecdc28f2b35e09b257eabb4739bd4e46d96f641"
 AUTO_CLEANUP_FAILED = os.environ.get("ORCHESTRATOR_AUTO_CLEANUP_FAILED", "true").strip().lower() in {
     "1",
     "true",
@@ -154,11 +154,13 @@ def postgres_compose(name: str) -> str:
       - INDEXER_REGISTRY_ADDR=${{INDEXER_REGISTRY_ADDR}}
       - GATEWAY_DOMAIN=${{GATEWAY_DOMAIN}}
       - DSTACK_SOCKET=/var/run/dstack.sock
+      - SIDECAR_STATE_DIR=/var/lib/attestmesh
       - HEALTH_HTTP_ADDR=0.0.0.0:9090
       - LOG_FORMAT=pretty
       - LOG_LEVEL=info,cluster_mesh_agent=debug
     volumes:
       - /var/run/dstack.sock:/var/run/dstack.sock
+      - sidecar-state:/var/lib/attestmesh
     ports:
       - "9090:9090"
       - "51900:51900"
@@ -216,6 +218,7 @@ def postgres_compose(name: str) -> str:
       - no-new-privileges:true
 
 volumes:
+  sidecar-state:
   pgdata:
 """
 
@@ -236,11 +239,13 @@ def generic_compose(name: str, image: str, catalog_id: str | None) -> str:
       - INDEXER_REGISTRY_ADDR=${{INDEXER_REGISTRY_ADDR}}
       - GATEWAY_DOMAIN=${{GATEWAY_DOMAIN}}
       - DSTACK_SOCKET=/var/run/dstack.sock
+      - SIDECAR_STATE_DIR=/var/lib/attestmesh
       - HEALTH_HTTP_ADDR=0.0.0.0:9090
       - LOG_FORMAT=pretty
       - LOG_LEVEL=info,cluster_mesh_agent=debug
     volumes:
       - /var/run/dstack.sock:/var/run/dstack.sock
+      - sidecar-state:/var/lib/attestmesh
     ports:
       - "9090:9090"
       - "51900:51900"
@@ -268,6 +273,9 @@ def generic_compose(name: str, image: str, catalog_id: str | None) -> str:
     labels:
       attestmesh.name: "{name}"
       attestmesh.source: "fleet-control"
+
+volumes:
+  sidecar-state:
 """
 
 
