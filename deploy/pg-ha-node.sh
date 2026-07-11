@@ -672,7 +672,8 @@ verify_agent() {
 }
 
 switchover() {
-  local candidate="${1:?usage: pg-ha-node.sh <name> switchover <pgN>}" first_ip topology leader eligible response
+  local candidate="${1:?usage: pg-ha-node.sh <name> switchover <pgN>}" first_ip control_ip topology leader eligible response pair
+  local -a pairs
   _load_cluster
   case " $(_nodes | tr '\n' ' ') " in
     *" $candidate "*) ;;
@@ -689,18 +690,24 @@ switchover() {
     | .name' <<<"$topology")
   [ -n "$leader" ] && [ "$eligible" = "$candidate" ] \
     || die "candidate $candidate is not a zero-lag streaming replica"
+  control_ip=""
+  IFS=',' read -ra pairs <<<"$PGHA_PEERS"
+  for pair in "${pairs[@]}"; do
+    [ "${pair%%=*}" = "$candidate" ] && control_ip="${pair#*=}"
+  done
+  [ -n "$control_ip" ] || die "could not resolve mesh IP for candidate $candidate"
 
   log "▶ controlled Patroni switchover: leader=$leader candidate=$candidate"
   response=$(
     {
-      printf 'TOKEN=%q\nCANDIDATE=%q\nFIRST=%q\n' "$PGHA_VERIFY_PASSWORD" "$candidate" "$first_ip"
+      printf 'TOKEN=%q\nCANDIDATE=%q\nCONTROL=%q\n' "$PGHA_VERIFY_PASSWORD" "$candidate" "$control_ip"
       cat <<'RSCRIPT'
 payload=$(printf '{"candidate":"%s"}' "$CANDIDATE")
 curl -fsS --max-time 30 -X POST \
   -H "Authorization: Bearer $TOKEN" \
   -H 'Content-Type: application/json' \
   --data-binary "$payload" \
-  "http://$FIRST:8010/switchover"
+  "http://$CONTROL:8010/switchover"
 RSCRIPT
     } | _mesh_ssh "bash -s"
   ) || die "controlled Patroni switchover request failed"
