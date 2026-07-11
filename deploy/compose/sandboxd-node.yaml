@@ -1,7 +1,7 @@
 # confidential-sandboxes daemon, enrolled as a Path-A member of net_open_webhost.
 services:
   sidecar:
-    image: ghcr.io/attestmesh/cluster-mesh-agent@sha256:f455ad9e778573080459eb9e46af269547d72d3624cbcf6d21e4a279c0527284
+    image: ghcr.io/attestmesh/cluster-mesh-agent@sha256:b9e0ae107d9db015c22059c9fecdc28f2b35e09b257eabb4739bd4e46d96f641
     restart: unless-stopped
     environment:
       - CHAIN_ID=${CHAIN_ID}
@@ -11,12 +11,14 @@ services:
       - INDEXER_REGISTRY_ADDR=${INDEXER_REGISTRY_ADDR}
       - GATEWAY_DOMAIN=${GATEWAY_DOMAIN}
       - DSTACK_SOCKET=/var/run/dstack.sock
+      - SIDECAR_STATE_DIR=/var/lib/attestmesh
       - PEER_ENVELOPE_FALLBACK=true
       - HEALTH_HTTP_ADDR=0.0.0.0:9090
       - LOG_FORMAT=pretty
       - LOG_LEVEL=info,cluster_mesh_agent=debug
     volumes:
       - /var/run/dstack.sock:/var/run/dstack.sock
+      - sidecar-state:/var/lib/attestmesh
     ports:
       - "9090:9090"
       - "51900:51900"
@@ -62,3 +64,6 @@ services:
       - "9092:9092"
     volumes:
       - /var/run/dstack.sock:/var/run/dstack.sock
+
+volumes:
+  sidecar-state:

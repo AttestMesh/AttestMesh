@@ -7,7 +7,7 @@
 # mesh peer-control gRPC on :50051, so the indexer uses :50052.
 services:
   sidecar:
-    image: ghcr.io/dmvt/cluster-mesh-agent@sha256:e0d0b2c6d088bca121e4e58ab01a04b50dd46ba6b877ca50979884349d9b6dab
+    image: ghcr.io/attestmesh/cluster-mesh-agent@sha256:b9e0ae107d9db015c22059c9fecdc28f2b35e09b257eabb4739bd4e46d96f641
     restart: unless-stopped
     environment:
       # MEMBER_CONTRACT intentionally unset. Path A upgrades this stock DstackApp
@@ -20,12 +20,14 @@ services:
       - INDEXER_REGISTRY_ADDR=${INDEXER_REGISTRY_ADDR}
       - GATEWAY_DOMAIN=${GATEWAY_DOMAIN}
       - DSTACK_SOCKET=/var/run/dstack.sock
+      - SIDECAR_STATE_DIR=/var/lib/attestmesh
       # The indexer owns :9090 in the shared netns.
       - HEALTH_HTTP_ADDR=0.0.0.0:9091
       - LOG_FORMAT=pretty
       - LOG_LEVEL=info,cluster_mesh_agent=debug
     volumes:
       - /var/run/dstack.sock:/var/run/dstack.sock
+      - sidecar-state:/var/lib/attestmesh
       - agent-sock:/var/run/attestmesh
     ports:
       - "51900:51900"
@@ -80,5 +82,6 @@ services:
       - /var/run/dstack.sock:/var/run/dstack.sock
 
 volumes:
+  sidecar-state:
   agent-sock:
   indexer-state:

@@ -1,6 +1,6 @@
 services:
   sidecar:
-    image: ghcr.io/attestmesh/cluster-mesh-agent@sha256:db0a74f5cb68aab6441ac187522276999fc45ee760db3ae3dea0240e86d5c1af
+    image: ghcr.io/attestmesh/cluster-mesh-agent@sha256:b9e0ae107d9db015c22059c9fecdc28f2b35e09b257eabb4739bd4e46d96f641
     restart: unless-stopped
     environment:
       - CHAIN_ID=${CHAIN_ID}
@@ -10,11 +10,13 @@ services:
       - INDEXER_REGISTRY_ADDR=${INDEXER_REGISTRY_ADDR}
       - GATEWAY_DOMAIN=${GATEWAY_DOMAIN}
       - DSTACK_SOCKET=/var/run/dstack.sock
+      - SIDECAR_STATE_DIR=/var/lib/attestmesh
       - HEALTH_HTTP_ADDR=0.0.0.0:9090
       - LOG_FORMAT=pretty
       - LOG_LEVEL=info,cluster_mesh_agent=debug
     volumes:
       - /var/run/dstack.sock:/var/run/dstack.sock
+      - sidecar-state:/var/lib/attestmesh
     ports:
       - "9090:9090"
       - "51900:51900"
@@ -165,6 +167,7 @@ services:
       - frontproxy
 
 volumes:
+  sidecar-state:
   daemon_data:
   briefs:
   digests:
