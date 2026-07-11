@@ -124,8 +124,8 @@ _member_mesh_ip() {
   member_id=$(cast call "$cluster" "memberIdOf(address)(bytes32)" "$app" --rpc-url "$RPC_URL" 2>/dev/null) \
     || return 1
   [ -n "$member_id" ] && [ "$member_id" != "$ZERO32" ] || return 1
-  raw=$(cast call "$cluster" "meshIpOf(bytes32)(uint32)" "$member_id" --rpc-url "$RPC_URL" 2>/dev/null) \
-    || return 1
+  raw=$(cast call "$cluster" "meshIpOf(bytes32)(uint32)" "$member_id" \
+    --json --rpc-url "$RPC_URL" 2>/dev/null | jq -er '.[0]') || return 1
   python3 - "$raw" <<'PY'
 import ipaddress, sys
 print(ipaddress.IPv4Address(int(sys.argv[1], 0)))
