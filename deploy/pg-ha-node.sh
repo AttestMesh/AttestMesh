@@ -672,28 +672,42 @@ verify_agent() {
 }
 
 switchover() {
-  local candidate="${1:?usage: pg-ha-node.sh <name> switchover <pgN>}" bot fqdn
-  _load_cluster; _default_matrix_env; _matrix_verify_credentials
+  local candidate="${1:?usage: pg-ha-node.sh <name> switchover <pgN>}" first_ip topology leader eligible response
+  _load_cluster
   case " $(_nodes | tr '\n' ' ') " in
     *" $candidate "*) ;;
     *) die "unknown switchover candidate: $candidate" ;;
   esac
-  bot="$(_bot_user_id pg1)"
-  fqdn="$(_matrix_fqdn)" || die "could not find live Matrix tailnet FQDN"
-  log "▶ controlled Patroni switchover to $candidate via $bot"
-  MATRIX_PROBE_FQDN="$fqdn" \
-    MATRIX_PROBE_ROOM_ID="$MATRIX_ROOM_ID" \
-    MATRIX_PROBE_USER="$MATRIX_VERIFY_LOCALPART" \
-    MATRIX_PROBE_PASSWORD="$MATRIX_VERIFY_PASSWORD_RESOLVED" \
-    MATRIX_PROBE_BOT="$bot" \
-    MATRIX_PROBE_COMMAND="$bot !pgha switchover $candidate" \
-    MATRIX_PROBE_EXPECT_RE='confirm ([a-f0-9]{6,12})' \
-    MATRIX_PROBE_FOLLOWUP_TEMPLATE='confirm {1}' \
-    MATRIX_PROBE_FOLLOWUP_EXPECT_RE='Switchover requested' \
-    python3 "$HERE/matrix-probe.py" || die "controlled switchover request failed"
-
-  local first_ip leader
   first_ip="${PGHA_PEERS#*=}"; first_ip="${first_ip%%,*}"
+  topology=$(_mesh_ssh "curl -fsS --max-time 5 http://${first_ip}:8008/cluster")
+  leader=$(jq -r '.members[]? | select(.role == "leader") | .name' <<<"$topology")
+  eligible=$(jq -r --arg n "$candidate" '
+    .members[]?
+    | select(.name == $n and .role == "replica")
+    | select(.state == "streaming" or .state == "running")
+    | select((.lag // 0) == 0)
+    | .name' <<<"$topology")
+  [ -n "$leader" ] && [ "$eligible" = "$candidate" ] \
+    || die "candidate $candidate is not a zero-lag streaming replica"
+
+  log "▶ controlled Patroni switchover: leader=$leader candidate=$candidate"
+  response=$(
+    {
+      printf 'TOKEN=%q\nCANDIDATE=%q\nFIRST=%q\n' "$PGHA_VERIFY_PASSWORD" "$candidate" "$first_ip"
+      cat <<'RSCRIPT'
+payload=$(printf '{"candidate":"%s"}' "$CANDIDATE")
+curl -fsS --max-time 30 -X POST \
+  -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' \
+  --data-binary "$payload" \
+  "http://$FIRST:8010/switchover"
+RSCRIPT
+    } | _mesh_ssh "bash -s"
+  ) || die "controlled Patroni switchover request failed"
+  jq -e --arg candidate "$candidate" '.candidate == $candidate' <<<"$response" >/dev/null \
+    || die "Patroni control response did not confirm candidate $candidate: $response"
+  log "Patroni switchover accepted by the mesh control plane"
+
   for i in $(seq 1 30); do
     leader=$(_mesh_ssh "curl -fsS --max-time 5 http://${first_ip}:8008/cluster" 2>/dev/null \
       | jq -r '.members[]? | select(.role == "leader") | .name' || true)

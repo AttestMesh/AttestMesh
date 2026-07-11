@@ -181,6 +181,124 @@ services:
     volumes:
       - pgha-secrets:/pgha-secrets:ro
 
+  # Narrow mesh-only control plane used by deploy/pg-ha-node.sh. Patroni keeps
+  # its CSK-derived Basic Auth password inside the CVM; this proxy never returns
+  # it and permits only a zero-lag controlled switchover authenticated by the
+  # existing rollout verifier token.
+  patroni-control:
+    image: ghcr.io/attestmesh/postgres-admin-agent@sha256:3d38a34f7f0858ca45d87e4235881bd24762f7407dfba4a6de3be0fd110da4e3
+    restart: unless-stopped
+    network_mode: service:sidecar
+    depends_on:
+      patroni:
+        condition: service_started
+    environment:
+      - PGHA_NODE_NAME=${PGHA_NODE_NAME}
+      - PGHA_PEERS=${PGHA_PEERS}
+      - PGHA_CONTROL_TOKEN=${PGHA_VERIFY_PASSWORD}
+    volumes:
+      - pgha-secrets:/pgha-secrets:ro
+    entrypoint: ["python", "-c"]
+    command:
+      - |
+        import base64
+        import hmac
+        import json
+        import os
+        import urllib.error
+        import urllib.request
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+        NODE = os.environ["PGHA_NODE_NAME"]
+        PEERS = dict(item.split("=", 1) for item in os.environ["PGHA_PEERS"].split(","))
+        TOKEN = os.environ["PGHA_CONTROL_TOKEN"]
+        BIND = PEERS[NODE]
+        PATRONI = "http://127.0.0.1:8008"
+
+        def json_request(url, *, data=None, headers=None):
+            request = urllib.request.Request(url, data=data, headers=headers or {})
+            with urllib.request.urlopen(request, timeout=20) as response:
+                body = response.read(1024 * 1024)
+                return response.status, body
+
+        def topology():
+            _, body = json_request(PATRONI + "/cluster")
+            return json.loads(body)
+
+        class Handler(BaseHTTPRequestHandler):
+            def send_json(self, status, payload):
+                data = json.dumps(payload, sort_keys=True).encode()
+                self.send_response(status)
+                self.send_header("content-type", "application/json")
+                self.send_header("content-length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+
+            def authorized(self):
+                supplied = self.headers.get("authorization", "")
+                return bool(TOKEN) and hmac.compare_digest(supplied, "Bearer " + TOKEN)
+
+            def do_GET(self):
+                if self.path != "/healthz":
+                    self.send_json(404, {"error": "not found"})
+                    return
+                try:
+                    cluster = topology()
+                    self.send_json(200, {"node": NODE, "members": len(cluster.get("members", []))})
+                except Exception as exc:
+                    self.send_json(503, {"error": type(exc).__name__})
+
+            def do_POST(self):
+                if self.path != "/switchover":
+                    self.send_json(404, {"error": "not found"})
+                    return
+                if not self.authorized():
+                    self.send_json(401, {"error": "unauthorized"})
+                    return
+                try:
+                    length = min(int(self.headers.get("content-length", "0") or 0), 4096)
+                    body = json.loads(self.rfile.read(length) or b"{}")
+                    candidate = str(body.get("candidate", ""))
+                    cluster = topology()
+                    members = cluster.get("members", [])
+                    leaders = [m for m in members if m.get("role") == "leader"]
+                    targets = [
+                        m for m in members
+                        if m.get("name") == candidate
+                        and m.get("role") == "replica"
+                        and m.get("state") in ("streaming", "running")
+                        and (m.get("lag") or 0) == 0
+                    ]
+                    if len(leaders) != 1 or len(targets) != 1:
+                        raise ValueError("candidate is not a zero-lag streaming replica")
+                    leader = leaders[0]["name"]
+                    password = open("/pgha-secrets/patroni-api", encoding="utf-8").read()
+                    basic = base64.b64encode(("patroni:" + password).encode()).decode()
+                    payload = json.dumps({"leader": leader, "candidate": candidate}).encode()
+                    status, patroni_body = json_request(
+                        PATRONI + "/switchover",
+                        data=payload,
+                        headers={
+                            "Authorization": "Basic " + basic,
+                            "Content-Type": "application/json",
+                        },
+                    )
+                    self.send_json(200, {
+                        "candidate": candidate,
+                        "leader": leader,
+                        "patroni_status": status,
+                        "patroni_response": patroni_body.decode(errors="replace")[:500],
+                    })
+                except urllib.error.HTTPError as exc:
+                    self.send_json(502, {"error": "Patroni HTTP " + str(exc.code)})
+                except Exception as exc:
+                    self.send_json(400, {"error": type(exc).__name__ + ": " + str(exc)})
+
+            def log_message(self, *_):
+                pass
+
+        ThreadingHTTPServer((BIND, 8010), Handler).serve_forever()
+
   # Agent egress is deny-by-default: local Patroni/Postgres + the sidecar Matrix proxy,
   # internal Prometheus, Docker DNS, and the pinned LLM endpoint only.
   agent-egress-fw:
