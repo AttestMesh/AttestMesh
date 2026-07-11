@@ -45,11 +45,15 @@ impl Agent for AgentService {
     async fn get_mesh_status(&self, _: Request<Empty>) -> Result<Response<MeshStatus>, Status> {
         let phase = self.shared.current_phase().await;
         let live = self.shared.peers.lock().await.live_count() as u32;
+        let indexer = self.shared.get_indexer_status().await;
         Ok(Response::new(MeshStatus {
             phase: phase.as_str().to_string(),
             first_converged: self.shared.gates.first_converged(),
             csk_acquired: self.shared.gates.csk_acquired(),
             live_peer_count: live,
+            indexer_connected: indexer.connected,
+            indexer_caught_up: indexer.caught_up,
+            indexer_cursor_block: indexer.cursor_block,
         }))
     }
 

@@ -6,7 +6,7 @@
 //! bytes); `ListPeers` is symmetric; heartbeat liveness reflects connectivity; an
 //! A→B `SendMessage` appears decrypted in B's stream but not C's; killing the
 //! originator and adding a fourth onboardee still succeeds; and killing the Indexer
-//! mid-flight keeps healthy sidecars healthy while a fresh one stalls at `subscribing`.
+//! mid-flight only changes diagnostic status and never activates a direct-log scan.
 //!
 //! It is `#[ignore]`d because it requires anvil + the deployed contracts + a mock
 //! dstack runtime + spawning multiple wireguard-capable processes — out of scope for

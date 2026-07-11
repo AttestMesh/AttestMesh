@@ -17,7 +17,7 @@ path = "src/main.rs"
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }
-tokio-stream = "0.1"
+tokio-stream = { version = "0.1", features = ["net", "sync"] }
 tonic = "0.12"
 prost = "0.13"
 

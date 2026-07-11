@@ -5,8 +5,7 @@
 //! directly via RPC reads (`listMembers` / `memberById` / `meshIpOf`), wireguard
 //! links bootstrap over the gateway TCP leg (see `transport`), and the encrypted
 //! `PeerEndpoint` envelopes — which carry each peer's Ed25519 heartbeat key — are
-//! exchanged through `MessageFacet` and recovered by polling `MessageSent` logs
-//! over the same RPC (Indexer push is an optimization, not a dependency).
+//! exchanged through `MessageFacet` and delivered by the signed Indexer stream.
 //!
 //! Spawned tasks: wg-tcp ingress, peer reconciler (chain → bridges → wg peers →
 //! envelope exchange), heartbeat send/recv, CSK originate-or-pull, the peer-control
@@ -28,8 +27,6 @@ use crate::wg::{
 };
 use crate::{csk, transport};
 use alloy::primitives::{keccak256, Address, Bytes, B256, U256};
-use alloy::providers::Provider;
-use alloy::rpc::types::Filter;
 use alloy::signers::local::PrivateKeySigner;
 use anyhow::{Context, Result};
 use rand::Rng;
@@ -53,16 +50,14 @@ const CSK_RETRY_MIN: Duration = Duration::from_millis(250);
 const CSK_RETRY_MAX: Duration = Duration::from_secs(2);
 const CSK_PULL_PARALLELISM: usize = 8;
 /// Base wait before re-sending our PeerEndpoint to a peer whose Ed25519 key is
-/// still unknown (the peer is symmetric-polling, so a fresh send lands in its log
-/// window). Doubles per attempt up to [`ENVELOPE_RESEND_MAX`]: every resend is a
+/// still unknown (a fresh send is delivered through its Indexer subscription).
+/// Doubles per attempt up to [`ENVELOPE_RESEND_MAX`]: every resend is a
 /// sponsored UserOp, and a peer that never answers (an on-chain orphan whose VM is
 /// gone — this cluster has no removeMember) would otherwise cost 144 ops/day from
 /// every live node, forever (live-found 2026-07: ~1.3k ops/day fleet-wide).
 const ENVELOPE_RESEND: Duration = Duration::from_secs(600);
 /// Resend backoff ceiling: one envelope per day to a peer that never answers.
 const ENVELOPE_RESEND_MAX: Duration = Duration::from_secs(86_400);
-/// How far back the first MessageSent log poll reaches (Base ≈ 2s blocks ≈ 2.2h).
-const LOG_LOOKBACK_BLOCKS: u64 = 4000;
 
 /// Our PeerEndpoint send history toward one peer (drives the resend backoff).
 #[derive(Clone, Copy)]
@@ -95,9 +90,11 @@ struct Ctx {
     /// health never depend on it.
     puncher: Option<Arc<transport::punch::Puncher>>,
     /// Peer Ed25519 keys learned from PeerEndpoint envelopes, mirrored to the
-    /// dstack sealed store so a restart doesn't forget them (and restart the
-    /// sponsored-UserOp resend loop toward peers that will never reply).
+    /// durable state volume so a restart doesn't forget them.
     learned_keys: Mutex<crate::peer_cache::LearnedKeys>,
+    /// PeerEndpoint send/reply history shared by reconciliation and Indexer message
+    /// dispatch so the sponsored resend backoff has one authoritative state.
+    last_sent: Mutex<HashMap<[u8; 32], SendState>>,
 }
 
 fn now_ms() -> u64 {
@@ -126,6 +123,38 @@ impl Ctx {
         let _g = self.submit_lock.lock().await;
         self.bundler.submit(&self.owner_signer, op).await
     }
+}
+
+async fn resend_due(ctx: &Ctx, member_id: &[u8; 32], peer_key_known: bool, now: u64) -> bool {
+    let sent = ctx.last_sent.lock().await;
+    match sent.get(member_id) {
+        None => true,
+        Some(state) => {
+            !peer_key_known && now.saturating_sub(state.at_ms) > resend_delay_ms(state.attempts)
+        }
+    }
+}
+
+async fn reply_due(ctx: &Ctx, member_id: &[u8; 32], now: u64) -> bool {
+    let sent = ctx.last_sent.lock().await;
+    sent.get(member_id).map_or(true, |state| {
+        now.saturating_sub(state.at_ms) > ENVELOPE_RESEND.as_millis() as u64
+    })
+}
+
+/// Record either a successful or failed sponsored send and return the prior attempt
+/// count for logging. Both paths share the same backoff budget.
+async fn record_send_attempt(ctx: &Ctx, member_id: [u8; 32], now: u64) -> u32 {
+    let mut sent = ctx.last_sent.lock().await;
+    let attempts = sent.get(&member_id).map_or(0, |state| state.attempts);
+    sent.insert(
+        member_id,
+        SendState {
+            at_ms: now,
+            attempts: attempts.saturating_add(1),
+        },
+    );
+    attempts
 }
 
 /// Spawn all mesh bring-up tasks. Returns once spawned (health::serve blocks after).
@@ -200,6 +229,7 @@ pub async fn launch(
         self_sni,
         puncher: puncher.clone(),
         learned_keys: Mutex::new(learned_keys),
+        last_sent: Mutex::new(HashMap::new()),
     });
 
     // 1. wg-over-TCP ingress (peers reach us through the gateway).
@@ -229,8 +259,27 @@ pub async fn launch(
         tokio::spawn(async move { publish_own_ed25519_loop(ctx).await });
     }
 
-    // Indexer pushes wake the reconcile pass early; polling remains the fallback.
+    // Indexer is the sole event source. State-change events wake the direct-view
+    // reconciler; MessageSent events are handled and Ack'd through event_rx.
+    if let Some((block, log_index)) = crate::indexer_client::load_cursor(
+        config.sidecar_state_dir.as_deref(),
+        shared.cluster,
+        &shared.self_member_id,
+    )
+    .await
+    {
+        shared.set_indexer_progress(block, log_index, false).await;
+        tracing::info!(block, log_index, "loaded durable Indexer replay checkpoint");
+    }
     let (wake_tx, wake_rx) = tokio::sync::mpsc::channel::<()>(8);
+    let (event_tx, event_rx) =
+        tokio::sync::mpsc::channel::<crate::indexer_client::DispatchRequest>(128);
+
+    {
+        let ctx = ctx.clone();
+        let wake = wake_tx.clone();
+        tokio::spawn(async move { indexer_event_loop(ctx, event_rx, wake).await });
+    }
 
     // 3. peer reconciler: chain → bridges → wg peers → envelope exchange.
     {
@@ -240,12 +289,15 @@ pub async fn launch(
     }
 
     // 3b. Indexer subscription (sidecar spec §9): discover via IndexerRegistry,
-    // verify every push, reconnect with backoff. Absent registration → poll-only.
+    // verify every push, dispatch, Ack, and reconnect with backoff.
     {
         let shared = shared.clone();
         let chain = chain.clone();
         let registry = config.indexer_registry_addr;
-        tokio::spawn(async move { indexer_loop(shared, chain, registry, wake_tx).await });
+        let state_dir = config.sidecar_state_dir.clone();
+        tokio::spawn(
+            async move { indexer_loop(shared, chain, registry, event_tx, state_dir).await },
+        );
     }
 
     // 4. CSK originate-or-pull.
@@ -273,23 +325,18 @@ pub async fn launch(
     Ok(())
 }
 
-/// One pass + steady-state loop: enumerate members from chain, configure any new
-/// peer (bridge + wg), send our PeerEndpoint envelope, and poll MessageSent logs
-/// for inbound envelopes (peers' Ed25519 keys).
+/// One pass + steady-state loop: enumerate members from current chain views,
+/// configure peers, and send transitional PeerEndpoint envelopes when enabled.
 async fn reconcile_loop(
     ctx: Arc<Ctx>,
     gw_domain: String,
     mut wake: tokio::sync::mpsc::Receiver<()>,
 ) {
-    let mut last_sent: HashMap<[u8; 32], SendState> = HashMap::new();
-    let mut next_from_block: Option<u64> = None;
-
     loop {
-        if let Err(e) = reconcile_once(&ctx, &gw_domain, &mut last_sent, &mut next_from_block).await
-        {
+        if let Err(e) = reconcile_once(&ctx, &gw_domain).await {
             tracing::warn!(error = ?e, "peer reconcile pass failed; retrying");
         }
-        // Indexer pushes cut the latency; the interval is the poll fallback.
+        // Indexer state events cut the latency; the interval reconciles current views.
         tokio::select! {
             _ = tokio::time::sleep(RECONCILE_INTERVAL) => {}
             _ = wake.recv() => {}
@@ -298,14 +345,17 @@ async fn reconcile_loop(
 }
 
 /// Discover the Indexer from the on-chain registry and hold the subscription open,
-/// re-discovering + reconnecting with backoff (spec §9.2). An empty registry means
-/// no indexer is operated yet — the reconcile poll remains the only event source.
+/// re-discovering + reconnecting with backoff (spec §9.2). There is deliberately no
+/// direct-log fallback: an unavailable Indexer pauses event delivery only.
 async fn indexer_loop(
     shared: Arc<Shared>,
     chain: Arc<ChainClient>,
     registry: Address,
-    wake: tokio::sync::mpsc::Sender<()>,
+    dispatch: tokio::sync::mpsc::Sender<crate::indexer_client::DispatchRequest>,
+    state_dir: Option<std::path::PathBuf>,
 ) {
+    shared.set_indexer_connected(false).await;
+    let mut reconnect_backoff = Duration::from_secs(1);
     loop {
         let info = match crate::chain::registry::read_indexer(chain.provider(), registry).await {
             Ok(i) => i,
@@ -316,32 +366,45 @@ async fn indexer_loop(
             }
         };
         if info.endpoint.is_empty() {
-            tracing::info!("no indexer registered; staying in poll-only mode");
+            tracing::info!("no indexer registered; event delivery paused");
             tokio::time::sleep(Duration::from_secs(300)).await;
             continue;
         }
         tracing::info!(endpoint = %info.endpoint, "subscribing to indexer");
-        match crate::indexer_client::connect_and_run(
+        let result = crate::indexer_client::connect_and_run(
             shared.clone(),
             info.endpoint.clone(),
             info.pubkey.0,
-            wake.clone(),
+            dispatch.clone(),
+            state_dir.clone(),
         )
-        .await
-        {
+        .await;
+        // connect_and_run marks the diagnostic connected only after Subscribe opens.
+        // A hot LB cutover therefore gets the minimum retry, while repeated failures
+        // before a stream opens back off to avoid hammering the endpoint.
+        let had_open_stream = shared.get_indexer_status().await.connected;
+        match result {
             Ok(()) => tracing::info!("indexer stream ended; re-discovering"),
             Err(e) => tracing::warn!(error = ?e, "indexer subscription failed; re-discovering"),
         }
-        tokio::time::sleep(Duration::from_secs(15)).await;
+        shared.set_indexer_connected(false).await;
+        let retry_in = if had_open_stream {
+            reconnect_backoff = Duration::from_secs(1);
+            Duration::from_secs(1)
+        } else {
+            let current = reconnect_backoff;
+            reconnect_backoff = (reconnect_backoff * 2).min(Duration::from_secs(30));
+            current
+        };
+        tracing::info!(
+            retry_ms = retry_in.as_millis(),
+            "retrying Indexer discovery"
+        );
+        tokio::time::sleep(retry_in).await;
     }
 }
 
-async fn reconcile_once(
-    ctx: &Ctx,
-    gw_domain: &str,
-    last_sent: &mut HashMap<[u8; 32], SendState>,
-    next_from_block: &mut Option<u64>,
-) -> Result<()> {
+async fn reconcile_once(ctx: &Ctx, gw_domain: &str) -> Result<()> {
     let cluster = ctx.shared.cluster;
     let members = ctx.chain.list_members(cluster).await?;
     if let Some(originator) = members.first() {
@@ -463,47 +526,26 @@ async fn reconcile_once(
             .is_some();
         let now = now_ms();
         let due = ctx.config.peer_envelope_fallback
-            && match last_sent.get(member_id) {
-                None => true,
-                Some(s) => {
-                    !peer_ed_known && now.saturating_sub(s.at_ms) > resend_delay_ms(s.attempts)
-                }
-            };
+            && resend_due(ctx, member_id, peer_ed_known, now).await;
         if due {
             match send_peer_endpoint(ctx, *member_id).await {
                 Ok(tx) => {
-                    let attempts = last_sent.get(member_id).map_or(0, |s| s.attempts);
+                    let attempts = record_send_attempt(ctx, *member_id, now).await;
                     tracing::info!(peer = %hex::encode(member_id), tx = %tx, attempts,
                         "PeerEndpoint envelope sent");
-                    last_sent.insert(
-                        *member_id,
-                        SendState {
-                            at_ms: now,
-                            attempts: attempts.saturating_add(1),
-                        },
-                    );
                 }
                 Err(e) => {
                     // Failures back off exactly like resends: a systematic bundler/
                     // paymaster rejection must not retry at reconcile cadence — each
                     // attempt consumes a sponsorship (live-found: 19 peers x 15s
                     // burned a 100-op policy counter in ~90s with zero landed ops).
-                    let attempts = last_sent.get(member_id).map_or(0, |s| s.attempts);
-                    last_sent.insert(
-                        *member_id,
-                        SendState {
-                            at_ms: now,
-                            attempts: attempts.saturating_add(1),
-                        },
-                    );
+                    let attempts = record_send_attempt(ctx, *member_id, now).await;
                     tracing::warn!(peer = %hex::encode(member_id), error = ?e, attempts,
                         "PeerEndpoint envelope send failed; backing off");
                 }
             }
         }
     }
-
-    poll_envelopes(ctx, next_from_block, last_sent).await?;
 
     if ctx.shared.peers.lock().await.live_count() > 0 || ctx.shared.gates.first_converged() {
         if ctx.shared.gates.healthy() {
@@ -553,141 +595,112 @@ async fn send_peer_endpoint(ctx: &Ctx, peer_id: [u8; 32]) -> Result<B256> {
     ctx.submit_op(inner).await
 }
 
-/// Poll `MessageSent` logs addressed to us and absorb PeerEndpoint envelopes
-/// (chain-authenticated sender: the facet emits the sender's memberId).
-async fn poll_envelopes(
-    ctx: &Ctx,
-    next_from_block: &mut Option<u64>,
-    last_sent: &mut HashMap<[u8; 32], SendState>,
-) -> Result<()> {
-    use crate::chain::abi::IMessageEvents::MessageSent;
-    use alloy::sol_types::SolEvent;
+/// Serialize signed Indexer events through the existing bring-up handlers. Completion
+/// is returned to the transport task, which sends the durable Ack only afterward.
+async fn indexer_event_loop(
+    ctx: Arc<Ctx>,
+    mut events: tokio::sync::mpsc::Receiver<crate::indexer_client::DispatchRequest>,
+    wake: tokio::sync::mpsc::Sender<()>,
+) {
+    while let Some(request) = events.recv().await {
+        let result = match request.event {
+            crate::indexer_client::IndexedEvent::MessageSent {
+                sender,
+                envelope_id,
+                ciphertext,
+                block_number,
+            } => handle_indexed_message(&ctx, sender, envelope_id, &ciphertext, block_number).await,
+            crate::indexer_client::IndexedEvent::Reconcile => {
+                let _ = wake.try_send(());
+                Ok(())
+            }
+        };
+        let completion = result.map_err(|error| format!("{error:#}"));
+        let _ = request.completion.send(completion);
+    }
+}
 
-    let head = ctx.chain.provider().get_block_number().await?;
-    let from = match *next_from_block {
-        Some(b) if b <= head => b,
-        Some(_) => return Ok(()),
-        None => head.saturating_sub(LOG_LOOKBACK_BLOCKS),
+/// Absorb one chain-authenticated MessageSent event. Invalid ciphertext or an invalid
+/// internal sender binding is a handled drop and is Ack'd so one poison message cannot
+/// wedge the member cursor indefinitely.
+async fn handle_indexed_message(
+    ctx: &Ctx,
+    sender: [u8; 32],
+    envelope_id: [u8; 32],
+    ciphertext: &[u8],
+    block_number: u64,
+) -> Result<()> {
+    let Ok(plaintext) = envelopes::open(
+        &ctx.shared.keys.x_secret,
+        &ctx.shared.keys.x_pub,
+        ciphertext,
+    ) else {
+        tracing::debug!(sender = %hex::encode(sender), envelope = %hex::encode(envelope_id),
+            block = block_number, "dropping undecryptable indexed message");
+        return Ok(());
     };
 
-    let filter = Filter::new()
-        .address(ctx.shared.cluster)
-        .event_signature(MessageSent::SIGNATURE_HASH)
-        .topic2(B256::from(ctx.shared.self_member_id))
-        .from_block(from)
-        .to_block(head);
-    let logs = ctx.chain.provider().get_logs(&filter).await?;
-    *next_from_block = Some(head + 1);
-
-    for log in logs {
-        let block_number = log.block_number.unwrap_or(0);
-        let Ok(ev) = log.log_decode::<MessageSent>() else {
-            continue;
-        };
-        let m = ev.inner.data;
-        let sender = m.senderMemberId.0;
-        let Ok(pt) = envelopes::open(
-            &ctx.shared.keys.x_secret,
-            &ctx.shared.keys.x_pub,
-            &m.ciphertext,
-        ) else {
-            continue; // not for us / not openable — fine, other envelope kinds exist
-        };
-
-        // Demux on the inner `kind`: a well-formed PeerEndpoint carrying the reserved
-        // kind is sidecar-internal; every other decrypted payload is an opaque
-        // application message forwarded to the app via SubscribeMessages (master spec
-        // §7.1 step 7, sidecar spec §12.3). The sidecar never parses app protocols.
-        match envelopes::classify_internal(&pt) {
-            Some(pe) => {
-                if pe.member_id != sender {
-                    continue; // sender-binding mismatch on an internal envelope — drop
+    match envelopes::classify_internal(&plaintext) {
+        Some(peer_endpoint) => {
+            if peer_endpoint.member_id != sender {
+                tracing::warn!(sender = %hex::encode(sender),
+                    claimed = %hex::encode(peer_endpoint.member_id),
+                    "dropping PeerEndpoint with sender-binding mismatch");
+                return Ok(());
+            }
+            {
+                let mut peers = ctx.shared.peers.lock().await;
+                if peers.set_ed25519(&sender, peer_endpoint.ed25519_pub) {
+                    tracing::info!(peer = %hex::encode(sender), host = %peer_endpoint.host,
+                        "PeerEndpoint envelope absorbed (Ed25519 key learned)");
                 }
-                {
-                    let mut peers = ctx.shared.peers.lock().await;
-                    if peers.set_ed25519(&sender, pe.ed25519_pub) {
-                        tracing::info!(peer = %hex::encode(sender), host = %pe.host,
-                            "PeerEndpoint envelope absorbed (Ed25519 key learned)");
-                    }
-                    if let Some(udp) = pe.udp_addr() {
-                        peers.set_advertised_udp(&sender, Some(udp));
-                    }
+                if let Some(udp) = peer_endpoint.udp_addr() {
+                    peers.set_advertised_udp(&sender, Some(udp));
                 }
-                // Mirror to durable state regardless of the table update: the
-                // table entry may not exist yet (envelope raced our configure pass)
-                // — the reconcile loop applies cached keys once it does.
-                {
-                    let mut learned = ctx.learned_keys.lock().await;
-                    if learned.get(&sender) != Some(&pe.ed25519_pub) {
-                        learned.insert(sender, pe.ed25519_pub);
-                        if let Err(e) = crate::peer_cache::store(
-                            ctx.config.sidecar_state_dir.as_deref(),
-                            &learned,
-                        )
-                        .await
-                        {
-                            tracing::warn!(error = ?e, "peer-key cache write failed (non-fatal)");
-                        }
-                    }
-                }
-                // The sender is announcing because it does not know OUR key (fresh
-                // join, or a restart wiped its memory — it can't ask, it can only
-                // announce). Reply with our own envelope so it converges instead of
-                // resending forever. Replying only when our last send to it is at
-                // least one resend period old makes two live nodes settle after one
-                // round trip instead of ping-ponging.
-                let now = now_ms();
-                let reply_due = ctx.config.peer_envelope_fallback
-                    && last_sent.get(&sender).map_or(true, |s| {
-                        now.saturating_sub(s.at_ms) > ENVELOPE_RESEND.as_millis() as u64
-                    });
-                if reply_due {
-                    match send_peer_endpoint(ctx, sender).await {
-                        Ok(tx) => {
-                            let attempts = last_sent.get(&sender).map_or(0, |s| s.attempts);
-                            tracing::info!(peer = %hex::encode(sender), tx = %tx,
-                                "PeerEndpoint reply sent (peer announced itself)");
-                            last_sent.insert(
-                                sender,
-                                SendState {
-                                    at_ms: now,
-                                    attempts: attempts.saturating_add(1),
-                                },
-                            );
-                        }
-                        Err(e) => {
-                            let attempts = last_sent.get(&sender).map_or(0, |s| s.attempts);
-                            last_sent.insert(
-                                sender,
-                                SendState {
-                                    at_ms: now,
-                                    attempts: attempts.saturating_add(1),
-                                },
-                            );
-                            tracing::warn!(peer = %hex::encode(sender), error = ?e,
-                                "PeerEndpoint reply failed; backing off");
-                        }
+            }
+            {
+                let mut learned = ctx.learned_keys.lock().await;
+                if learned.get(&sender) != Some(&peer_endpoint.ed25519_pub) {
+                    learned.insert(sender, peer_endpoint.ed25519_pub);
+                    if let Err(error) =
+                        crate::peer_cache::store(ctx.config.sidecar_state_dir.as_deref(), &learned)
+                            .await
+                    {
+                        tracing::warn!(error = ?error, "peer-key cache write failed (non-fatal)");
                     }
                 }
             }
-            None => {
-                // Application message: forward verbatim to SubscribeMessages
-                // subscribers. send() errs only when there are no subscribers yet —
-                // not an error (same broadcast semantics as peer_event_tx).
-                let bytes = pt.len();
-                if ctx
-                    .shared
-                    .incoming_tx
-                    .send(crate::state::AppIncoming {
-                        sender_member_id: sender,
-                        payload: pt,
-                        block_number,
-                    })
-                    .is_ok()
-                {
-                    tracing::debug!(sender = %hex::encode(sender), block = block_number,
-                        bytes, "app message forwarded to SubscribeMessages");
+
+            let now = now_ms();
+            if ctx.config.peer_envelope_fallback && reply_due(ctx, &sender, now).await {
+                match send_peer_endpoint(ctx, sender).await {
+                    Ok(tx) => {
+                        let attempts = record_send_attempt(ctx, sender, now).await;
+                        tracing::info!(peer = %hex::encode(sender), tx = %tx, attempts,
+                            "PeerEndpoint reply sent (peer announced itself)");
+                    }
+                    Err(error) => {
+                        let attempts = record_send_attempt(ctx, sender, now).await;
+                        tracing::warn!(peer = %hex::encode(sender), error = ?error, attempts,
+                            "PeerEndpoint reply failed; backing off");
+                    }
                 }
+            }
+        }
+        None => {
+            let bytes = plaintext.len();
+            if ctx
+                .shared
+                .incoming_tx
+                .send(crate::state::AppIncoming {
+                    sender_member_id: sender,
+                    payload: plaintext,
+                    block_number,
+                })
+                .is_ok()
+            {
+                tracing::debug!(sender = %hex::encode(sender), block = block_number, bytes,
+                    "app message forwarded to SubscribeMessages");
             }
         }
     }
@@ -1187,8 +1200,132 @@ async fn serve_agent_grpc(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloy::sol_types::SolValue;
+    use axum::extract::State;
+    use axum::routing::post;
+    use axum::{Json, Router};
     use rand::rngs::OsRng;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[derive(Clone)]
+    struct RejectLogsRpc {
+        list_members_result: String,
+        log_calls: Arc<AtomicUsize>,
+        view_calls: Arc<AtomicUsize>,
+    }
+
+    async fn reject_logs_rpc(
+        State(state): State<RejectLogsRpc>,
+        Json(request): Json<serde_json::Value>,
+    ) -> Json<serde_json::Value> {
+        let id = request
+            .get("id")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
+        match request.get("method").and_then(|method| method.as_str()) {
+            Some("eth_getLogs") => {
+                state.log_calls.fetch_add(1, Ordering::SeqCst);
+                Json(serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "error": {"code": -32000, "message": "archive logs disabled"}
+                }))
+            }
+            Some("eth_call") => {
+                state.view_calls.fetch_add(1, Ordering::SeqCst);
+                Json(serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "result": state.list_members_result
+                }))
+            }
+            _ => Json(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "error": {"code": -32601, "message": "unsupported test method"}
+            })),
+        }
+    }
+
+    #[tokio::test]
+    async fn current_view_reconcile_never_uses_log_rpc() {
+        let dstack: Arc<dyn DstackRuntime> =
+            Arc::new(crate::dstack::MockDstack::from_label("reject-logs-sidecar"));
+        let keys = Arc::new(crate::keys::derive_all(dstack.as_ref()).await.unwrap());
+        let member = Address::repeat_byte(0x11);
+        let cluster = Address::repeat_byte(0xc1);
+        let shared = Shared::new(keys.clone(), member, cluster, 0x0a0d0000, 16, 51821);
+        let list_members = vec![B256::from(shared.self_member_id)].abi_encode();
+        let log_calls = Arc::new(AtomicUsize::new(0));
+        let view_calls = Arc::new(AtomicUsize::new(0));
+        let rpc_state = RejectLogsRpc {
+            list_members_result: format!("0x{}", hex::encode(list_members)),
+            log_calls: log_calls.clone(),
+            view_calls: view_calls.clone(),
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let rpc_server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new()
+                    .route("/", post(reject_logs_rpc))
+                    .with_state(rpc_state),
+            )
+            .await
+            .unwrap();
+        });
+        let rpc_url = format!("http://{addr}");
+        let chain = Arc::new(ChainClient::new(&rpc_url, 8453, member, &keys).unwrap());
+        let ctx = Ctx {
+            config: Config {
+                member_contract: Some(member),
+                chain_id: 8453,
+                rpc_url: rpc_url.clone(),
+                bundler_url: "http://bundler.invalid".into(),
+                gas_policy_id: String::new(),
+                indexer_registry_addr: Address::repeat_byte(0x22),
+                gateway_domain: Some("gateway.invalid".into()),
+                peer_envelope_fallback: false,
+                wg_tcp_port: 51900,
+                wg_listen_port: 51821,
+                wg_udp_punch: false,
+                punch_timeout_secs: 10,
+                punch_retry_backoff_secs: 30,
+                dstack_socket: String::new(),
+                sidecar_state_dir: None,
+                agent_grpc_socket: String::new(),
+                health_http_addr: String::new(),
+                log_format: "json".into(),
+                log_level: "info".into(),
+            },
+            dstack: dstack.clone(),
+            chain,
+            shared: shared.clone(),
+            wg: Arc::new(crate::wg::MockWg::default()),
+            bundler: Arc::new(BundlerClient::new(
+                "http://bundler.invalid",
+                rpc_url,
+                ENTRY_POINT,
+                8453,
+                "",
+            )),
+            owner_signer: dstack_facet::derive_owner_signer(dstack.as_ref())
+                .await
+                .unwrap(),
+            submit_lock: Mutex::new(()),
+            self_sni: "self.gateway.invalid".into(),
+            puncher: None,
+            learned_keys: Mutex::new(HashMap::new()),
+            last_sent: Mutex::new(HashMap::new()),
+        };
+
+        reconcile_once(&ctx, "gateway.invalid").await.unwrap();
+        assert_eq!(view_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(log_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(shared.current_phase().await, Phase::WaitingPeers);
+        rpc_server.abort();
+    }
 
     /// The peer ingress hostname derives purely from chain state + config — the
     /// gateway's TLS-passthrough route needs the `s` suffix (a plain route is

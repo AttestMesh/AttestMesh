@@ -2,7 +2,7 @@
 
 Rust workspace for `cluster-mesh-agent` — the per-node sidecar that runs inside every AttestMesh node.
 
-Boots, derives attestation-bound identity keys (x25519 for sealed-box messaging, Ed25519 for off-chain heartbeat signatures, plus a wireguard keypair), registers with the cluster via the appropriate attestor facet, subscribes to the Indexer over gRPC, exchanges peer endpoints via MessageFacet, brings up the wireguard mesh, runs heartbeats, and reports healthy only when the mesh is converged.
+Boots, derives attestation-bound identity keys (x25519 for sealed-box messaging, Ed25519 for off-chain heartbeat signatures, plus a wireguard keypair), registers with the cluster via the appropriate attestor facet, consumes signed cluster events from the authoritative Indexer stream, brings up the wireguard mesh, runs heartbeats, and reports healthy only after mesh convergence and CSK acquisition. Direct chain RPC is used for current-state views, never event-log polling.
 
 **Spec**: [`docs/specs/sidecar.md`](../docs/specs/sidecar.md)
 **Master spec**: [`docs/specs/attestmesh-coordination-layer.md`](../docs/specs/attestmesh-coordination-layer.md)
@@ -26,7 +26,7 @@ The `MeshControl` trait abstracts wireguard (command-based impl + mock) so the c
 
 ```bash
 cargo build --release
-cargo test                    # 75 unit tests (live on Base mainnet — see docs/deployment.md + docs/specs/sidecar.md §1.1)
+cargo test                    # unit tests (live on Base mainnet — see docs/deployment.md + docs/specs/sidecar.md §1.1)
 cargo clippy -- -D warnings
 cargo fmt --check
 ```

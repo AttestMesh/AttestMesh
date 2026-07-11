@@ -120,12 +120,20 @@ impl ReadModel {
                 )
             })
             .collect::<HashMap<_, _>>();
-        g.order
-            .sort_by_key(|cluster| sort_keys.get(cluster).copied().unwrap_or((u64::MAX, u64::MAX)));
+        g.order.sort_by_key(|cluster| {
+            sort_keys
+                .get(cluster)
+                .copied()
+                .unwrap_or((u64::MAX, u64::MAX))
+        });
         true
     }
 
-    pub async fn ingest(&self, log: &crate::chain::watcher::IndexedLog, registered_at: Option<u64>) {
+    pub async fn ingest(
+        &self,
+        log: &crate::chain::watcher::IndexedLog,
+        registered_at: Option<u64>,
+    ) {
         use crate::chain::watcher::EventKind;
 
         let mut g = self.inner.write().await;
@@ -154,9 +162,7 @@ impl ReadModel {
                         tx_hash: log.tx_hash,
                         log_index: log.log_index,
                     });
-                    cluster
-                        .members
-                        .sort_by_key(|m| (m.block, m.log_index));
+                    cluster.members.sort_by_key(|m| (m.block, m.log_index));
                 }
                 cluster.events.push(timeline_event(
                     "MemberRegistered",
@@ -174,7 +180,10 @@ impl ReadModel {
                 member_id,
                 wg_pub_key,
             } => {
-                if let Some(member) = cluster.members.iter_mut().find(|m| m.member_id == *member_id)
+                if let Some(member) = cluster
+                    .members
+                    .iter_mut()
+                    .find(|m| m.member_id == *member_id)
                 {
                     member.wg_pub_key = *wg_pub_key;
                 }
@@ -211,9 +220,7 @@ impl ReadModel {
                 ));
             }
         }
-        cluster
-            .events
-            .sort_by_key(|e| (e.block, e.log_index));
+        cluster.events.sort_by_key(|e| (e.block, e.log_index));
     }
 
     pub async fn set_scanned_to_block(&self, block: u64) {
@@ -499,7 +506,9 @@ pub fn b256_hex(v: B256) -> String {
 }
 
 fn app_id_of(member_contract: Address) -> String {
-    addr_hex(member_contract).trim_start_matches("0x").to_string()
+    addr_hex(member_contract)
+        .trim_start_matches("0x")
+        .to_string()
 }
 
 fn ip_to_dotted(ip: u32) -> String {

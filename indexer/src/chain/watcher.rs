@@ -6,8 +6,7 @@
 //! relevance metadata used by the dispatch loop.
 
 use super::{
-    ClusterDeployed, CskCommitmentSet, HttpProvider, MemberRegistered, MessageSent,
-    WgKeyPublished,
+    ClusterDeployed, CskCommitmentSet, HttpProvider, MemberRegistered, MessageSent, WgKeyPublished,
 };
 use crate::query::ClusterDeployment;
 use alloy::primitives::{Address, B256};
@@ -30,14 +29,19 @@ pub enum EventKind {
         wg_pub_key: B256,
     },
     /// All cluster members care (a peer (re)published its wireguard key).
-    WgKeyPublished { member_id: B256, wg_pub_key: B256 },
+    WgKeyPublished {
+        member_id: B256,
+        wg_pub_key: B256,
+    },
     /// Only the recipient member cares; never leaked to others (spec §7.3).
     MessageSent {
         sender_member_id: B256,
         recipient_member_id: B256,
         envelope_id: B256,
     },
-    CskCommitmentSet { commitment: B256 },
+    CskCommitmentSet {
+        commitment: B256,
+    },
 }
 
 impl EventKind {

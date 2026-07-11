@@ -1,6 +1,6 @@
 # AttestMesh Sidecar — Component Spec
 
-**Status**: Implemented v1 — **live on Base mainnet (8453)**; see §1.1 and [`docs/deployment.md`](../deployment.md)
+**Status**: Implemented v1 + protocol-v2 Indexer delivery — Base canary rollout pending; see §1.1 and [`docs/deployment.md`](../deployment.md)
 **Parent spec**: [`attestmesh-coordination-layer.md`](./attestmesh-coordination-layer.md) (especially §7, §8)
 **Component**: `sidecar/`
 **Binary**: `cluster-mesh-agent`
@@ -14,7 +14,7 @@ The sidecar is the per-node process that turns "a CVM running in dstack" into "a
 
 ### 1.1 Implementation status (v1)
 
-**Complete and live-proven on Base mainnet (8453)** — see the status log in [`docs/deployment.md`](../deployment.md). `state::run()` drives the full boot sequence on a real dstack CVM: key derivation (the guest agent's `/GetKey` + `/Info`) → proof construction (`dstack_facet::build_proof_from_runtime` — the `DstackRuntime` trait sources the KMS sig chain from `/GetKey`, validated against the real on-chain `DstackSigChain.verify`) → sponsored `dstack_register` bootstrap UserOp → mesh bring-up via `bringup::launch`: wireguard over the gateway TCP leg (`transport` + `bringup` modules), `PeerEndpoint` envelopes via `MessageFacet.send` + `MessageSent` log polling, heartbeats, the CSK originate / re-derive / pull lifecycle, the peer-control + agent gRPC servers, and the Indexer subscription (§9). A two-node mesh registered, converged, distributed the CSK, and reported `healthy` on Base mainnet on 2026-06-10. The crate carries 40 unit tests; the end-to-end harness (§16.2, `tests/integration.rs`) remains `#[ignore]`d because it needs anvil + a mock dstack runtime locally — the flow it would exercise has been validated live.
+The original two-node bring-up is live-proven on Base mainnet (8453); see [`docs/deployment.md`](../deployment.md). `state::run()` drives key derivation, proof construction, sponsored registration, wireguard-over-gateway setup, heartbeats, CSK lifecycle, and the app/peer gRPC façades. Protocol v2 replaces the former sidecar `MessageSent` log poll with signed Indexer envelope dispatch while direct RPC remains limited to current-state views. The v2 path has unit and fake-Indexer transport coverage (including ACK ordering and checkpoints) and awaits the documented Indexer-first canary rollout.
 
 ---
 
@@ -123,15 +123,15 @@ All configuration is via environment variables (no config files). The sidecar fa
 |---|---|---|---|
 | `MEMBER_CONTRACT` | no | — | hex address of this node's ClusterMember proxy. Unset → self-discovered from the dstack `/Info` `app_id` at runtime (Path A: the member contract IS the phala-provisioned app_id, unknowable before `phala deploy`) |
 | `CHAIN_ID` | yes | — | EVM chain id (`8453` — Base mainnet, the v1 deployment) |
-| `RPC_URL` | yes | — | EVM RPC endpoint URL (read-only direct chain reads — §8.4) |
-| `BUNDLER_URL` | yes | — | EIP-4337 bundler RPC endpoint (Alchemy in v1). All state-mutating calls go through here. |
+| `RPC_URL` | yes | — | EVM RPC endpoint URL for current-state reads (§8.4); production may keep the local proxyd endpoint as hotfix/rollback support. |
+| `BUNDLER_URL` | yes | — | Separate EIP-4337 bundler endpoint (Alchemy in v1). It must not be replaced by the read-RPC/proxyd URL. |
 | `GAS_POLICY_ID` | no | `` | Alchemy Gas Manager policy id for `alchemy_requestGasAndPaymasterAndData` (sponsored UserOps — §8.2). |
 | `INDEXER_REGISTRY_ADDR` | yes | — | hex address of the per-chain IndexerRegistry. (Hardcoded per chain id in v1 sidecar binary; env var allows overriding for tests.) |
 | `GATEWAY_DOMAIN` | no | — | dstack gateway base domain (live value: `dstack-base-prod5.phala.network`). Peer ingress hostnames are `<app_id>-<port>s.<domain>` (§10). Unset → mesh bring-up is skipped (registration-only mode). |
 | `WG_TCP_PORT` | no | `51900` | TCP port of the wg-over-TCP ingress, exposed through the gateway (§10) |
 | `WG_LISTEN_PORT` | no | `51821` | wireguard outer listen port. Distinct from the in-mesh heartbeat port `51820` (§11.1) because kernel wg owns its UDP socket — the two must not collide |
 | `DSTACK_SOCKET` | no | `/var/run/dstack.sock` | path to dstack guest-agent socket |
-| `SIDECAR_STATE_DIR` | no | — | sidecar-only durable directory for the KMS-wrapped CSK and public peer-key cache. Production mounts `/var/lib/attestmesh` from the `sidecar-state` named volume; unset preserves network-only restart behavior. |
+| `SIDECAR_STATE_DIR` | no | — | sidecar-only durable directory for the KMS-wrapped CSK, public peer-key cache, and last signed Indexer checkpoint. Production mounts `/var/lib/attestmesh` from the `sidecar-state` named volume; unset preserves memory-only restart behavior. |
 | `AGENT_GRPC_SOCKET` | no | `/var/run/attestmesh/agent.sock` | path the app facade listens on |
 | `HEALTH_HTTP_ADDR` | no | `127.0.0.1:9090` | HTTP /healthz endpoint (for docker-compose healthcheck) |
 | `LOG_FORMAT` | no | `json` | `json` or `pretty` |
@@ -227,7 +227,7 @@ The sidecar never submits raw transactions to the chain. Every state-mutating ca
 
 ### 8.1 Provider, bundler, signer
 
-- **EVM RPC provider** (read-only): `alloy-provider` HTTP transport against `RPC_URL`. Used only for the small set of direct startup reads listed in §8.4.
+- **EVM RPC provider** (read-only): `alloy-provider` HTTP transport against `RPC_URL`. Used for current contract views listed in §8.4, never event logs.
 - **Bundler RPC**: a separate HTTP client against `BUNDLER_URL` (Alchemy's `https://...api.g.alchemy.com/v2/<key>` endpoint with the `eth_sendUserOperation` namespace). The sidecar sends a single `eth_sendUserOperation` per outbound call and polls `eth_getUserOperationReceipt` until inclusion.
 - **Signer**: a single `alloy-signer-local::PrivateKeySigner` constructed from the `attestmesh.binding.v1` k256 derived key. This is the key whose address gets set as the ClusterMember's `owner` during `dstack_register`. It signs:
   - The dstack-registration binding hash (recovered inside `DstackFacet.dstack_register`).
@@ -257,17 +257,19 @@ The very first UserOp from a fresh ClusterMember invokes `dstack_register`. At t
 
 The sidecar does not need to do anything different on its end — it constructs the UserOp the same way it constructs any other one. The chicken-and-egg is resolved entirely contract-side.
 
-### 8.4 Direct RPC reads (the only direct ones)
+### 8.4 Direct RPC reads (current state only)
 
-Used at startup, before the Indexer subscription is established:
+Direct RPC is retained for contract views:
 
 - `member.cluster()` — finds the ClusterDiamond from the predicted ClusterMember address.
 - `IndexerRegistry.current()` — finds the v1 Indexer endpoint + pubkey.
 - `AttestFacet.memberOf(memberAddr)` — restart detection (§7.1 step 4).
 - `AttestFacet.memberCount()` — CSK-role determination (§7.1 step 4a).
 - `AttestFacet.cskCommitment()` — verifying a pulled CSK against the on-chain commitment (§13 onboardee path). Read when a pull response arrives rather than at startup, but uses the same direct-RPC path.
+- `listMembers`, `memberById`, `meshIpOf`, and member key views — the periodic current-state reconciler uses these to configure peers and recover from missed wake-ups.
+- EntryPoint nonce/view calls needed to construct outbound UserOperations.
 
-Every other chain read goes via the Indexer.
+The sidecar never uses direct RPC for event history: there is no `eth_getLogs`, lookback cursor, or Indexer-outage fallback. Signed Indexer envelopes are the sole source of `MessageSent` and state-change events; state-change events merely wake the direct-view reconciler early.
 
 ### 8.5 Tx-receipt failure handling
 
@@ -300,7 +302,8 @@ message Hello {
   bytes32 cluster_addr = 1;
   bytes32 member_id = 2;
   bytes attestation = 3;    // reserved for milestone B re-verification; v1 indexer ignores (indexer.md §8.3)
-  uint64 from_block = 4;    // resume cursor; 0 means "from this member's MemberRegistered"
+  uint64 from_block = 4;    // 0 on first boot; last handled block on reconnect/backend change
+  uint32 protocol_version = 5; // 2 = signed checkpoints + initialize missing cursor at indexed head
 }
 
 message Ack {
@@ -325,13 +328,13 @@ The proto file itself is canonical for codegen; both this spec and indexer.md mu
 ### 9.2 Client behavior
 
 - Read `IndexerRegistry.current()` at boot. Cache `indexerPubKey` and `endpoint`.
-- Open a single bidi stream. Send `Hello`. Verify the first `PushEnvelope`'s `indexer_attestation` matches the registry's `codeId`. Verify `indexer_signature` against the registry's `pubKey`.
-- On every push: verify signature, decode event, dispatch to the appropriate handler (`MessageSent` → envelopes; `MemberRegistered` → state machine; `WgKeyPublished` → wg peer-key refresh; `MemberRemoved` (milestone B) → wg peer drop).
-- On every successfully-handled push: send `Ack(blockNumber, logIndex)` so the Indexer can advance its cursor for this subscriber.
-- On stream drop: exponential backoff `min(2^n s, 30s)` reconnect; resume from last-acked cursor. Re-read `IndexerRegistry.current()` on each retry in case the Indexer pubkey rotated.
-- Sampling spot-check: every Nth push (configurable, default disabled in v1, off-by-design opt-in), execute `rpc_repro` against `RPC_URL` and compare. Mismatch → log loudly, do not abort.
+- Open a single bidi stream and send protocol-v2 `Hello`. A first boot sends `from_block = 0`; reconnects send the last handled block, loaded from `SIDECAR_STATE_DIR/indexer-cursor.v1` when available. This lets a newly selected Indexer with no server cursor replay the boundary block instead of skipping to head. Verify every `indexer_signature` against the registry's `pubKey`; the signed `rpc_repro` remains diagnostic material and is not executed by default.
+- On every event push: validate the cluster/RLP shape, decode and dispatch (`MessageSent` → decrypt/demux; membership/key/CSK events → wake the current-view reconciler). Cross-cluster or malformed signed data tears down the stream; undecryptable addressed messages are handled drops.
+- Send `Ack(blockNumber, logIndex)` only after the handler completes. A signed empty checkpoint uses `(indexedThroughBlock, uint64::MAX)`, advances the server cursor across blocks with no relevant events, and is atomically persisted as the sidecar's cross-backend replay floor.
+- On stream drop: mark the Indexer diagnostic disconnected, re-read `IndexerRegistry.current()`, and retry an established stream after 1 second. Failures before Subscribe opens back off `1s → 2s → 4s … 30s`. The server's exact cursor wins when present; a different backend replays from the sidecar-supplied block, including that whole boundary block. Registry read failures retry after 60 seconds, and an empty registry after 300 seconds.
+- Preserve the signed `rpc_repro` for diagnostics/future sampling; protocol v2 does not execute it.
 
-As wired in v1 (live): `bringup::indexer_loop` + `indexer_client.rs` implement exactly this — endpoint + pubkey discovered from `IndexerRegistry`, every push Ed25519-verified, reconnect with backoff (re-reading the registry each time). A verified push **wakes the chain-read reconcile pass** (§10/§7 peer reconciler) — pushed payloads are never the data source, only the latency cut; the periodic RPC poll remains the fallback, and an empty registry leaves the sidecar in poll-only mode (re-checked every 5 minutes). One gateway quirk: the dstack gateway's TLS-passthrough route does proxy gRPC/h2, but answers ALPN with `http/1.1`, so the tonic client must set `ClientTlsConfig::assume_http2(true)`.
+As wired in protocol v2, the Indexer is the sidecar's sole event source: there is no `eth_getLogs` boot scan or outage fallback. Direct RPC remains for current contract views (`listMembers`, member/key/CSK reads, and IndexerRegistry discovery). A missing/down Indexer pauses event delivery while reconnect runs; `MeshStatus` and `/healthz` report `indexer_connected`, `indexer_caught_up`, and the cursor block, but those diagnostics do not participate in the convergence+CSK health result. One gateway quirk remains: the tonic client must set `ClientTlsConfig::assume_http2(true)` for the dstack gateway.
 
 ---
 
@@ -432,6 +435,9 @@ message MeshStatus {
   bool first_converged = 2;
   bool csk_acquired = 3;
   uint32 live_peer_count = 4;
+  bool indexer_connected = 5;        // diagnostic only
+  bool indexer_caught_up = 6;        // signed checkpoint observed this session
+  uint64 indexer_cursor_block = 7;
 }
 
 message SelfInfo {
@@ -485,7 +491,7 @@ message ClusterSharedKey { bytes key = 1; }   // 32 bytes
 ### 12.3 Semantics
 
 - `SendMessage`: sidecar encrypts payload with sealed-box to `recipient_member_id`'s `xPubKey` (read from local cache → fallback `AttestFacet.xPubKeyOf` via RPC), submits `MessageFacet.send(recipient, envelope_id, ciphertext)`. Returns when the tx is mined (Base ≈ 2s blocks; a few seconds typical). On revert (`DuplicateEnvelope`, `RecipientNotMember`), returns `FailedPrecondition` with a descriptive message.
-- `SubscribeMessages`: stream every successfully-decrypted incoming message whose recipient is self and whose kind is *not* a sidecar-internal type. Forwarding rule (`bringup.rs::poll_envelopes`): a plaintext that decodes as a `PeerEndpoint` carrying the reserved `peer-endpoint.v1` kind is consumed internally; **every other decrypted payload is forwarded verbatim** to the app as `AppIncoming{sender_member_id, payload, block_number}` → `IncomingMessage`. Detection is structural (`PeerEndpoint::decode(..) && is_peer_endpoint()`), not a byte-prefix, since envelopes are CBOR-map-encoded; the sidecar never parses the app payload. Failed decryptions are silently dropped. Catchup/dedup: `poll_envelopes` re-scans `LOG_LOOKBACK_BLOCKS` and the channel is bounded (§12.4), so the app **sees replays** on restart / re-poll and must dedup (the first consumer, the matrix-admin-agent [`matrix-admin-agent.md`](./matrix-admin-agent.md), keeps a `request_id` ledger).
+- `SubscribeMessages`: stream every successfully-decrypted indexed message whose recipient is self and whose kind is *not* sidecar-internal. A plaintext `PeerEndpoint` carrying the reserved `peer-endpoint.v1` kind is consumed internally; **every other decrypted payload is forwarded verbatim** as `AppIncoming{sender_member_id, payload, block_number}`. Failed decryptions are handled drops and Ack'd so poison messages cannot wedge replay. Delivery is at-least-once; applications must dedup (the matrix-admin-agent keeps a `request_id` ledger), and the in-memory app queue remains non-durable across sidecar process restarts.
 - `SubscribePeerEvents`: stream `PeerJoined` (on MemberRegistered + endpoint) and `PeerLiveness` (on heartbeat status changes).
 - `GetClusterSharedKey`: returns the 32-byte CSK. Returns `Unavailable` before acquisition.
 - `GetSelf` / `GetMeshStatus` / `ListPeers`: trivial reads of in-memory state.
@@ -547,7 +553,7 @@ Phases reported (`MeshStatus.phase`):
 - `booting` — pre key-derivation
 - `registering` — pre-`dstack_register` tx
 - `subscribing` — opening Indexer stream
-- `waiting-peers` — Indexer connected, awaiting `PeerEndpoint` envelopes
+- `waiting-peers` — no other current members yet, or awaiting peer configuration
 - `pulling-csk` — onboardees only: pulling the CSK from a connected peer over the mesh
 - `wg-configuring` — adding peers to wireguard
 - `heartbeating` — peers added, awaiting first convergence
@@ -558,7 +564,7 @@ Phases reported (`MeshStatus.phase`):
 ## 15. Failure handling
 
 - **Registration revert** (any reason except `AlreadyRegistered` — see §7.1 step 4): exit non-zero. docker-compose restart policy applies; if the cause is allowlist-related, the loop continues until ops intervenes.
-- **Indexer down**: exponential backoff reconnect. Bring-up does not block: the chain-read reconcile poll (§9, as-wired note) keeps delivering membership + envelopes over RPC, so joiners still progress; healthy nodes stay healthy (first-converged gate fires once).
+- **Indexer down**: reconnect with backoff; event delivery pauses and no direct-log fallback starts. Current-view peer reconciliation and the latched convergence+CSK health result continue, while Indexer diagnostics report disconnected.
 - **CSK pull fails (no reachable peer holds it)**: phase stuck at `pulling-csk` (onboardees). Operational fix required.
 - **Convergence never reached**: phase stuck at `heartbeating`. Same.
 - **wg netlink errors**: log at error, retry. Persistent failure → exit non-zero (capability issue or kernel mismatch).
@@ -588,7 +594,9 @@ Phases reported (`MeshStatus.phase`):
 4. Heartbeat liveness reflects connection state.
 5. `SendMessage` from A to B is observed in B's `SubscribeMessages` stream as a decrypted payload; not observed in C's stream.
 6. Killing the originator and bringing up a fourth onboardee still succeeds (the fourth pulls from one of the remaining two).
-7. Killing the Indexer mid-flight: existing healthy sidecars stay healthy; a fresh sidecar boots and stays at `subscribing` phase.
+7. Killing the Indexer mid-flight only flips the diagnostic connection fields: existing health remains unchanged, event delivery pauses, and neither an existing nor a fresh sidecar starts an RPC log scan.
+8. The focused fake-Indexer transport test delivers a signed `MessageSent`, proves its Ack happens only after handler completion, and verifies checkpoint Ack/diagnostics.
+9. A rejecting JSON-RPC fixture allows current-view reconciliation but rejects every `eth_getLogs`; boot reconciliation succeeds with zero log calls.
 
 No fuzz tests for v1. No mainnet-fork tests. No actual dstack hardware tests; those are milestone B.
 
