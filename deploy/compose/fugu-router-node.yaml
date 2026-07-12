@@ -310,7 +310,7 @@ services:
   #    Its entrypoint CSK-derives the redis password over the agent gRPC before exec.
   #    DSN is the multi-host pg-ha forwarder path (survives node rolls/failover). ──
   litellm:
-    image: ghcr.io/attestmesh/fugu-router@sha256:dd092faba6987084516f980d9c19843fdf91985b35cefe9368eb2ef032a72ebd # build 29172279919: bounded recovery + LB health contract
+    image: ghcr.io/attestmesh/fugu-router@sha256:557aaa0d555b4f93c0565dabcd6a0ce7e7ab35573d5e6fe68dea590b99838b10 # build 29175095994: bounded DB connect retry + LB health contract
     restart: unless-stopped
     depends_on:
       - sidecar
@@ -378,7 +378,7 @@ services:
   # quota/rate-limit retry across subscription keys, and the /fugu/dashboard UI. It
   # shares LiteLLM's network namespace so the egress firewall governs both processes.
   session-router:
-    image: ghcr.io/attestmesh/fugu-router@sha256:dd092faba6987084516f980d9c19843fdf91985b35cefe9368eb2ef032a72ebd # build 29172279919: bounded recovery + LB health contract
+    image: ghcr.io/attestmesh/fugu-router@sha256:557aaa0d555b4f93c0565dabcd6a0ce7e7ab35573d5e6fe68dea590b99838b10 # build 29175095994: bounded DB connect retry + LB health contract
     restart: unless-stopped
     network_mode: service:litellm
     depends_on:
