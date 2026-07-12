@@ -8,6 +8,7 @@ on:
   push:
     paths:
       - "deploy/pg-ha/**"
+      - "deploy/postgres-walg/**"
       - ".github/workflows/build-pg-ha.yml"
   workflow_dispatch: {}
 
@@ -33,7 +34,7 @@ jobs:
       - name: Build and push
         uses: docker/build-push-action@v6
         with:
-          context: ./deploy/pg-ha
+          context: ./deploy
           file: ./deploy/pg-ha/Dockerfile
           push: true
           tags: |
