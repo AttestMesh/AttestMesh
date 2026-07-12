@@ -12,6 +12,7 @@ import asyncio
 import json
 import os
 import re
+import time
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Any, Callable
@@ -30,18 +31,27 @@ UPSTREAM = os.environ.get("FUGU_LITELLM_UPSTREAM", "http://127.0.0.1:4000").rstr
 MASTER_KEY = os.environ.get("LITELLM_MASTER_KEY", "")
 COOLDOWN_SECONDS = int(os.environ.get("FUGU_ACCOUNT_COOLDOWN_SECONDS", "300"))
 TIE_EPSILON = Decimal(os.environ.get("FUGU_ROUTING_TIE_EPSILON", "0.000001"))
+DB_CONNECT_ATTEMPTS = max(1, int(os.environ.get("FUGU_DB_CONNECT_ATTEMPTS", "4")))
+DB_CONNECT_BACKOFF_SECONDS = max(0.0, float(os.environ.get("FUGU_DB_CONNECT_BACKOFF_SECONDS", "0.1")))
 
 app = FastAPI(title="fugu-session-router", docs_url=None, redoc_url=None)
 
 
 def _conn():
-    return psycopg.connect(
-        DATABASE_URL,
-        autocommit=True,
-        row_factory=dict_row,
-        connect_timeout=3,
-        options="-c statement_timeout=5000 -c lock_timeout=3000",
-    )
+    for attempt in range(DB_CONNECT_ATTEMPTS):
+        try:
+            return psycopg.connect(
+                DATABASE_URL,
+                autocommit=True,
+                row_factory=dict_row,
+                connect_timeout=2,
+                options="-c statement_timeout=5000 -c lock_timeout=3000",
+            )
+        except psycopg.OperationalError:
+            if attempt + 1 == DB_CONNECT_ATTEMPTS:
+                raise
+            time.sleep(DB_CONNECT_BACKOFF_SECONDS * (2**attempt))
+    raise RuntimeError("unreachable")
 
 
 def _utcnow() -> datetime:

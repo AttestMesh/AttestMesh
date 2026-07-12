@@ -160,6 +160,15 @@ case "$ACTION" in
     prepare_probe_env
     baseline_rounds
     ;;
+  soak)
+    prepare_probe_env
+    baseline_rounds
+    log_file="$LOGDIR/pg-ha-client-soak.$(ts).jsonl"
+    if ! run_probes "${PROBE_SOAK_SECONDS:-150}" >"$log_file" 2>&1; then
+      die "client soak violated the recovery SLO; probe log: $log_file"
+    fi
+    log "✔ client soak passed; probe log: $log_file"
+    ;;
   gate)
     prepare_probe_env
     baseline_rounds
@@ -186,6 +195,6 @@ case "$ACTION" in
     log "✔ client failover gate passed; probe log: $log_file"
     ;;
   *)
-    die "usage: $0 [probe-once|gate [pgN]]"
+    die "usage: $0 [probe-once|soak|gate [pgN]]"
     ;;
 esac

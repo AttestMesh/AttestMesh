@@ -12,6 +12,7 @@ import json
 import math
 import os
 import re
+import time
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Any
@@ -29,6 +30,8 @@ except Exception:  # pragma: no cover - import failure is reported at runtime.
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
 ACCOUNT_COUNT = int(os.environ.get("FUGU_ACCOUNT_COUNT", "3"))
 MODEL_PUBLIC_NAMES = ("fugu-ultra", "fugu")
+DB_CONNECT_ATTEMPTS = max(1, int(os.environ.get("FUGU_DB_CONNECT_ATTEMPTS", "4")))
+DB_CONNECT_BACKOFF_SECONDS = max(0.0, float(os.environ.get("FUGU_DB_CONNECT_BACKOFF_SECONDS", "0.1")))
 WINDOWS = {
     "5h": "5 hours",
     "week": "7 days",
@@ -235,13 +238,20 @@ def _conn():
         raise RuntimeError("psycopg is not installed")
     if not DATABASE_URL:
         raise RuntimeError("DATABASE_URL is empty")
-    return psycopg.connect(
-        DATABASE_URL,
-        autocommit=True,
-        row_factory=dict_row,
-        connect_timeout=3,
-        options="-c statement_timeout=5000 -c lock_timeout=3000",
-    )
+    for attempt in range(DB_CONNECT_ATTEMPTS):
+        try:
+            return psycopg.connect(
+                DATABASE_URL,
+                autocommit=True,
+                row_factory=dict_row,
+                connect_timeout=2,
+                options="-c statement_timeout=5000 -c lock_timeout=3000",
+            )
+        except psycopg.OperationalError:
+            if attempt + 1 == DB_CONNECT_ATTEMPTS:
+                raise
+            time.sleep(DB_CONNECT_BACKOFF_SECONDS * (2**attempt))
+    raise RuntimeError("unreachable")
 
 
 def init_schema(conn) -> None:

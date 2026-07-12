@@ -8,6 +8,7 @@ import json
 import os
 import sys
 import time
+import urllib.error
 import urllib.request
 from collections.abc import Awaitable, Callable
 
@@ -22,10 +23,17 @@ def _http_json(url: str, headers: dict[str, str] | None = None) -> object:
     request_headers = {"User-Agent": "curl/8.0"}
     request_headers.update(headers or {})
     request = urllib.request.Request(url, headers=request_headers)
-    with urllib.request.urlopen(request, timeout=8) as response:
-        if response.status != 200:
-            raise RuntimeError(f"{url} returned HTTP {response.status}")
-        return json.loads(response.read().decode())
+    try:
+        with urllib.request.urlopen(request, timeout=8) as response:
+            if response.status != 200:
+                raise RuntimeError(f"{url} returned HTTP {response.status}")
+            return json.loads(response.read().decode())
+    except urllib.error.HTTPError as exc:
+        # urllib otherwise hides the application response body behind a generic
+        # HTTPError. Keep this bounded so a failed gate says which database path
+        # failed without allowing an untrusted response to flood the JSONL log.
+        body = exc.read(2048).decode(errors="replace").replace("\n", " ").strip()
+        raise RuntimeError(f"{url} returned HTTP {exc.code}: {body[:1000]}") from exc
 
 
 async def hindsight() -> None:
