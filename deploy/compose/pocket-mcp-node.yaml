@@ -227,7 +227,8 @@ services:
   # and metered Qwen via sidecar:18889. MCP_AUTH_TOKEN is optional
   # (empty = mesh membership is the trust boundary in v1).
   mcp:
-    image: ghcr.io/attestmesh/pocket-mcp@sha256:471a99c04123ae6461d5f177fc570d5457bf4411309c4bab3ad0b5e90f75d1e4
+    # Exact base application plus bounded, idempotent read retry during Patroni failover.
+    image: ghcr.io/attestmesh/pocket-mcp-failover@sha256:7097e0149a58b4c70970a0d8e42876fcb2ef884b2bb51b9fb17c00e2b2e0ce5f
     restart: unless-stopped
     depends_on:
       init:
