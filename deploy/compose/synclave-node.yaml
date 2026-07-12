@@ -166,6 +166,7 @@ services:
   # (DAEMON_URL below). Tenant apps + the concierge are served by Cluster 2 under its own domain.
 
   app:
+    # v44 = synclave main fce1b94 — external app resource/key-signing APIs + compact API-token permissions.
     # v6 = cluster API bridge: logged-in users see the live C3 members as CVM
     # graph nodes, with the API URL sealed to the dstack bridge listener.
     # Digest-pinned: in-place UpgradeApp rolls never re-pull a same-tag image.
@@ -188,7 +189,7 @@ services:
     # v21 = user-visible orchestrator failure details in enclave deploys;
     # v20 = CLUSTER_NETWORKS-only live mesh config + structured orchestrator errors;
     # v19 = Apps → Sandboxes rename (labels only, wire stays app).
-    image: ghcr.io/dmvt/synclave-app:v43-pg-failover-20260711@sha256:a62b1cb741dcef5bff3fb9583ce93f44e4f87b99fe1a8c63fed4e0b164f1d1b6
+    image: ghcr.io/dmvt/synclave-app:v44-api-permissions-20260712@sha256:2e67b3d4b1238a151bef6626a01fe2f1e61cfa3c8d7309bef76ba6fa3631cba1
     environment:
       API_HOST: 0.0.0.0
       API_PORT: 80
