@@ -133,12 +133,14 @@ case "$ACTION" in
     done
     ;;
   gate)
-    CANDIDATE="${CANDIDATE:-$(zero_lag_replica)}"
-    [ -n "$CANDIDATE" ] || die "no zero-lag replica is eligible for the failover gate"
     prepare_probe_env
     for _ in 1 2 3; do
       run_probes 0
     done
+    # Baseline probes can generate WAL. Select immediately before the mutation
+    # rather than carrying a replica decision made before those writes.
+    CANDIDATE="${CANDIDATE:-$(zero_lag_replica)}"
+    [ -n "$CANDIDATE" ] || die "no zero-lag replica is eligible for the failover gate"
     former_leader="$(current_leader)"
     log_file="$LOGDIR/pg-ha-client-gate.$(ts).jsonl"
     run_probes 150 >"$log_file" 2>&1 &

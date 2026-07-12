@@ -675,7 +675,7 @@ verify_agent() {
 }
 
 switchover() {
-  local candidate="${1:?usage: pg-ha-node.sh <name> switchover <pgN>}" first_ip control_ip topology leader eligible response pair request_ok
+  local candidate="${1:?usage: pg-ha-node.sh <name> switchover <pgN>}" first_ip control_ip topology leader eligible response pair request_ok i
   local -a pairs
   _load_cluster
   case " $(_nodes | tr '\n' ' ') " in
@@ -683,14 +683,20 @@ switchover() {
     *) die "unknown switchover candidate: $candidate" ;;
   esac
   first_ip="${PGHA_PEERS#*=}"; first_ip="${first_ip%%,*}"
-  topology=$(_mesh_ssh "curl -fsS --max-time 5 http://${first_ip}:8008/cluster")
-  leader=$(jq -r '.members[]? | select(.role == "leader") | .name' <<<"$topology")
-  eligible=$(jq -r --arg n "$candidate" '
-    .members[]?
-    | select(.name == $n and .role == "replica")
-    | select(.state == "streaming" or .state == "running")
-    | select((.lag // 0) == 0)
-    | .name' <<<"$topology")
+  leader=""; eligible=""
+  for i in $(seq 1 30); do
+    topology=$(_mesh_ssh "curl -fsS --max-time 5 http://${first_ip}:8008/cluster")
+    leader=$(jq -r '.members[]? | select(.role == "leader") | .name' <<<"$topology")
+    eligible=$(jq -r --arg n "$candidate" '
+      .members[]?
+      | select(.name == $n and .role == "replica")
+      | select(.state == "streaming" or .state == "running")
+      | select((.lag // 0) == 0)
+      | .name' <<<"$topology")
+    [ -n "$leader" ] && [ "$eligible" = "$candidate" ] && break
+    log "… waiting for zero-lag switchover candidate=$candidate ($i/30)"
+    sleep 1
+  done
   [ -n "$leader" ] && [ "$eligible" = "$candidate" ] \
     || die "candidate $candidate is not a zero-lag streaming replica"
   control_ip=""
