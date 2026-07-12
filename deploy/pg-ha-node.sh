@@ -685,7 +685,7 @@ verify_agent() {
 }
 
 switchover() {
-  local candidate="${1:?usage: pg-ha-node.sh <name> switchover <pgN>}" first_ip control_ip topology leader eligible response pair request_ok i
+  local candidate="${1:?usage: pg-ha-node.sh <name> switchover <pgN>}" first_ip control_ip topology leader eligible response pair request_ok i request_i current_leader
   local -a pairs
   _load_cluster
   case " $(_nodes | tr '\n' ' ') " in
@@ -720,20 +720,53 @@ switchover() {
   [ -n "$control_ip" ] || die "could not resolve mesh IP for leader $leader"
 
   log "▶ controlled Patroni switchover: leader=$leader candidate=$candidate"
-  request_ok=1
-  response=$(
-    {
-      printf 'TOKEN=%q\nCANDIDATE=%q\nCONTROL=%q\n' "$PGHA_VERIFY_PASSWORD" "$candidate" "$control_ip"
-      cat <<'RSCRIPT'
+  request_ok=0
+  response=""
+  for request_i in $(seq 1 30); do
+    topology=$(_mesh_ssh "curl -fsS --max-time 5 http://${first_ip}:8008/cluster")
+    current_leader=$(jq -r '.members[]? | select(.role == "leader") | .name' <<<"$topology")
+    eligible=$(jq -r --arg n "$candidate" '
+      .members[]?
+      | select(.name == $n and .role == "replica")
+      | select(.state == "streaming" or .state == "running")
+      | select((.lag // 0) == 0)
+      | .name' <<<"$topology")
+    if [ "$current_leader" != "$leader" ]; then
+      log "Patroni leader changed before the switchover request; refusing to retry"
+      break
+    fi
+    if [ "$eligible" != "$candidate" ]; then
+      log "… waiting for candidate=$candidate to return to zero lag before request ($request_i/30)"
+      sleep 1
+      continue
+    fi
+    if response=$(
+      {
+        printf 'TOKEN=%q\nCANDIDATE=%q\nCONTROL=%q\n' "$PGHA_VERIFY_PASSWORD" "$candidate" "$control_ip"
+        cat <<'RSCRIPT'
 payload=$(printf '{"candidate":"%s"}' "$CANDIDATE")
-curl -fsS --max-time 30 -X POST \
+curl -sS --fail-with-body --max-time 30 -X POST \
   -H "Authorization: Bearer $TOKEN" \
   -H 'Content-Type: application/json' \
   --data-binary "$payload" \
   "http://$CONTROL:8010/switchover"
 RSCRIPT
-    } | _mesh_ssh "bash -s"
-  ) || request_ok=0
+      } | _mesh_ssh "bash -s"
+    ); then
+      request_ok=1
+      break
+    fi
+    if jq -e '.error == "ValueError: candidate is not a zero-lag streaming replica"' \
+      <<<"$response" >/dev/null 2>&1; then
+      # The controller performs this validation before checkpointing or sending
+      # anything to Patroni, so this one explicit response is safe to retry.
+      log "… controller observed transient replica lag; retrying the pre-mutation check ($request_i/30)"
+      sleep 1
+      continue
+    fi
+    log "Patroni control rejected the request: ${response:-no response body}"
+    break
+  done
   if [ "$request_ok" = 1 ]; then
     jq -e --arg candidate "$candidate" '.candidate == $candidate' <<<"$response" >/dev/null \
       || die "Patroni control response did not confirm candidate $candidate: $response"
