@@ -1,0 +1,29 @@
+#!/bin/sh
+# Keep an in-flight WAL upload from extending a planned Patroni demotion.
+# A failed archive_command is safe: PostgreSQL leaves the WAL segment queued
+# and retries it later.  An unbounded wal-g child, however, prevents the old
+# primary from completing shutdown and leaves the cluster without a writer.
+set -u
+
+. /usr/local/bin/walg-env.sh
+
+wal_path="${1:?usage: walg-archive WAL_PATH}"
+timeout_seconds="${WALG_ARCHIVE_TIMEOUT_SECONDS:-5}"
+case "$timeout_seconds" in
+  ''|*[!0-9]*|0)
+    echo "walg-archive: invalid WALG_ARCHIVE_TIMEOUT_SECONDS=$timeout_seconds" >&2
+    exit 2
+    ;;
+esac
+
+if [ -z "${WALG_LIBSODIUM_KEY:-}" ]; then
+  echo "walg-archive: CSK key not ready, deferring $wal_path" >&2
+  exit 1
+fi
+
+timeout --signal=TERM --kill-after=1s "${timeout_seconds}s" wal-g wal-push "$wal_path"
+rc=$?
+if [ "$rc" -ne 0 ]; then
+  echo "walg-archive: wal-push failed or timed out rc=$rc; PostgreSQL will retry $wal_path" >&2
+fi
+exit "$rc"

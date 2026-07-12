@@ -25,5 +25,5 @@ RUN set -eux; \
     etcd --version; patroni --version; haproxy -v
 
 COPY pgha-common.sh pgha-etcd-entrypoint.sh pgha-patroni-entrypoint.sh pgha-haproxy-entrypoint.sh \
-     pgha-backup-loop.sh pgha-post-init.sh pgha-walg-bootstrap.sh /usr/local/bin/
-RUN chmod +x /usr/local/bin/pgha-*.sh
+     pgha-backup-loop.sh pgha-post-init.sh pgha-walg-bootstrap.sh walg-archive /usr/local/bin/
+RUN chmod +x /usr/local/bin/pgha-*.sh /usr/local/bin/walg-archive
