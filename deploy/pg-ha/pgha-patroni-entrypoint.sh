@@ -96,7 +96,7 @@ bootstrap:
     # Keep planned switchovers inside the one-request client recovery budget.
     # ttl/retry_timeout retain their conservative defaults and still satisfy
     # Patroni's loop_wait + 2 * retry_timeout <= ttl safety constraint.
-    loop_wait: 2
+    loop_wait: 1
     retry_timeout: 10
     maximum_lag_on_failover: 1048576
     synchronous_mode: false

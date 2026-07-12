@@ -218,7 +218,7 @@ services:
         BIND = PEERS[NODE]
         PATRONI = "http://127.0.0.1:8008"
 
-        SWITCHOVER_LOOP_WAIT = 2
+        SWITCHOVER_LOOP_WAIT = 1
 
         def json_request(url, *, data=None, headers=None, method=None):
             request = urllib.request.Request(
