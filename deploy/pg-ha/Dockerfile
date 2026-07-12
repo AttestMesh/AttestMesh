@@ -5,6 +5,9 @@
 # the image contains none. Built/pushed by .github/workflows/build-pg-ha.yml.
 FROM postgres:16-bookworm@sha256:da788743d2060767375896de4d646f7576f5911461444b372616f19ea61db2ec
 
+LABEL org.opencontainers.image.source="https://github.com/AttestMesh/AttestMesh" \
+      org.opencontainers.image.description="AttestMesh PostgreSQL HA runtime"
+
 # Build the postgres-walg layer in this provenance run instead of depending on
 # GHCR package-to-package permissions. The source remains shared with the
 # standalone Matrix image under deploy/postgres-walg/.

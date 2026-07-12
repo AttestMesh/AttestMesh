@@ -38,7 +38,6 @@ jobs:
           file: ./deploy/pg-ha/Dockerfile
           push: true
           tags: |
-            ghcr.io/attestmesh/pg-ha:latest
-            ghcr.io/attestmesh/pg-ha:${{ github.sha }}
+            ghcr.io/attestmesh/pg-ha-v2:${{ github.sha }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
