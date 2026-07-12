@@ -141,18 +141,27 @@ current_leader() {
 }
 
 zero_lag_replica() {
-  local first_ip
+  local first_ip candidate i topology
   first_ip="$(state_value "$PG_STATE" PGHA_PEERS)"
   first_ip="${first_ip#*=}"; first_ip="${first_ip%%,*}"
-  ssh -o BatchMode=yes "$MESH_SSH_HOST" \
-    "curl -fsS --max-time 5 http://${first_ip}:8008/cluster" \
-    | jq -r '.members[]
-      | select(.role == "replica")
-      | select(.state == "streaming" or .state == "running")
-      | select((.lag // 0) == 0)
-      | .name' \
-    | sort \
-    | head -1
+  for i in $(seq 1 30); do
+    topology="$(ssh -o BatchMode=yes "$MESH_SSH_HOST" \
+      "curl -fsS --max-time 5 http://${first_ip}:8008/cluster" 2>/dev/null || true)"
+    candidate="$(jq -r '.members[]?
+        | select(.role == "replica")
+        | select(.state == "streaming" or .state == "running")
+        | select((.lag // 0) == 0)
+        | .name' <<<"$topology" \
+      | sort \
+      | head -1)"
+    if [ -n "$candidate" ]; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+    log "… waiting for a zero-lag failover candidate ($i/30)" >&2
+    sleep 1
+  done
+  return 0
 }
 
 case "$ACTION" in
