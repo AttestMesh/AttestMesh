@@ -49,6 +49,17 @@ mesh_ip_for_state() {
   ipv4_from_u32 "$raw"
 }
 
+probe_enabled() {
+  local name="$1" selected
+  selected="${PROBE_NAMES:-}"
+  [ -z "$selected" ] && return 0
+  selected="${selected//[[:space:]]/}"
+  case ",$selected," in
+    *",$name,"*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 open_tunnel() {
   local local_port="$1" mesh_ip="$2" remote_port="$3" pid
   # The mesh gateway can reset a long-lived TLS/SSH session during an unrelated
@@ -94,36 +105,55 @@ baseline_rounds() {
 
 prepare_probe_env() {
   local agent_ip pocket_ip telegram_ip hindsight_ip fugu_lb_ip fugu_blue_ip fugu_green_ip
-  agent_ip="$(mesh_ip_for_state "$AGENT_STATE")"
-  pocket_ip="$(mesh_ip_for_state "$POCKET_STATE")"
-  telegram_ip="$(state_value "$TELEGRAM_STATE" MESH_IP)"
-  hindsight_ip="$(state_value "$HINDSIGHT_STATE" MESH_IP)"
-  fugu_lb_ip="$(state_value "$FUGU_LB_STATE" MESH_IP)"
-  fugu_blue_ip="$(state_value "$FUGU_BLUE_STATE" MESH_IP)"
-  fugu_green_ip="$(state_value "$FUGU_GREEN_STATE" MESH_IP)"
-  [ -n "$fugu_lb_ip" ] && [ -n "$fugu_blue_ip" ] && [ -n "$fugu_green_ip" ] \
-    || die "Fugu LB/blue/green state is incomplete"
-  source "$FUGU_SECRETS"
-  [ -n "${LITELLM_MASTER_KEY:-}" ] || die "LITELLM_MASTER_KEY is missing from $FUGU_SECRETS"
-
-  open_tunnel 28081 "$agent_ip" 8081
-  open_tunnel 28085 "$telegram_ip" 18085
-  open_tunnel 28088 "$hindsight_ip" 18888
-  open_tunnel 28410 "$fugu_lb_ip" 18410
-  open_tunnel 28411 "$fugu_blue_ip" 18410
-  open_tunnel 28412 "$fugu_green_ip" 18410
-  open_tunnel 28800 "$pocket_ip" 20800
-
-  export PROBE_AGENT_MCP_URL=http://127.0.0.1:28081/mcp
-  export PROBE_TELEGRAM_MCP_URL=http://127.0.0.1:28085/mcp
-  export PROBE_HINDSIGHT_URL=http://127.0.0.1:28088
-  export PROBE_HINDSIGHT_TOKEN="$(state_value "$HINDSIGHT_STATE" TAK)"
-  export PROBE_FUGU_LB_URL=http://127.0.0.1:28410
-  export PROBE_FUGU_BLUE_URL=http://127.0.0.1:28411
-  export PROBE_FUGU_GREEN_URL=http://127.0.0.1:28412
-  export PROBE_FUGU_API_KEY="$LITELLM_MASTER_KEY"
-  export PROBE_POCKET_MCP_URL=http://127.0.0.1:28800/sse
-  export PROBE_SYNCLAVE_URL=https://console.attestmesh.xyz
+  if probe_enabled agent_session_mcp; then
+    agent_ip="$(mesh_ip_for_state "$AGENT_STATE")"
+    open_tunnel 28081 "$agent_ip" 8081
+    export PROBE_AGENT_MCP_URL=http://127.0.0.1:28081/mcp
+  fi
+  if probe_enabled telegram_fts; then
+    telegram_ip="$(state_value "$TELEGRAM_STATE" MESH_IP)"
+    [ -n "$telegram_ip" ] || die "Telegram mesh state is incomplete"
+    open_tunnel 28085 "$telegram_ip" 18085
+    export PROBE_TELEGRAM_MCP_URL=http://127.0.0.1:28085/mcp
+  fi
+  if probe_enabled hindsight; then
+    hindsight_ip="$(state_value "$HINDSIGHT_STATE" MESH_IP)"
+    [ -n "$hindsight_ip" ] || die "Hindsight mesh state is incomplete"
+    open_tunnel 28088 "$hindsight_ip" 18888
+    export PROBE_HINDSIGHT_URL=http://127.0.0.1:28088
+    export PROBE_HINDSIGHT_TOKEN="$(state_value "$HINDSIGHT_STATE" TAK)"
+  fi
+  if probe_enabled pocket_mcp; then
+    pocket_ip="$(mesh_ip_for_state "$POCKET_STATE")"
+    open_tunnel 28800 "$pocket_ip" 20800
+    export PROBE_POCKET_MCP_URL=http://127.0.0.1:28800/sse
+  fi
+  if probe_enabled synclave; then
+    export PROBE_SYNCLAVE_URL=https://console.attestmesh.xyz
+  fi
+  if probe_enabled fugu_lb || probe_enabled fugu_blue || probe_enabled fugu_green; then
+    source "$FUGU_SECRETS"
+    [ -n "${LITELLM_MASTER_KEY:-}" ] || die "LITELLM_MASTER_KEY is missing from $FUGU_SECRETS"
+    export PROBE_FUGU_API_KEY="$LITELLM_MASTER_KEY"
+  fi
+  if probe_enabled fugu_lb; then
+    fugu_lb_ip="$(state_value "$FUGU_LB_STATE" MESH_IP)"
+    [ -n "$fugu_lb_ip" ] || die "Fugu LB state is incomplete"
+    open_tunnel 28410 "$fugu_lb_ip" 18410
+    export PROBE_FUGU_LB_URL=http://127.0.0.1:28410
+  fi
+  if probe_enabled fugu_blue; then
+    fugu_blue_ip="$(state_value "$FUGU_BLUE_STATE" MESH_IP)"
+    [ -n "$fugu_blue_ip" ] || die "Fugu blue state is incomplete"
+    open_tunnel 28411 "$fugu_blue_ip" 18410
+    export PROBE_FUGU_BLUE_URL=http://127.0.0.1:28411
+  fi
+  if probe_enabled fugu_green; then
+    fugu_green_ip="$(state_value "$FUGU_GREEN_STATE" MESH_IP)"
+    [ -n "$fugu_green_ip" ] || die "Fugu green state is incomplete"
+    open_tunnel 28412 "$fugu_green_ip" 18410
+    export PROBE_FUGU_GREEN_URL=http://127.0.0.1:28412
+  fi
 }
 
 run_probes() {
