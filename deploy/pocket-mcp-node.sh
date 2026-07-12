@@ -448,7 +448,11 @@ update_member() {
   _load; _require_env
   [ -n "${X:-}" ] && [ -n "${VM_ID:-}" ] && [ -n "${CLUSTER:-}" ] || die "need X/VM_ID/CLUSTER in $STATE"
   local nh allowed out j mode
-  embedding_preflight
+  if [ "${SKIP_EMBEDDING_PREFLIGHT:-false}" = true ]; then
+    log "Pocket embedding preflight explicitly skipped for this update"
+  else
+    embedding_preflight
+  fi
   nh=$(_box_run hash | grep -oE '^[0-9a-f]{64}$' | tail -1)
   [ -n "$nh" ] || die "could not compute new compose_hash"
   log "new compose_hash=0x$nh"
