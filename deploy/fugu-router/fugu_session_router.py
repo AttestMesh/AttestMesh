@@ -9,6 +9,7 @@ serves a small mesh-only dashboard backed by the fugu credit ledger.
 from __future__ import annotations
 
 import asyncio
+import functools
 import json
 import os
 import re
@@ -33,6 +34,7 @@ COOLDOWN_SECONDS = int(os.environ.get("FUGU_ACCOUNT_COOLDOWN_SECONDS", "300"))
 TIE_EPSILON = Decimal(os.environ.get("FUGU_ROUTING_TIE_EPSILON", "0.000001"))
 DB_CONNECT_ATTEMPTS = max(1, int(os.environ.get("FUGU_DB_CONNECT_ATTEMPTS", "4")))
 DB_CONNECT_BACKOFF_SECONDS = max(0.0, float(os.environ.get("FUGU_DB_CONNECT_BACKOFF_SECONDS", "0.1")))
+DB_READ_ATTEMPTS = max(1, int(os.environ.get("FUGU_DB_READ_ATTEMPTS", "2")))
 
 app = FastAPI(title="fugu-session-router", docs_url=None, redoc_url=None)
 
@@ -44,7 +46,7 @@ def _conn():
                 DATABASE_URL,
                 autocommit=True,
                 row_factory=dict_row,
-                connect_timeout=2,
+                connect_timeout=1,
                 options="-c statement_timeout=5000 -c lock_timeout=3000",
             )
         except psycopg.OperationalError:
@@ -52,6 +54,23 @@ def _conn():
                 raise
             time.sleep(DB_CONNECT_BACKOFF_SECONDS * (2**attempt))
     raise RuntimeError("unreachable")
+
+
+def _retry_read_operation(func: Callable[..., Any]) -> Callable[..., Any]:
+    """Retry a read-only handler when a mesh handoff drops its DB socket."""
+
+    @functools.wraps(func)
+    def wrapped(*args: Any, **kwargs: Any) -> Any:
+        for attempt in range(DB_READ_ATTEMPTS):
+            try:
+                return func(*args, **kwargs)
+            except psycopg.OperationalError:
+                if attempt + 1 == DB_READ_ATTEMPTS:
+                    raise
+                time.sleep(DB_CONNECT_BACKOFF_SECONDS * (2**attempt))
+        raise RuntimeError("unreachable")
+
+    return wrapped
 
 
 def _utcnow() -> datetime:
@@ -605,6 +624,7 @@ async def dashboard() -> HTMLResponse:
 
 
 @app.get("/fugu/api/summary")
+@_retry_read_operation
 def summary(request: Request, window: str = "5h", model: str = "all") -> JSONResponse:
     denied = _require_admin(request)
     if denied:

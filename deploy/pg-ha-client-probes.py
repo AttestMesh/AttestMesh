@@ -104,6 +104,12 @@ async def main() -> int:
         "fugu_blue": lambda: fugu(os.environ["PROBE_FUGU_BLUE_URL"]),
         "fugu_green": lambda: fugu(os.environ["PROBE_FUGU_GREEN_URL"]),
     }
+    selected = [name.strip() for name in os.environ.get("PROBE_NAMES", "").split(",") if name.strip()]
+    if selected:
+        unknown = sorted(set(selected) - set(probes))
+        if unknown:
+            raise ValueError(f"unknown probe names: {', '.join(unknown)}")
+        probes = {name: probes[name] for name in selected}
     duration = float(os.environ.get("PROBE_DURATION", "0"))
     interval = float(os.environ.get("PROBE_INTERVAL", "1"))
     max_recovery = float(os.environ.get("PROBE_MAX_RECOVERY", "10"))

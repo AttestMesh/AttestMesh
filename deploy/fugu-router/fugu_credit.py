@@ -244,7 +244,7 @@ def _conn():
                 DATABASE_URL,
                 autocommit=True,
                 row_factory=dict_row,
-                connect_timeout=2,
+                connect_timeout=1,
                 options="-c statement_timeout=5000 -c lock_timeout=3000",
             )
         except psycopg.OperationalError:
