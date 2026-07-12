@@ -178,10 +178,20 @@ _mesh_ip_for_member() {
 
 _box_run() {
   local mode="$1" node="${2:-pg1}" app_id="${3:-}" vm_id="${4:-}" guser gtok bootstrap
+  local cvm_rpc_url local_rpc_base rpc_alias
   guser=$(grep -E '^\s*username\s*=' "$HOME/.teesql/ghcr-pull.toml" 2>/dev/null | head -1 | sed -E 's/.*=\s*//' | tr -d "\"' ")
   gtok=$(grep  -E '^\s*token\s*='    "$HOME/.teesql/ghcr-pull.toml" 2>/dev/null | head -1 | sed -E 's/.*=\s*//' | tr -d "\"' ")
   [ -n "$gtok" ] || die "no ghcr token in ~/.teesql/ghcr-pull.toml"
   bootstrap="${NODE_BOOTSTRAP:-new}"
+  # proxyd requires a distinct path token for each pg-ha member. A bare local
+  # URL returns HTTP 401 and leaves the Sidecar alive but unable to initialize.
+  # Resolve the token only in memory; it is sealed over SSH stdin below.
+  local_rpc_base="${BOX_LOCAL_RPC_BASE_URL:-http://10.0.100.1:8545}"
+  cvm_rpc_url="${CVM_RPC_URL:-}"
+  if [ -z "$cvm_rpc_url" ] || [ "${cvm_rpc_url%/}" = "${local_rpc_base%/}" ]; then
+    rpc_alias="pg-ha-${node#pg}"
+    cvm_rpc_url="$(box_local_rpc_url "$BOX_HOST" "$rpc_alias")"
+  fi
   # Per-node mention alias so `@pgha-pgN` addresses exactly one bot. Only pg1 also answers to
   # the friendly shared "pg-ha" alias — giving it to every node would make one `pg-ha: …`
   # message activate all N agents in the shared room (N staged switchovers, N LLM runs).
@@ -191,7 +201,7 @@ _box_run() {
   scp -o BatchMode=yes -q "$HERE/pg-ha-node-box.py" "$BOX_HOST:/tmp/pg-ha-node-box.py"
   {
     printf 'E_CHAIN_ID=%q\n'              "$CHAIN_ID"
-    printf 'E_RPC_URL=%q\n'               "${CVM_RPC_URL:-$RPC_URL}"
+    printf 'E_RPC_URL=%q\n'               "$cvm_rpc_url"
     printf 'E_BUNDLER_URL=%q\n'           "${CVM_BUNDLER_URL:-${BUNDLER_URL:-$RPC_URL}}"
     printf 'E_GAS_POLICY_ID=%q\n'         "${GAS_POLICY_ID:-}"
     printf 'E_INDEXER_REGISTRY_ADDR=%q\n' "${INDEXER_REGISTRY_ADDR:-}"
