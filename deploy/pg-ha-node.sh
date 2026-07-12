@@ -702,9 +702,12 @@ switchover() {
   control_ip=""
   IFS=',' read -ra pairs <<<"$PGHA_PEERS"
   for pair in "${pairs[@]}"; do
-    [ "${pair%%=*}" = "$candidate" ] && control_ip="${pair#*=}"
+    # Match patronictl: submit a healthy switchover to the current leader's
+    # Patroni API.  Sending it through the candidate falls back to DCS
+    # coordination and can delay demotion by tens of seconds.
+    [ "${pair%%=*}" = "$leader" ] && control_ip="${pair#*=}"
   done
-  [ -n "$control_ip" ] || die "could not resolve mesh IP for candidate $candidate"
+  [ -n "$control_ip" ] || die "could not resolve mesh IP for leader $leader"
 
   log "▶ controlled Patroni switchover: leader=$leader candidate=$candidate"
   request_ok=1
