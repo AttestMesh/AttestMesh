@@ -28,6 +28,7 @@ cleanup() {
   local pid
   for pid in "${TUNNEL_PIDS[@]}"; do
     kill "$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
   done
 }
 trap cleanup EXIT
@@ -50,8 +51,23 @@ mesh_ip_for_state() {
 
 open_tunnel() {
   local local_port="$1" mesh_ip="$2" remote_port="$3" pid
-  ssh -N -o BatchMode=yes -o ExitOnForwardFailure=yes \
-    -L "127.0.0.1:${local_port}:${mesh_ip}:${remote_port}" "$MESH_SSH_HOST" &
+  # The mesh gateway can reset a long-lived TLS/SSH session during an unrelated
+  # CVM restart. Keep each forwarding process supervised so one transport reset
+  # cannot masquerade as a 40-second application outage.
+  (
+    trap - EXIT
+    child=""
+    trap '[ -z "$child" ] || { kill "$child" 2>/dev/null || true; wait "$child" 2>/dev/null || true; }; exit 0' TERM INT HUP
+    while :; do
+      ssh -N -o BatchMode=yes -o ExitOnForwardFailure=yes \
+        -o ServerAliveInterval=5 -o ServerAliveCountMax=2 \
+        -L "127.0.0.1:${local_port}:${mesh_ip}:${remote_port}" "$MESH_SSH_HOST" &
+      child=$!
+      wait "$child" 2>/dev/null || true
+      child=""
+      sleep 0.25
+    done
+  ) &
   pid=$!
   TUNNEL_PIDS+=("$pid")
   for _ in $(seq 1 20); do
@@ -60,6 +76,20 @@ open_tunnel() {
     sleep 0.25
   done
   die "SSH tunnel to ${mesh_ip}:${remote_port} did not open"
+}
+
+baseline_rounds() {
+  local consecutive=0 attempts=0
+  while [ "$consecutive" -lt 3 ] && [ "$attempts" -lt 12 ]; do
+    attempts=$((attempts + 1))
+    if run_probes 0; then
+      consecutive=$((consecutive + 1))
+    else
+      consecutive=0
+      log "baseline probe failure reset the consecutive-round counter ($attempts/12)"
+    fi
+  done
+  [ "$consecutive" -eq 3 ] || die "could not establish three consecutive clean consumer rounds"
 }
 
 prepare_probe_env() {
@@ -128,15 +158,11 @@ zero_lag_replica() {
 case "$ACTION" in
   probe-once)
     prepare_probe_env
-    for _ in 1 2 3; do
-      run_probes 0
-    done
+    baseline_rounds
     ;;
   gate)
     prepare_probe_env
-    for _ in 1 2 3; do
-      run_probes 0
-    done
+    baseline_rounds
     # Baseline probes can generate WAL. Select immediately before the mutation
     # rather than carrying a replica decision made before those writes.
     CANDIDATE="${CANDIDATE:-$(zero_lag_replica)}"
