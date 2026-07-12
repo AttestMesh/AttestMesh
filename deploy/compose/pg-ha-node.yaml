@@ -210,6 +210,8 @@ services:
         import urllib.request
         from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+        import psycopg
+
         NODE = os.environ["PGHA_NODE_NAME"]
         PEERS = dict(item.split("=", 1) for item in os.environ["PGHA_PEERS"].split(","))
         TOKEN = os.environ["PGHA_CONTROL_TOKEN"]
@@ -280,6 +282,8 @@ services:
                     if len(leaders) != 1 or len(targets) != 1:
                         raise ValueError("candidate is not a zero-lag streaming replica")
                     leader = leaders[0]["name"]
+                    if leader != NODE:
+                        raise ValueError("switchover control must run on the current leader")
                     password = open("/pgha-secrets/patroni-api", encoding="utf-8").read()
                     basic = base64.b64encode(("patroni:" + password).encode()).decode()
                     auth_headers = {
@@ -302,6 +306,18 @@ services:
                         # Dynamic configuration is cluster-wide. Give every member one
                         # complete old-cadence cycle to observe it before demotion.
                         time.sleep(min(previous_loop_wait + 1, 15))
+                    # Patroni's fast shutdown performs a checkpoint.  Do the heavy
+                    # flush while the primary is still serving so the subsequent
+                    # demotion/promotion window contains only the final WAL delta.
+                    super_password = open("/pgha-secrets/pg-superuser", encoding="utf-8").read()
+                    with psycopg.connect(
+                        "postgresql://postgres@127.0.0.1:5434/postgres",
+                        password=super_password,
+                        autocommit=True,
+                        connect_timeout=5,
+                        options="-c statement_timeout=60000",
+                    ) as conn:
+                        conn.execute("CHECKPOINT")
                     payload = json.dumps({"leader": leader, "candidate": candidate}).encode()
                     status, patroni_body = json_request(
                         PATRONI + "/switchover",
@@ -310,6 +326,7 @@ services:
                     )
                     self.send_json(200, {
                         "candidate": candidate,
+                        "checkpoint": True,
                         "leader": leader,
                         "loop_wait": SWITCHOVER_LOOP_WAIT,
                         "patroni_status": status,
