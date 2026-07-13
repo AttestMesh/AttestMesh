@@ -46,7 +46,7 @@ PORTS = json.loads(os.environ.get("BOX_PORTS", "[]"))
 # backend + the dstack gateway reach tlsproxy:443 at the CVM's bridge IP. In bridge
 # mode KMS is the SLIRP alias 10.0.2.2 (RA-TLS cert SAN), reached via the host DNAT.
 NET_MODE = (os.environ.get("BOX_NET_MODE", "bridge").strip().lower() or "bridge")
-# Gateway ON: tenant apps at *.app.attestmesh.xyz route through the dstack gateway,
+# Gateway ON: tenant apps at *.app.s.n route through the dstack gateway,
 # and the CVM is reachable at <app_id>-<port>s.gateway.attestmesh.xyz. Measured into
 # compose_hash (gateway_enabled).
 GATEWAY_ENABLED = os.environ.get("BOX_GATEWAY_ENABLED", "true").strip().lower() in {
@@ -73,6 +73,7 @@ ENV_KEYS = [
     "NEXTAUTH_SECRET",
     "NEXTAUTH_URL",
     "APP_DOMAIN",
+    "DIRECTORY_HOST",
     "CONSOLE_HOST",
     "REDPILL_API_KEY",
     "REDPILL_BASE_URL",
@@ -82,6 +83,7 @@ ENV_KEYS = [
     "VENICE_MODEL",
     "RUNYARD_HUB_URL",
     "RUNYARD_HUB_TOKEN",
+    "RUNYARD_PRIVACY_PREFLIGHT_CAPABILITY",
     "RUNYARD_PRIVACY_AUDIT_CAPABILITY",
     "RUNYARD_EXECUTION_MODE",
     "RUNYARD_RUNNER_LOCATION",
@@ -190,6 +192,36 @@ fi
 "$RUNSC_BIN" --version
 docker info 2>/dev/null | grep -iE "runtime" || true
 docker info 2>/dev/null | grep -qi "runsc"
+
+# dstack's minimal guest /dev does not populate loop device nodes. The kernel
+# loop driver is built in, so create the standard control and block-device nodes
+# before the privileged storage helper starts.
+if command -v modprobe >/dev/null 2>&1; then
+  modprobe loop 2>/dev/null || true
+fi
+if [ ! -e /dev/loop-control ]; then
+  mknod -m 660 /dev/loop-control c 10 237
+fi
+for n in $(seq 0 255); do
+  if [ ! -e "/dev/loop$n" ]; then
+    mknod -m 660 "/dev/loop$n" b 7 "$n"
+  fi
+done
+
+# The storage helper mounts loopback ext4 filesystems under the daemon_data
+# volume. Make that subtree a shared host mount so child mounts created in the
+# helper namespace propagate back to Docker and can be bind-mounted into tenant
+# containers. Creating the named volume here also makes its host path stable
+# before Compose evaluates the helper's bind mount.
+DAEMON_VOLUME="${DAEMON_VOLUME_NAME:-dstack_daemon_data}"
+docker volume create "$DAEMON_VOLUME" >/dev/null
+DAEMON_VOLUME_ROOT="$(docker volume inspect -f '{{ .Mountpoint }}' "$DAEMON_VOLUME")"
+STORAGE_ROOT="$DAEMON_VOLUME_ROOT/storage"
+mkdir -p "$STORAGE_ROOT"
+if ! mountpoint -q "$STORAGE_ROOT"; then
+  mount --bind "$STORAGE_ROOT" "$STORAGE_ROOT"
+fi
+mount --make-rshared "$STORAGE_ROOT"
 
 if [ -n "${DSTACK_DOCKER_PASSWORD:-}" ]; then
   echo "$DSTACK_DOCKER_PASSWORD" | docker login "${DSTACK_DOCKER_REGISTRY:-ghcr.io}" -u "$DSTACK_DOCKER_USERNAME" --password-stdin
