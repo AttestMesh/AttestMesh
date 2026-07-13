@@ -332,24 +332,25 @@ verify_app() {
 
 verify_daemon() {
   _load
-  local probe_host="${DAEMON_PROBE_HOST:-$DIRECTORY_HOST}" i code resolve=()
-  if [ -n "${WEBHOST_CVM_IP:-}" ]; then
-    resolve=(--resolve "${probe_host}:443:${WEBHOST_CVM_IP}")
+  local probe_host="${DAEMON_PROBE_HOST:-health-probe.${APP_DOMAIN}}" cvm_ip="${WEBHOST_CVM_IP:-}" i code
+  # The directory host intentionally routes every path to the public UI, so it
+  # cannot prove daemon reachability. Resolve the running CVM's bridge address
+  # from its QEMU MAC and the box DHCP lease, then probe frontproxy over the
+  # private bridge with an app-domain Host header.
+  if [ -z "$cvm_ip" ] && [ -n "${VM_ID:-}" ]; then
+    cvm_ip=$(ssh_box "mac=\$(pgrep -af qemu-system | grep '/${VM_ID}/' | sed -nE 's/.*mac=([0-9a-f:]{17}).*/\\1/p' | head -1); [ -n \"\$mac\" ] && sudo awk -v mac=\"\$mac\" '\$2 == mac { print \$3 }' /var/lib/misc/dnsmasq-dstack-br0.leases | tail -1" 2>/dev/null || true)
   fi
+  [ -n "$cvm_ip" ] || die "could not resolve Webhost CVM bridge IP; set WEBHOST_CVM_IP"
   for i in $(seq 1 30); do
-    if [ -n "${WEBHOST_CVM_IP:-}" ]; then
-      code=$(ssh_box "curl -sk -o /dev/null -w '%{http_code}' --max-time 10 --resolve ${probe_host}:443:${WEBHOST_CVM_IP} https://${probe_host}/_api/projects" 2>/dev/null || true)
-    else
-      code=$(curl -sk -o /dev/null -w '%{http_code}' --max-time 10 "${resolve[@]}" "https://${probe_host}/_api/projects" 2>/dev/null || true)
-    fi
+    code=$(ssh_box "curl -sS -o /dev/null -w '%{http_code}' --max-time 10 -H 'Host: ${probe_host}' http://${cvm_ip}/_api/projects" 2>/dev/null || true)
     if [ "$code" = 401 ] || [ "$code" = 200 ]; then
-      log "✔ tee-daemon reachable: ${probe_host}/_api/projects -> $code"
+      log "✔ tee-daemon reachable: ${probe_host} via ${cvm_ip}/_api/projects -> $code"
       return 0
     fi
     log "… tee-daemon not ready ($i/30, /_api/projects -> ${code:-000})"
     sleep 10
   done
-  die "tee-daemon did not respond at https://${probe_host}/_api/projects"
+  die "tee-daemon did not respond via ${cvm_ip}/_api/projects"
 }
 
 update_member() {
