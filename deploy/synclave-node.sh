@@ -50,7 +50,7 @@ SANDBOX_DAEMON_TOKEN="${SANDBOX_DAEMON_TOKEN:-$(sed -nE 's/^SANDBOX_DAEMON_TOKEN
 PUBLIC_BASE_URL="${PUBLIC_BASE_URL:-https://console.attestmesh.xyz}"
 CORS_ORIGIN="${CORS_ORIGIN:-https://console.attestmesh.xyz}"
 CONSOLE_HOST="${CONSOLE_HOST:-console.attestmesh.xyz}"
-APP_DOMAIN="${APP_DOMAIN:-app.attestmesh.xyz}"
+APP_DOMAIN="${APP_DOMAIN:-app.s.n}"
 INDEXER_URL="${INDEXER_URL:-http://10.0.100.1:8787}"
 GITHUB_OAUTH_CALLBACK_URL="${GITHUB_OAUTH_CALLBACK_URL:-https://console.attestmesh.xyz/api/v1/auth/github/callback}"
 # CF app-fronting (non-secret): the attestmesh.xyz zone + the origin the proxied
@@ -318,6 +318,7 @@ update_member() {
       || die "addComposeHash failed — NOT proceeding to UpgradeApp (unallowlisted compose bricks the boot)"
     allowed=$(cast call "$CLUSTER" 'allowedComposeHashes(bytes32)(bool)' "0x$nh" --rpc-url "$RPC_URL" 2>/dev/null)
     [ "$allowed" = true ] || die "compose hash still not allowlisted after send — aborting before UpgradeApp"
+    settle_compose_hash_for_kms "$CLUSTER" "$nh"
   fi
   out=$(_box_run update "$X" "$VM_ID") || die "in-place update failed"
   echo "$out"

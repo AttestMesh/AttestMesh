@@ -36,14 +36,16 @@ SYNCLAVE_SECRETS="${SYNCLAVE_SECRETS:-$HOME/.attestmesh/synclave.env}"
 REDPILL_KEY_FILE="${REDPILL_KEY_FILE:-$HOME/.attestmesh/redpill-key}"
 CLOUDFLARE_TOML="${CLOUDFLARE_TOML:-$HOME/.attestmesh/cloudflare-attestmesh-xyz.toml}"
 
-APP_DOMAIN="${APP_DOMAIN:-apps.attestmesh.xyz}"
-CONSOLE_HOST="${CONSOLE_HOST:-console.${APP_DOMAIN}}"
+APP_DOMAIN="${APP_DOMAIN:-app.s.n}"
+DIRECTORY_HOST="${DIRECTORY_HOST:-apps.synclave.net}"
+CONSOLE_HOST="${CONSOLE_HOST:-$DIRECTORY_HOST}"
 NEXTAUTH_URL="${NEXTAUTH_URL:-https://${CONSOLE_HOST}}"
 REDPILL_BASE_URL="${REDPILL_BASE_URL:-https://api.redpill.ai/v1}"
 REDPILL_MODEL="${REDPILL_MODEL:-deepseek/deepseek-v3.2}"
 VENICE_BASE_URL="${VENICE_BASE_URL:-$REDPILL_BASE_URL}"
 VENICE_MODEL="${VENICE_MODEL:-$REDPILL_MODEL}"
 RUNYARD_PRIVACY_AUDIT_CAPABILITY="${RUNYARD_PRIVACY_AUDIT_CAPABILITY:-privacy-audit}"
+RUNYARD_PRIVACY_PREFLIGHT_CAPABILITY="${RUNYARD_PRIVACY_PREFLIGHT_CAPABILITY:-privacy-preflight}"
 RUNYARD_EXECUTION_MODE="${RUNYARD_EXECUTION_MODE:-remote}"
 RUNYARD_RUNNER_LOCATION="${RUNYARD_RUNNER_LOCATION:-vps}"
 RUNYARD_PRIVACY_AUDIT_LLM="${RUNYARD_PRIVACY_AUDIT_LLM:-auto}"
@@ -165,6 +167,7 @@ _box_run() {
     printf 'E_NEXTAUTH_SECRET=%q\n' "$NEXTAUTH_SECRET"
     printf 'E_NEXTAUTH_URL=%q\n' "$NEXTAUTH_URL"
     printf 'E_APP_DOMAIN=%q\n' "$APP_DOMAIN"
+    printf 'E_DIRECTORY_HOST=%q\n' "$DIRECTORY_HOST"
     printf 'E_CONSOLE_HOST=%q\n' "$CONSOLE_HOST"
     printf 'E_REDPILL_API_KEY=%q\n' "$REDPILL_API_KEY"
     printf 'E_REDPILL_BASE_URL=%q\n' "$REDPILL_BASE_URL"
@@ -174,6 +177,7 @@ _box_run() {
     printf 'E_VENICE_MODEL=%q\n' "$VENICE_MODEL"
     printf 'E_RUNYARD_HUB_URL=%q\n' "${RUNYARD_HUB_URL:-}"
     printf 'E_RUNYARD_HUB_TOKEN=%q\n' "${RUNYARD_HUB_TOKEN:-}"
+    printf 'E_RUNYARD_PRIVACY_PREFLIGHT_CAPABILITY=%q\n' "$RUNYARD_PRIVACY_PREFLIGHT_CAPABILITY"
     printf 'E_RUNYARD_PRIVACY_AUDIT_CAPABILITY=%q\n' "$RUNYARD_PRIVACY_AUDIT_CAPABILITY"
     printf 'E_RUNYARD_EXECUTION_MODE=%q\n' "$RUNYARD_EXECUTION_MODE"
     printf 'E_RUNYARD_RUNNER_LOCATION=%q\n' "$RUNYARD_RUNNER_LOCATION"
@@ -323,7 +327,7 @@ verify_app() {
 
 verify_daemon() {
   _load
-  local probe_host="${DAEMON_PROBE_HOST:-verify-daemon.${APP_DOMAIN}}" i code resolve=()
+  local probe_host="${DAEMON_PROBE_HOST:-$DIRECTORY_HOST}" i code resolve=()
   if [ -n "${WEBHOST_CVM_IP:-}" ]; then
     resolve=(--resolve "${probe_host}:443:${WEBHOST_CVM_IP}")
   fi
