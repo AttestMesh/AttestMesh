@@ -53,7 +53,7 @@ services:
   # validated ensure/unmount/destroy API over a root-only Unix socket; tenant
   # containers and the public network cannot reach it.
   storage-helper:
-    image: ghcr.io/dmvt/webhost-storage-helper@sha256:c20c4966cb9f72d9471cd04cd752414a94d76744cf1719dcb05cecba2b315995
+    image: ghcr.io/dmvt/webhost-storage-helper:production-9738ed2@sha256:c20c4966cb9f72d9471cd04cd752414a94d76744cf1719dcb05cecba2b315995
     restart: unless-stopped
     privileged: true
     environment:
@@ -83,7 +83,7 @@ services:
   # API is gateway-exposed, so TEE_DAEMON_TOKEN is REQUIRED (the image refuses
   # to boot without it). RUNYARD_HUB_TOKEN stays sealed in this cluster.
   tee-daemon:
-    image: ghcr.io/dmvt/webhost-control@sha256:a27f52cfe4f3776c4a0852e5fc3c23d3ad78d60fc0bb10c073a34c6ab91bd0d7
+    image: ghcr.io/dmvt/webhost-control:hostname-directory-9738ed2@sha256:7043db73b5d715db3efb63b398b5aa923178816ba6f3dc677d7361fea1fa62d9
     environment:
       TEE_DAEMON_TOKEN: ${TEE_DAEMON_TOKEN}
       WEBHOST_MCP_TOKEN: ${WEBHOST_MCP_TOKEN}
@@ -165,7 +165,7 @@ services:
   # exposed, token-gated control API (/_api on tee-daemon), never the browser.
 
   concierge:
-    image: ghcr.io/dmvt/concierge@sha256:b28b71baaccfa3045e4964b3ef621fa63cadd7bc7d42e8b235101dcaf071cd2b
+    image: ghcr.io/dmvt/concierge:daemon-audit-gate-2b51e2e@sha256:efdfc40ad77876521a0c4bd4fad6995ebcc4eae7d83bfaff4804970a0d2fff07
     environment:
       CONCIERGE_PORT: 8787
       CONCIERGE_BRIEFS: /data/briefs
@@ -180,7 +180,7 @@ services:
       - "8787"
 
   frontproxy:
-    image: ghcr.io/dmvt/webhost-frontproxy@sha256:548bd0fc671fd0c8a42582e2b4cba227ca61b742cb70128eed0c94c38a545a7a
+    image: ghcr.io/dmvt/webhost-frontproxy:hostname-routing-2b51e2e@sha256:77e2294eaefb8bf146c7e44b6d522d6f5fc54b21d1dd22d6e1601abedcaf28d9
     environment:
       APP_DOMAIN: ${APP_DOMAIN}
       CONSOLE_HOST: ${CONSOLE_HOST}
@@ -197,9 +197,10 @@ services:
       - tee-daemon
 
   tlsproxy:
-    image: ghcr.io/dmvt/webhost-tlsproxy:tls-v4@sha256:d38f090a9f54cf0498591ce3b00fc5b47a7a8c353942fa1082bc74ff0e7e4120
+    image: ghcr.io/dmvt/webhost-tlsproxy:directory-e4fb640@sha256:afc0bca11b4624bf180c5eb4c962ea2b8f06ce8aed05c004e2756e3a8d2a32c0
     environment:
       CLOUDFLARE_API_TOKEN: ${CLOUDFLARE_API_TOKEN}
+      CLOUDFLARE_SYNCLAVE_API_TOKEN: ${CLOUDFLARE_SYNCLAVE_API_TOKEN}
       APP_DOMAIN: ${APP_DOMAIN}
       DIRECTORY_HOST: ${DIRECTORY_HOST}
     ports:
