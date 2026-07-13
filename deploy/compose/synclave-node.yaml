@@ -185,7 +185,7 @@ services:
     # v21 = user-visible orchestrator failure details in enclave deploys;
     # v20 = CLUSTER_NETWORKS-only live mesh config + structured orchestrator errors;
     # v19 = Apps → Sandboxes rename (labels only, wire stays app).
-    image: ghcr.io/dmvt/synclave-app:v45-api-catalog-cleanup-20260713@sha256:efb53ff96d63b8b581e28b79d90a6da31121f199927780f4aa7ee228f1bcd9e0
+    image: ghcr.io/dmvt/synclave-app:webhost-contracts-900fb9a@sha256:4750764d561b0929afb8ee4c841ad82dae6f420b6025f281e5e83a1771426f7b
     environment:
       API_HOST: 0.0.0.0
       API_PORT: 80
