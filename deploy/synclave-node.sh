@@ -295,7 +295,7 @@ verify_app() {
 # daemon lives in the isolated Open Webhost node. Keep this action for the
 # canonical Synclave deploy checklist, but delegate to the daemon owner.
 verify_daemon() {
-  local webhost_node="${WEBHOST_NODE:-webhost}"
+  local webhost_node="${WEBHOST_NODE:-open-webhost}"
   log "verify-daemon: delegating to Open Webhost node ${webhost_node}"
   "$HERE/webhost-node.sh" "$webhost_node" verify-daemon
 }
