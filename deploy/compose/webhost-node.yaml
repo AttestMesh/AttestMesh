@@ -49,13 +49,41 @@ services:
       - caddy_config_v2:/restore/caddy_config_v2
       - /var/run/dstack.sock:/var/run/dstack.sock
 
+  # The only privileged component in the tenant storage path. It exposes a
+  # validated ensure/unmount/destroy API over a root-only Unix socket; tenant
+  # containers and the public network cannot reach it.
+  storage-helper:
+    image: ghcr.io/dmvt/webhost-storage-helper@sha256:c20c4966cb9f72d9471cd04cd752414a94d76744cf1719dcb05cecba2b315995
+    restart: unless-stopped
+    privileged: true
+    environment:
+      STORAGE_ROOT: /storage
+      STORAGE_HOST_ROOT: ${DAEMON_STORAGE_HOST_DIR:-/var/lib/docker/volumes/dstack_daemon_data/_data/storage}
+      STORAGE_HELPER_SOCKET: /run/webhost-storage/helper.sock
+      STORAGE_MIN_BYTES: "67108864"
+      STORAGE_MAX_BYTES: "107374182400"
+      STORAGE_OWNER: "65532:65532"
+      STORAGE_BACKEND: fuse2fs
+      STORAGE_MOUNT_OPTIONS: loop,nodev,nosuid,noexec
+    volumes:
+      - ${DAEMON_STORAGE_HOST_DIR:-/var/lib/docker/volumes/dstack_daemon_data/_data/storage}:/storage:rshared
+      - storage_helper_run:/run/webhost-storage
+    healthcheck:
+      test: ["CMD", "python", "-m", "storage_helper.healthcheck"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    depends_on:
+      restore:
+        condition: service_completed_successfully
+
   # Our own control service (repo: webhost-control, seeded from Fleet Control's
   # services/daemon). Hosts tenant apps AND owns the source-privacy brief +
   # Runyard privacy-audit — replacing dmvt's tee-daemon + console. The control
   # API is gateway-exposed, so TEE_DAEMON_TOKEN is REQUIRED (the image refuses
   # to boot without it). RUNYARD_HUB_TOKEN stays sealed in this cluster.
   tee-daemon:
-    image: ghcr.io/dmvt/webhost-control@sha256:546f964ed3724e51d16390d22cc462489d2f73fe45e3365429b9c32c376329f0
+    image: ghcr.io/dmvt/webhost-control@sha256:a27f52cfe4f3776c4a0852e5fc3c23d3ad78d60fc0bb10c073a34c6ab91bd0d7
     environment:
       TEE_DAEMON_TOKEN: ${TEE_DAEMON_TOKEN}
       WEBHOST_MCP_TOKEN: ${WEBHOST_MCP_TOKEN}
@@ -65,13 +93,24 @@ services:
       # in deploy/webhost-node-box.py before Docker Compose starts.
       DAEMON_CONTAINER_RUNTIME: "runsc"
       DAEMON_TELEMETRY_DIR: /var/lib/tee-daemon/telemetry
+      DAEMON_MAX_ARTIFACT_BYTES: "536870912"
+      DAEMON_DEFAULT_STORAGE_BYTES: "268435456"
+      DAEMON_STORAGE_HELPER_SOCKET: /run/webhost-storage/helper.sock
+      DAEMON_STORAGE_HOST_DIR: ${DAEMON_STORAGE_HOST_DIR:-/var/lib/docker/volumes/dstack_daemon_data/_data/storage}
+      DAEMON_SLEEP_ENABLED: "true"
+      DAEMON_SLEEP_IDLE_SECONDS: "900"
+      DAEMON_WAKE_TIMEOUT_SECONDS: "25"
+      DAEMON_WAKE_CONCURRENCY: "8"
+      DAEMON_SLEEP_CONCURRENCY: "8"
       # Source-privacy brief output (shared RO with concierge) + tree-hash cache.
       BRIEFS_DIR: /data/briefs
       DIGEST_CACHE_DIR: /data/digests
       APP_DOMAIN: ${APP_DOMAIN}
+      APPS_DIRECTORY_HOST: ${DIRECTORY_HOST}
       # Runyard privacy-audit (co-located Runyard node, Cluster-2 internal).
       RUNYARD_HUB_URL: ${RUNYARD_HUB_URL:-}
       RUNYARD_HUB_TOKEN: ${RUNYARD_HUB_TOKEN:-}
+      RUNYARD_PRIVACY_PREFLIGHT_CAPABILITY: ${RUNYARD_PRIVACY_PREFLIGHT_CAPABILITY:-privacy-preflight}
       RUNYARD_PRIVACY_AUDIT_CAPABILITY: ${RUNYARD_PRIVACY_AUDIT_CAPABILITY:-privacy-audit}
       RUNYARD_EXECUTION_MODE: ${RUNYARD_EXECUTION_MODE:-auto}
       RUNYARD_RUNNER_LOCATION: ${RUNYARD_RUNNER_LOCATION:-}
@@ -82,6 +121,7 @@ services:
       - /var/run/docker.sock:/var/run/docker.sock
       - /var/run/dstack.sock:/var/run/dstack.sock:ro
       - daemon_data:/var/lib/tee-daemon
+      - storage_helper_run:/run/webhost-storage
       - briefs:/data/briefs
       - digests:/data/digests
     expose:
@@ -89,6 +129,8 @@ services:
     depends_on:
       restore:
         condition: service_completed_successfully
+      storage-helper:
+        condition: service_healthy
 
   # Periodic app-key-sealed DR backups of the control-plane volumes (read-only).
   # The pre-release export is the same `backup` op run on demand by the release
@@ -123,7 +165,7 @@ services:
   # exposed, token-gated control API (/_api on tee-daemon), never the browser.
 
   concierge:
-    image: ghcr.io/dmvt/concierge:v1@sha256:7951bf0ca4dfe31483f7ca439958b394bf924da1abcb7621ed6a05467efa8747
+    image: ghcr.io/dmvt/concierge@sha256:b28b71baaccfa3045e4964b3ef621fa63cadd7bc7d42e8b235101dcaf071cd2b
     environment:
       CONCIERGE_PORT: 8787
       CONCIERGE_BRIEFS: /data/briefs
@@ -138,10 +180,10 @@ services:
       - "8787"
 
   frontproxy:
-    image: ghcr.io/dmvt/webhost-frontproxy:unverified-v1@sha256:e2b6466d38f2bbcaeee53ec8ef46a7c67a54077bb3a1c44b8ba4b206da8f00f8
+    image: ghcr.io/dmvt/webhost-frontproxy@sha256:548bd0fc671fd0c8a42582e2b4cba227ca61b742cb70128eed0c94c38a545a7a
     environment:
       APP_DOMAIN: ${APP_DOMAIN}
-      CONSOLE_HOST: ${CONSOLE_HOST:-console.${APP_DOMAIN}}
+      CONSOLE_HOST: ${CONSOLE_HOST}
       # No console UI on this CVM (Synclave is the UI). Point the console host at
       # the daemon so it serves the public verifier/viewer landing page instead.
       CONSOLE_UPSTREAM: http://tee-daemon:8080
@@ -158,6 +200,8 @@ services:
     image: ghcr.io/dmvt/webhost-tlsproxy:tls-v4@sha256:d38f090a9f54cf0498591ce3b00fc5b47a7a8c353942fa1082bc74ff0e7e4120
     environment:
       CLOUDFLARE_API_TOKEN: ${CLOUDFLARE_API_TOKEN}
+      APP_DOMAIN: ${APP_DOMAIN}
+      DIRECTORY_HOST: ${DIRECTORY_HOST}
     ports:
       - "443:443"
     volumes:
@@ -169,6 +213,8 @@ services:
 volumes:
   sidecar-state:
   daemon_data:
+    name: ${DAEMON_VOLUME_NAME:-dstack_daemon_data}
+  storage_helper_run:
   briefs:
   digests:
   caddy_data_v2:
