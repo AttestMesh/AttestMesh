@@ -41,7 +41,7 @@ services:
   # Patroni's DCS. One member per pg node; quorum forms over the mesh. Bootstrap state
   # machine (new/join/restart) lives in the entrypoint — see docs/specs/pg-ha.md §3.1.
   etcd:
-    image: ghcr.io/attestmesh/pg-ha@sha256:05c6d46c72f6feb444be055e1c12c116ba1334ed6d738e7d649e0ea6e71cabf5 # pinned 2026-07-02 r5 (pg_hba localhost replication entries)
+    image: ghcr.io/attestmesh/pg-ha@sha256:3cce594b31cc9c57dea6f1b7fc4e6a3e9b31be15853c49e22c4c6423d7a9b066 # pinned 2026-07-07 r6 (pgvector for Hindsight + pg_hba localhost replication entries)
     restart: unless-stopped
     network_mode: service:sidecar
     entrypoint: ["/usr/local/bin/pgha-etcd-entrypoint.sh"]
@@ -61,7 +61,7 @@ services:
   # the CSK at boot; the superuser/REST creds the admin agent needs are dropped on the
   # pgha-secrets volume. Data survives disk-preserving rolls (UpgradeApp).
   patroni:
-    image: ghcr.io/attestmesh/pg-ha@sha256:05c6d46c72f6feb444be055e1c12c116ba1334ed6d738e7d649e0ea6e71cabf5 # pinned 2026-07-02 r5 (pg_hba localhost replication entries)
+    image: ghcr.io/attestmesh/pg-ha@sha256:3cce594b31cc9c57dea6f1b7fc4e6a3e9b31be15853c49e22c4c6423d7a9b066 # pinned 2026-07-07 r6 (pgvector for Hindsight + pg_hba localhost replication entries)
     restart: unless-stopped
     network_mode: service:sidecar
     entrypoint: ["/usr/local/bin/pgha-patroni-entrypoint.sh"]
@@ -89,7 +89,7 @@ services:
 
   # Primary/replica routing on the mesh IP. Backend health = Patroni's public role GETs.
   haproxy:
-    image: ghcr.io/attestmesh/pg-ha@sha256:05c6d46c72f6feb444be055e1c12c116ba1334ed6d738e7d649e0ea6e71cabf5 # pinned 2026-07-02 r5 (pg_hba localhost replication entries)
+    image: ghcr.io/attestmesh/pg-ha@sha256:3cce594b31cc9c57dea6f1b7fc4e6a3e9b31be15853c49e22c4c6423d7a9b066 # pinned 2026-07-07 r6 (pgvector for Hindsight + pg_hba localhost replication entries)
     restart: unless-stopped
     network_mode: service:sidecar
     entrypoint: ["/usr/local/bin/pgha-haproxy-entrypoint.sh"]
@@ -104,7 +104,7 @@ services:
   # Mesh-only status page (:8009): the TEE blocks container logs, so every pg-ha entrypoint
   # self-reports to /pgha-status and this serves it read-only to mesh peers for debugging.
   status-server:
-    image: ghcr.io/attestmesh/pg-ha@sha256:05c6d46c72f6feb444be055e1c12c116ba1334ed6d738e7d649e0ea6e71cabf5 # pinned 2026-07-02 r5 (pg_hba localhost replication entries)
+    image: ghcr.io/attestmesh/pg-ha@sha256:3cce594b31cc9c57dea6f1b7fc4e6a3e9b31be15853c49e22c4c6423d7a9b066 # pinned 2026-07-07 r6 (pgvector for Hindsight + pg_hba localhost replication entries)
     restart: unless-stopped
     network_mode: service:sidecar
     entrypoint:

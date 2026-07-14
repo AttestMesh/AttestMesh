@@ -11,7 +11,7 @@ ARG PATRONI_SPEC="patroni[etcd3]~=4.0.4"
 RUN set -eux; \
     apt-get update; \
     apt-get install -y --no-install-recommends \
-        python3-venv haproxy jq iproute2 curl ca-certificates; \
+        python3-venv haproxy jq iproute2 curl ca-certificates postgresql-16-pgvector; \
     python3 -m venv /opt/patroni; \
     /opt/patroni/bin/pip install --no-cache-dir "${PATRONI_SPEC}" "psycopg[binary]"; \
     ln -s /opt/patroni/bin/patroni /usr/local/bin/patroni; \
