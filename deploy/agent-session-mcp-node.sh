@@ -16,6 +16,7 @@ BOX_DEPLOYER_KEY="${BOX_DEPLOYER_KEY:-/root/.attestmesh/base-deployer.json}"
 BOX_RPC="${BOX_RPC:-https://base-rpc.publicnode.com}"
 COMPOSE="${COMPOSE:-$ROOT/deploy/compose/agent-session-mcp-node.yaml}"
 GATEWAY_DOMAIN="${GATEWAY_DOMAIN:-gateway.attestmesh.xyz}"
+MESH_SSH_HOST="${MESH_SSH_HOST:-attestmesh-mesh-node}"
 
 export BOX_VCPU="${BOX_VCPU:-2}" BOX_MEM="${BOX_MEM:-4096}" BOX_DISK="${BOX_DISK:-40}"
 export BOX_PORTS="${BOX_PORTS:-[]}" BOX_GATEWAY_ENABLED="${BOX_GATEWAY_ENABLED:-true}" BOX_NET_MODE="${BOX_NET_MODE:-bridge}"
@@ -33,18 +34,60 @@ fi
 set -a; source "$SECRETS_FILE"; set +a
 : "${APP_DB_PASSWORD:?set APP_DB_PASSWORD in $SECRETS_FILE}"
 : "${INGEST_TOKEN:?set INGEST_TOKEN in $SECRETS_FILE}"
-EMBEDDING_URL="${EMBEDDING_URL:-https://api.redpill.ai/v1}"
+RUNTIME_ENV_FILE="${RUNTIME_ENV_FILE:-$HOME/.attestmesh/agent-session-hindsight.env}"
+if [ -s "$RUNTIME_ENV_FILE" ]; then
+  # The file supplies persistent defaults, but an explicit one-shot deployment
+  # override must win.  Sourcing the file directly used to replace values such
+  # as HINDSIGHT_OUTBOX_RUN_LIMIT passed on the command line, silently turning a
+  # bounded canary back into an unbounded worker.
+  _runtime_override_names=()
+  _runtime_override_values=()
+  while IFS= read -r _runtime_line; do
+    _runtime_name="${_runtime_line%%=*}"
+    [[ "$_runtime_name" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || continue
+    if [[ -v $_runtime_name ]]; then
+      _runtime_override_names+=("$_runtime_name")
+      _runtime_override_values+=("${!_runtime_name}")
+    fi
+  done < "$RUNTIME_ENV_FILE"
+  set -a; source "$RUNTIME_ENV_FILE"; set +a
+  for _runtime_i in "${!_runtime_override_names[@]}"; do
+    printf -v "${_runtime_override_names[$_runtime_i]}" '%s' \
+      "${_runtime_override_values[$_runtime_i]}"
+    export "${_runtime_override_names[$_runtime_i]}"
+  done
+  unset _runtime_line _runtime_name _runtime_i
+  unset _runtime_override_names _runtime_override_values
+fi
+HINDSIGHT_MESH_IP="${HINDSIGHT_MESH_IP:-$(grep -E '^MESH_IP=' "$HINDSIGHT_STATE" 2>/dev/null | head -1 | cut -d= -f2-)}"
+HINDSIGHT_TOKEN="${HINDSIGHT_TOKEN:-$(grep -E '^TAK=' "$HINDSIGHT_STATE" 2>/dev/null | head -1 | cut -d= -f2-)}"
+HINDSIGHT_PROXY_TOKEN="${HINDSIGHT_PROXY_TOKEN:-$(grep -E '^BPT=' "$HINDSIGHT_STATE" 2>/dev/null | head -1 | cut -d= -f2-)}"
+[ -n "$HINDSIGHT_MESH_IP" ] || die "could not resolve MESH_IP from $HINDSIGHT_STATE"
+[ -n "$HINDSIGHT_TOKEN" ] || die "could not resolve HINDSIGHT_TOKEN (TAK) from $HINDSIGHT_STATE"
+
+EMBEDDING_VIA_HINDSIGHT_PROXY="${EMBEDDING_VIA_HINDSIGHT_PROXY:-true}"
 EMBEDDING_MODEL="${EMBEDDING_MODEL:-qwen/qwen3-embedding-8b}"
 EMBEDDING_DIM="${EMBEDDING_DIM:-1024}"
-if [ -z "${EMBEDDING_API_KEY:-}" ]; then
-  [ -s "$REDPILL_KEY_FILE" ] || die "no EMBEDDING_API_KEY and no RedPill key at $REDPILL_KEY_FILE"
-  EMBEDDING_API_KEY="$(tr -d '[:space:]' < "$REDPILL_KEY_FILE")"
+if [ "$EMBEDDING_VIA_HINDSIGHT_PROXY" = true ]; then
+  [ -n "$HINDSIGHT_PROXY_TOKEN" ] || die "could not resolve BPT from $HINDSIGHT_STATE"
+  EMBEDDING_URL="http://sidecar:18889/v1/embeddings"
+  EMBEDDING_API_KEY="$HINDSIGHT_PROXY_TOKEN"
+  ALLOW_BASE_URL="http://sidecar:18889"
+else
+  EMBEDDING_URL="${EMBEDDING_URL:-https://api.redpill.ai/v1/embeddings}"
+  if [ -z "${EMBEDDING_API_KEY:-}" ]; then
+    [ -s "$REDPILL_KEY_FILE" ] || die "no EMBEDDING_API_KEY and no RedPill key at $REDPILL_KEY_FILE"
+    EMBEDDING_API_KEY="$(tr -d '[:space:]' < "$REDPILL_KEY_FILE")"
+  fi
+  ALLOW_BASE_URL="$EMBEDDING_URL"
 fi
-ALLOW_BASE_URL="$EMBEDDING_URL"
 HINDSIGHT_URL="${HINDSIGHT_URL:-http://sidecar:18888}"
 HINDSIGHT_BANK="${HINDSIGHT_BANK:-agent-sessions}"
-HINDSIGHT_TOKEN="${HINDSIGHT_TOKEN:-$(grep -E '^TAK=' "$HINDSIGHT_STATE" 2>/dev/null | head -1 | cut -d= -f2-)}"
-[ -n "$HINDSIGHT_TOKEN" ] || die "could not resolve HINDSIGHT_TOKEN (TAK) from $HINDSIGHT_STATE"
+HINDSIGHT_SYNC_ENABLED="${HINDSIGHT_SYNC_ENABLED:-false}"
+HINDSIGHT_OUTBOX_MAX_IN_FLIGHT="${HINDSIGHT_OUTBOX_MAX_IN_FLIGHT:-2}"
+HINDSIGHT_OUTBOX_TICK_SECONDS="${HINDSIGHT_OUTBOX_TICK_SECONDS:-30}"
+HINDSIGHT_OUTBOX_RUN_LIMIT="${HINDSIGHT_OUTBOX_RUN_LIMIT:-0}"
+RECALL_BACKEND="${RECALL_BACKEND:-postgres}"
 DATABASE_URL="${DATABASE_URL:-postgresql://agent_sessions:${APP_DB_PASSWORD}@sidecar:15431,sidecar:15432,sidecar:15433/agent_sessions?target_session_attrs=read-write&connect_timeout=5}"
 
 # Seed cluster identity from a live C3 state file if not already exported.
@@ -72,10 +115,11 @@ EOF
 
 _load() { [ -f "$STATE" ] && source "$STATE" || true; }
 ssh_box() { ssh -o BatchMode=yes -o ConnectTimeout=8 "$BOX_HOST" "$@"; }
+ssh_mesh() { ssh -o BatchMode=yes -o ConnectTimeout=15 "$MESH_SSH_HOST" "$@"; }
 
 _require_tools() {
   local tool
-  for tool in jq cast ssh scp; do
+  for tool in jq cast ssh scp curl; do
     command -v "$tool" >/dev/null 2>&1 || die "missing required tool: $tool"
   done
 }
@@ -86,6 +130,7 @@ _require_env() {
   indexer=$(jq -r .indexerRegistry "$ROOT/contracts/script/deployments/${CHAIN_ID}.json" 2>/dev/null)
   INDEXER_REGISTRY_ADDR="${INDEXER_REGISTRY_ADDR:-$indexer}"
   [ -n "$INDEXER_REGISTRY_ADDR" ] && [ "$INDEXER_REGISTRY_ADDR" != null ] || die "missing INDEXER_REGISTRY_ADDR"
+  CVM_RUNTIME_RPC_URL="${CVM_RUNTIME_RPC_URL:-$(box_local_rpc_url "$BOX_HOST" hindsight)}"
   [ -n "${CLUSTER:-}" ] || die "missing CLUSTER"
   [ -n "${MEMBER_IMPL:-}" ] || die "missing MEMBER_IMPL"
   [ -n "${KMS_ROOT:-}" ] || die "missing KMS_ROOT"
@@ -96,6 +141,36 @@ _require_env() {
   APP_ENV_B64="${APP_ENV_B64:-}"
 }
 
+embedding_preflight() {
+  local response body code dim
+  if [ "$EMBEDDING_VIA_HINDSIGHT_PROXY" = true ]; then
+    response=$(ssh_mesh "bash -s" <<SCRIPT
+curl -sS --max-time 60 -w '\n%{http_code}' \
+  -X POST 'http://$HINDSIGHT_MESH_IP:18889/v1/embeddings' \
+  -H 'Authorization: Bearer $EMBEDDING_API_KEY' \
+  -H 'Content-Type: application/json' \
+  --data '{"model":"$EMBEDDING_MODEL","input":["attestmesh deployment embedding preflight"]}'
+SCRIPT
+    ) || die "metered Qwen embedding preflight transport failure"
+  else
+    response=$(curl -sS --max-time 60 -w $'\n%{http_code}' \
+      -X POST "$EMBEDDING_URL" \
+      -H "Authorization: Bearer $EMBEDDING_API_KEY" \
+      -H 'Content-Type: application/json' \
+      --data "$(jq -nc --arg model "$EMBEDDING_MODEL" \
+        '{model:$model,input:["attestmesh deployment embedding preflight"]}')" \
+      || die "Qwen embedding preflight transport failure")
+  fi
+  code=${response##*$'\n'}
+  body=${response%$'\n'*}
+  [ "$code" = 200 ] || die "Qwen embedding preflight returned HTTP $code"
+  dim=$(jq -er '.data[0].embedding | length' <<<"$body" 2>/dev/null) \
+    || die "Qwen embedding preflight response omitted a vector"
+  [ "$dim" -ge "$EMBEDDING_DIM" ] \
+    || die "Qwen embedding preflight returned dimension $dim (< $EMBEDDING_DIM)"
+  log "✔ Qwen embedding preflight passed model=$EMBEDDING_MODEL native_dim=$dim configured_dim=$EMBEDDING_DIM"
+}
+
 preflight() {
   _load; _require_env
   log "▶ preflight generic node=$NODE compose=$COMPOSE cluster=$CLUSTER"
@@ -104,6 +179,7 @@ preflight() {
   cast call "$CLUSTER" 'memberCount()(uint256)' --rpc-url "$RPC_URL" >/dev/null || die "CLUSTER does not expose memberCount(): $CLUSTER"
   cast code "$MEMBER_IMPL" --rpc-url "$RPC_URL" | grep -Eq '^0x[0-9a-fA-F]{4,}$' || die "MEMBER_IMPL has no code: $MEMBER_IMPL"
   ssh_box "sudo test -x '$BOX_PY' && sudo test -r '$BOX_DEPLOYER_KEY'" >/dev/null || die "box prerequisites missing on $BOX_HOST"
+  embedding_preflight
   _box_run hash >/dev/null || die "box cannot render/hash compose $COMPOSE"
   STATE_PHASE="preflighted"; _save
   log "✔ preflight passed for generic node=$NODE"
@@ -123,7 +199,7 @@ _box_run() {
   scp -o BatchMode=yes -q "$HERE/agent-session-mcp-node-box.py" "$BOX_HOST:/tmp/agent-session-mcp-node-box.py"
   {
     printf 'E_CHAIN_ID=%q\n' "${CHAIN_ID:-}"
-    printf 'E_RPC_URL=%q\n' "${RPC_URL:-}"
+    printf 'E_RPC_URL=%q\n' "$CVM_RUNTIME_RPC_URL"
     printf 'E_BUNDLER_URL=%q\n' "${BUNDLER_URL:-${RPC_URL:-}}"
     printf 'E_GAS_POLICY_ID=%q\n' "${GAS_POLICY_ID:-}"
     printf 'E_INDEXER_REGISTRY_ADDR=%q\n' "${INDEXER_REGISTRY_ADDR:-}"
@@ -133,8 +209,14 @@ _box_run() {
     printf 'E_APP_DB_PASSWORD=%q\n' "${APP_DB_PASSWORD:-}"
     printf 'E_DATABASE_URL=%q\n' "${DATABASE_URL:-}"
     printf 'E_HINDSIGHT_URL=%q\n' "${HINDSIGHT_URL:-}"
+    printf 'E_HINDSIGHT_MESH_IP=%q\n' "${HINDSIGHT_MESH_IP:-}"
     printf 'E_HINDSIGHT_TOKEN=%q\n' "${HINDSIGHT_TOKEN:-}"
     printf 'E_HINDSIGHT_BANK=%q\n' "${HINDSIGHT_BANK:-agent-sessions}"
+    printf 'E_HINDSIGHT_SYNC_ENABLED=%q\n' "${HINDSIGHT_SYNC_ENABLED:-false}"
+    printf 'E_HINDSIGHT_OUTBOX_MAX_IN_FLIGHT=%q\n' "${HINDSIGHT_OUTBOX_MAX_IN_FLIGHT:-2}"
+    printf 'E_HINDSIGHT_OUTBOX_TICK_SECONDS=%q\n' "${HINDSIGHT_OUTBOX_TICK_SECONDS:-30}"
+    printf 'E_HINDSIGHT_OUTBOX_RUN_LIMIT=%q\n' "${HINDSIGHT_OUTBOX_RUN_LIMIT:-0}"
+    printf 'E_RECALL_BACKEND=%q\n' "${RECALL_BACKEND:-postgres}"
     printf 'E_INGEST_TOKEN=%q\n' "${INGEST_TOKEN:-}"
     printf 'E_EMBEDDING_URL=%q\n' "${EMBEDDING_URL:-}"
     printf 'E_EMBEDDING_API_KEY=%q\n' "${EMBEDDING_API_KEY:-}"
@@ -353,6 +435,7 @@ update_member() {
   _load; _require_env
   [ -n "${X:-}" ] && [ -n "${VM_ID:-}" ] && [ -n "${CLUSTER:-}" ] || die "need X/VM_ID/CLUSTER in $STATE"
   local nh allowed out j mode
+  embedding_preflight
   nh=$(_box_run hash | grep -oE '^[0-9a-f]{64}$' | tail -1)
   [ -n "$nh" ] || die "could not compute new compose_hash"
   log "new compose_hash=0x$nh"

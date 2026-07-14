@@ -106,6 +106,32 @@ Text egresses to RedPill (Phala confidential-compute) — the accepted in-infra-
 - Stop (cleanup refuses while registered unless `FORCE_CLEANUP=1`):
   `deploy/agent-session-mcp-node.sh agent-session-mcp cleanup`
 
+### Cost-gated Hindsight releases
+
+Persistent worker controls live in
+`~/.attestmesh/agent-session-hindsight.env`. The wrapper treats those values as
+defaults and preserves explicit command-line overrides. Keep the persistent file
+at the same cap before a roll so a later unattended update cannot restore an
+unbounded worker. The staged recovery setting is two Agent documents in flight;
+Hindsight allows three LLM calls per worker and the provider guard opens Agent
+above six total provider calls.
+
+`HINDSIGHT_OUTBOX_RUN_LIMIT` is cumulative: the worker counts `submitting`,
+`submitted`, `succeeded`, `failed`, and `blocked`. A safe staged release is:
+
+1. Open `hindsight_sync_state.circuit_open` and wait for provider `in_flight=0`.
+2. Set the persistent cumulative run limit, then roll the CVM with the same
+   explicit value. Keep total cross-bank concurrency at eight or less.
+3. Confirm the API is healthy and the circuit stayed open before closing it.
+4. Stop immediately on any failed/blocked row, 401/402, duplicate operation or
+   document ID, budget circuit, or attempted count above the cumulative cap.
+5. At the cap, require zero active Hindsight operations and stable spend before
+   projecting and authorizing another stage.
+
+An explicit retry must first prove that the old operation is terminal and the
+document is absent. The app snapshots that attempt in
+`hindsight_outbox_retry_history`; never clear or resubmit a `submitted` row.
+
 ## Notes / caveats
 
 - Gateway is OFF (mesh-only). We dial all peers, so inbound mesh reachability works once
