@@ -260,7 +260,13 @@ send_seq() {
 # Forward compose + helper to the box and run a box-side mode. Secrets ride ssh
 # STDIN as printf-%q'd assignments sourced by the remote shell (webhost pattern).
 _box_run() {
-  local mode="$1" app_id="${2:-}" vm_id="${3:-}" guser gtok
+  local mode="$1" app_id="${2:-}" vm_id="${3:-}" guser gtok rpc_url_for_cvm
+  rpc_url_for_cvm="${FUGU_RPC_URL:-}"
+  if [ -s "$FUGU_RPC_FILE" ]; then
+    rpc_url_for_cvm="$(awk -F= '$1=="FUGU_RPC_URL"{print substr($0,index($0,"=")+1)}' "$FUGU_RPC_FILE" | tail -1)"
+  fi
+  rpc_url_for_cvm="${rpc_url_for_cvm:-${CVM_RPC_URL:-$RPC_URL}}"
+  [ -n "$rpc_url_for_cvm" ] || die "missing Fugu CVM RPC URL"
   guser=$(grep -E '^\s*username\s*=' "$HOME/.teesql/ghcr-pull.toml" 2>/dev/null | head -1 | sed -E 's/.*=\s*//' | tr -d "\"' ")
   gtok=$(grep  -E '^\s*token\s*='    "$HOME/.teesql/ghcr-pull.toml" 2>/dev/null | head -1 | sed -E 's/.*=\s*//' | tr -d "\"' ")
   [ -n "$gtok" ] || die "no ghcr token in ~/.teesql/ghcr-pull.toml"
@@ -268,7 +274,7 @@ _box_run() {
   scp -o BatchMode=yes -q "$HERE/fugu-router-node-box.py" "$BOX_HOST:/tmp/fugu-router-node-box.py"
   {
     printf 'E_CHAIN_ID=%q\n' "$CHAIN_ID"
-    printf 'E_RPC_URL=%q\n' "${CVM_RPC_URL:-${FUGU_RPC_URL:-$RPC_URL}}"
+    printf 'E_RPC_URL=%q\n' "$rpc_url_for_cvm"
     printf 'E_BUNDLER_URL=%q\n' "${CVM_BUNDLER_URL:-${BUNDLER_URL:-$RPC_URL}}"
     printf 'E_GAS_POLICY_ID=%q\n' "${GAS_POLICY_ID:-}"
     printf 'E_INDEXER_REGISTRY_ADDR=%q\n' "$INDEXER_REGISTRY_ADDR"

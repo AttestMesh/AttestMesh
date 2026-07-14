@@ -44,7 +44,26 @@ set -a; source "$SECRETS_FILE"; set +a
 MCP_AUTH_TOKEN="${MCP_AUTH_TOKEN:-}"
 RUNTIME_ENV_FILE="${RUNTIME_ENV_FILE:-$HOME/.attestmesh/pocket-hindsight.env}"
 if [ -s "$RUNTIME_ENV_FILE" ]; then
+  # Persistent values are defaults.  Preserve explicit deployment overrides so
+  # a bounded HINDSIGHT_OUTBOX_RUN_LIMIT cannot silently become zero.
+  _runtime_override_names=()
+  _runtime_override_values=()
+  while IFS= read -r _runtime_line; do
+    _runtime_name="${_runtime_line%%=*}"
+    [[ "$_runtime_name" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || continue
+    if [[ -v $_runtime_name ]]; then
+      _runtime_override_names+=("$_runtime_name")
+      _runtime_override_values+=("${!_runtime_name}")
+    fi
+  done < "$RUNTIME_ENV_FILE"
   set -a; source "$RUNTIME_ENV_FILE"; set +a
+  for _runtime_i in "${!_runtime_override_names[@]}"; do
+    printf -v "${_runtime_override_names[$_runtime_i]}" '%s' \
+      "${_runtime_override_values[$_runtime_i]}"
+    export "${_runtime_override_names[$_runtime_i]}"
+  done
+  unset _runtime_line _runtime_name _runtime_i
+  unset _runtime_override_names _runtime_override_values
 fi
 
 # Hindsight and its budget proxy are mesh-only. Resolve both credentials from the

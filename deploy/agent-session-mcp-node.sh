@@ -36,7 +36,28 @@ set -a; source "$SECRETS_FILE"; set +a
 : "${INGEST_TOKEN:?set INGEST_TOKEN in $SECRETS_FILE}"
 RUNTIME_ENV_FILE="${RUNTIME_ENV_FILE:-$HOME/.attestmesh/agent-session-hindsight.env}"
 if [ -s "$RUNTIME_ENV_FILE" ]; then
+  # The file supplies persistent defaults, but an explicit one-shot deployment
+  # override must win.  Sourcing the file directly used to replace values such
+  # as HINDSIGHT_OUTBOX_RUN_LIMIT passed on the command line, silently turning a
+  # bounded canary back into an unbounded worker.
+  _runtime_override_names=()
+  _runtime_override_values=()
+  while IFS= read -r _runtime_line; do
+    _runtime_name="${_runtime_line%%=*}"
+    [[ "$_runtime_name" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || continue
+    if [[ -v $_runtime_name ]]; then
+      _runtime_override_names+=("$_runtime_name")
+      _runtime_override_values+=("${!_runtime_name}")
+    fi
+  done < "$RUNTIME_ENV_FILE"
   set -a; source "$RUNTIME_ENV_FILE"; set +a
+  for _runtime_i in "${!_runtime_override_names[@]}"; do
+    printf -v "${_runtime_override_names[$_runtime_i]}" '%s' \
+      "${_runtime_override_values[$_runtime_i]}"
+    export "${_runtime_override_names[$_runtime_i]}"
+  done
+  unset _runtime_line _runtime_name _runtime_i
+  unset _runtime_override_names _runtime_override_values
 fi
 HINDSIGHT_MESH_IP="${HINDSIGHT_MESH_IP:-$(grep -E '^MESH_IP=' "$HINDSIGHT_STATE" 2>/dev/null | head -1 | cut -d= -f2-)}"
 HINDSIGHT_TOKEN="${HINDSIGHT_TOKEN:-$(grep -E '^TAK=' "$HINDSIGHT_STATE" 2>/dev/null | head -1 | cut -d= -f2-)}"

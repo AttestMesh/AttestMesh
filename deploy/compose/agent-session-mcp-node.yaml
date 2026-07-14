@@ -121,7 +121,10 @@ services:
           bind 0.0.0.0:15431
           option httpchk GET /primary
           http-check expect status 200
-          default-server inter 200ms fastinter 100ms downinter 500ms fall 1 rise 1 on-marked-down shutdown-sessions
+          # Require three consecutive Patroni misses before terminating client
+          # sessions.  A single transient mesh/API miss must not look like a PG
+          # failover; 1s/3 still detects a real role loss within a few seconds.
+          default-server inter 1s fastinter 500ms downinter 1s fall 3 rise 2 on-marked-down shutdown-sessions
           server pg1 10.18.147.86:5434 check port 8008
           server pg2 10.18.251.71:5434 check port 8008
           server pg3 10.18.172.186:5434 check port 8008
@@ -197,7 +200,7 @@ services:
   # sidecar:1543N. Egress is unlocked here, but migrate only runs DDL — no session text
   # or embeddings flow during migration.
   migrate:
-    image: ghcr.io/attestmesh/agent-session-mcp@sha256:41bd38582f7e4b52b2699fbee81ba1e70c3d5b7e30abd7b17a780c674d6b5d74
+    image: ghcr.io/attestmesh/agent-session-mcp@sha256:0592224f1cb046bd79da5767703ba702050c9c98b8ca6dfb4b0dc4997e823fce
     restart: on-failure
     network_mode: service:sidecar
     depends_on:
@@ -221,7 +224,7 @@ services:
   # sidecar:1543N and embeds via Redpill. Hard-waits on the
   # migration barrier — ingest does NOT tolerate a missing schema.
   ingest:
-    image: ghcr.io/attestmesh/agent-session-mcp@sha256:41bd38582f7e4b52b2699fbee81ba1e70c3d5b7e30abd7b17a780c674d6b5d74
+    image: ghcr.io/attestmesh/agent-session-mcp@sha256:0592224f1cb046bd79da5767703ba702050c9c98b8ca6dfb4b0dc4997e823fce
     restart: unless-stopped
     depends_on:
       migrate:
@@ -246,7 +249,7 @@ services:
 
   # MCP server (:8081) over streamable-HTTP. Joins ingest's netns/egress; waits on migrate.
   mcp:
-    image: ghcr.io/attestmesh/agent-session-mcp@sha256:41bd38582f7e4b52b2699fbee81ba1e70c3d5b7e30abd7b17a780c674d6b5d74
+    image: ghcr.io/attestmesh/agent-session-mcp@sha256:0592224f1cb046bd79da5767703ba702050c9c98b8ca6dfb4b0dc4997e823fce
     restart: unless-stopped
     network_mode: service:ingest
     depends_on:
@@ -277,7 +280,7 @@ services:
   # when explicitly enabled it uses the transactional outbox, a bank advisory lock,
   # an eight-document cap, and a 30-second tick. Failed work requires explicit retry.
   hindsight-outbox:
-    image: ghcr.io/attestmesh/agent-session-mcp@sha256:41bd38582f7e4b52b2699fbee81ba1e70c3d5b7e30abd7b17a780c674d6b5d74
+    image: ghcr.io/attestmesh/agent-session-mcp@sha256:0592224f1cb046bd79da5767703ba702050c9c98b8ca6dfb4b0dc4997e823fce
     restart: unless-stopped
     network_mode: service:ingest
     depends_on:
