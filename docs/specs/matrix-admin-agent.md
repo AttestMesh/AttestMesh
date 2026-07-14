@@ -134,13 +134,9 @@ The agent is a gRPC **client** of the sidecar's app-facing service over the UDS 
 - **`SendMessage(SendRequest{recipient_member_id, payload, envelope_id}) → SendResponse{envelope_id, tx_hash}`** — used to send sealed replies/acks back to a command's sender. The sidecar seals to the recipient's x25519 key and submits the sponsored UserOp.
 - **`GetSelf() → SelfInfo{member_id, …}`** — the node's own memberId (for logging + reply correlation).
 
-### 6.1 Required sidecar change (prerequisite, ships in `cluster-mesh-agent`)
+### 6.1 Sidecar prerequisite (implemented)
 
-Today the inbound path is a no-op: `sidecar/src/bringup.rs::poll_envelopes()` decrypts every `MessageSent` addressed to the node but **drops** any payload that is not a `PeerEndpoint`, and `Shared.incoming_tx` (the broadcast channel behind `SubscribeMessages`) is never published to. The consumer side (`agent_grpc.rs::subscribe_messages`, `state::AppIncoming`, the `IncomingMessage` mapping) is already complete.
-
-**Change (producer only, ~5 lines, no proto change):** in `poll_envelopes`, demux on the inner kind — a plaintext that decodes as a `PeerEndpoint` **with the reserved kind** is sidecar-internal and handled as today; **everything else is forwarded verbatim** to `incoming_tx` as `AppIncoming{sender_member_id, payload, block_number}`. Detection is structural (`PeerEndpoint::decode(..) && is_peer_endpoint()`), not a byte-prefix, because `PeerEndpoint` is CBOR-map-encoded. The sidecar stays **app-protocol-agnostic** — it never parses Matrix; it forwards opaque application bytes (preserving the CLAUDE.md "no method-specific assumptions outside the relevant module" posture). This realizes the behavior [`sidecar.md`](./sidecar.md) §12.3 already documents.
-
-Backpressure ([`sidecar.md`](./sidecar.md) §12.4): the broadcast channel is bounded (1024) and drops oldest on overflow; combined with the lookback re-scan, the agent **must** dedup (see §9).
+The signed Indexer event dispatcher decrypts addressed `MessageSent` events and demuxes on the inner kind. A `PeerEndpoint` with the reserved kind is consumed internally; every other plaintext is forwarded verbatim to `incoming_tx` as `AppIncoming{sender_member_id, payload, block_number}`. The sidecar remains app-protocol-agnostic. Delivery is at-least-once and the in-memory broadcast channel is bounded, so the agent **must** dedup by request id (see §9).
 
 ---
 
@@ -228,7 +224,7 @@ Both allowlists are sealed env, so their **keys** are measured into the compose 
 
 ## 9. Replay / idempotency / ordering
 
-Delivery is **at-least-once, possibly reordered, possibly replayed on restart** (the sidecar re-scans `LOG_LOOKBACK_BLOCKS` and has no inbound persistence; in-place CVM rolls wipe its cursor). The generic `synapse_request` is **not** inherently idempotent, so a dedup ledger is a **v1 requirement**, not just defense-in-depth.
+Delivery is **at-least-once and may replay after an unflushed Ack or reconnect**; the sidecar's application queue itself is not durable. The generic `synapse_request` is **not** inherently idempotent, so a dedup ledger is a **v1 requirement**, not just defense-in-depth.
 
 - **Ledger** in the node's Postgres (the only store that survives in-place rolls — pgdata is a named volume):
   ```sql
