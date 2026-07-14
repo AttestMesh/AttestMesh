@@ -29,6 +29,17 @@ message Hello {
   // exists and from_block is zero, a v2 subscription starts at the Indexer's current
   // indexed head instead of replaying pre-upgrade history from MemberRegistered.
   uint32 protocol_version = 5;
+  // Version 3 supplies the subscriber's exact highest durably handled position.
+  // Presence matters: an absent cursor is a genuinely fresh subscription, while
+  // (0, 0) is a real cursor. New servers treat this cursor as authoritative even
+  // when their replica-local Ack cursor is further ahead. `from_block` remains
+  // populated as a safe boundary-block fallback for older servers.
+  DeliveryCursor resume_cursor = 6;
+}
+
+message DeliveryCursor {
+  uint64 block_number = 1;
+  uint64 log_index = 2;
 }
 
 message Ack {

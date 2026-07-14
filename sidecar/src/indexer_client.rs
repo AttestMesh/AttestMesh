@@ -4,7 +4,9 @@
 //! down and re-discovered (treated as adversarial).
 
 use crate::proto::indexer::indexer_client::IndexerClient;
-use crate::proto::indexer::{subscribe_message, Ack, Hello, PushEnvelope, SubscribeMessage};
+use crate::proto::indexer::{
+    subscribe_message, Ack, DeliveryCursor, Hello, PushEnvelope, SubscribeMessage,
+};
 use crate::state::Shared;
 use alloy::sol_types::SolEvent;
 use alloy_rlp::Decodable;
@@ -17,12 +19,12 @@ use tokio::sync::{mpsc, oneshot};
 use tokio_stream::wrappers::ReceiverStream;
 
 pub const ENVELOPE_DOMAIN: &[u8] = b"attestmesh.indexer.envelope.v1";
-pub const PROTOCOL_VERSION: u32 = 2;
+pub const PROTOCOL_VERSION: u32 = 3;
 pub const CHECKPOINT_LOG_INDEX: u64 = u64::MAX;
 const CURSOR_FILE: &str = "indexer-cursor.v1";
 const CURSOR_BYTES: u64 = 69;
 
-/// Load the last durably handled checkpoint. Corruption degrades to a replay from
+/// Load the last durably handled cursor. Corruption degrades to a replay from
 /// the normal fresh-subscription policy; cursor state is an optimization, not a
 /// boot requirement.
 pub async fn load_cursor(
@@ -53,7 +55,7 @@ pub async fn load_cursor(
     Some((u64::from_be_bytes(block), u64::from_be_bytes(log_index)))
 }
 
-async fn store_checkpoint(
+async fn store_cursor(
     state_dir: Option<&Path>,
     cluster: alloy::primitives::Address,
     member_id: &[u8; 32],
@@ -222,10 +224,10 @@ pub async fn connect_and_run(
     let mut client = IndexerClient::new(channel);
 
     let (tx, rx) = mpsc::channel::<SubscribeMessage>(64);
-    // A different Indexer deployment has no server-side cursor for this member.
-    // Supplying the last handled block makes it replay that block (duplicates are
-    // safe) instead of treating the subscription as brand new and starting at head.
-    let from_block = shared.get_indexer_status().await.cursor_block;
+    // The exact sidecar cursor is authoritative across independent Indexer replicas.
+    // Keep `from_block` populated as a boundary-block fallback for a pre-v3 server.
+    let resume = shared.indexer_resume_cursor().await;
+    let from_block = resume.map_or(0, |cursor| cursor.0);
     let hello = SubscribeMessage {
         inner: Some(subscribe_message::Inner::Hello(Hello {
             cluster_addr: shared.cluster.as_slice().to_vec(),
@@ -233,6 +235,10 @@ pub async fn connect_and_run(
             attestation: Vec::new(),
             from_block,
             protocol_version: PROTOCOL_VERSION,
+            resume_cursor: resume.map(|(block_number, log_index)| DeliveryCursor {
+                block_number,
+                log_index,
+            }),
         })),
     };
     tx.send(hello).await.context("send indexer Hello")?;
@@ -245,7 +251,7 @@ pub async fn connect_and_run(
 
     tracing::info!(cluster = %shared.cluster, "indexer subscription open");
     shared.set_indexer_connected(true).await;
-    let mut last_handled: Option<(u64, u64)> = None;
+    let mut last_handled = resume;
     while let Some(env) = inbound.message().await.context("indexer stream")? {
         if !verify_envelope(&env, &indexer_pubkey) {
             anyhow::bail!("indexer signature mismatch — tearing down subscription");
@@ -291,6 +297,25 @@ pub async fn connect_and_run(
                 .map_err(anyhow::Error::msg)?;
         }
 
+        let advances = last_handled.map_or(true, |last| position > last);
+        if advances {
+            // Make the handled position crash-durable before telling any replica it
+            // may advance its local cursor. If this write fails, tear down without
+            // Ack so the position is replayed on reconnect.
+            store_cursor(
+                state_dir.as_deref(),
+                shared.cluster,
+                &shared.self_member_id,
+                position.0,
+                position.1,
+            )
+            .await
+            .context("persist Indexer cursor before Ack")?;
+            last_handled = Some(position);
+        }
+        shared
+            .set_indexer_progress(env.block_number, env.log_index, checkpoint)
+            .await;
         let ack = SubscribeMessage {
             inner: Some(subscribe_message::Inner::Ack(Ack {
                 block_number: env.block_number,
@@ -298,26 +323,6 @@ pub async fn connect_and_run(
             })),
         };
         tx.send(ack).await.context("send indexer Ack")?;
-        if last_handled.map_or(true, |last| position > last) {
-            last_handled = Some(position);
-        }
-        shared
-            .set_indexer_progress(env.block_number, env.log_index, checkpoint)
-            .await;
-        if checkpoint {
-            let progress = shared.get_indexer_status().await;
-            if let Err(error) = store_checkpoint(
-                state_dir.as_deref(),
-                shared.cluster,
-                &shared.self_member_id,
-                progress.cursor_block,
-                progress.cursor_log_index,
-            )
-            .await
-            {
-                tracing::warn!(error = ?error, "Indexer checkpoint cursor persist failed");
-            }
-        }
         tracing::debug!(
             block = env.block_number,
             log_index = env.log_index,
@@ -494,7 +499,7 @@ mod tests {
         let cluster = Address::repeat_byte(0xc1);
         let member = [0xa1; 32];
         assert_eq!(load_cursor(Some(temp.path()), cluster, &member).await, None);
-        store_checkpoint(
+        store_cursor(
             Some(temp.path()),
             cluster,
             &member,

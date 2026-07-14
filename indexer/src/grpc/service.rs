@@ -16,7 +16,7 @@ use crate::chain::{repro, watcher, HttpProvider};
 use crate::identity::Identity;
 use crate::metrics::Metrics;
 use crate::pb::indexer_server::Indexer;
-use crate::pb::{subscribe_message::Inner, PushEnvelope, SubscribeMessage};
+use crate::pb::{subscribe_message::Inner, DeliveryCursor, PushEnvelope, SubscribeMessage};
 use crate::state::cursor::Cursor;
 use crate::state::IndexerState;
 use alloy::primitives::{Address, B256};
@@ -92,14 +92,44 @@ fn replay_start(reg_floor: u64, requested: u64, persisted: Option<Cursor>) -> u6
     }
 }
 
+/// Start block for an exact subscriber cursor. An event cursor replays the rest of
+/// its block; a checkpoint cursor proves the complete block and starts at the next.
+fn exact_replay_start(reg_floor: u64, cursor: Cursor) -> u64 {
+    let requested = if cursor.log_index == envelope::CHECKPOINT_LOG_INDEX {
+        cursor.block_number.saturating_add(1)
+    } else {
+        cursor.block_number
+    };
+    requested.max(reg_floor)
+}
+
+fn parse_exact_cursor(
+    protocol_version: u32,
+    resume_cursor: Option<DeliveryCursor>,
+) -> Result<Option<Cursor>, Status> {
+    match resume_cursor {
+        None => Ok(None),
+        Some(_) if protocol_version < envelope::EXACT_CURSOR_PROTOCOL_VERSION => Err(
+            Status::invalid_argument("resume_cursor requires protocol_version >= 3"),
+        ),
+        Some(cursor) => Ok(Some(Cursor::new(cursor.block_number, cursor.log_index))),
+    }
+}
+
 fn is_after_cursor(block_number: u64, log_index: u64, cursor: Option<Cursor>) -> bool {
     cursor.map_or(true, |c| Cursor::new(block_number, log_index) > c)
 }
 
-fn initialize_at_head(protocol_version: u32, requested: u64, persisted: Option<Cursor>) -> bool {
+fn initialize_at_head(
+    protocol_version: u32,
+    requested: u64,
+    persisted: Option<Cursor>,
+    exact_cursor: Option<Cursor>,
+) -> bool {
     protocol_version >= envelope::CHECKPOINT_PROTOCOL_VERSION
         && requested == 0
         && persisted.is_none()
+        && exact_cursor.is_none()
 }
 
 // `tonic` fixes the streaming error type as `Status`; keep the unavoidable large
@@ -137,6 +167,7 @@ impl Indexer for IndexerService {
             .ok_or_else(|| Status::invalid_argument("cluster_addr must be 20 bytes"))?;
         let member_id = parse_member_id(&hello.member_id)
             .ok_or_else(|| Status::invalid_argument("member_id must be 32 bytes"))?;
+        let exact_cursor = parse_exact_cursor(hello.protocol_version, hello.resume_cursor)?;
 
         // 2. Validate cluster membership.
         if !self.state.is_known_cluster(cluster).await {
@@ -156,10 +187,13 @@ impl Indexer for IndexerService {
 
         // 2b. Clamp from_block to the registration floor (no rewinding past join).
         let requested = hello.from_block;
-        if requested != 0 && requested < reg_floor {
+        let requested_floor = exact_cursor
+            .map(|cursor| cursor.block_number)
+            .unwrap_or(requested);
+        if requested_floor != 0 && requested_floor < reg_floor {
             tracing::warn!(
-                cluster = %cluster, member = %member_id, requested, reg_floor,
-                "clamping from_block to member registration floor"
+                cluster = %cluster, member = %member_id, requested = requested_floor, reg_floor,
+                "clamping resume cursor to member registration floor"
             );
         }
 
@@ -172,7 +206,7 @@ impl Indexer for IndexerService {
             .cursors()
             .load(cluster, member_id)
             .map_err(|e| Status::internal(format!("cursor load: {e}")))?;
-        if initialize_at_head(hello.protocol_version, requested, persisted) {
+        if initialize_at_head(hello.protocol_version, requested, persisted, exact_cursor) {
             let baseline = Cursor::new(latest.max(reg_floor), envelope::CHECKPOINT_LOG_INDEX);
             self.state
                 .cursors()
@@ -187,7 +221,15 @@ impl Indexer for IndexerService {
                 block = baseline.block_number,
                 "initialized protocol-v2 subscriber cursor at indexed head");
         }
-        let effective_from = replay_start(reg_floor, requested, persisted);
+        // An explicit v3 cursor is the cross-replica source of truth. In particular,
+        // a replica-local cursor may be ahead because another sidecar process Ack'd
+        // work this subscriber has not durably recorded. Legacy clients retain the
+        // existing max(requested, server cursor, registration floor) behavior.
+        let replay_cursor = exact_cursor.or(persisted);
+        let effective_from = exact_cursor.map_or_else(
+            || replay_start(reg_floor, requested, persisted),
+            |cursor| exact_replay_start(reg_floor, cursor),
+        );
 
         // 4. Register behind a delivery gate. Replay owns the gate until its
         // checkpoint is queued, so live dispatch cannot overtake catch-up.
@@ -235,7 +277,7 @@ impl Indexer for IndexerService {
                         };
                     for log in logs.into_iter().filter(|log| {
                         log.is_relevant_for(&member_id)
-                            && is_after_cursor(log.block_number, log.log_index, persisted)
+                            && is_after_cursor(log.block_number, log.log_index, replay_cursor)
                     }) {
                         let label = log.kind.label();
                         let stub = repro::build_stub(&log);
@@ -339,9 +381,46 @@ mod tests {
 
     #[test]
     fn only_v2_empty_cursor_uses_head_initialization() {
-        assert!(initialize_at_head(2, 0, None));
-        assert!(!initialize_at_head(1, 0, None));
-        assert!(!initialize_at_head(2, 10, None));
-        assert!(!initialize_at_head(2, 0, Some(Cursor::new(9, 1))));
+        assert!(initialize_at_head(2, 0, None, None));
+        assert!(!initialize_at_head(1, 0, None, None));
+        assert!(!initialize_at_head(2, 10, None, None));
+        assert!(!initialize_at_head(2, 0, Some(Cursor::new(9, 1)), None));
+        assert!(!initialize_at_head(3, 0, None, Some(Cursor::new(0, 0))));
+    }
+
+    #[test]
+    fn exact_cursor_replays_remaining_logs_in_the_same_block() {
+        let cursor = Cursor::new(100, 7);
+        assert_eq!(exact_replay_start(10, cursor), 100);
+        assert!(!is_after_cursor(100, 7, Some(cursor)));
+        assert!(is_after_cursor(100, 8, Some(cursor)));
+    }
+
+    #[test]
+    fn explicit_cursor_wins_when_server_local_cursor_is_ahead() {
+        let client = Cursor::new(100, 3);
+        let server = Cursor::new(100, 9);
+        let replay_cursor = Some(client).or(Some(server));
+        assert_eq!(replay_cursor, Some(client));
+        assert_eq!(exact_replay_start(10, client), 100);
+        assert!(is_after_cursor(100, 4, replay_cursor));
+    }
+
+    #[test]
+    fn exact_checkpoint_starts_at_the_next_block() {
+        assert_eq!(exact_replay_start(10, Cursor::new(100, u64::MAX)), 101);
+    }
+
+    #[test]
+    fn exact_cursor_requires_protocol_v3() {
+        let wire = DeliveryCursor {
+            block_number: 12,
+            log_index: 4,
+        };
+        assert!(parse_exact_cursor(2, Some(wire.clone())).is_err());
+        assert_eq!(
+            parse_exact_cursor(3, Some(wire)).unwrap(),
+            Some(Cursor::new(12, 4))
+        );
     }
 }

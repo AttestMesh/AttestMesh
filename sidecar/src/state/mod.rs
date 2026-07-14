@@ -73,6 +73,8 @@ pub struct AppIncoming {
 pub struct IndexerStatus {
     pub connected: bool,
     pub caught_up: bool,
+    /// Distinguishes a genuinely fresh subscriber from the valid cursor `(0, 0)`.
+    pub cursor_present: bool,
     pub cursor_block: u64,
     pub cursor_log_index: u64,
 }
@@ -219,11 +221,21 @@ impl Shared {
 
     pub async fn set_indexer_progress(&self, block: u64, log_index: u64, caught_up: bool) {
         let mut status = self.indexer_status.lock().await;
-        if (block, log_index) >= (status.cursor_block, status.cursor_log_index) {
+        if !status.cursor_present
+            || (block, log_index) >= (status.cursor_block, status.cursor_log_index)
+        {
+            status.cursor_present = true;
             status.cursor_block = block;
             status.cursor_log_index = log_index;
         }
         status.caught_up |= caught_up;
+    }
+
+    pub async fn indexer_resume_cursor(&self) -> Option<(u64, u64)> {
+        let status = self.indexer_status.lock().await;
+        status
+            .cursor_present
+            .then_some((status.cursor_block, status.cursor_log_index))
     }
 
     pub async fn get_indexer_status(&self) -> IndexerStatus {

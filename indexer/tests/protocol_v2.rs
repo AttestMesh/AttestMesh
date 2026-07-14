@@ -5,7 +5,7 @@ use attestmesh_indexer::identity::Identity;
 use attestmesh_indexer::metrics::Metrics;
 use attestmesh_indexer::pb::indexer_client::IndexerClient;
 use attestmesh_indexer::pb::indexer_server::IndexerServer;
-use attestmesh_indexer::pb::{subscribe_message, Ack, Hello, SubscribeMessage};
+use attestmesh_indexer::pb::{subscribe_message, Ack, DeliveryCursor, Hello, SubscribeMessage};
 use attestmesh_indexer::state::cursor::{Cursor, CursorStore, SledCursorStore};
 use attestmesh_indexer::state::IndexerState;
 use std::sync::Arc;
@@ -58,6 +58,7 @@ async fn empty_v2_cursor_starts_at_head_and_empty_checkpoint_advances_it() {
                 attestation: Vec::new(),
                 from_block: 0,
                 protocol_version: envelope::CHECKPOINT_PROTOCOL_VERSION,
+                resume_cursor: None,
             })),
         })
         .await
@@ -126,6 +127,80 @@ async fn empty_v2_cursor_starts_at_head_and_empty_checkpoint_advances_it() {
 
     drop(outbound_tx);
     drop(inbound);
+    let _ = shutdown_tx.send(());
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn an_unacked_exact_cursor_session_does_not_advance_replica_state() {
+    let state_dir = TempDir::new().unwrap();
+    let cursors = Arc::new(SledCursorStore::open(state_dir.path().to_str().unwrap()).unwrap());
+    let state = IndexerState::new(cursors.clone());
+    let cluster = Address::repeat_byte(0xc2);
+    let member = B256::repeat_byte(0xa2);
+    state.add_cluster(cluster).await;
+    state
+        .record_member(cluster, member, Address::repeat_byte(0x12), 40)
+        .await;
+    state.set_last_indexed_block(100).await;
+
+    let identity = Arc::new(
+        Identity::derive(&MockDstack::from_label("protocol-v3-indexer"))
+            .await
+            .unwrap(),
+    );
+    let service = IndexerService::new(state, identity, Arc::new(Metrics::new()));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let server = tokio::spawn(async move {
+        tonic::transport::Server::builder()
+            .add_service(IndexerServer::new(service))
+            .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async {
+                let _ = shutdown_rx.await;
+            })
+            .await
+            .unwrap();
+    });
+
+    for _ in 0..2 {
+        let mut client = IndexerClient::connect(format!("http://{addr}"))
+            .await
+            .unwrap();
+        let (outbound_tx, outbound_rx) = mpsc::channel(8);
+        outbound_tx
+            .send(SubscribeMessage {
+                inner: Some(subscribe_message::Inner::Hello(Hello {
+                    cluster_addr: cluster.as_slice().to_vec(),
+                    member_id: member.as_slice().to_vec(),
+                    attestation: Vec::new(),
+                    // Kept for a pre-v3 server; the exact cursor below is authoritative.
+                    from_block: 50,
+                    protocol_version: envelope::EXACT_CURSOR_PROTOCOL_VERSION,
+                    resume_cursor: Some(DeliveryCursor {
+                        block_number: 50,
+                        log_index: 3,
+                    }),
+                })),
+            })
+            .await
+            .unwrap();
+        let mut inbound = client
+            .subscribe(ReceiverStream::new(outbound_rx))
+            .await
+            .unwrap()
+            .into_inner();
+        let checkpoint = inbound.message().await.unwrap().unwrap();
+        assert!(envelope::is_checkpoint(&checkpoint));
+        assert_eq!(checkpoint.block_number, 100);
+
+        // Drop without Ack. A second connection with the same explicit cursor must
+        // receive the checkpoint again, and the replica-local store must stay empty.
+        drop(inbound);
+        drop(outbound_tx);
+        assert_eq!(cursors.load(cluster, member).unwrap(), None);
+    }
+
     let _ = shutdown_tx.send(());
     server.await.unwrap();
 }
