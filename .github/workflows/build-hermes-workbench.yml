@@ -37,7 +37,7 @@ jobs:
           file: ./deploy/hermes-workbench/Dockerfile
           push: true
           tags: |
-            ghcr.io/attestmesh/hermes-workbench:latest
+            ${{ github.ref == 'refs/heads/main' && 'ghcr.io/attestmesh/hermes-workbench:latest' || '' }}
             ghcr.io/attestmesh/hermes-workbench:${{ github.sha }}
           cache-from: type=gha
           cache-to: type=gha,mode=max

@@ -37,7 +37,7 @@ jobs:
           file: ./indexer/Dockerfile
           push: true
           tags: |
-            ghcr.io/attestmesh/attestmesh-indexer:latest
+            ${{ github.ref == 'refs/heads/main' && 'ghcr.io/attestmesh/attestmesh-indexer:latest' || '' }}
             ghcr.io/attestmesh/attestmesh-indexer:${{ github.sha }}
           cache-from: type=gha
           cache-to: type=gha,mode=max

@@ -37,7 +37,7 @@ jobs:
           file: ./deploy/clickhouse-ha/Dockerfile
           push: true
           tags: |
-            ghcr.io/attestmesh/clickhouse-ha:latest
+            ${{ github.ref == 'refs/heads/main' && 'ghcr.io/attestmesh/clickhouse-ha:latest' || '' }}
             ghcr.io/attestmesh/clickhouse-ha:${{ github.sha }}
           cache-from: type=gha
           cache-to: type=gha,mode=max

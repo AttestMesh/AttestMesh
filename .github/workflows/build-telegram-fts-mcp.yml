@@ -36,7 +36,7 @@ jobs:
           file: ./deploy/telegram-fts-mcp/Dockerfile
           push: true
           tags: |
-            ghcr.io/attestmesh/telegram-fts-mcp:latest
+            ${{ github.ref == 'refs/heads/main' && 'ghcr.io/attestmesh/telegram-fts-mcp:latest' || '' }}
             ghcr.io/attestmesh/telegram-fts-mcp:${{ github.sha }}
           cache-from: type=gha
           cache-to: type=gha,mode=max

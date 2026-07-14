@@ -37,7 +37,7 @@ jobs:
           file: ./deploy/redis-ha/Dockerfile
           push: true
           tags: |
-            ghcr.io/attestmesh/redis-ha:latest
+            ${{ github.ref == 'refs/heads/main' && 'ghcr.io/attestmesh/redis-ha:latest' || '' }}
             ghcr.io/attestmesh/redis-ha:${{ github.sha }}
           cache-from: type=gha
           cache-to: type=gha,mode=max

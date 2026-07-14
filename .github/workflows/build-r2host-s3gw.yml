@@ -36,7 +36,7 @@ jobs:
           file: ./deploy/r2-host/Dockerfile
           push: true
           tags: |
-            ghcr.io/attestmesh/r2host-s3gw:latest
+            ${{ github.ref == 'refs/heads/main' && 'ghcr.io/attestmesh/r2host-s3gw:latest' || '' }}
             ghcr.io/attestmesh/r2host-s3gw:${{ github.sha }}
           cache-from: type=gha
           cache-to: type=gha,mode=max

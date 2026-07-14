@@ -36,7 +36,7 @@ jobs:
           file: ./deploy/agent-egress-fw/Dockerfile
           push: true
           tags: |
-            ghcr.io/attestmesh/agent-egress-fw:latest
+            ${{ github.ref == 'refs/heads/main' && 'ghcr.io/attestmesh/agent-egress-fw:latest' || '' }}
             ghcr.io/attestmesh/agent-egress-fw:${{ github.sha }}
           cache-from: type=gha
           cache-to: type=gha,mode=max

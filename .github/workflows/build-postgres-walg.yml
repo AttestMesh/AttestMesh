@@ -36,7 +36,7 @@ jobs:
           file: ./deploy/postgres-walg/Dockerfile
           push: true
           tags: |
-            ghcr.io/attestmesh/postgres-walg:latest
+            ${{ github.ref == 'refs/heads/main' && 'ghcr.io/attestmesh/postgres-walg:latest' || '' }}
             ghcr.io/attestmesh/postgres-walg:${{ github.sha }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
