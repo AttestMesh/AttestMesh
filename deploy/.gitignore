@@ -9,3 +9,6 @@ bun.lockb
 smithers.db*
 __pycache__/
 *.state
+
+# Operational backups and database exports must remain local.
+/backups/
