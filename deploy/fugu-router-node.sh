@@ -205,13 +205,7 @@ _require_env() {
 
 send_seq() {
   local label="$1"; shift
-  local nonce
-  nonce=$(cast nonce "$DEPLOYER_ADDR" --rpc-url "$RPC_URL")
-  run_step "$label" cast send "$@" --nonce "$nonce" --rpc-url "$RPC_URL" --private-key "$PRIVATE_KEY" && return 0
-  log "↻ $label: refetching nonce + retrying"
-  sleep 4
-  nonce=$(cast nonce "$DEPLOYER_ADDR" --rpc-url "$RPC_URL")
-  run_step "${label}-retry" cast send "$@" --nonce "$nonce" --rpc-url "$RPC_URL" --private-key "$PRIVATE_KEY"
+  send_with_nonce_retry "$label" "$@"
 }
 
 # Forward compose + helper to the box and run a box-side mode. Secrets ride ssh
@@ -345,8 +339,9 @@ bind_member() {
   ssh_box "sudo bash -s" <<SCRIPT 2>&1 | tee "$LOGDIR/fugu-bind-${NODE}.$(ts).log"
 export PATH=\$PATH:/root/.foundry/bin
 KEY=\$(jq -r '.[0].private_key' $BOX_DEPLOYER_KEY)
-cast send $X "upgradeToAndCall(address,bytes)" $MEMBER_IMPL "$reinit" --rpc-url $BOX_RPC --private-key "\$KEY" 2>&1 | grep -iE "^status|^transactionHash|error|FailedCall" | head -3
+cast send $X "upgradeToAndCall(address,bytes)" $MEMBER_IMPL "$reinit" --async --rpc-url $BOX_RPC --private-key "\$KEY"
 SCRIPT
+  confirm_latest_transaction "fugu-bind-${NODE}" "$RPC_URL" "$LOGDIR/fugu-bind-${NODE}.*.log" || die "bind transaction not confirmed"
   local c=""
   for _ in 1 2 3 4 5 6 7 8; do
     c=$(cast call "$X" 'cluster()(address)' --rpc-url "$RPC_URL" 2>/dev/null)

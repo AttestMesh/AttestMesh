@@ -136,13 +136,7 @@ _require_env() {
 
 send_seq() {
   local label="$1"; shift
-  local nonce
-  nonce=$(cast nonce "$DEPLOYER_ADDR" --rpc-url "$RPC_URL")
-  run_step "$label" cast send "$@" --nonce "$nonce" --rpc-url "$RPC_URL" --private-key "$PRIVATE_KEY" && return 0
-  log "↻ $label: refetching nonce + retrying"
-  sleep 4
-  nonce=$(cast nonce "$DEPLOYER_ADDR" --rpc-url "$RPC_URL")
-  run_step "${label}-retry" cast send "$@" --nonce "$nonce" --rpc-url "$RPC_URL" --private-key "$PRIVATE_KEY"
+  send_with_nonce_retry "$label" "$@"
 }
 
 # ── mesh-IP precompute (must match AttestFacet.meshIpOf + sidecar wg/cidr.rs) ────────────
@@ -363,8 +357,9 @@ bind_all() {
     ssh_box "sudo bash -s" <<SCRIPT 2>&1 | tee "$LOGDIR/pgha-bind-${NODE}-${n}.$(ts).log"
 export PATH=\$PATH:/root/.foundry/bin
 KEY=\$(jq -r '.[0].private_key' $BOX_DEPLOYER_KEY)
-cast send $X "upgradeToAndCall(address,bytes)" $MEMBER_IMPL "$reinit" --rpc-url $BOX_RPC --private-key "\$KEY" 2>&1 | grep -iE "^status|^transactionHash|error|FailedCall" | head -3
+cast send $X "upgradeToAndCall(address,bytes)" $MEMBER_IMPL "$reinit" --async --rpc-url $BOX_RPC --private-key "\$KEY"
 SCRIPT
+    confirm_latest_transaction "pgha-bind-${NODE}-${n}" "$RPC_URL" "$LOGDIR/pgha-bind-${NODE}-${n}.*.log" || die "bind transaction not confirmed for $n"
     c=""
     for _ in 1 2 3 4 5 6 7 8; do
       c=$(cast call "$X" 'cluster()(address)' --rpc-url "$RPC_URL" 2>/dev/null)

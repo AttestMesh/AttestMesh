@@ -94,15 +94,9 @@ _load() { [ -f "$STATE" ] && source "$STATE" || true; }
 ssh_box() { ssh -o BatchMode=yes -o ConnectTimeout=8 "$BOX_HOST" "$@"; }
 _vmm() { ssh_box "curl -s --max-time 30 http://127.0.0.1:9080/prpc/$1?json -H 'content-type: application/json' -d '$2'"; }
 
-send_seq() {  # cast send with a FRESHLY-fetched nonce + one retry — handles RPC nonce lag right
-              # after forge scripts (DeployCluster/patha) where `cast nonce` can read stale.
+send_seq() {
   local label="$1"; shift
-  local nonce
-  nonce=$(cast nonce "$DEPLOYER_ADDR" --rpc-url "$RPC_URL")
-  run_step "$label" cast send "$@" --nonce "$nonce" --rpc-url "$RPC_URL" --private-key "$PRIVATE_KEY" && return 0
-  log "↻ $label: refetching nonce + retrying (likely RPC nonce lag after a forge script)"
-  sleep 4; nonce=$(cast nonce "$DEPLOYER_ADDR" --rpc-url "$RPC_URL")
-  run_step "${label}-retry" cast send "$@" --nonce "$nonce" --rpc-url "$RPC_URL" --private-key "$PRIVATE_KEY"
+  send_with_nonce_retry "$label" "$@"
 }
 
 # Run the box-side helper (matrix-node-box.py) with the sealed secret env passed over SSH (in-memory,
@@ -217,8 +211,9 @@ bind_member() {
   ssh_box "sudo bash -s" <<SCRIPT 2>&1 | tee "$LOGDIR/matrix-bind-${NODE}.$(ts).log"
 export PATH=\$PATH:/root/.foundry/bin
 KEY=\$(jq -r '.[0].private_key' $BOX_DEPLOYER_KEY)
-cast send $X "upgradeToAndCall(address,bytes)" $MEMBER_IMPL "$reinit" --rpc-url $BOX_RPC --private-key "\$KEY" 2>&1 | grep -iE "^status|^transactionHash|error|FailedCall" | head -3
+cast send $X "upgradeToAndCall(address,bytes)" $MEMBER_IMPL "$reinit" --async --rpc-url $BOX_RPC --private-key "\$KEY"
 SCRIPT
+  confirm_latest_transaction "matrix-bind-${NODE}" "$RPC_URL" "$LOGDIR/matrix-bind-${NODE}.*.log" || die "bind transaction not confirmed"
   local c=""
   for _ in 1 2 3 4 5 6 7 8; do
     c=$(cast call "$X" 'cluster()(address)' --rpc-url "$RPC_URL" 2>/dev/null)

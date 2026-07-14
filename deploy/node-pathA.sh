@@ -66,8 +66,7 @@ NEXT_NONCE=""
 send_seq() {
   local label="$1"; shift
   [ -n "$NEXT_NONCE" ] || NEXT_NONCE=$(cast nonce "$DEPLOYER_ADDR" --rpc-url "$RPC_URL")
-  run_step "$label" cast send "$@" --nonce "$NEXT_NONCE" \
-    --rpc-url "$RPC_URL" --private-key "$PRIVATE_KEY" \
+  send_confirmed "$label" "$RPC_URL" "$PRIVATE_KEY" "$@" --nonce "$NEXT_NONCE" \
     && NEXT_NONCE=$((NEXT_NONCE + 1))
 }
 

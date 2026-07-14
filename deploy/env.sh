@@ -29,6 +29,10 @@ export ALCHEMY_RPC_URL="https://base-mainnet.g.alchemy.com/v2/${ALCHEMY_API_KEY}
 # a NEW node / fresh registration still needs a real bundler (Pimlico, or our own gateway-exposed
 # Base node). Durable plan: our own Base node's RPC via the C3 gateway (box-admin/base-node).
 export RPC_URL="${RPC_URL:-https://base-rpc.publicnode.com}"       # deployer host-side cast: nonce/send/call
+export WS_RPC_URL="${WS_RPC_URL:-wss://base-rpc.publicnode.com}"   # preferred receipt wake-up; HTTP polling is fallback
+export TX_RECEIPT_TIMEOUT_SECONDS="${TX_RECEIPT_TIMEOUT_SECONDS:-300}"
+export TX_RECEIPT_POLL_SECONDS="${TX_RECEIPT_POLL_SECONDS:-2}"
+export TX_CONFIRMATIONS="${TX_CONFIRMATIONS:-1}"
 export CVM_RPC_URL="${CVM_RPC_URL:-https://base-rpc.publicnode.com}"       # sealed into CVM sidecars (was Alchemy → dead → outage)
 export BUNDLER_URL="${BUNDLER_URL:-$ALCHEMY_RPC_URL}"              # host-side AA bundler (unused by `update`; Alchemy dead)
 export CVM_BUNDLER_URL="${CVM_BUNDLER_URL:-https://base-rpc.publicnode.com}"  # sealed; interim — NEW-node registration needs a real bundler

@@ -255,14 +255,7 @@ SCRIPT
 
 send_seq() {
   local label="$1"; shift
-  local nonce
-  nonce=$(cast nonce "$DEPLOYER_ADDR" --rpc-url "$RPC_URL")
-  run_step "$label" cast send "$@" --nonce "$nonce" --rpc-url "$RPC_URL" --private-key "$PRIVATE_KEY" \
-    && return 0
-  log "↻ $label: refetching nonce + retrying"
-  sleep 4
-  nonce=$(cast nonce "$DEPLOYER_ADDR" --rpc-url "$RPC_URL")
-  run_step "${label}-retry" cast send "$@" --nonce "$nonce" --rpc-url "$RPC_URL" --private-key "$PRIVATE_KEY"
+  send_with_nonce_retry "$label" "$@"
 }
 
 _set_registry() {
