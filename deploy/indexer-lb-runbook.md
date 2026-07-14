@@ -29,7 +29,7 @@ As of 2026-07-11, the production blue/green pair is:
 
 The stable gRPC endpoint is `https://42b122e37c9805e7c5a7c77aff0f6c3c80603602-50052.gateway.attestmesh.xyz`; stable HTTP diagnostics use the same host with port `9090`. Both colors run Indexer image `ghcr.io/attestmesh/attestmesh-indexer@sha256:14e9e3f6869ada585642c14e4e2e43bee197978ffc68d146dd6d3cddbc49d2bb`.
 
-Treat the on-chain registry and `active` command as authoritative if this record is stale. Keep green running until the protocol-v2 Sidecar rollout is complete and subscriber/checkpoint diagnostics remain caught up.
+Treat the on-chain registry and `active` command as authoritative if this record is stale. Keep green running until the protocol-v3 exact-cursor Sidecar rollout is complete and subscriber/checkpoint diagnostics remain caught up.
 
 ## Why the switch is two-phase
 
@@ -42,7 +42,7 @@ The implemented cutover is:
 3. `commit`: re-probe, switch both HAProxy backends to the selected worker(s), close old LB streams, and reopen the frontends.
 4. Sidecars reconnect, re-read the registry, and send their last handled block. The candidate replays that block, so same-block duplicates are possible but gaps are not.
 
-The sidecar persists the last signed checkpoint in `SIDECAR_STATE_DIR/indexer-cursor.v1`. Roll the sidecar image containing this behavior before relying on blue/green Indexer switching.
+The sidecar persists the last signed checkpoint in `SIDECAR_STATE_DIR/indexer-cursor.v1`. Every production sidecar must run the protocol-v3 exact-cursor implementation and mount `SIDECAR_STATE_DIR` on durable storage before a shared pool is activated. An ephemeral or missing state directory can lose the exact resume cursor on restart.
 
 If the registry transaction fails, the driver aborts the prepare and keeps the old backend. If commit fails after the transaction, it restores both the previous registry record and the previous HAProxy pool. Registry rollback happens first so the old data plane is never deliberately reopened against the new identity.
 
@@ -60,12 +60,17 @@ The `indexerCluster` must be a dedicated Dstack-only Indexer cluster. It must no
 
 Every shared-pool operation also requires `INDEXER_BACKEND_PUBKEY` as a nonzero, independently obtained pin. Obtain and verify this key from trusted enclave serial output or attestation evidence out of band; never copy it from the unauthenticated bridge `/status` response used by the switch. The driver requires every worker's reported key to match the pin before it can prepare the registry transaction.
 
+Shared activation is additionally fail-closed behind `INDEXER_PROTOCOL_V3_FLEET_CONFIRMED=1`. Set this operator confirmation only after fleet inventory proves that all production sidecars have both durable `SIDECAR_STATE_DIR` storage and protocol-v3 exact-cursor support. The driver and the sealed LB controller both require the exact value `1`; update an existing LB once to seal the confirmation before its first pool switch. Without it, every multi-backend switch and shared initial pool is rejected, while legacy single-backend blue/green switching remains available.
+
 Select a prepared shared pool with one comma-separated argument:
 
 ```bash
 source deploy/env.sh
 
 export INDEXER_BACKEND_PUBKEY='0x<verified 64-hex-character shared key>'
+export INDEXER_PROTOCOL_V3_FLEET_CONFIRMED=1
+# Seal the confirmed gate into an existing LB controller before its first pool switch.
+deploy/indexer-lb-node.sh attestmesh-indexer-lb update
 deploy/indexer-lb-node.sh attestmesh-indexer-lb switch indexer-ha-r1,indexer-ha-r2
 deploy/indexer-lb-node.sh attestmesh-indexer-lb active
 deploy/indexer-lb-node.sh attestmesh-indexer-lb verify-lb

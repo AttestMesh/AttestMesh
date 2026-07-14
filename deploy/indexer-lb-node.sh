@@ -107,6 +107,11 @@ EOF
   [ -n "${INDEXER_LB_ADMIN_KEY:-}" ] || die "INDEXER_LB_ADMIN_KEY missing in $SECRETS_FILE"
 }
 
+_require_protocol_v3_fleet_confirmation() {
+  [ "${INDEXER_PROTOCOL_V3_FLEET_CONFIRMED:-}" = 1 ] \
+    || die "shared Indexer pools require INDEXER_PROTOCOL_V3_FLEET_CONFIRMED=1 after every production sidecar has durable protocol-v3 exact-cursor support"
+}
+
 _seal_lb_env() {
   _ensure_secrets
   local initial="${INDEXER_LB_INITIAL_BACKEND:-}" target ip require_bridge=0 pinned_pubkey
@@ -119,6 +124,7 @@ _seal_lb_env() {
     [ "${#initial_targets[@]}" -le "$MAX_INDEXER_BACKENDS" ] \
       || die "INDEXER_LB_INITIAL_BACKEND supports at most $MAX_INDEXER_BACKENDS members"
     if [ "${#initial_targets[@]}" -ge 2 ]; then
+      _require_protocol_v3_fleet_confirmation
       require_bridge=1
       pinned_pubkey="${INDEXER_BACKEND_PUBKEY:-}"
       pinned_pubkey="${pinned_pubkey,,}"
@@ -144,6 +150,7 @@ _seal_lb_env() {
     printf 'INDEXER_LB_INITIAL_BACKEND=%s\n' "$initial"
     printf 'INDEXER_LB_CLUSTER=%s\n' "$CLUSTER"
     printf 'INDEXER_LB_PINNED_PUBKEY=%s\n' "${INDEXER_BACKEND_PUBKEY:-}"
+    printf 'INDEXER_PROTOCOL_V3_FLEET_CONFIRMED=%s\n' "${INDEXER_PROTOCOL_V3_FLEET_CONFIRMED:-}"
   } | base64 | tr -d '\n')"
   export APP_ENV_B64
 }
@@ -375,6 +382,7 @@ _resolve_switch_pool() {
   if [ "${#raw_targets[@]}" -gt 1 ]; then
     mode=shared
     POOL_SHARED_HA=1
+    _require_protocol_v3_fleet_confirmation
     POOL_PINNED_PUBKEY="${INDEXER_BACKEND_PUBKEY:-}"
     POOL_PINNED_PUBKEY="${POOL_PINNED_PUBKEY,,}"
     echo "$POOL_PINNED_PUBKEY" | grep -Eq '^0x[0-9a-f]{64}$' \
@@ -522,7 +530,7 @@ switch_backend() {
       --arg pubkey "$POOL_PUBKEY" \
       --arg code "$POOL_CODE_ID" \
       --arg cluster "$POOL_CLUSTER" \
-      '{backends:$backends, expected_pubkey:$pubkey, expected_code_id:$code, expected_cluster:$cluster}')
+      '{backends:$backends, expected_pubkey:$pubkey, expected_code_id:$code, expected_cluster:$cluster, protocol_v3_fleet_confirmed:true}')
     shared_label="shared pool nodes=$POOL_TARGETS_CSV backends=$POOL_BACKENDS_CSV cluster=$POOL_CLUSTER members=$POOL_MEMBER_IDS_CSV"
   else
     prepare_payload=$(jq -nc \

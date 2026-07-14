@@ -164,6 +164,9 @@ services:
         PINNED_SHARED_PUBKEY = os.environ.get(
             "INDEXER_LB_PINNED_PUBKEY", ""
         ).strip().lower()
+        PROTOCOL_V3_FLEET_CONFIRMED = (
+            os.environ.get("INDEXER_PROTOCOL_V3_FLEET_CONFIRMED", "") == "1"
+        )
         SOCKET_PATH = "/indexer-lb-run/admin.sock"
         ACTIVE_BACKEND_PATH = "/indexer-lb-state/active_backend"
         ACTIVE_PUBKEY_PATH = "/indexer-lb-state/active_pubkey"
@@ -415,6 +418,10 @@ services:
         def probe_initial_shared_pool(backends: list[str]) -> dict:
             # Initial pool recovery is allowed only when the registry already lets
             # the workers serve. A first migration must go through prepare/commit.
+            if not PROTOCOL_V3_FLEET_CONFIRMED:
+                raise RuntimeError(
+                    "initial shared pool requires protocol-v3 fleet confirmation"
+                )
             with urllib.request.urlopen(
                 f"http://{backends[0]}:9090/status", timeout=10
             ) as resp:
@@ -592,6 +599,13 @@ services:
             backends = validate_backends(body.get("backends"))
             if len(backends) < 2:
                 raise ValueError("a shared HA pool requires at least two backends")
+            if (
+                not PROTOCOL_V3_FLEET_CONFIRMED
+                or body.get("protocol_v3_fleet_confirmed") is not True
+            ):
+                raise ValueError(
+                    "shared HA pool requires protocol-v3 fleet confirmation"
+                )
             code_id = normalize_hex32(
                 str(body.get("expected_code_id", "")), "expected_code_id", nonzero=True
             )

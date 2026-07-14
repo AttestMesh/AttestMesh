@@ -29,7 +29,9 @@ def controller_source() -> str:
     )
 
 
-def load_controller(*, include_handler: bool = False) -> dict:
+def load_controller(
+    *, include_handler: bool = False, fleet_confirmed: bool = True
+) -> dict:
     source = controller_source()
     boundary = "for _ in range(120):" if include_handler else "class Handler"
     namespace: dict = {}
@@ -38,6 +40,7 @@ def load_controller(*, include_handler: bool = False) -> dict:
         {
             "INDEXER_LB_ADMIN_KEY": ADMIN_KEY,
             "INDEXER_LB_CLUSTER": LB_CLUSTER,
+            "INDEXER_PROTOCOL_V3_FLEET_CONFIRMED": "1" if fleet_confirmed else "0",
         },
     ):
         exec(source[: source.index(boundary)], namespace)
@@ -47,6 +50,34 @@ def load_controller(*, include_handler: bool = False) -> dict:
 class ControllerPoolTests(unittest.TestCase):
     def test_embedded_controller_compiles(self) -> None:
         compile(controller_source(), "indexer_lb_controller.py", "exec")
+
+    def test_initial_shared_pool_requires_fleet_confirmation(self) -> None:
+        controller = load_controller(fleet_confirmed=False)
+        with self.assertRaisesRegex(RuntimeError, "protocol-v3 fleet confirmation"):
+            controller["probe_initial_shared_pool"](["10.0.0.2", "10.0.0.3"])
+
+        with self.assertRaisesRegex(ValueError, "protocol-v3 fleet confirmation"):
+            controller["prepare_from_body"](
+                {
+                    "backends": ["10.0.0.2", "10.0.0.3"],
+                    "expected_pubkey": "0x" + ("1" * 64),
+                    "expected_code_id": "0x" + ("2" * 64),
+                    "expected_cluster": "0x" + ("b" * 40),
+                    "protocol_v3_fleet_confirmed": True,
+                }
+            )
+
+    def test_legacy_single_does_not_require_fleet_confirmation(self) -> None:
+        controller = load_controller(fleet_confirmed=False)
+        controller["probe_pool"] = lambda *_args, **_kwargs: [{}]
+        prepared, _probes = controller["prepare_from_body"](
+            {
+                "backend": "10.0.0.2",
+                "expected_pubkey": "0x" + ("1" * 64),
+                "expected_code_id": "0x" + ("2" * 64),
+            }
+        )
+        self.assertFalse(prepared["shared_ha"])
 
     def test_shared_pool_requires_consensus_and_dedicated_cluster(self) -> None:
         controller = load_controller()
@@ -78,6 +109,7 @@ class ControllerPoolTests(unittest.TestCase):
                 "expected_pubkey": pubkey,
                 "expected_code_id": code_id,
                 "expected_cluster": cluster,
+                "protocol_v3_fleet_confirmed": True,
             }
         )
         self.assertTrue(prepared["shared_ha"])
@@ -91,11 +123,23 @@ class ControllerPoolTests(unittest.TestCase):
                     "expected_pubkey": pubkey,
                     "expected_code_id": code_id,
                     "expected_cluster": LB_CLUSTER,
+                    "protocol_v3_fleet_confirmed": True,
                 }
             )
 
         members["10.0.0.3"] = members["10.0.0.2"]
         with self.assertRaisesRegex(RuntimeError, "distinct servingMemberIds"):
+            controller["prepare_from_body"](
+                {
+                    "backends": list(members),
+                    "expected_pubkey": pubkey,
+                    "expected_code_id": code_id,
+                    "expected_cluster": cluster,
+                    "protocol_v3_fleet_confirmed": True,
+                }
+            )
+
+        with self.assertRaisesRegex(ValueError, "protocol-v3 fleet confirmation"):
             controller["prepare_from_body"](
                 {
                     "backends": list(members),
