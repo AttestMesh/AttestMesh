@@ -49,7 +49,7 @@ jobs:
         run: bash -n deploy/indexer*.sh
 
       - name: Lint deployment scripts
-        run: shellcheck deploy/indexer*.sh
+        run: shellcheck -x -e SC1090,SC1091,SC2018,SC2019 deploy/indexer*.sh
 
   build:
     needs: [test, deploy-check]

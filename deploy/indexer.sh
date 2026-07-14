@@ -75,7 +75,8 @@ EOF
 
 deploy_cvm() {
   [ -f "$ENV_FILE" ] || _build_env_file
-  local lf="$LOGDIR/indexer-deploy-${NAME}.$(ts).log"
+  local lf
+  lf="$LOGDIR/indexer-deploy-${NAME}.$(ts).log"
   log "▶ phala deploy (stock dstack app) name=$NAME compose=$COMPOSE node-id=$NODE_ID"
   npx --yes phala deploy --kms base --kms-contract "$KMS_CONTRACT" \
     --name "$NAME" --compose "$COMPOSE" -e "$ENV_FILE" --node-id "$NODE_ID" \
