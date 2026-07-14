@@ -21,6 +21,24 @@ require() {
   [ "$miss" -eq 0 ] || die "missing required environment (source deploy/env.sh first)"
 }
 
+# Resolve an authenticated box-local Base Reth proxy URL without copying its
+# token to the repository. Callers keep the URL in memory and seal it directly
+# into the CVM environment.
+box_local_rpc_url() {
+  local box_host="${1:?box host required}" alias="${2:?rpc alias required}"
+  local base="${BOX_LOCAL_RPC_BASE_URL:-http://10.0.100.1:8545}"
+  local keys="${BOX_LOCAL_RPC_KEYS_FILE:-/srv/data/base-node/proxyd/keys.env}"
+  local token
+  case "$alias" in
+    *[!a-zA-Z0-9_-]*) die "invalid local RPC alias: $alias" ;;
+  esac
+  token=$(ssh -o BatchMode=yes -o ConnectTimeout=8 "$box_host" \
+    "sudo awk -F= -v a='$alias' '\$1 == a { print \$2; exit }' '$keys'" 2>/dev/null) \
+    || die "could not read local RPC alias '$alias' from $box_host"
+  [ -n "$token" ] || die "local RPC alias '$alias' is absent from $keys"
+  printf '%s/%s\n' "${base%/}" "$token"
+}
+
 # run_step <name> <cmd...> : log start, tee output to its own logfile, fail loud with a tail.
 run_step() {
   local name="$1"; shift

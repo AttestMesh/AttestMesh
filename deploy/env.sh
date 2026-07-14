@@ -23,9 +23,12 @@ export ALCHEMY_RPC_URL="https://base-mainnet.g.alchemy.com/v2/${ALCHEMY_API_KEY}
 #
 # UPDATE 2026-07-08: Alchemy is fully dead now, and the CVM-sealed Alchemy RPC took console DOWN —
 # on a full stop/start the sidecar couldn't READ its peers on-chain to re-join the mesh, so
-# pg-provision hung and the app never started (~1.5h outage). So the CVM-sealed RPC is publicnode
-# now too (interim). CAVEAT: publicnode is a plain RPC, NOT an AA bundler. Fine for an EXISTING node
-# whose ed25519 key is already published (one sponsored op per node LIFETIME → boot is reads-only);
+# pg-provision hung and the app never started (~1.5h outage).
+#
+# UPDATE 2026-07-11: PublicNode began rejecting the sidecar's bounded 4,000-block startup
+# eth_getLogs read as an archive request. Base's official archive endpoint accepts that exact
+# query, so CVM reads use mainnet.base.org. Neither public endpoint is an AA bundler. This is fine
+# for an EXISTING node whose ed25519 key is already published (one sponsored op per node LIFETIME);
 # a NEW node / fresh registration still needs a real bundler (Pimlico, or our own gateway-exposed
 # Base node). Durable plan: our own Base node's RPC via the C3 gateway (box-admin/base-node).
 export RPC_URL="${RPC_URL:-https://base-rpc.publicnode.com}"       # deployer host-side cast: nonce/send/call
@@ -33,7 +36,7 @@ export WS_RPC_URL="${WS_RPC_URL:-wss://base-rpc.publicnode.com}"   # preferred r
 export TX_RECEIPT_TIMEOUT_SECONDS="${TX_RECEIPT_TIMEOUT_SECONDS:-300}"
 export TX_RECEIPT_POLL_SECONDS="${TX_RECEIPT_POLL_SECONDS:-2}"
 export TX_CONFIRMATIONS="${TX_CONFIRMATIONS:-1}"
-export CVM_RPC_URL="${CVM_RPC_URL:-https://base-rpc.publicnode.com}"       # sealed into CVM sidecars (was Alchemy → dead → outage)
+export CVM_RPC_URL="${CVM_RPC_URL:-https://mainnet.base.org}"       # sealed into CVM sidecars; archive reads, rate-limited
 export BUNDLER_URL="${BUNDLER_URL:-$ALCHEMY_RPC_URL}"              # host-side AA bundler (unused by `update`; Alchemy dead)
 export CVM_BUNDLER_URL="${CVM_BUNDLER_URL:-https://base-rpc.publicnode.com}"  # sealed; interim — NEW-node registration needs a real bundler
 export GAS_POLICY_ID="$(_read "$TEESQL/alchemy-policy.id")"
