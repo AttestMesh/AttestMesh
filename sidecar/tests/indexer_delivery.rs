@@ -62,8 +62,10 @@ struct FakeIndexer {
     signing_key: SigningKey,
     cluster: Address,
     acks: mpsc::UnboundedSender<(u64, u64)>,
-    hellos: mpsc::UnboundedSender<(u32, u64, Option<(u64, u64)>)>,
+    hellos: mpsc::UnboundedSender<HelloRecord>,
 }
+
+type HelloRecord = (u32, u64, Option<(u64, u64)>);
 
 #[tonic::async_trait]
 impl Indexer for FakeIndexer {

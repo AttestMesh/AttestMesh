@@ -20,8 +20,10 @@ use crate::pb::{subscribe_message::Inner, DeliveryCursor, PushEnvelope, Subscrib
 use crate::state::cursor::Cursor;
 use crate::state::IndexerState;
 use alloy::primitives::{Address, B256};
+use std::collections::VecDeque;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::Mutex as StdMutex;
 use tokio_stream::wrappers::{ReceiverStream, WatchStream};
 use tokio_stream::{Stream, StreamExt};
 use tonic::{Request, Response, Status, Streaming};
@@ -119,6 +121,36 @@ fn parse_exact_cursor(
 
 fn is_after_cursor(block_number: u64, log_index: u64, cursor: Option<Cursor>) -> bool {
     cursor.map_or(true, |c| Cursor::new(block_number, log_index) > c)
+}
+
+/// Positions actually emitted on one response stream, in wire order. A client may
+/// acknowledge only the next emitted position; arbitrary cursors never reach the
+/// replica-local store. This is not member authentication, but it removes cursor
+/// poisoning from the unauthenticated Ack surface.
+#[derive(Clone, Default)]
+struct SentPositions(Arc<StdMutex<VecDeque<Cursor>>>);
+
+const MAX_PENDING_ACKS: usize = 4_096;
+
+impl SentPositions {
+    fn record(&self, cursor: Cursor) -> bool {
+        let mut sent = self.0.lock().expect("sent-position lock");
+        if sent.len() >= MAX_PENDING_ACKS {
+            return false;
+        }
+        sent.push_back(cursor);
+        true
+    }
+
+    fn is_next(&self, cursor: Cursor) -> bool {
+        self.0.lock().expect("sent-position lock").front().copied() == Some(cursor)
+    }
+
+    fn consume(&self, cursor: Cursor) {
+        let mut sent = self.0.lock().expect("sent-position lock");
+        debug_assert_eq!(sent.front().copied(), Some(cursor));
+        sent.pop_front();
+    }
 }
 
 fn initialize_at_head(
@@ -307,8 +339,10 @@ impl Indexer for IndexerService {
         // 6. Spawn the inbound Ack handler. It advances the persistent cursor and is
         //    naturally torn down when the inbound stream ends (stream-drop), at which
         //    point we deregister the subscriber.
+        let sent_positions = SentPositions::default();
         let ack_state = self.state.clone();
         let ack_metrics = self.metrics.clone();
+        let ack_positions = sent_positions.clone();
         tokio::spawn(async move {
             while let Some(msg) = inbound.next().await {
                 match msg {
@@ -316,9 +350,22 @@ impl Indexer for IndexerService {
                         inner: Some(Inner::Ack(ack)),
                     }) => {
                         let cur = Cursor::new(ack.block_number, ack.log_index);
+                        if !ack_positions.is_next(cur) {
+                            tracing::warn!(
+                                cluster = %cluster,
+                                member = %member_id,
+                                block = ack.block_number,
+                                log_index = ack.log_index,
+                                "ignoring Ack for a position not emitted next in this session"
+                            );
+                            continue;
+                        }
                         if let Err(e) = ack_state.cursors().advance(cluster, member_id, cur) {
                             tracing::warn!(error = %e, "cursor advance failed");
-                        } else if ack.log_index == envelope::CHECKPOINT_LOG_INDEX {
+                            continue;
+                        }
+                        ack_positions.consume(cur);
+                        if ack.log_index == envelope::CHECKPOINT_LOG_INDEX {
                             // A checkpoint proves the whole ordered prefix was handled;
                             // make that empty-block progress durable immediately.
                             if let Err(e) = ack_state.cursors().flush() {
@@ -343,7 +390,17 @@ impl Indexer for IndexerService {
 
         // A full live channel emits an explicit terminal status. No later checkpoint
         // can pass the gap, so reconnect always resumes from the last durable Ack.
-        let messages = ReceiverStream::new(rx).map(Ok);
+        #[allow(clippy::result_large_err)]
+        let messages = ReceiverStream::new(rx).map(move |envelope| {
+            let cursor = Cursor::new(envelope.block_number, envelope.log_index);
+            if sent_positions.record(cursor) {
+                Ok(envelope)
+            } else {
+                Err(Status::resource_exhausted(
+                    "too many delivered positions await acknowledgement; reconnect from cursor",
+                ))
+            }
+        });
         let overflow = WatchStream::new(overflow_rx)
             .filter_map(overflow_terminal)
             .take(1);
@@ -423,5 +480,22 @@ mod tests {
             parse_exact_cursor(3, Some(wire)).unwrap(),
             Some(Cursor::new(12, 4))
         );
+    }
+
+    #[test]
+    fn acks_must_match_emitted_session_order() {
+        let sent = SentPositions::default();
+        let first = Cursor::new(10, 2);
+        let second = Cursor::new(11, u64::MAX);
+        assert!(sent.record(first));
+        assert!(sent.record(second));
+
+        assert!(!sent.is_next(Cursor::new(999, 0)));
+        assert!(!sent.is_next(second));
+        assert!(sent.is_next(first));
+        sent.consume(first);
+        assert!(sent.is_next(second));
+        sent.consume(second);
+        assert!(!sent.is_next(second));
     }
 }

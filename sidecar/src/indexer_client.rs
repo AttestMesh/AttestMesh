@@ -24,9 +24,8 @@ pub const CHECKPOINT_LOG_INDEX: u64 = u64::MAX;
 const CURSOR_FILE: &str = "indexer-cursor.v1";
 const CURSOR_BYTES: u64 = 69;
 
-/// Load the last durably handled cursor. Corruption degrades to a replay from
-/// the normal fresh-subscription policy; cursor state is an optimization, not a
-/// boot requirement.
+/// Load the last durably handled cursor. A missing file is a genuinely fresh
+/// subscription; malformed state is ignored conservatively and logged.
 pub async fn load_cursor(
     state_dir: Option<&Path>,
     cluster: alloy::primitives::Address,
@@ -209,6 +208,8 @@ pub async fn connect_and_run(
     dispatch: mpsc::Sender<DispatchRequest>,
     state_dir: Option<PathBuf>,
 ) -> Result<()> {
+    let state_dir = state_dir
+        .context("SIDECAR_STATE_DIR is required for protocol-v3 durable delivery cursors")?;
     // Explicit TLS config for https endpoints (the gateway-terminated route).
     // assume_http2: the dstack gateway serves gRPC/h2 but may answer ALPN with
     // http/1.1 — gRPC requires h2, so trust the verified reality over ALPN.
@@ -303,7 +304,7 @@ pub async fn connect_and_run(
             // may advance its local cursor. If this write fails, tear down without
             // Ack so the position is replayed on reconnect.
             store_cursor(
-                state_dir.as_deref(),
+                Some(state_dir.as_path()),
                 shared.cluster,
                 &shared.self_member_id,
                 position.0,
