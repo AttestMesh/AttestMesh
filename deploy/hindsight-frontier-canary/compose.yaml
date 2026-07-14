@@ -1,0 +1,188 @@
+name: hindsight-frontier-canary
+
+x-hindsight-environment: &hindsight_environment
+  HINDSIGHT_API_LLM_PROVIDER: openai
+  HINDSIGHT_API_LLM_REASONING_EFFORT: low
+  HINDSIGHT_API_LLM_EXTRA_BODY: '{"reasoning_effort":"low","include_reasoning":false}'
+  HINDSIGHT_API_LLM_STRICT_SCHEMA: "false"
+  HINDSIGHT_API_LLM_MAX_RETRIES: "1"
+  HINDSIGHT_API_WORKER_MAX_RETRIES: "0"
+  HINDSIGHT_API_SKIP_LLM_VERIFICATION: "true"
+  HINDSIGHT_API_RETAIN_MAX_COMPLETION_TOKENS: "8192"
+  HINDSIGHT_API_CONSOLIDATION_MAX_COMPLETION_TOKENS: "8192"
+  HINDSIGHT_API_LLM_MAX_CONCURRENT: "8"
+  HINDSIGHT_API_ENABLE_AUTO_CONSOLIDATION: "true"
+  HINDSIGHT_API_VECTOR_EXTENSION: pgvector
+  HINDSIGHT_API_TENANT_EXTENSION: hindsight_api.extensions.builtin.tenant:ApiKeyTenantExtension
+  HINDSIGHT_API_TENANT_API_KEY: ${FRONTIER_HINDSIGHT_TOKEN}
+  HINDSIGHT_CP_ACCESS_KEY: ${FRONTIER_HINDSIGHT_TOKEN}
+  HINDSIGHT_CP_DATAPLANE_API_KEY: ${FRONTIER_HINDSIGHT_TOKEN}
+  HF_HUB_OFFLINE: "1"
+  TRANSFORMERS_OFFLINE: "1"
+  LITELLM_LOCAL_MODEL_COST_MAP: "True"
+  LITELLM_LOCAL_BLOG_POSTS: "True"
+
+x-proxy-environment: &proxy_environment
+  PROVIDER_BASE_URL: ${FRONTIER_UPSTREAM_BASE_URL}
+  PROVIDER_API_KEY: ${FRONTIER_UPSTREAM_API_KEY}
+  PROVIDER_EGRESS_ENABLED: "true"
+  PROVIDER_SAFETY_MARGIN_USD: "0.25"
+  HINDSIGHT_BUDGET_PHASE: backfill
+  HINDSIGHT_MONTHLY_LIMIT_USD: "1"
+  QWEN_MONTHLY_LIMIT_USD: "1"
+  QWEN_INPUT_USD_PER_M: "0.01"
+  QWEN_OUTPUT_USD_PER_M: "0"
+  PROXY_RPM_LIMIT: "240"
+  PROXY_TPM_LIMIT: "6000000"
+  INITIAL_PROVIDER_SPEND_USD: "0"
+
+services:
+  proxy-grok:
+    image: ghcr.io/vectorize-io/hindsight:0.8.4
+    restart: "no"
+    user: "${FRONTIER_RUN_UID}:${FRONTIER_RUN_GID}"
+    network_mode: host
+    entrypoint:
+      - /app/api/.venv/bin/python
+      - /budget-proxy/budget_proxy.py
+      - --ledger
+      - /run/grok-ledger.json
+      - --state
+      - /run/grok-proxy-state.json
+      - --host
+      - 192.168.96.1
+      - --port
+      - "28082"
+    environment:
+      <<: *proxy_environment
+      PROXY_API_KEY: ${FRONTIER_GROK_PROXY_KEY}
+      PROVIDER_TOTAL_LIMIT_USD: "20.25"
+      HINDSIGHT_BACKFILL_LIMIT_USD: "20"
+      HINDSIGHT_MODEL: grok-4.5
+      HINDSIGHT_INPUT_USD_PER_M: "2"
+      HINDSIGHT_OUTPUT_USD_PER_M: "6"
+    volumes:
+      - ../hindsight-budget-proxy:/budget-proxy:ro
+      - ${FRONTIER_RUN_DIR}:/run
+    healthcheck:
+      test:
+        - CMD
+        - /app/api/.venv/bin/python
+        - -c
+        - import httpx; r=httpx.get('http://192.168.96.1:28082/health', timeout=3); r.raise_for_status(); assert r.json()['status']=='healthy'
+      interval: 3s
+      timeout: 4s
+      retries: 30
+
+  proxy-fugu:
+    image: ghcr.io/vectorize-io/hindsight:0.8.4
+    restart: "no"
+    user: "${FRONTIER_RUN_UID}:${FRONTIER_RUN_GID}"
+    network_mode: host
+    entrypoint:
+      - /app/api/.venv/bin/python
+      - /budget-proxy/budget_proxy.py
+      - --ledger
+      - /run/fugu-plain-ledger.json
+      - --state
+      - /run/fugu-plain-proxy-state.json
+      - --host
+      - 192.168.96.1
+      - --port
+      - "28083"
+    environment:
+      <<: *proxy_environment
+      PROXY_API_KEY: ${FRONTIER_FUGU_PROXY_KEY}
+      # Plain Fugu is subscription-backed. Keep synthetic usage accounting but no
+      # practical credit ceiling; operational/schema/circuit gates remain active.
+      PROVIDER_TOTAL_LIMIT_USD: "1000000.25"
+      HINDSIGHT_BACKFILL_LIMIT_USD: "1000000"
+      HINDSIGHT_MODEL: fugu
+      HINDSIGHT_INPUT_USD_PER_M: "1"
+      HINDSIGHT_OUTPUT_USD_PER_M: "1"
+    volumes:
+      - ../hindsight-budget-proxy:/budget-proxy:ro
+      - ${FRONTIER_RUN_DIR}:/run
+    healthcheck:
+      test:
+        - CMD
+        - /app/api/.venv/bin/python
+        - -c
+        - import httpx; r=httpx.get('http://192.168.96.1:28083/health', timeout=3); r.raise_for_status(); assert r.json()['status']=='healthy'
+      interval: 3s
+      timeout: 4s
+      retries: 30
+
+  postgres:
+    image: pgvector/pgvector:pg16
+    restart: unless-stopped
+    shm_size: 1gb
+    command:
+      - postgres
+      - -c
+      - max_parallel_workers_per_gather=0
+      - -c
+      - max_parallel_maintenance_workers=0
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${FRONTIER_POSTGRES_PASSWORD}
+    volumes:
+      - frontier-postgres:/var/lib/postgresql/data
+      - ./init/00-create-databases.sql:/docker-entrypoint-initdb.d/00-create-databases.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d postgres"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+
+  hindsight-grok:
+    image: ghcr.io/vectorize-io/hindsight:0.8.4
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      proxy-grok:
+        condition: service_healthy
+    extra_hosts:
+      - host.docker.internal:host-gateway
+    ports:
+      - "127.0.0.1:48888:8888"
+    environment:
+      <<: *hindsight_environment
+      HINDSIGHT_API_LLM_BASE_URL: http://192.168.96.1:28082/v1
+      HINDSIGHT_API_LLM_API_KEY: ${FRONTIER_GROK_PROXY_KEY}
+      HINDSIGHT_API_LLM_MODEL: grok-4.5
+      HINDSIGHT_API_DATABASE_URL: postgresql://postgres:${FRONTIER_POSTGRES_PASSWORD}@postgres/hindsight_frontier_grok
+      HINDSIGHT_API_MIGRATION_DATABASE_URL: postgresql://postgres:${FRONTIER_POSTGRES_PASSWORD}@postgres/hindsight_frontier_grok
+      HINDSIGHT_API_WORKER_ID: frontier-grok
+
+  hindsight-fugu:
+    image: ghcr.io/vectorize-io/hindsight:0.8.4
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      proxy-fugu:
+        condition: service_healthy
+    extra_hosts:
+      - host.docker.internal:host-gateway
+    ports:
+      - "127.0.0.1:58888:8888"
+    environment:
+      <<: *hindsight_environment
+      HINDSIGHT_API_LLM_BASE_URL: http://192.168.96.1:28083/v1
+      HINDSIGHT_API_LLM_API_KEY: ${FRONTIER_FUGU_PROXY_KEY}
+      HINDSIGHT_API_LLM_MODEL: fugu
+      HINDSIGHT_API_DATABASE_URL: postgresql://postgres:${FRONTIER_POSTGRES_PASSWORD}@postgres/hindsight_frontier_fugu_plain
+      HINDSIGHT_API_MIGRATION_DATABASE_URL: postgresql://postgres:${FRONTIER_POSTGRES_PASSWORD}@postgres/hindsight_frontier_fugu_plain
+      HINDSIGHT_API_WORKER_ID: frontier-fugu-plain
+
+volumes:
+  frontier-postgres:
+
+networks:
+  default:
+    ipam:
+      config:
+        - subnet: 192.168.96.0/20
+          gateway: 192.168.96.1

@@ -1,0 +1,119 @@
+name: hindsight-canary
+
+x-hindsight-environment: &hindsight_environment
+  HINDSIGHT_API_LLM_PROVIDER: openai
+  HINDSIGHT_API_LLM_BASE_URL: http://budget-proxy:28080/v1
+  HINDSIGHT_API_LLM_API_KEY: ${CANARY_REDPILL_API_KEY}
+  HINDSIGHT_API_LLM_REASONING_EFFORT: low
+  HINDSIGHT_API_LLM_EXTRA_BODY: '{"reasoning_effort":"low","include_reasoning":false}'
+  HINDSIGHT_API_LLM_STRICT_SCHEMA: "false"
+  # Hindsight 0.8.4 uses range(max_retries) for fact extraction, so 1 means
+  # exactly one content-quality attempt. Worker retries remain disabled.
+  HINDSIGHT_API_LLM_MAX_RETRIES: "1"
+  HINDSIGHT_API_WORKER_MAX_RETRIES: "0"
+  HINDSIGHT_API_SKIP_LLM_VERIFICATION: "true"
+  HINDSIGHT_API_RETAIN_MAX_COMPLETION_TOKENS: "8192"
+  HINDSIGHT_API_CONSOLIDATION_MAX_COMPLETION_TOKENS: "8192"
+  HINDSIGHT_API_LLM_MAX_CONCURRENT: "1"
+  HINDSIGHT_API_ENABLE_AUTO_CONSOLIDATION: "true"
+  HINDSIGHT_API_VECTOR_EXTENSION: pgvector
+  HINDSIGHT_API_TENANT_EXTENSION: hindsight_api.extensions.builtin.tenant:ApiKeyTenantExtension
+  HINDSIGHT_API_TENANT_API_KEY: ${CANARY_HINDSIGHT_TOKEN}
+  HINDSIGHT_CP_ACCESS_KEY: ${CANARY_HINDSIGHT_TOKEN}
+  HINDSIGHT_CP_DATAPLANE_API_KEY: ${CANARY_HINDSIGHT_TOKEN}
+  HF_HUB_OFFLINE: "1"
+  TRANSFORMERS_OFFLINE: "1"
+  LITELLM_LOCAL_MODEL_COST_MAP: "True"
+  LITELLM_LOCAL_BLOG_POSTS: "True"
+
+services:
+  budget-proxy:
+    image: ghcr.io/vectorize-io/hindsight:0.8.4
+    restart: "no"
+    user: "${CANARY_RUN_UID}:${CANARY_RUN_GID}"
+    entrypoint:
+      - /app/api/.venv/bin/python
+      - /canary/budget_proxy.py
+      - --ledger
+      - /run/ledger.json
+      - --state
+      - /run/budget-proxy-state.json
+      - --host
+      - 0.0.0.0
+      - --port
+      - "28080"
+    environment:
+      CANARY_REDPILL_API_KEY: ${CANARY_REDPILL_API_KEY}
+      CANARY_REDPILL_BASE_URL: ${CANARY_REDPILL_BASE_URL:-https://api.redpill.ai/v1}
+      CANARY_HARD_BUDGET_USD: ${CANARY_HARD_BUDGET_USD}
+      CANARY_SAFETY_MARGIN_USD: ${CANARY_SAFETY_MARGIN_USD:-0.05}
+      CANARY_RPM_LIMIT: ${CANARY_RPM_LIMIT}
+      CANARY_TPM_LIMIT: ${CANARY_TPM_LIMIT}
+      CANARY_20B_INPUT_USD_PER_M: ${CANARY_20B_INPUT_USD_PER_M}
+      CANARY_20B_OUTPUT_USD_PER_M: ${CANARY_20B_OUTPUT_USD_PER_M}
+      CANARY_120B_INPUT_USD_PER_M: ${CANARY_120B_INPUT_USD_PER_M}
+      CANARY_120B_OUTPUT_USD_PER_M: ${CANARY_120B_OUTPUT_USD_PER_M}
+    volumes:
+      - ./:/canary:ro
+      - ${CANARY_RUN_DIR}:/run
+    healthcheck:
+      test:
+        - CMD
+        - /app/api/.venv/bin/python
+        - -c
+        - import httpx; r=httpx.get('http://127.0.0.1:28080/health', timeout=3); r.raise_for_status()
+      interval: 3s
+      timeout: 4s
+      retries: 20
+
+  postgres:
+    image: pgvector/pgvector:pg16
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${CANARY_POSTGRES_PASSWORD}
+    volumes:
+      - canary-postgres:/var/lib/postgresql/data
+      - ./init/00-create-databases.sql:/docker-entrypoint-initdb.d/00-create-databases.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d postgres"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+
+  hindsight-20b:
+    image: ghcr.io/vectorize-io/hindsight:0.8.4
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      budget-proxy:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:28888:8888"
+    environment:
+      <<: *hindsight_environment
+      HINDSIGHT_API_LLM_MODEL: openai/gpt-oss-20b
+      HINDSIGHT_API_DATABASE_URL: postgresql://postgres:${CANARY_POSTGRES_PASSWORD}@postgres/hindsight_canary_20b
+      HINDSIGHT_API_MIGRATION_DATABASE_URL: postgresql://postgres:${CANARY_POSTGRES_PASSWORD}@postgres/hindsight_canary_20b
+      HINDSIGHT_API_WORKER_ID: canary-20b
+
+  hindsight-120b:
+    image: ghcr.io/vectorize-io/hindsight:0.8.4
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      budget-proxy:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:38888:8888"
+    environment:
+      <<: *hindsight_environment
+      HINDSIGHT_API_LLM_MODEL: openai/gpt-oss-120b
+      HINDSIGHT_API_DATABASE_URL: postgresql://postgres:${CANARY_POSTGRES_PASSWORD}@postgres/hindsight_canary_120b
+      HINDSIGHT_API_MIGRATION_DATABASE_URL: postgresql://postgres:${CANARY_POSTGRES_PASSWORD}@postgres/hindsight_canary_120b
+      HINDSIGHT_API_WORKER_ID: canary-120b
+
+volumes:
+  canary-postgres:
