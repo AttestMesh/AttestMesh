@@ -335,7 +335,10 @@ For each incoming `Subscribe(stream)`:
 4. Register the subscription behind its per-session ordering gate.
 5. Page and send relevant events after the cursor, then send a signed checkpoint through `latest_indexed`. Checkpoints use empty event/tx/repro fields and `(blockNumber, logIndex) = (indexedThrough, uint64::MAX)`.
 6. Continue streaming new events as they're indexed.
-7. Process inbound `Ack` messages to advance the persistent cursor.
+7. Process inbound `Ack` messages only when they match the exact next position
+   emitted on that session, then advance the persistent cursor. A bounded
+   pending-Ack queue terminates a client that reads indefinitely without Acking;
+   arbitrary cursors never reach the worker store.
 
 ### 8.3 Attestation verification on subscribe
 
@@ -349,7 +352,7 @@ Each subscription has a bounded channel (capacity 1024). Catch-up applies backpr
 
 A dropped TCP connection terminates the stream. A protocol-v3 sidecar serially completes its handler, atomically persists the exact `(blockNumber, logIndex)` position, updates in-memory progress, and only then sends the Ack. If persistence fails, it tears down the stream without Ack so the position is replayed. On reconnect it sends that exact position in `resume_cursor`; `from_block` remains populated with the same boundary block as an additive fallback for a pre-v3 Indexer.
 
-The explicit subscriber cursor is the cross-replica source of truth. This prevents a newly selected worker's missing, stale, or further-ahead local cursor from creating a gap. At-least-once delivery still permits safe duplicate replay, which the sidecar validates before suppressing redispatch. A genuinely fresh sidecar omits `resume_cursor`; protocol-v2/fallback head-initialization behavior remains unchanged. Catch-up ends with a signed checkpoint Ack before live delivery continues.
+The explicit subscriber cursor is the cross-replica source of truth. This prevents a newly selected worker's missing, stale, or further-ahead local cursor from creating a gap. At-least-once delivery still permits safe duplicate replay, which the sidecar validates before suppressing redispatch. A genuinely fresh sidecar omits `resume_cursor`; an existing but unreadable, malformed, or wrong-member cursor file fails closed rather than being mistaken for a fresh subscription. Protocol-v2/fallback head-initialization behavior remains unchanged. Catch-up ends with a signed checkpoint Ack before live delivery continues.
 
 ### 8.6 Stable load-balancer endpoint
 
@@ -383,6 +386,8 @@ This design preserves instance mode and protocol-v2 behavior while avoiding a sh
 
 Event Acks advance monotonically; a crash before Ack causes re-delivery (at-least-once semantics). Checkpoint Acks flush immediately because they certify the complete ordered prefix through a block, including empty blocks. In protocol v3 the sidecar makes the handled cursor durable before Ack; failure to persist terminates the stream without Ack. The sidecar suppresses repeated positions within one stream, while a reconnect may deliberately invoke the handler again; applications retain request-level idempotency across those deliveries.
 
+This durability boundary is the sidecar's internal event handler, not end-to-end application consumption. An app message is not Ack'd when there is no active `SubscribeMessages` consumer, but the current broadcast API has no application Ack or durable inbox: a connected consumer that crashes or lags after dispatch can still lose that app-level delivery. A durable application inbox/acknowledgement protocol is separate follow-on work.
+
 ---
 
 ## 10. RPC repro stub generation
@@ -413,7 +418,9 @@ After constructing a `PushEnvelope` (with `indexer_signature` and `indexer_attes
 2. Compute `signing_input = keccak256("attestmesh.indexer.envelope.v1" || canonical_cbor_bytes)`.
 3. Sign with the Indexer's Ed25519 key.
 4. Set `indexer_signature = signature`.
-5. Set `indexer_attestation` on the *first* envelope of each session, then `None` thereafter (the sidecar caches the attestation result for the duration of the stream).
+5. Set diagnostic `indexer_attestation` on the *first* envelope of each session,
+   then `None` thereafter. The current sidecar does not verify it; authorization is
+   the registry-pinned envelope key.
 6. Wrap in the tonic message and send.
 
 The subscriber-side verification mirrors this: serialize the envelope with `indexer_signature = empty` and `indexer_attestation = empty`, recompute `signing_input`, verify the signature against the pubkey from IndexerRegistry.
@@ -440,10 +447,10 @@ HTTP at `HEALTH_HTTP_ADDR`:
 
 ## 13. Failure modes
 
-- **RPC down**: block-watcher loop retries with exponential backoff. `/healthz` flips to 503 after one missed poll. Existing subscriptions stay open (no new events to push); reconnecting subscribers can still verify membership cache, get the indexer attestation, and wait.
+- **RPC down**: block-watcher loop retries with exponential backoff and `/healthz` flips to 503 after one missed poll. A direct worker leaves existing subscriptions open with no new events; the Stage A LB uses that HTTP readiness signal to mark the corresponding gRPC backend down and close its sessions.
 - **RPC behind** (chain reorg, provider lag): tolerated. Events from the original chain head are re-emitted when the new head exceeds the old. Subscribers dedup off `(block_number, log_index)`.
 - **Reorgs ≤ shallow finality**: v1 treats Base confirmations as final. If a deep reorg removes events the Indexer already pushed, subscribers see the original push as Ack'd; the chain no longer reflects it. v1 logs at error but does not re-emit corrections. This is the same posture as master spec §13 item 4 — Base is finality-on-confirmation for v1.
-- **Out-of-disk on cursor store**: writes start failing. `/healthz` flips to 503. Operator must add disk capacity.
+- **Out-of-disk on a worker cursor store**: local Ack advances fail and are not counted as accepted. Protocol-v3 sidecar cursors remain authoritative across reconnects, but operators must restore worker storage; worker disk health is not yet a separate `/healthz` signal.
 - **gRPC stream errors mid-session**: individual subscriptions terminate; subscribers reconnect; cursor is durable. No global impact.
 - **Crash and restart**: state restored from sled. Subscribers reconnect after their stream-drop detection (couple seconds). Continuity gap of ~seconds, no event loss.
 - **One shared worker dies**: HAProxy stops selecting it. Affected protocol-v3 sidecars reconnect to another worker and present their exact durable cursor; no worker-local cursor transfer is needed.
@@ -472,7 +479,7 @@ HTTP at `HEALTH_HTTP_ADDR`:
 Executable cross-component protocol coverage is split between the two Rust crates:
 
 - `indexer/tests/protocol_v2.rs` (the filename is retained for compatibility) drives the real tonic service and covers protocol-v2 empty-cursor initialization/checkpoints plus protocol-v3 explicit-cursor replay and no-Ack behavior.
-- `sidecar/tests/indexer_delivery.rs` uses a fake gRPC Indexer to verify that handler completion and durable cursor storage precede Ack, a process restart reloads and transmits the exact cursor, `from_block` remains an older-server fallback, and already-handled positions are not redispatched.
+- `sidecar/tests/indexer_delivery.rs` uses a fake gRPC Indexer to verify that handler completion and durable cursor storage precede Ack, a process restart reloads and transmits the exact cursor, `from_block` remains an older-server fallback, and already-handled positions are not redispatched. Unit coverage also requires existing corrupt or cross-member cursor state to fail closed.
 
 The anvil/forge `indexer/tests/integration.rs` harness remains explicitly ignored and out of scope for the current prototype. There are no Indexer mainnet-fork or fuzz tests.
 
