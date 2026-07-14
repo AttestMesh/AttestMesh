@@ -1,8 +1,8 @@
 # AttestMesh — Coordination Layer Master Spec
 
-**Status**: Implemented v1; protocol-v2 authoritative Indexer delivery awaits Base canary rollout
+**Status**: Implemented v1; protocol-v3 exact-cursor and Stage A shared-worker code complete, production rollout pending
 **Authors**: LSDan
-**Last updated**: 2026-07-11
+**Last updated**: 2026-07-14
 
 ---
 
@@ -233,24 +233,24 @@ The Indexer is an attested off-chain service that:
 1. Watches the chain (one RPC subscription, shared across every cluster it serves) for events emitted by any ClusterDiamond it has been asked to follow.
 2. For each event, identifies which cluster it belongs to and which members of that cluster have subscribed.
 3. Pushes the event to those members — and only those members.
-4. Pairs each push with two artefacts that let the member verify the push independently:
-   - the Indexer's **attestation signature** over the pushed bytes (the Indexer's signing key is itself covered by its attestation; the cluster knows the Indexer's pubkey from on-chain discovery), and
+4. Pairs each push with two artefacts that make the claim auditable:
+   - an Ed25519 signature over the pushed bytes, verified against the pubkey in `IndexerRegistry` (plus a diagnostic TEE quote on the first push), and
    - an **RPC repro stub** — the exact `eth_getLogs` / `eth_getTransactionReceipt` call (contract address, block range, topic filter) that, if a member runs it against any RPC provider, returns the same event bytes. The repro stub means the Indexer's claim is independently checkable, not just trust-the-signature.
 
 The Indexer covers many clusters but each push only goes to members of the specific cluster that emitted the event. There is no cross-cluster leak — a member of cluster A is not subscribed to and never receives events from cluster B.
 
 ### 6.2 Trust posture
 
-The Indexer's attestation commits to its code. Members trust the Indexer for:
+The registry-pinned signature and operator admission policy authorize the Indexer generation. The current sidecar does not cryptographically verify the diagnostic TEE quote or execute the repro stub. Members therefore trust the Indexer for:
 
 - **Liveness** of event delivery (the Indexer is online and pushing).
 - **Completeness** of event delivery within its subscription window (no event is silently dropped).
 
-Members do **not** trust the Indexer for confidentiality of message contents: `MessageSent` ciphertext is sealed-boxed to the recipient, so the Indexer cannot decrypt it. Correctness is independently checkable through the signed RPC repro stub, but protocol-v2 sidecars deliberately trust the registry-pinned Indexer signature and do not execute that stub. Configurable sampling remains deferred.
+Members do **not** trust the Indexer for confidentiality of message contents: `MessageSent` ciphertext is sealed-boxed to the recipient, so the Indexer cannot decrypt it. Correctness is independently checkable through the signed RPC repro stub, but protocol-v2/v3 sidecars deliberately trust the registry-pinned Indexer signature and do not execute that stub. Configurable sampling and challenge-bound per-replica attestation remain deferred.
 
 ### 6.3 Discovery
 
-A member sidecar discovers the Indexer at startup by reading a known **IndexerRegistry** contract — a tiny on-chain registry mapping `chainId → (indexerEndpoint, indexerCodeId, indexerPubKey)`. The registry is owned by the AttestMesh org Safe and exists per chain we deploy on (Base mainnet for v1).
+A member sidecar discovers the Indexer at startup by reading a known **IndexerRegistry** contract — a tiny on-chain registry mapping `chainId → (indexerEndpoint, indexerCodeId, indexerPubKey)`. One registry exists per deployed chain. The live Base v1 registry is still owned by the bring-up deployer EOA; transfer to the org Safe remains a governance migration.
 
 The node sidecar reads the IndexerRegistry directly via RPC at startup — this is one of the only direct RPC reads the sidecar does. After Indexer subscription is established, all subsequent event ingestion goes through the Indexer.
 
@@ -260,17 +260,17 @@ A cluster may override the default indexer by storing its own indexer reference 
 
 Member sidecar → Indexer over a long-lived bidirectional connection (gRPC bidi streaming, see §13 item 9):
 
-1. Member opens a connection and presents `(memberId, clusterAddress, attestationProof)`.
-2. Indexer verifies that `memberId` exists in `clusterAddress`'s AttestFacet `MemberStorage` and that the attestation matches the recorded attestation-bound pubkeys. (The Indexer is essentially re-running the same verification the attestor facet did at registration time — but it can do so as an off-chain read since the cluster diamond is authoritative.)
+1. Member opens a connection and presents `(memberId, clusterAddress, resumeCursor)`; the attestation field remains reserved.
+2. Indexer verifies that `memberId` exists in `clusterAddress`'s AttestFacet `MemberStorage`. Protocol v3 still does not authenticate the subscriber itself; addressed message payloads remain sealed to the real member key, and challenge-bound subscriber authentication is deferred.
 3. On success, Indexer adds the member to the cluster's subscriber set and begins streaming events. Its cursor advances only when the sidecar Ack arrives after handling.
 4. Each event is delivered as a signed envelope: `{event_data, cluster_addr, block_number, tx_hash, log_index, rpc_repro, indexer_signature, indexer_attestation}` (proto field names — see indexer spec §8.1 and sidecar spec §9.1 for the full message definition).
-5. Member verifies the signature against the Indexer's pubkey from IndexerRegistry. On signature mismatch (or attestation mismatch on the Indexer's first push of the session), the member tears down the subscription and re-discovers.
+5. Member verifies the signature against the Indexer's pubkey from IndexerRegistry. On signature mismatch it tears down the subscription and re-discovers.
 
-Subscriptions are stateful: an Indexer remembers exact per-member delivery cursors. The sidecar also persists the last signed checkpoint block and supplies it on reconnect, allowing a newly selected blue/green backend with no local cursor to replay the boundary block safely.
+Subscriptions are stateful: each Indexer remembers exact per-member delivery cursors. Protocol-v3 sidecars also fsync the exact highest handled `(blockNumber, logIndex)` before Ack and supply it on reconnect. That subscriber cursor overrides a newly selected worker's independent local cursor; `from_block` remains a boundary-block fallback for older servers.
 
-### 6.5 Indexer infrastructure (v1)
+### 6.5 Indexer infrastructure
 
-The Indexer is **shared infrastructure: one active Indexer serves every cluster on the chains it watches** — it is chain-scoped, never deployed per customer cluster. Production uses a stable HAProxy gateway plus verified blue/green C3-member candidates. The switch updates the registry-pinned candidate key/code ID and forces checkpoint-based reconnect; it is single-active deployment HA, not milestone-B active-active identity. Dog-fooded multi-replica identity remains the later stage described in the Indexer HA spec.
+The Indexer is **shared infrastructure: one logical Indexer generation serves every cluster on the chains it watches** — it is chain-scoped, never deployed per customer cluster. Production currently uses a stable HAProxy gateway plus verified single-active blue/green candidates. Stage A code adds a two-to-eight-worker pool whose replicas use a fresh dedicated dstack-only cluster and one CSK-derived signing identity behind that same stable endpoint. Protocol-v3 exact cursors provide continuity across their independent stores. The worker-pool rollout is pending, and the stable LB remains a front-door SPOF; see the Indexer HA spec.
 
 ---
 
@@ -319,7 +319,7 @@ A Rust binary (target: `cluster-mesh-agent`) shipped as an OCI image and include
 
 - **Pattern revoked mid-flight.** If the cluster owner removes the attestation pattern between step 4 and the application coming up, no member already registered is forcibly removed (no on-chain eviction in v1); but new joiners cannot register, and a future re-register attempt (e.g. after a CVM restart) will fail. v1 punts cluster-driven eviction to a later spec.
 - **Indexer down.** The sidecar reconnects with backoff and pauses cluster-event delivery; it never starts a direct `eth_getLogs` fallback. Current-view peer reconciliation continues, and Indexer connectivity is reported diagnostically without changing the convergence+CSK health result.
-- **Indexer signature/attestation mismatch.** Treated as adversarial: the sidecar tears down the subscription, re-reads IndexerRegistry, and retries. If the pubkey on chain has been rotated (legitimate operator action), the new subscription succeeds. If not, the sidecar fails closed and stays unhealthy.
+- **Indexer signature mismatch.** Treated as adversarial: the sidecar tears down the subscription, re-reads IndexerRegistry, and retries. If the pubkey on chain has been rotated (legitimate operator action), the new subscription succeeds. If not, event delivery remains paused; current mesh health reports Indexer connectivity diagnostically rather than re-gating an already healthy application.
 - **Message channel poisoned.** A malicious member could spam another member's channel with garbage. Decryption failures are silently dropped; the sidecar logs at debug only. Rate-limiting is not enforced on chain in v1.
 - **First-convergence deadlock.** If the network is partitioned at startup such that no convergence is possible, a *joining* sidecar stays unhealthy indefinitely. This is intentional — degraded boot of an unmeshed mesh is worse than visible failure. Already-healthy sidecars elsewhere in the cluster are unaffected; the gate fires once per process.
 - **CSK acquisition deadlock.** An onboardee that can't pull the CSK — because it has no live tunnel to any member that holds it — stays unhealthy indefinitely. Same surface as first-convergence deadlock; the application container does not start. Recovery is operational (verify the mesh is coming up and at least one peer holding the CSK is reachable). The originator-lost case (§8.6) is permanent.
@@ -342,7 +342,7 @@ Different clusters can use overlapping CIDRs because each cluster's mesh is a se
 
 ## 8. Cluster Shared Key
 
-The **Cluster Shared Key (CSK)** is a 32-byte AES-256 key that every member of an AttestMesh cluster holds. The cluster contract never sees it; the Indexer never sees it. AttestMesh treats its plaintext as opaque — the application layer decides what to use it for (typically: encrypting cluster-wide shared state, deriving sub-keys for specific app concerns, sealing artifacts at rest).
+The **Cluster Shared Key (CSK)** is a 32-byte AES-256 key that every member of an AttestMesh cluster holds. The cluster contract never sees it. Ordinary chain-scoped Indexers never see workload-cluster CSKs; the dedicated Stage A Indexer replicas are the deliberate exception for their own signer cluster, where the co-located sidecar exposes that CSK over a private UDS to derive the shared envelope key. AttestMesh otherwise treats CSK plaintext as opaque.
 
 This is the one AttestMesh primitive that lets the application bootstrap symmetric-key crypto across the cluster without rolling its own key-exchange protocol.
 
@@ -459,7 +459,7 @@ v1 targeted a **working multi-node demo** (milestone "A"); it shipped as a **liv
 
 - Ownership transfer to a Safe (the contracts are live on Base mainnet, owned by the deployer for bring-up).
 - Pure punched-UDP mesh transport (v1 bootstraps wireguard over the gateway TCP leg; two-sided UDP hole-punching was live-verified, the upgrade is wiring work).
-- HA Indexer (multiple replicas, load balancer, monitoring).
+- Production rollout of the implemented Stage A shared-identity Indexer worker pool; redundant front doors remain later work.
 - Production sidecar packaging (signed OCI images, dstack runtime integration).
 - Formal threat model review.
 - Member-side sampling cadence policy (v1 default: always trust the Indexer signature; the repro stub is always generated so sampling is *available*, just not exercised by default).
@@ -495,7 +495,7 @@ No remaining open questions block v1. (Component-level specs may surface new one
 6. **Monorepo.** Contracts, node sidecar, and Indexer service all live in `AttestMesh/AttestMesh`. The protocol and its reference implementations evolve together; the spec in this repo is authoritative for the deployed Indexer it ships alongside.
 7. **No dstackgres compatibility, Postgres deferred.** AttestMesh is the generic mesh primitive. The existing TeeSQL Postgres-as-a-Service product is on hold and the existing dstackgres deployments on Base mainnet are not migration targets. dstackgres is referenced in §10 strictly as the *extraction source* — useful for understanding which moving parts were ripped out and why — not as a system we owe ABI compatibility to. A future Postgres application on top of AttestMesh is plausible but explicitly out of scope for v1.
 8. **Atomic constructor bootstrapping.** ClusterDiamond's constructor takes `(facetCuts, initContract, initCalldata)` and delegatecalls the init contract into its own storage on construction, seeding the dstack KMS root allowlist, the initial compose-hash / device-id allowlists, the cluster owner Safe, and any other per-attestor-facet config in one transaction. The diamond is never reachable in a "deployed but unconfigured" state. Same pattern dstackgres's `DiamondInit` uses; the constructor-arg encoding burden is real but worth it for atomicity.
-9. **Indexer push transport: gRPC bidirectional streaming over HTTP/2 (via `tonic`).** One `.proto` for the subscription envelope generates code on both ends; eliminates schema drift between sidecar and Indexer. HTTP/2 plays well with load balancers when the Indexer goes HA in milestone B. OpenTelemetry instrumentation is first-class.
+9. **Indexer push transport: gRPC bidirectional streaming over HTTP/2 (via `tonic`).** One `.proto` for the subscription envelope generates code on both ends; eliminates schema drift between sidecar and Indexer. Protocol v3 adds the exact subscriber-owned resume cursor used by the Stage A worker pool. OpenTelemetry instrumentation is first-class.
 10. **Heartbeat defaults (v1).** 2-second interval, 3-miss threshold (a peer is considered down after 6 seconds of silence). Convergence calc tolerates a single missed heartbeat without breaking the converged signal — only a full miss-threshold flips a peer to down. These are tunable in milestone B; v1 picks defaults and we adjust during the demo build-out.
 11. **First-convergence gate fires once per sidecar process, not continuously.** Bringing a node up gates its application container behind the first cluster-wide convergence it observes. Subsequent member joins or peer drops may temporarily break cluster-wide convergence; already-healthy sidecars do not re-gate or report unhealthy. Joining nodes still integrate (new peer is added to wireguard, heartbeats start), they just don't push existing nodes back through the healthcheck.
 12. **CVM restart is sidecar-detected, not a contract concern.** Before calling `dstack_register` (or any other attestor-facet register selector), the sidecar checks `AttestFacet.memberOf(memberAddr)` and skips the registration tx if a matching record already exists. Pubkey mismatch on the existing record means lost TEE state — sidecar fails closed in v1; future eviction / rotation specs cover automated recovery. Contracts treat re-registration as an error (`AlreadyRegistered`) — the sidecar is responsible for not getting there.
