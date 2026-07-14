@@ -71,7 +71,7 @@ services:
 
   # --- RunYard application stack -------------------------------------------------
   hub:
-    image: ghcr.io/yolo-maxi/runyard-hub@sha256:5ab1dd625e103f0618f2c415161dadc606a31e0b05f2f69b3db099cb8e27302e
+    image: ghcr.io/yolo-maxi/runyard-hub@sha256:0dd1aab7ab74c6520e1f1fdde53da1a66c7e74296658191181dddbda2f89f3bb
     environment:
       HOST: 0.0.0.0
       PORT: "80"
@@ -90,8 +90,38 @@ services:
       - "80:80"
     restart: unless-stopped
 
+  # One-shot Smithers workspace bootstrap. The runner workspace predates the
+  # v0.7 image on long-lived nodes; reusing that v0.3-era engine state causes
+  # every detached workflow (including RunYard's golden smoke) to render an
+  # empty frame and stall. Initialize a fresh v2 volume with the engine version
+  # pinned in the runner image before accepting work. OPENAI_API_KEY here is a
+  # non-secret sentinel used only to let `smithers init` scaffold without an
+  # interactive login; it is never present in the long-lived runner service.
+  runner-setup:
+    image: ghcr.io/yolo-maxi/runyard-runner@sha256:2cb8104a2d0b32452cd8884f2fc6995dde75d88015e9cf77cd0a69d7b04934dd
+    restart: "no"
+    environment:
+      HOME: /tmp
+      OPENAI_API_KEY: workspace-init-placeholder
+    volumes:
+      - wf-templates:/app/workflow-templates:ro
+      - runner-workspace-v2:/workspace
+    depends_on:
+      seed-templates:
+        condition: service_completed_successfully
+    command:
+      - /bin/sh
+      - -c
+      - |
+        if [ -f /workspace/.runyard-v0.7-ready ]; then
+          echo "runner-setup: existing v0.7 workspace is ready"
+          exit 0
+        fi
+        node src/cli.js runner setup --workspace /workspace --location vps
+        touch /workspace/.runyard-v0.7-ready
+
   runner:
-    image: ghcr.io/yolo-maxi/runyard-runner@sha256:1350fbc3a0a0728bafc990241a6aa0a9c9125728ca08c06ff943c468c254c8e6
+    image: ghcr.io/yolo-maxi/runyard-runner@sha256:2cb8104a2d0b32452cd8884f2fc6995dde75d88015e9cf77cd0a69d7b04934dd
     environment:
       RUNYARD_HUB_URL: http://hub:80
       RUNYARD_HUB_TOKEN: ${RUNYARD_HUB_TOKEN}
@@ -106,20 +136,22 @@ services:
       - wf-templates:/app/workflow-templates
       - codex-auth:/root/.codex
       - claude-auth:/root/.claude
-      - runner-workspace:/workspace
+      - runner-workspace-v2:/workspace
       - /var/run/docker.sock:/var/run/docker.sock
     depends_on:
       hub:
         condition: service_started
       seed-templates:
         condition: service_completed_successfully   # wait for the template copy
+      runner-setup:
+        condition: service_completed_successfully   # fresh Smithers engine state
     restart: unless-stopped
 
   # one-shot: seed the runner's missing /app/workflow-templates from the HUB image
   # (which carries the full 22-file template set). Re-runs on every roll, so the
   # templates track the hub image if it's ever bumped.
   seed-templates:
-    image: ghcr.io/yolo-maxi/runyard-hub@sha256:5ab1dd625e103f0618f2c415161dadc606a31e0b05f2f69b3db099cb8e27302e
+    image: ghcr.io/yolo-maxi/runyard-hub@sha256:0dd1aab7ab74c6520e1f1fdde53da1a66c7e74296658191181dddbda2f89f3bb
     restart: "no"
     # Run as root: the hub image's default user is `node` (uid 1000), which can't
     # write the root-owned fresh volume mountpoint. `cp -a` as root preserves the
@@ -210,7 +242,7 @@ volumes:
   hub-data:
   codex-auth:
   claude-auth:
-  runner-workspace:
+  runner-workspace-v2: # clean v0.7 Smithers state; v0.3 workspace intentionally retired
   wf-templates:        # runner's workflow-templates, seeded from the hub image
   tailscale-state:     # tailscale node identity (persists across rolls)
   ts-config:           # tailscale serve config (TS_SERVE_CONFIG → HTTPS on tailnet)
