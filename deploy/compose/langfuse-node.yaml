@@ -53,15 +53,40 @@ services:
     devices:
       - /dev/net/tun
 
-  # ── pg-ha forwarders: :15431-3 -> each pg node's HAProxy :5432 (current primary). ──
-  pg1-proxy:
-    image: alpine/socat:1.8.0.0
+  # ── :15431 follows Patroni's writable primary; :15432/3 remain node fallbacks. ──
+  pg-primary-router:
+    image: haproxy:3.0-alpine@sha256:dee54db8b27cd6c21519ea4f0ba0604f3742e8e7369bc16fb5b69133dec3f47f
     restart: unless-stopped
     network_mode: service:sidecar
     depends_on:
       - sidecar
-    command: ["TCP-LISTEN:15431,fork,reuseaddr,bind=0.0.0.0", "TCP:10.18.147.86:5432"]
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - |
+        cat >/tmp/pg-primary-router.cfg <<'CFG'
+        global
+          maxconn 400
+        defaults
+          mode tcp
+          timeout connect 2s
+          timeout client 30m
+          timeout server 30m
+          timeout check 2s
+          retries 2
+          option redispatch
+        listen primary
+          bind 0.0.0.0:15431
+          option httpchk GET /primary
+          http-check expect status 200
+          default-server inter 1s fall 2 rise 1 on-marked-down shutdown-sessions
+          server pg1 10.18.147.86:5434 check port 8008
+          server pg2 10.18.251.71:5434 check port 8008
+          server pg3 10.18.172.186:5434 check port 8008
+        CFG
+        exec haproxy -f /tmp/pg-primary-router.cfg -db
     read_only: true
+    tmpfs:
+      - /tmp
     cap_drop:
       - ALL
     security_opt:
@@ -344,7 +369,7 @@ services:
   #    Redis db 1 defaults; S3 -> r2-host via sidecar:19000, path-style, bucket
   #    PRE-CREATED (never rely on CreateBucket).
   #    NOTE: DSN is single-host sidecar:15431 (Prisma has no multi-host DSN support);
-  #    pg1's HAProxy itself tracks the primary, so failover still works.
+  #    the local Patroni-aware router keeps that endpoint on the writable primary.
   #    The sh wrapper reads the CSK-derived redis/CH passwords from derived-secrets and
   #    execs the stock entrypoint — keep the exec path in sync with the pinned image. ──
   langfuse-web:
@@ -397,6 +422,7 @@ services:
       - LANGFUSE_S3_MEDIA_UPLOAD_FORCE_PATH_STYLE=true
     volumes:
       - derived-secrets:/derived:ro
+      - debug-logs:/debug
     expose:
       - "3000"
     entrypoint:
@@ -404,10 +430,21 @@ services:
       - -ec
     command:
       - |
+        set +e
         export REDIS_AUTH="$$(cat /derived/redis-password)"
         export CLICKHOUSE_PASSWORD="$$(cat /derived/clickhouse-password)"
         export CLICKHOUSE_DB=langfuse
-        exec dumb-init -- ./web/entrypoint.sh node ./web/server.js --keepAliveTimeout 110000
+        rm -f /tmp/web-start.pipe
+        mkfifo /tmp/web-start.pipe
+        sed -E 's#(postgres(ql)?://)[^@[:space:]]+@#\1<redacted>@#g' \
+          < /tmp/web-start.pipe > /debug/web.log &
+        filter_pid=$$!
+        dumb-init -- ./web/entrypoint.sh node ./web/server.js --keepAliveTimeout 110000 \
+          > /tmp/web-start.pipe 2>&1
+        rc=$$?
+        wait "$$filter_pid" || true
+        printf '\nexit=%s\n' "$$rc" >> /debug/web.log
+        exit "$$rc"
 
   langfuse-worker:
     image: langfuse/langfuse-worker:3@sha256:ef2490d1ac96b88063deb383acec884a53efe5a9ae998432ee54ed655833f31b # pinned 2026-07-03
@@ -422,6 +459,7 @@ services:
     environment: *langfuse-env
     volumes:
       - derived-secrets:/derived:ro
+      - debug-logs:/debug
     expose:
       - "3030"
     entrypoint:
@@ -429,10 +467,40 @@ services:
       - -ec
     command:
       - |
+        set +e
         export REDIS_AUTH="$$(cat /derived/redis-password)"
         export CLICKHOUSE_PASSWORD="$$(cat /derived/clickhouse-password)"
         export CLICKHOUSE_DB=langfuse
-        exec dumb-init -- ./worker/entrypoint.sh node ./worker/dist/index.js
+        rm -f /tmp/worker-start.pipe
+        mkfifo /tmp/worker-start.pipe
+        sed -E 's#(postgres(ql)?://)[^@[:space:]]+@#\1<redacted>@#g' \
+          < /tmp/worker-start.pipe > /debug/worker.log &
+        filter_pid=$$!
+        dumb-init -- ./worker/entrypoint.sh node ./worker/dist/index.js \
+          > /tmp/worker-start.pipe 2>&1
+        rc=$$?
+        wait "$$filter_pid" || true
+        printf '\nexit=%s\n' "$$rc" >> /debug/worker.log
+        exit "$$rc"
+
+  # Temporary, mesh-only startup diagnostics. Removed after the failed process
+  # has been identified; files are pre-redacted by the wrappers above.
+  debug-http:
+    image: alpine/socat@sha256:a6be4c0262b339c53ddad723cdd178a1a13271e1137c65e27f90a08c16de02b8
+    restart: unless-stopped
+    network_mode: service:sidecar
+    depends_on:
+      - sidecar
+    volumes:
+      - debug-logs:/www:ro
+    command:
+      - TCP-LISTEN:19090,fork,reuseaddr,bind=0.0.0.0
+      - SYSTEM:for f in web worker; do echo "--- $$f"; cat "/www/$$f.log" 2>/dev/null || true; done
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
 
   # Langfuse egress: ZERO external CIDRs — internal forwarders (pg/redis/ch/S3) + the
   # compose-internal worker<->web paths + Docker DNS only. Network-enforced telemetry-off.
@@ -560,5 +628,6 @@ volumes:
   sidecar-state:
   agent-sock:
   derived-secrets:   # CSK-derived redis/CH client passwords (csk-derive -> langfuse wrappers)
+  debug-logs:
   ts-state:          # tailscale node state (survives in-place rolls)
   ts-config:         # tailscale serve config (TS_SERVE_CONFIG -> HTTPS on the tailnet)
