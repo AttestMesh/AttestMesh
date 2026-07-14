@@ -31,6 +31,12 @@ dist/
 # Logs
 *.log
 
+# Operational backups, exports, and local recovery artifacts
+**/backups/
+**/*.bak
+**/*.backup
+**/*.dump
+
 # smithers runtime state
 smithers.db*
 deploy/smithers.db*

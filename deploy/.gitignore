@@ -4,7 +4,6 @@ env.local.sh
 .smithers/
 logs/
 node_modules/
-bun.lock
 bun.lockb
 smithers.db*
 __pycache__/
