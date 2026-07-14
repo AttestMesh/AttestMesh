@@ -8,6 +8,9 @@ on:
     paths:
       - "indexer/**"
       - "sidecar/proto/**"
+      - "deploy/indexer*.sh"
+      - "deploy/compose/indexer-*.yaml"
+      - "deploy/indexer-lb-runbook.md"
       - ".github/workflows/build-indexer.yml"
   workflow_dispatch: {}
 
@@ -16,7 +19,40 @@ permissions:
   packages: write
 
 jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@1.78
+        with:
+          components: clippy, rustfmt
+
+      - name: Format
+        working-directory: indexer
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        working-directory: indexer
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Test
+        working-directory: indexer
+        run: cargo test --all-targets
+
+  deploy-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Parse deployment scripts
+        run: bash -n deploy/indexer*.sh
+
+      - name: Lint deployment scripts
+        run: shellcheck deploy/indexer*.sh
+
   build:
+    needs: [test, deploy-check]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
