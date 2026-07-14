@@ -185,7 +185,9 @@ services:
     # v21 = user-visible orchestrator failure details in enclave deploys;
     # v20 = CLUSTER_NETWORKS-only live mesh config + structured orchestrator errors;
     # v19 = Apps → Sandboxes rename (labels only, wire stays app).
-    image: ghcr.io/dmvt/synclave-app:webhost-contracts-900fb9a@sha256:4750764d561b0929afb8ee4c841ad82dae6f420b6025f281e5e83a1771426f7b
+    # v44 = fleet-control main 1cb4ebb — sandbox-first Stripe billing foundation;
+    #       production stays keyless/inert until separately approved credentials and switches arrive.
+    image: ghcr.io/dmvt/synclave-app:prod-1cb4ebb@sha256:a7940ec3be39337df1fd3ee044523350d232754dad11bcf1aa2229b9718ccf36
     environment:
       API_HOST: 0.0.0.0
       API_PORT: 80
@@ -212,13 +214,17 @@ services:
       # (unset ⇒ the send is a no-op; the email is still captured in the DB).
       TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
       TELEGRAM_WAITLIST_CHAT_ID: ${TELEGRAM_WAITLIST_CHAT_ID:-}
-      # Billing (Stripe) — LIVE-mode keys for prod (config.ts refuses test keys under
-      # NODE_ENV=production unless STRIPE_ALLOW_TEST_MODE=true, and hard-requires the webhook
-      # secret in live mode). Unset ⇒ billing routes stay dark. REQUIRES synclave-app built
-      # from fleet-control ≥ 63bd1b2 (empty string counts as unset; older images crash on "").
+      # Billing (Stripe). Keys may stay empty. Even with a live key, Checkout/meter delivery
+      # remain inert until their independent switches are explicitly enabled after approval.
       STRIPE_SECRET_KEY: ${STRIPE_SECRET_KEY:-}
       STRIPE_WEBHOOK_SECRET: ${STRIPE_WEBHOOK_SECRET:-}
       STRIPE_ALLOW_TEST_MODE: ${STRIPE_ALLOW_TEST_MODE:-}
+      BILLING_LIVE_ENABLED: ${BILLING_LIVE_ENABLED:-false}
+      STRIPE_AUTOMATIC_TAX_ENABLED: ${STRIPE_AUTOMATIC_TAX_ENABLED:-false}
+      STRIPE_MANAGED_PAYMENTS_ENABLED: ${STRIPE_MANAGED_PAYMENTS_ENABLED:-false}
+      BILLING_METERING_ENABLED: ${BILLING_METERING_ENABLED:-false}
+      BILLING_WORKER_INTERVAL_SEC: ${BILLING_WORKER_INTERVAL_SEC:-10}
+      BILLING_CATALOG_RECONCILE_INTERVAL_SEC: ${BILLING_CATALOG_RECONCILE_INTERVAL_SEC:-3600}
       PUBLIC_BASE_URL: ${PUBLIC_BASE_URL}
       APP_DOMAIN: ${APP_DOMAIN}
       INDEXER_URL: ${INDEXER_URL}

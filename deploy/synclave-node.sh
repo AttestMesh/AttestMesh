@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Synclave AttestMesh node on the self-hosted on-chain dstack box.
 #
-# Deploys Synclave (console.attestmesh.xyz + tenant apps at *.app.attestmesh.xyz)
+# Deploys the Synclave control plane at synclave.net. Tenant apps run in the
+# isolated webhost cluster and are not served by this node.
 # as a full, on-chain-anchored AttestMesh node via the canonical Path-A flow:
 #   deploy (stock DstackApp + sealed env + bridge CreateVm, gateway ON)
 #     -> prime (allowlist compose_hash + app_id on the cluster)
@@ -47,12 +48,12 @@ SANDBOX_DEFAULT_PLAN="${SANDBOX_DEFAULT_PLAN:-std-1-4-128}"
 SANDBOX_DAEMON_TOKEN="${SANDBOX_DAEMON_TOKEN:-$(sed -nE 's/^SANDBOX_DAEMON_TOKEN=//p' "$HOME/.attestmesh/sandboxd.env" 2>/dev/null)}"
 
 # Non-secret config (overridable), sealed alongside the secrets for one measured surface.
-PUBLIC_BASE_URL="${PUBLIC_BASE_URL:-https://console.attestmesh.xyz}"
-CORS_ORIGIN="${CORS_ORIGIN:-https://console.attestmesh.xyz}"
-CONSOLE_HOST="${CONSOLE_HOST:-console.attestmesh.xyz}"
+PUBLIC_BASE_URL="${PUBLIC_BASE_URL:-https://synclave.net}"
+CORS_ORIGIN="${CORS_ORIGIN:-https://synclave.net}"
+CONSOLE_HOST="${CONSOLE_HOST:-synclave.net}"
 APP_DOMAIN="${APP_DOMAIN:-app.s.n}"
 INDEXER_URL="${INDEXER_URL:-http://10.0.100.1:8787}"
-GITHUB_OAUTH_CALLBACK_URL="${GITHUB_OAUTH_CALLBACK_URL:-https://console.attestmesh.xyz/api/v1/auth/github/callback}"
+GITHUB_OAUTH_CALLBACK_URL="${GITHUB_OAUTH_CALLBACK_URL:-https://synclave.net/api/v1/auth/github/callback}"
 # CF app-fronting (non-secret): the attestmesh.xyz zone + the origin the proxied
 # <slug>.app records point at (the box haproxy public IP).
 CLOUDFLARE_ZONE_ID="${CLOUDFLARE_ZONE_ID:-5b276342195bda12c978f20ed38a3757}"
@@ -163,6 +164,12 @@ _box_run() {
     printf 'E_STRIPE_SECRET_KEY=%q\n'        "${STRIPE_SECRET_KEY:-}"
     printf 'E_STRIPE_WEBHOOK_SECRET=%q\n'    "${STRIPE_WEBHOOK_SECRET:-}"
     printf 'E_STRIPE_ALLOW_TEST_MODE=%q\n'   "${STRIPE_ALLOW_TEST_MODE:-}"
+    printf 'E_BILLING_LIVE_ENABLED=%q\n'     "${BILLING_LIVE_ENABLED:-false}"
+    printf 'E_STRIPE_AUTOMATIC_TAX_ENABLED=%q\n' "${STRIPE_AUTOMATIC_TAX_ENABLED:-false}"
+    printf 'E_STRIPE_MANAGED_PAYMENTS_ENABLED=%q\n' "${STRIPE_MANAGED_PAYMENTS_ENABLED:-false}"
+    printf 'E_BILLING_METERING_ENABLED=%q\n' "${BILLING_METERING_ENABLED:-false}"
+    printf 'E_BILLING_WORKER_INTERVAL_SEC=%q\n' "${BILLING_WORKER_INTERVAL_SEC:-10}"
+    printf 'E_BILLING_CATALOG_RECONCILE_INTERVAL_SEC=%q\n' "${BILLING_CATALOG_RECONCILE_INTERVAL_SEC:-3600}"
     printf 'E_CLOUDFLARE_API_TOKEN=%q\n'     "$CLOUDFLARE_API_TOKEN"
     printf 'E_CLOUDFLARE_ZONE_ID=%q\n'       "$CLOUDFLARE_ZONE_ID"
     printf 'E_CLOUDFLARE_ORIGIN_IP=%q\n'     "$CLOUDFLARE_ORIGIN_IP"
