@@ -24,7 +24,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: dtolnay/rust-toolchain@1.78
+      # Cargo.lock currently contains edition-2024 dependencies, which Cargo 1.78
+      # cannot parse. Match the `rust:1-bookworm` release builder's stable channel.
+      - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
 
