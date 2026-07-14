@@ -10,6 +10,13 @@ pub mod pb {
     tonic::include_proto!("attestmesh.indexer.v1");
 }
 
+/// Generated client types for the sidecar's existing app-facing Agent API. The
+/// canonical proto remains owned by the sidecar and is compiled directly by build.rs.
+pub mod agent_pb {
+    tonic::include_proto!("attestmesh.agent.v1");
+}
+
+pub mod agent;
 pub mod chain;
 pub mod config;
 pub mod dstack;

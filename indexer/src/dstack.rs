@@ -10,6 +10,37 @@ use async_trait::async_trait;
 use sha3::{Digest, Keccak256};
 use zeroize::Zeroizing;
 
+/// CVM identity returned by the guest-agent `/Info` endpoint.
+#[derive(Debug, Clone, Default)]
+pub struct DstackInfo {
+    pub app_id: Vec<u8>,
+    pub compose_hash: Vec<u8>,
+}
+
+/// Convert `/Info.compose_hash` to the registry/attestation code ID. Shared mode
+/// refuses empty, truncated, padded, and all-zero measurements.
+pub fn validated_compose_hash(info: &DstackInfo) -> Result<[u8; 32]> {
+    let hash: [u8; 32] = info.compose_hash.as_slice().try_into().map_err(|_| {
+        anyhow::anyhow!(
+            "dstack /Info compose_hash is {} bytes, expected exactly 32",
+            info.compose_hash.len()
+        )
+    })?;
+    anyhow::ensure!(hash != [0u8; 32], "dstack /Info compose_hash is all zero");
+    Ok(hash)
+}
+
+pub fn validated_app_id(info: &DstackInfo) -> Result<[u8; 20]> {
+    let app_id: [u8; 20] = info.app_id.as_slice().try_into().map_err(|_| {
+        anyhow::anyhow!(
+            "dstack /Info app_id is {} bytes, expected exactly 20",
+            info.app_id.len()
+        )
+    })?;
+    anyhow::ensure!(app_id != [0u8; 20], "dstack /Info app_id is all zero");
+    Ok(app_id)
+}
+
 /// The dstack runtime surface the indexer depends on. Deterministic per TEE state:
 /// the same purpose/subkey yields the same bytes across restarts of the same CVM,
 /// but differs across CVMs (dstack keys by app_id). The indexer only needs key
@@ -21,6 +52,9 @@ pub trait DstackRuntime: Send + Sync {
 
     /// Request a TEE quote whose user-data slot commits to `report_data` (64 bytes).
     async fn get_quote(&self, report_data: [u8; 64]) -> Result<Vec<u8>>;
+
+    /// Fetch the CVM app identity and measured compose hash.
+    async fn info(&self) -> Result<DstackInfo>;
 }
 
 /// In-memory mock for tests. `root_seed` stands in for the per-CVM TEE state, so two
@@ -66,6 +100,16 @@ impl DstackRuntime for MockDstack {
         q.extend_from_slice(b"MOCKQUOTE-v1");
         q.extend_from_slice(&report_data);
         Ok(q)
+    }
+
+    async fn info(&self) -> Result<DstackInfo> {
+        Ok(DstackInfo {
+            app_id: self.root_seed[..20].to_vec(),
+            compose_hash: Keccak256::digest(
+                [b"mock-compose:".as_ref(), self.root_seed.as_slice()].concat(),
+            )
+            .to_vec(),
+        })
     }
 }
 
@@ -135,5 +179,62 @@ impl DstackRuntime for UnixSocketDstack {
             .and_then(|v| v.as_str())
             .context("missing quote")?;
         Ok(hex::decode(q.trim_start_matches("0x"))?)
+    }
+
+    async fn info(&self) -> Result<DstackInfo> {
+        let response = self.request("/Info", &serde_json::json!({})).await?;
+        let hex_field = |name: &str| -> Result<Vec<u8>> {
+            let value = response
+                .get(name)
+                .and_then(|value| value.as_str())
+                .with_context(|| format!("dstack /Info response missing '{name}'"))?;
+            hex::decode(value.trim_start_matches("0x"))
+                .with_context(|| format!("dstack /Info field '{name}' is not hex"))
+        };
+        Ok(DstackInfo {
+            app_id: hex_field("app_id")?,
+            compose_hash: hex_field("compose_hash")?,
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn mock_info_has_exact_nonzero_compose_hash() {
+        let info = MockDstack::from_label("indexer-cvm").info().await.unwrap();
+        assert_ne!(validated_app_id(&info).unwrap(), [0u8; 20]);
+        assert_ne!(validated_compose_hash(&info).unwrap(), [0u8; 32]);
+    }
+
+    #[test]
+    fn compose_hash_must_be_exact_and_nonzero() {
+        let mut info = DstackInfo {
+            compose_hash: vec![7; 32],
+            ..Default::default()
+        };
+        assert_eq!(validated_compose_hash(&info).unwrap(), [7u8; 32]);
+
+        info.compose_hash = vec![7; 31];
+        assert!(validated_compose_hash(&info).is_err());
+        info.compose_hash = vec![7; 33];
+        assert!(validated_compose_hash(&info).is_err());
+        info.compose_hash = vec![0; 32];
+        assert!(validated_compose_hash(&info).is_err());
+    }
+
+    #[test]
+    fn app_id_must_be_exact_and_nonzero() {
+        let mut info = DstackInfo {
+            app_id: vec![7; 20],
+            ..Default::default()
+        };
+        assert_eq!(validated_app_id(&info).unwrap(), [7u8; 20]);
+        info.app_id = vec![7; 19];
+        assert!(validated_app_id(&info).is_err());
+        info.app_id = vec![0; 20];
+        assert!(validated_app_id(&info).is_err());
     }
 }

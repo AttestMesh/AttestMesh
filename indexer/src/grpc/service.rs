@@ -103,6 +103,7 @@ fn exact_replay_start(reg_floor: u64, cursor: Cursor) -> u64 {
     requested.max(reg_floor)
 }
 
+#[allow(clippy::result_large_err)]
 fn parse_exact_cursor(
     protocol_version: u32,
     resume_cursor: Option<DeliveryCursor>,
@@ -417,7 +418,7 @@ mod tests {
             block_number: 12,
             log_index: 4,
         };
-        assert!(parse_exact_cursor(2, Some(wire.clone())).is_err());
+        assert!(parse_exact_cursor(2, Some(wire)).is_err());
         assert_eq!(
             parse_exact_cursor(3, Some(wire)).unwrap(),
             Some(Cursor::new(12, 4))

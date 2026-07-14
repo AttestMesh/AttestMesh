@@ -62,6 +62,8 @@ sol! {
         function memberOf(address account) external view returns (MemberRecord memory);
         function memberById(bytes32 memberId) external view returns (MemberRecord memory);
         function memberCount() external view returns (uint256);
+        function memberIdOf(address account) external view returns (bytes32);
+        function isClusterMember(address account) external view returns (bool);
         function meshCidr() external view returns (uint32 ip, uint8 prefix);
     }
 
@@ -132,6 +134,40 @@ pub async fn member_registered_at(
     Ok(r._0.registeredAt)
 }
 
+/// Fail-closed proof that the sidecar's `GetSelf` facts describe a live member of
+/// the explicitly configured dedicated indexer cluster.
+pub async fn validate_shared_member(
+    provider: &HttpProvider,
+    cluster: Address,
+    member_contract: Address,
+    expected_member_id: B256,
+) -> Result<()> {
+    let contract = IAttest::new(cluster, provider);
+    let onchain_id = retry_rpc("memberIdOf()", || async {
+        contract.memberIdOf(member_contract).call().await
+    })
+    .await?
+    ._0;
+    let active = retry_rpc("isClusterMember()", || async {
+        contract.isClusterMember(member_contract).call().await
+    })
+    .await?
+    ._0;
+    validate_shared_member_result(onchain_id, active, expected_member_id)
+}
+
+fn validate_shared_member_result(onchain_id: B256, active: bool, expected: B256) -> Result<()> {
+    anyhow::ensure!(
+        onchain_id == expected,
+        "sidecar memberId {expected} does not match indexer cluster memberIdOf {onchain_id}"
+    );
+    anyhow::ensure!(
+        active,
+        "sidecar member is not active in the indexer cluster"
+    );
+    Ok(())
+}
+
 async fn retry_rpc<T, E, Fut, F>(label: &'static str, mut f: F) -> Result<T>
 where
     F: FnMut() -> Fut,
@@ -155,4 +191,17 @@ where
         }
     }
     Err(anyhow::Error::new(last_error.expect("retry loop ran"))).context(label)
+}
+
+#[cfg(test)]
+mod shared_member_tests {
+    use super::*;
+
+    #[test]
+    fn requires_matching_active_membership() {
+        let id = B256::repeat_byte(7);
+        assert!(validate_shared_member_result(id, true, id).is_ok());
+        assert!(validate_shared_member_result(B256::repeat_byte(8), true, id).is_err());
+        assert!(validate_shared_member_result(id, false, id).is_err());
+    }
 }
