@@ -29,9 +29,8 @@ impl SelfCheck {
     }
 }
 
-/// Poll policy for the shared-mode admission boundary. One registry read already
-/// contains the chain module's bounded RPC retries; three failed reads therefore
-/// represent a sustained outage rather than a single transient request failure.
+/// Poll policy for the shared-mode admission boundary. A small consecutive-error
+/// budget tolerates a transient RPC failure but closes serving on a sustained one.
 #[derive(Debug, Clone, Copy)]
 pub struct AdmissionPolicy {
     pub poll_interval: Duration,

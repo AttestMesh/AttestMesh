@@ -22,9 +22,9 @@ use std::time::Duration;
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::transport::Server;
 
-/// Compile-time expected code id (spec §6.2: derived from the OCI image hash). The
-/// build/release pipeline overrides this via the `INDEXER_CODE_ID` env at image-bake
-/// time; absent that it is zero, which simply makes the self-check log a mismatch.
+/// Legacy instance-mode code ID supplied by the deployment. Cluster-shared mode
+/// deliberately ignores this value and uses the measured dstack compose hash from
+/// `/Info`; absent here it is zero, which makes the compatibility self-check warn.
 fn expected_code_id() -> B256 {
     match std::env::var("INDEXER_CODE_ID")
         .ok()
@@ -192,8 +192,8 @@ async fn main() -> Result<()> {
         .await?;
     }
 
-    // gRPC listener (spec §8). The service itself remains the current protocol-v2
-    // implementation; shared admission is entirely outside its request path.
+    // gRPC listener (spec §8). Protocol v3 adds only the exact resume cursor;
+    // shared-identity admission remains entirely outside the request path.
     let svc = IndexerService::new(state.clone(), identity.clone(), metrics.clone())
         .with_provider(provider.clone())
         .with_expected_code_id(code_id)
