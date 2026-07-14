@@ -55,9 +55,12 @@ RUN mkdir -p /run/sshd \
 # Node 22 + npm (donor copy, same approach as upstream) + Paseo CLI.
 COPY --from=node_source /usr/local/bin/node /usr/local/bin/node
 COPY --from=node_source /usr/local/lib/node_modules /usr/local/lib/node_modules
+COPY patches/install-paseo-fugu-usage-fetcher.sh /tmp/install-paseo-fugu-usage-fetcher.sh
 RUN ln -sf /usr/local/lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm \
   && ln -sf /usr/local/lib/node_modules/npm/bin/npx-cli.js /usr/local/bin/npx \
   && npm install -g "@getpaseo/cli@${PASEO_VERSION}" \
+  && /bin/sh /tmp/install-paseo-fugu-usage-fetcher.sh \
+  && rm /tmp/install-paseo-fugu-usage-fetcher.sh \
   && npm cache clean --force
 
 # uv (pinned) + CPython 3.11, mirroring setup-hermes.sh's desktop path.
@@ -73,6 +76,11 @@ RUN git clone https://github.com/NousResearch/hermes-agent.git /usr/local/lib/he
       || uv pip install -p venv/bin/python -e ".") \
   && ln -sf /usr/local/lib/hermes-agent/venv/bin/hermes /usr/local/bin/hermes \
   && echo git > .install_method
+
+COPY patches/hermes-acp-model-config-selector.patch /tmp/hermes-acp-model-config-selector.patch
+RUN cd /usr/local/lib/hermes-agent \
+  && patch -p1 < /tmp/hermes-acp-model-config-selector.patch \
+  && rm /tmp/hermes-acp-model-config-selector.patch
 
 COPY plugins/model-providers/fugu-router /usr/local/lib/hermes-agent/plugins/model-providers/fugu-router
 
