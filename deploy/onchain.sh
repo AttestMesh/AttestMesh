@@ -113,14 +113,110 @@ seed_appid() {
   log "allowedAppIds[$member] = $(cast call "$cluster" 'allowedAppIds(address)(bool)' "$member" --rpc-url "$RPC_URL")"
 }
 
-# patha-upgrade <cluster>: diamond-cut the cluster's DstackFacet to the Path A build (dstack_register
-# accepts owner-allowlisted app_ids) + deploy the Path A ClusterMember impl (the UUPS upgrade target
-# for dstack-provisioned app proxies). One-time per cluster; needs the deployer to be the diamond's
-# solidstate owner (the script acceptsOwnership if it is the nominee). Prints the new facet + impl.
+# patha-upgrade <cluster>: legacy EOA-owner flow. Diamond-cut the cluster's DstackFacet to the
+# Path A build (dstack_register accepts owner-allowlisted app_ids) + deploy the Path A ClusterMember
+# impl. Safe-owned clusters must use patha-safe-prepare below; this command cannot act as a Safe.
 patha_upgrade() {
   local cluster="${1:?usage: onchain.sh patha-upgrade <cluster>}"
   export CLUSTER="$cluster"
   run_step "patha-upgrade-${cluster}" bash -c "cd '$ROOT/contracts' && forge script script/UpgradeDstackFacetPathA.s.sol:UpgradeDstackFacetPathA --rpc-url '$RPC_URL' --broadcast"
+}
+
+# patha-safe-prepare <cluster> <safe>: deploy the Path A facet/member implementation from the
+# configured broadcaster, then emit an exact target/value/calldata bundle for separate Safe
+# review and execution. This command NEVER submits the diamondCut and fails unless the Safe has
+# already accepted the cluster's solidstate ownership.
+patha_safe_prepare() {
+  local cluster="${1:?usage: onchain.sh patha-safe-prepare <cluster> <safe>}"
+  local safe="${2:?usage: onchain.sh patha-safe-prepare <cluster> <safe>}"
+  local actual_chain accepted_owner policy_owner bundle_rel bundle_abs cluster_code safe_code
+  local new_facet member_impl current_facet current_register_facet calldata_hash
+  local new_facet_code member_impl_code
+
+  echo "$cluster" | grep -Eq '^0x[0-9a-fA-F]{40}$' \
+    || die "patha-safe-prepare cluster must be an address"
+  echo "$safe" | grep -Eq '^0x[0-9a-fA-F]{40}$' \
+    || die "patha-safe-prepare Safe must be an address"
+  [ "${cluster,,}" != "0x$(printf '0%.0s' {1..40})" ] \
+    || die "patha-safe-prepare cluster must be nonzero"
+  [ "${safe,,}" != "0x$(printf '0%.0s' {1..40})" ] \
+    || die "patha-safe-prepare Safe must be nonzero"
+
+  actual_chain=$(cast chain-id --rpc-url "$RPC_URL") \
+    || die "could not read RPC chain id"
+  [ "$actual_chain" = "$CHAIN_ID" ] \
+    || die "RPC chain mismatch ($actual_chain != configured $CHAIN_ID)"
+  cluster_code=$(cast code "$cluster" --rpc-url "$RPC_URL") \
+    || die "could not read cluster code: $cluster"
+  [ "$cluster_code" != "0x" ] || die "cluster has no code: $cluster"
+  safe_code=$(cast code "$safe" --rpc-url "$RPC_URL") \
+    || die "could not read Safe code: $safe"
+  [ "$safe_code" != "0x" ] || die "Safe has no code: $safe"
+
+  accepted_owner=$(cast call "$cluster" 'owner()(address)' --rpc-url "$RPC_URL") \
+    || die "could not read cluster solidstate owner"
+  [ "${accepted_owner,,}" = "${safe,,}" ] \
+    || die "Safe has not accepted solidstate ownership ($accepted_owner != $safe)"
+  policy_owner=$(cast call "$cluster" 'clusterOwner()(address)' --rpc-url "$RPC_URL") \
+    || die "could not read cluster policy owner"
+  [ "${policy_owner,,}" = "${safe,,}" ] \
+    || die "Safe does not own cluster policy ($policy_owner != $safe)"
+  cast call "$safe" 'getThreshold()(uint256)' --rpc-url "$RPC_URL" >/dev/null \
+    || die "expected owner does not expose the Safe threshold surface"
+  cast call "$safe" 'getOwners()(address[])' --rpc-url "$RPC_URL" >/dev/null \
+    || die "expected owner does not expose the Safe owners surface"
+
+  bundle_rel="script/deployments/${CHAIN_ID}-patha-safe-${cluster,,}.json"
+  bundle_abs="$ROOT/contracts/$bundle_rel"
+  rm -f "$bundle_abs"
+  export CLUSTER="$cluster" EXPECTED_SAFE_OWNER="$safe" PATHA_BUNDLE_FILE="$bundle_rel"
+
+  if ! run_step "patha-safe-prepare-${cluster}" bash -c \
+    "cd '$ROOT/contracts' && forge script script/PrepareDstackFacetPathASafe.s.sol:PrepareDstackFacetPathASafe --rpc-url '$RPC_URL' --broadcast --slow"; then
+    rm -f "$bundle_abs"
+    die "Path-A Safe preparation failed; no Safe transaction bundle was produced"
+  fi
+
+  [ -f "$bundle_abs" ] || die "Path-A Safe preparation returned without a bundle"
+  jq -e --arg cluster "$cluster" --arg safe "$safe" --arg chain "$CHAIN_ID" '
+      .schemaVersion == 1
+      and (.chainId | tostring) == $chain
+      and (.cluster | ascii_downcase) == ($cluster | ascii_downcase)
+      and (.target | ascii_downcase) == ($cluster | ascii_downcase)
+      and (.safeOwner | ascii_downcase) == ($safe | ascii_downcase)
+      and .value == 0
+      and ((.data | ascii_downcase) | test("^0x1f931c1c[0-9a-f]*$"))
+      and (.calldataHash | test("^0x[0-9a-fA-F]{64}$"))
+      and (.dstackFacet | test("^0x[0-9a-fA-F]{40}$"))
+      and (.clusterMemberImplementation | test("^0x[0-9a-fA-F]{40}$"))
+      and (.currentDstackFacet | test("^0x[0-9a-fA-F]{40}$"))
+    ' "$bundle_abs" >/dev/null || die "Path-A Safe bundle failed structural validation"
+
+  new_facet=$(jq -r .dstackFacet "$bundle_abs")
+  member_impl=$(jq -r .clusterMemberImplementation "$bundle_abs")
+  current_facet=$(jq -r .currentDstackFacet "$bundle_abs")
+  new_facet_code=$(cast code "$new_facet" --rpc-url "$RPC_URL") \
+    || die "could not read prepared DstackFacet deployment: $new_facet"
+  [ "$new_facet_code" != "0x" ] \
+    || die "prepared DstackFacet deployment has no code: $new_facet"
+  member_impl_code=$(cast code "$member_impl" --rpc-url "$RPC_URL") \
+    || die "could not read prepared ClusterMember implementation: $member_impl"
+  [ "$member_impl_code" != "0x" ] \
+    || die "prepared ClusterMember implementation has no code: $member_impl"
+  current_register_facet=$(cast call "$cluster" 'facetAddress(bytes4)(address)' \
+    0x537d491c --rpc-url "$RPC_URL") \
+    || die "could not verify current dstack_register facet"
+  [ "${current_register_facet,,}" = "${current_facet,,}" ] \
+    || die "cluster selector topology changed while preparing the Safe bundle"
+  calldata_hash=$(cast keccak "$(jq -r .data "$bundle_abs")") \
+    || die "could not hash Path-A Safe calldata"
+  [ "${calldata_hash,,}" = "$(jq -r '.calldataHash | ascii_downcase' "$bundle_abs")" ] \
+    || die "Path-A Safe bundle calldata hash mismatch"
+
+  log "Path-A implementations deployed; the cluster diamondCut has NOT been submitted"
+  log "review the exact Safe transaction bundle: $bundle_abs"
+  jq '{target, value, data, dstackFacet, clusterMemberImplementation, currentDstackFacet, calldataHash}' \
+    "$bundle_abs" >&2
 }
 
 case "${1:-all}" in
@@ -129,7 +225,8 @@ case "${1:-all}" in
   cluster)   cluster "${2:-attestmesh-1}" ;;
   indexer-cluster) preflight; indexer_cluster "${2:-attestmesh-indexer-ha}" ;;
   patha-upgrade) patha_upgrade "$2" ;;
+  patha-safe-prepare) preflight; patha_safe_prepare "${2:-}" "${3:-}" ;;
   seed-appid) seed_appid "$2" "$3" ;;
   all)       preflight; infra; cluster "${2:-attestmesh-1}" ;;
-  *) die "usage: onchain.sh {preflight|infra|cluster [name]|indexer-cluster [name]|patha-upgrade <cluster>|seed-appid <cluster> <member>|all}" ;;
+  *) die "usage: onchain.sh {preflight|infra|cluster [name]|indexer-cluster [name]|patha-upgrade <cluster>|patha-safe-prepare <cluster> <safe>|seed-appid <cluster> <member>|all}" ;;
 esac
