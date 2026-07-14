@@ -28,13 +28,17 @@
 # etag checks, so no other egress is needed. Do NOT mount a volume over
 # /home/hindsight/.cache — it would hide the baked-in models.
 #
+# Storage: defaults to embedded pg0 (`HINDSIGHT_API_DATABASE_URL=pg0`) so the
+# existing memory store survives ordinary rolls. For PG-HA cutover, the driver
+# seals a multi-host asyncpg DSN pointing at the sidecar DB forwarders below.
+#
 # No secrets are committed here; all ${VAR} values are sealed into the CVM by
 # deploy/hindsight-node.sh (key NAMES are measured into the compose_hash,
 # VALUES are sealed to the app's X25519 key).
 services:
   # --- AttestMesh sidecar: on-chain self-registration + wg mesh (Path A) --------
   sidecar:
-    image: ghcr.io/attestmesh/cluster-mesh-agent@sha256:b9e0ae107d9db015c22059c9fecdc28f2b35e09b257eabb4739bd4e46d96f641
+    image: ghcr.io/attestmesh/cluster-mesh-agent@sha256:e3d53442aa6e52d47227fb3528c1141302ad4fc63c4b3fb6dc38df7ce907d486
     restart: unless-stopped
     environment:
       # MEMBER_CONTRACT intentionally unset. Path A upgrades this stock DstackApp
@@ -48,12 +52,14 @@ services:
       - GATEWAY_DOMAIN=${GATEWAY_DOMAIN}
       - DSTACK_SOCKET=/var/run/dstack.sock
       - SIDECAR_STATE_DIR=/var/lib/attestmesh
+      - AGENT_GRPC_SOCKET=/var/run/attestmesh/agent.sock
       - HEALTH_HTTP_ADDR=0.0.0.0:9090
       - LOG_FORMAT=pretty
       - LOG_LEVEL=info,cluster_mesh_agent=debug
     volumes:
       - /var/run/dstack.sock:/var/run/dstack.sock
       - sidecar-state:/var/lib/attestmesh
+      - agent-sock:/var/run/attestmesh
     ports:
       # 9090 = sidecar health (the only box-visible signal; the TEE blocks
       # container logs, so this is the pre-mesh observability — synclave parity).
@@ -64,6 +70,467 @@ services:
       - NET_ADMIN
     devices:
       - /dev/net/tun
+
+  # --- Optional PG-HA routing: :15431 follows Patroni's writable primary directly;
+  #     :15432/3 remain node-specific HAProxy fallbacks for the multi-host runtime DSN.
+  #     Enabled only for `HINDSIGHT_DB_MODE=pgha`; pg0 mode keeps the router asleep.
+  pg-primary-router:
+    image: haproxy:3.0-alpine@sha256:dee54db8b27cd6c21519ea4f0ba0604f3742e8e7369bc16fb5b69133dec3f47f
+    restart: unless-stopped
+    network_mode: service:sidecar
+    depends_on:
+      - sidecar
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - |
+        [ "${HINDSIGHT_PGHA_ENABLED}" = "1" ] || exec sleep infinity
+        cat >/tmp/pg-primary-router.cfg <<CFG
+        global
+          maxconn 400
+        defaults
+          mode tcp
+          timeout connect 2s
+          timeout client 30m
+          timeout server 30m
+          timeout check 2s
+          retries 2
+          option redispatch
+        listen primary
+          bind 0.0.0.0:15431
+          option httpchk GET /primary
+          http-check expect status 200
+          default-server inter 200ms fastinter 100ms downinter 500ms fall 1 rise 1 on-marked-down shutdown-sessions
+          server pg1 ${HINDSIGHT_PGHA_IP_1}:5434 check port 8008
+          server pg2 ${HINDSIGHT_PGHA_IP_2}:5434 check port 8008
+          server pg3 ${HINDSIGHT_PGHA_IP_3}:5434 check port 8008
+        CFG
+        exec haproxy -f /tmp/pg-primary-router.cfg -db
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+
+  pg2-proxy:
+    image: alpine/socat:1.8.0.0
+    restart: unless-stopped
+    network_mode: service:sidecar
+    depends_on:
+      - sidecar
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - |
+        [ "${HINDSIGHT_PGHA_ENABLED}" = "1" ] || exec sleep infinity
+        exec socat -d -d TCP-LISTEN:15432,fork,reuseaddr,bind=0.0.0.0 TCP:${HINDSIGHT_PGHA_IP_2}:5432
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+
+  pg3-proxy:
+    image: alpine/socat:1.8.0.0
+    restart: unless-stopped
+    network_mode: service:sidecar
+    depends_on:
+      - sidecar
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - |
+        [ "${HINDSIGHT_PGHA_ENABLED}" = "1" ] || exec sleep infinity
+        exec socat -d -d TCP-LISTEN:15433,fork,reuseaddr,bind=0.0.0.0 TCP:${HINDSIGHT_PGHA_IP_3}:5432
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+
+  # One-shot: prepare the shared PG-HA database when the pgha mode is selected.
+  # The superuser password is HKDF-derived from the CSK in-CVM; the Hindsight DB
+  # role password is a driver-generated sealed value persisted in the state file.
+  pg-provision:
+    image: ghcr.io/attestmesh/pg-ha@sha256:3cce594b31cc9c57dea6f1b7fc4e6a3e9b31be15853c49e22c4c6423d7a9b066
+    restart: "no"
+    network_mode: service:sidecar
+    depends_on:
+      - sidecar
+    environment:
+      - AGENT_GRPC_SOCKET=/var/run/attestmesh/agent.sock
+      - HINDSIGHT_PGHA_ENABLED=${HINDSIGHT_PGHA_ENABLED}
+      - HINDSIGHT_DB_PASSWORD=${HINDSIGHT_DB_PASSWORD}
+      - HINDSIGHT_PGHA_IP_1=${HINDSIGHT_PGHA_IP_1}
+      - HINDSIGHT_PGHA_IP_2=${HINDSIGHT_PGHA_IP_2}
+      - HINDSIGHT_PGHA_IP_3=${HINDSIGHT_PGHA_IP_3}
+      - PGHA_LOG_TAG=hindsight-pg-provision
+    volumes:
+      - agent-sock:/var/run/attestmesh
+    entrypoint: ["/bin/bash", "-ec"]
+    command:
+      - |
+        if [ "${HINDSIGHT_PGHA_ENABLED}" != "1" ]; then
+          echo "hindsight-pg-provision: disabled; pg0 mode"
+          exit 0
+        fi
+        source /usr/local/bin/pgha-common.sh
+        _st "deriving pg-ha superuser credential for Hindsight"
+        SUPW="$$(csk_derive attestmesh.pgha.superuser.v1)"
+        HOSTS="${HINDSIGHT_PGHA_IP_1}:5432,${HINDSIGHT_PGHA_IP_2}:5432,${HINDSIGHT_PGHA_IP_3}:5432"
+        PGOPTS="connect_timeout=5&target_session_attrs=read-write"
+        ready=0
+        for attempt in $$(seq 1 60); do
+          if psql "postgresql://postgres:$${SUPW}@$${HOSTS}/postgres?$${PGOPTS}" \
+            -v ON_ERROR_STOP=1 -c 'select 1' >/dev/null 2>&1; then
+            ready=1
+            break
+          fi
+          _st "waiting for pg-ha mesh and writable primary ($${attempt}/60)"
+          sleep 5
+        done
+        if [ "$$ready" != "1" ]; then
+          _st "ERROR: pg-ha primary remained unreachable for 300 seconds"
+          exit 2
+        fi
+        _st "ensuring role + database hindsight"
+        psql "postgresql://postgres:$${SUPW}@$${HOSTS}/postgres?$${PGOPTS}" -v ON_ERROR_STOP=1 -v pw="$$HINDSIGHT_DB_PASSWORD" <<'SQL'
+        SELECT format('CREATE ROLE hindsight LOGIN PASSWORD %L', :'pw')
+        WHERE NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'hindsight')
+        \gexec
+        ALTER ROLE hindsight WITH LOGIN PASSWORD :'pw';
+        -- PG-HA containers intentionally keep Docker's small /dev/shm. Hindsight
+        -- creates per-bank vector indexes, so force serial plans rather than
+        -- allowing a parallel worker to request a 64 MB DSM segment.
+        ALTER ROLE hindsight SET max_parallel_workers_per_gather = 0;
+        ALTER ROLE hindsight SET max_parallel_maintenance_workers = 0;
+        SELECT format('CREATE DATABASE %I OWNER %I', 'hindsight', 'hindsight')
+        WHERE NOT EXISTS (SELECT FROM pg_database WHERE datname = 'hindsight')
+        \gexec
+        SQL
+        _st "ensuring Hindsight extensions"
+        psql "postgresql://postgres:$${SUPW}@$${HOSTS}/hindsight?$${PGOPTS}" -v ON_ERROR_STOP=1 <<'SQL'
+        CREATE EXTENSION IF NOT EXISTS vector;
+        CREATE EXTENSION IF NOT EXISTS pg_trgm;
+        SQL
+        psql "postgresql://hindsight:$${HINDSIGHT_DB_PASSWORD}@$${HOSTS}/hindsight?$${PGOPTS}" -v ON_ERROR_STOP=1 -c 'select 1' >/dev/null
+        _st "OK: hindsight role/database/extensions ensured; login verified"
+
+  # One-shot maintenance cleanup.  It is normally disabled; the recovery
+  # driver enables it only while provider egress is disabled.  Running before
+  # Hindsight starts removes worker races and avoids the API pool's command
+  # timeout on the contaminated bank's very large cascade.
+  bank-cleanup:
+    image: ghcr.io/attestmesh/pg-ha@sha256:3cce594b31cc9c57dea6f1b7fc4e6a3e9b31be15853c49e22c4c6423d7a9b066
+    restart: "no"
+    network_mode: service:sidecar
+    depends_on:
+      pg-provision:
+        condition: service_completed_successfully
+    environment:
+      - HINDSIGHT_BANK_CLEANUP_ENABLED=${HINDSIGHT_BANK_CLEANUP_ENABLED}
+      - HINDSIGHT_DB_PASSWORD=${HINDSIGHT_DB_PASSWORD}
+      - HINDSIGHT_PGHA_IP_1=${HINDSIGHT_PGHA_IP_1}
+      - HINDSIGHT_PGHA_IP_2=${HINDSIGHT_PGHA_IP_2}
+      - HINDSIGHT_PGHA_IP_3=${HINDSIGHT_PGHA_IP_3}
+    entrypoint: ["/bin/bash", "-ec"]
+    command:
+      - |
+        if [ "$${HINDSIGHT_BANK_CLEANUP_ENABLED}" != "1" ]; then
+          echo "hindsight-bank-cleanup: disabled"
+          exit 0
+        fi
+        HOSTS="$${HINDSIGHT_PGHA_IP_1}:5432,$${HINDSIGHT_PGHA_IP_2}:5432,$${HINDSIGHT_PGHA_IP_3}:5432"
+        DSN="postgresql://hindsight:$${HINDSIGHT_DB_PASSWORD}@$${HOSTS}/hindsight?connect_timeout=5&target_session_attrs=read-write"
+        psql "$${DSN}" -v ON_ERROR_STOP=1 -X <<'SQL'
+        \timing on
+        CREATE TEMP TABLE cleanup_bank_ids ON COMMIT PRESERVE ROWS AS
+          SELECT bank_id, internal_id
+          FROM banks
+          WHERE bank_id IN ('agent-sessions', 'dans-pocket');
+
+        SELECT bank_id, status, count(*) AS operations
+        FROM async_operations
+        WHERE bank_id IN ('agent-sessions', 'dans-pocket')
+        GROUP BY bank_id, status
+        ORDER BY bank_id, status;
+
+        BEGIN;
+        SET LOCAL statement_timeout = 0;
+        SET LOCAL lock_timeout = 0;
+        DELETE FROM async_operations WHERE bank_id IN ('agent-sessions', 'dans-pocket');
+        DELETE FROM graph_maintenance_queue WHERE bank_id IN ('agent-sessions', 'dans-pocket');
+        DELETE FROM llm_requests WHERE bank_id IN ('agent-sessions', 'dans-pocket');
+        DELETE FROM audit_log WHERE bank_id IN ('agent-sessions', 'dans-pocket');
+        DELETE FROM bank_stats_cache WHERE bank_id IN ('agent-sessions', 'dans-pocket');
+        DELETE FROM webhooks WHERE bank_id IN ('agent-sessions', 'dans-pocket');
+        DELETE FROM directives WHERE bank_id IN ('agent-sessions', 'dans-pocket');
+        DELETE FROM mental_model_history WHERE bank_id IN ('agent-sessions', 'dans-pocket');
+        DELETE FROM mental_models WHERE bank_id IN ('agent-sessions', 'dans-pocket');
+        DELETE FROM observation_history WHERE bank_id IN ('agent-sessions', 'dans-pocket');
+        DELETE FROM memory_links WHERE bank_id IN ('agent-sessions', 'dans-pocket');
+        DELETE FROM invalidated_memory_units WHERE bank_id IN ('agent-sessions', 'dans-pocket');
+        DELETE FROM documents WHERE bank_id IN ('agent-sessions', 'dans-pocket');
+        DELETE FROM memory_units WHERE bank_id IN ('agent-sessions', 'dans-pocket');
+        DELETE FROM chunks WHERE bank_id IN ('agent-sessions', 'dans-pocket');
+        DELETE FROM entities WHERE bank_id IN ('agent-sessions', 'dans-pocket');
+        DELETE FROM banks WHERE bank_id IN ('agent-sessions', 'dans-pocket');
+        COMMIT;
+
+        SELECT format(
+          'DROP INDEX IF EXISTS public.%I',
+          'idx_mu_emb_' || suffix || '_' || left(replace(internal_id::text, '-', ''), 16)
+        )
+        FROM cleanup_bank_ids
+        CROSS JOIN (VALUES ('worl'), ('expr'), ('obsv')) AS fact_types(suffix)
+        \gexec
+
+        SELECT table_name, residual_rows
+        FROM (
+          SELECT 'async_operations' AS table_name, count(*) AS residual_rows FROM async_operations WHERE bank_id IN ('agent-sessions', 'dans-pocket')
+          UNION ALL SELECT 'audit_log', count(*) FROM audit_log WHERE bank_id IN ('agent-sessions', 'dans-pocket')
+          UNION ALL SELECT 'bank_stats_cache', count(*) FROM bank_stats_cache WHERE bank_id IN ('agent-sessions', 'dans-pocket')
+          UNION ALL SELECT 'banks', count(*) FROM banks WHERE bank_id IN ('agent-sessions', 'dans-pocket')
+          UNION ALL SELECT 'chunks', count(*) FROM chunks WHERE bank_id IN ('agent-sessions', 'dans-pocket')
+          UNION ALL SELECT 'directives', count(*) FROM directives WHERE bank_id IN ('agent-sessions', 'dans-pocket')
+          UNION ALL SELECT 'documents', count(*) FROM documents WHERE bank_id IN ('agent-sessions', 'dans-pocket')
+          UNION ALL SELECT 'entities', count(*) FROM entities WHERE bank_id IN ('agent-sessions', 'dans-pocket')
+          UNION ALL SELECT 'graph_maintenance_queue', count(*) FROM graph_maintenance_queue WHERE bank_id IN ('agent-sessions', 'dans-pocket')
+          UNION ALL SELECT 'invalidated_memory_units', count(*) FROM invalidated_memory_units WHERE bank_id IN ('agent-sessions', 'dans-pocket')
+          UNION ALL SELECT 'llm_requests', count(*) FROM llm_requests WHERE bank_id IN ('agent-sessions', 'dans-pocket')
+          UNION ALL SELECT 'memory_links', count(*) FROM memory_links WHERE bank_id IN ('agent-sessions', 'dans-pocket')
+          UNION ALL SELECT 'memory_units', count(*) FROM memory_units WHERE bank_id IN ('agent-sessions', 'dans-pocket')
+          UNION ALL SELECT 'mental_model_history', count(*) FROM mental_model_history WHERE bank_id IN ('agent-sessions', 'dans-pocket')
+          UNION ALL SELECT 'mental_models', count(*) FROM mental_models WHERE bank_id IN ('agent-sessions', 'dans-pocket')
+          UNION ALL SELECT 'observation_history', count(*) FROM observation_history WHERE bank_id IN ('agent-sessions', 'dans-pocket')
+          UNION ALL SELECT 'webhooks', count(*) FROM webhooks WHERE bank_id IN ('agent-sessions', 'dans-pocket')
+        ) residuals
+        WHERE residual_rows <> 0;
+        SQL
+
+        residual="$$(psql "$${DSN}" -AtX -v ON_ERROR_STOP=1 -c "
+          SELECT count(*) FROM (
+            SELECT bank_id FROM banks WHERE bank_id IN ('agent-sessions','dans-pocket')
+            UNION ALL SELECT bank_id FROM async_operations WHERE bank_id IN ('agent-sessions','dans-pocket')
+            UNION ALL SELECT bank_id FROM documents WHERE bank_id IN ('agent-sessions','dans-pocket')
+            UNION ALL SELECT bank_id FROM memory_units WHERE bank_id IN ('agent-sessions','dans-pocket')
+            UNION ALL SELECT bank_id FROM entities WHERE bank_id IN ('agent-sessions','dans-pocket')
+          ) remaining")"
+        [ "$${residual}" = "0" ] || { echo "hindsight-bank-cleanup: residual rows=$${residual}" >&2; exit 1; }
+        echo "hindsight-bank-cleanup: complete; target banks and operations absent"
+
+  # --- Local inference budget enforcement --------------------------------------
+  # Redpill's key ceiling is total rather than monthly.  This measured proxy
+  # supplies persistent calendar-month Qwen/Hindsight budgets, a one-time
+  # backfill budget, a provider-total safety margin, and crash ambiguity.
+  budget-proxy-init:
+    image: ghcr.io/attestmesh/hindsight-budget-proxy@sha256:a7d9820c8a8bcf6d5c73189d240013c349e86309e68805210598bb3180d08b02
+    user: "0:0"
+    restart: "no"
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - |
+        install -d -o 1000 -g 1000 -m 0700 /var/lib/attestmesh-budget
+        find /var/lib/attestmesh-budget -mindepth 1 -maxdepth 1 -exec chown 1000:1000 {} +
+    volumes:
+      - hindsight-budget:/var/lib/attestmesh-budget
+    security_opt:
+      - no-new-privileges:true
+
+  # Explicit crash-ambiguity recovery. Disabled during normal boots. An
+  # operator may enable it for one measured roll after reviewing the failed
+  # call; the reservation is then charged at its maximum before the circuit is
+  # closed. --if-needed keeps a restarted maintenance roll idempotent without
+  # clearing provider/auth/budget circuits that have no ambiguous reservation.
+  budget-proxy-reconcile:
+    image: ghcr.io/attestmesh/hindsight-budget-proxy@sha256:a7d9820c8a8bcf6d5c73189d240013c349e86309e68805210598bb3180d08b02
+    user: "1000:1000"
+    restart: "no"
+    depends_on:
+      budget-proxy-init:
+        condition: service_completed_successfully
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - |
+        if [ "$${HINDSIGHT_RECONCILE_AMBIGUOUS_ENABLED}" != "1" ]; then
+          echo "hindsight-budget-reconcile: disabled"
+          exit 0
+        fi
+        # A hard restart can persist reservations before the proxy has copied
+        # its in-memory open circuit into state.json.  The pinned reconciler
+        # requires that bit, so materialize it only when this measured,
+        # acknowledged one-shot sees actual reservations.  This does not clear
+        # or charge anything; the reconciler below remains the sole mutator.
+        /app/api/.venv/bin/python - <<'PY'
+        import json
+        import os
+        from pathlib import Path
+
+        path = Path("/var/lib/attestmesh-budget/state.json")
+        if path.exists():
+            state = json.loads(path.read_text())
+            if state.get("in_flight") and not state.get("circuit_open"):
+                state["circuit_open"] = True
+                state["reason"] = "operator-authorized stale reservation reconciliation"
+                temporary = path.with_suffix(".json.new")
+                temporary.write_text(json.dumps(state, indent=2, sort_keys=True) + "\n")
+                os.replace(temporary, path)
+        PY
+        exec /app/api/.venv/bin/python /opt/attestmesh/reconcile_ambiguous.py \
+          --ledger /var/lib/attestmesh-budget/ledger.json \
+          --state /var/lib/attestmesh-budget/state.json \
+          --acknowledge-max-spend --if-needed
+    environment:
+      - HINDSIGHT_RECONCILE_AMBIGUOUS_ENABLED=${HINDSIGHT_RECONCILE_AMBIGUOUS_ENABLED}
+    volumes:
+      - hindsight-budget:/var/lib/attestmesh-budget
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+
+  # Explicit recovery for a provider 401/402 with no ambiguous reservation.
+  # The operator must validate the credential and exact models out of band,
+  # then supply a unique one-shot token. Reusing that token fails closed.
+  budget-proxy-auth-reset:
+    image: ghcr.io/attestmesh/hindsight-budget-proxy@sha256:a7d9820c8a8bcf6d5c73189d240013c349e86309e68805210598bb3180d08b02
+    user: "1000:1000"
+    restart: "no"
+    depends_on:
+      budget-proxy-reconcile:
+        condition: service_completed_successfully
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - |
+        if [ "$${HINDSIGHT_RESET_PROVIDER_AUTH_CIRCUIT_ENABLED}" != "1" ]; then
+          echo "hindsight-provider-auth-reset: disabled"
+          exit 0
+        fi
+        [ -n "$${HINDSIGHT_PROVIDER_AUTH_RESET_TOKEN}" ] || {
+          echo "hindsight-provider-auth-reset: missing one-shot token" >&2
+          exit 2
+        }
+        exec /app/api/.venv/bin/python /opt/attestmesh/reset_provider_auth.py \
+          --state /var/lib/attestmesh-budget/state.json \
+          --acknowledge-provider-credential-validated \
+          --reset-token "$${HINDSIGHT_PROVIDER_AUTH_RESET_TOKEN}" --if-needed
+    environment:
+      - HINDSIGHT_RESET_PROVIDER_AUTH_CIRCUIT_ENABLED=${HINDSIGHT_RESET_PROVIDER_AUTH_CIRCUIT_ENABLED}
+      - HINDSIGHT_PROVIDER_AUTH_RESET_TOKEN=${HINDSIGHT_PROVIDER_AUTH_RESET_TOKEN}
+    volumes:
+      - hindsight-budget:/var/lib/attestmesh-budget
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+
+  # Mesh-local upstream for both evaluated models. The budget proxy can reach
+  # only this listener; the sidecar then carries traffic to the stable Fugu LB.
+  fugu-router-proxy:
+    image: alpine/socat:1.8.0.0
+    restart: unless-stopped
+    network_mode: service:sidecar
+    depends_on:
+      - sidecar
+    command:
+      - -d
+      - -d
+      - TCP-LISTEN:18410,fork,reuseaddr,bind=0.0.0.0
+      - TCP:${HINDSIGHT_ROUTER_MESH_IP}:18410
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      # Probe through socat to the router process; a bare TCP listener check can
+      # pass while the mesh-side destination is unreachable.
+      test: ["CMD-SHELL", "wget -q -T 5 -O /dev/null http://127.0.0.1:18410/health/process"]
+      interval: 3s
+      timeout: 6s
+      # A cold sidecar can take several minutes to enumerate the large cluster.
+      # Keep the dependency in "starting" until the route exists instead of
+      # failing Compose's one-shot startup after 90 seconds.
+      start_period: 10m
+      retries: 200
+
+  budget-proxy:
+    image: ghcr.io/attestmesh/hindsight-budget-proxy@sha256:a7d9820c8a8bcf6d5c73189d240013c349e86309e68805210598bb3180d08b02
+    user: "1000:1000"
+    restart: unless-stopped
+    depends_on:
+      budget-proxy-auth-reset:
+        condition: service_completed_successfully
+    command:
+      - --ledger
+      - /var/lib/attestmesh-budget/ledger.json
+      - --state
+      - /var/lib/attestmesh-budget/state.json
+      - --host
+      - 0.0.0.0
+      - --port
+      - "28080"
+    environment:
+      - PROVIDER_BASE_URL=${HINDSIGHT_PROVIDER_BASE_URL}
+      - PROVIDER_API_KEY=${HINDSIGHT_PROVIDER_API_KEY}
+      - PROXY_API_KEY=${HINDSIGHT_PROXY_API_KEY}
+      - NO_PROXY=sidecar,127.0.0.1,localhost
+      - no_proxy=sidecar,127.0.0.1,localhost
+      - PROVIDER_EGRESS_ENABLED=${HINDSIGHT_PROVIDER_EGRESS_ENABLED}
+      - PROVIDER_TOTAL_LIMIT_USD=${HINDSIGHT_PROVIDER_TOTAL_LIMIT_USD}
+      - PROVIDER_SAFETY_MARGIN_USD=${HINDSIGHT_PROVIDER_SAFETY_MARGIN_USD}
+      - HINDSIGHT_BUDGET_PHASE=${HINDSIGHT_BUDGET_PHASE}
+      - HINDSIGHT_BACKFILL_LIMIT_USD=${HINDSIGHT_BACKFILL_LIMIT_USD}
+      - HINDSIGHT_MONTHLY_LIMIT_USD=${HINDSIGHT_MONTHLY_LIMIT_USD}
+      - QWEN_MONTHLY_LIMIT_USD=${QWEN_MONTHLY_LIMIT_USD}
+      - PROXY_RPM_LIMIT=${HINDSIGHT_PROXY_RPM_LIMIT}
+      - PROXY_TPM_LIMIT=${HINDSIGHT_PROXY_TPM_LIMIT}
+      - GPT_OSS_120B_INPUT_USD_PER_M=${GPT_OSS_120B_INPUT_USD_PER_M}
+      - GPT_OSS_120B_OUTPUT_USD_PER_M=${GPT_OSS_120B_OUTPUT_USD_PER_M}
+      - QWEN_INPUT_USD_PER_M=${QWEN_INPUT_USD_PER_M}
+      - QWEN_OUTPUT_USD_PER_M=${QWEN_OUTPUT_USD_PER_M}
+      - INITIAL_PROVIDER_SPEND_USD=${HINDSIGHT_INITIAL_PROVIDER_SPEND_USD}
+    volumes:
+      - hindsight-budget:/var/lib/attestmesh-budget
+    expose:
+      - "28080"
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test:
+        - CMD
+        - /app/api/.venv/bin/python
+        - -c
+        - import httpx; r=httpx.get('http://127.0.0.1:28080/health', timeout=3); r.raise_for_status()
+      interval: 3s
+      timeout: 4s
+      retries: 30
+
+  budget-proxy-egress-fw:
+    image: ghcr.io/attestmesh/agent-egress-fw@sha256:c6c00d1fc5e73dde050c1a8cf2fef43a93cc9cd0dc0f5f368e7c763f1f1c242c
+    restart: unless-stopped
+    network_mode: service:budget-proxy
+    depends_on:
+      budget-proxy:
+        condition: service_healthy
+      fugu-router-proxy:
+        condition: service_healthy
+    environment:
+      - ALLOW_BASE_URL=
+      - ALLOW_CIDRS=
+      - ALLOW_PORT=443
+      - INTERNAL_HOSTS=
+      - INTERNAL_HOST_PORTS=sidecar:18410
+      - ALLOW_DNS=127.0.0.11
+      - RERESOLVE_SECONDS=30
+    cap_add:
+      - NET_ADMIN
 
   # --- Mesh-only listeners: bind in the sidecar netns (wg iface) ---------------
   mesh-proxy-api:
@@ -92,10 +559,48 @@ services:
       - TCP-LISTEN:18999,fork,reuseaddr,bind=0.0.0.0
       - TCP:hindsight:9999
 
+  # Mesh-only Qwen proxy for the Postgres producers.  They authenticate with
+  # HINDSIGHT_PROXY_API_KEY and therefore never receive the provider key.
+  mesh-proxy-budget:
+    image: alpine/socat:1.8.0.0
+    restart: unless-stopped
+    network_mode: service:sidecar
+    depends_on:
+      - sidecar
+      - budget-proxy
+      - budget-proxy-egress-fw
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - |
+        while :; do
+          socat -d -d TCP-LISTEN:18889,fork,reuseaddr,bind=0.0.0.0 TCP:budget-proxy:28080 && exit 0
+          echo "mesh-proxy-budget: listener exited; retrying" >&2
+          sleep 1
+        done
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z 127.0.0.1 18889"]
+      interval: 3s
+      timeout: 2s
+      retries: 30
+
   # --- Hindsight: API (:8888) + control-plane UI (:9999) + embedded pg0 --------
   hindsight:
     image: ghcr.io/vectorize-io/hindsight:0.8.4
     restart: unless-stopped
+    depends_on:
+      pg-provision:
+        condition: service_completed_successfully
+      bank-cleanup:
+        condition: service_completed_successfully
+      budget-proxy:
+        condition: service_healthy
+      budget-proxy-egress-fw:
+        condition: service_started
     # pg0 needs a clean shutdown; Docker's 10s default can SIGKILL it mid-WAL-flush
     # (upstream data-loss issue #675).
     stop_grace_period: 30s
@@ -107,9 +612,24 @@ services:
       HINDSIGHT_API_LLM_BASE_URL: ${HINDSIGHT_API_LLM_BASE_URL}
       HINDSIGHT_API_LLM_MODEL: ${HINDSIGHT_API_LLM_MODEL}
       HINDSIGHT_API_LLM_API_KEY: ${HINDSIGHT_API_LLM_API_KEY}
-      # Default assumes ~64k output tokens; keep under the hosted model's cap
-      # (must stay > RETAIN_CHUNK_SIZE, default 3000).
-      HINDSIGHT_API_RETAIN_MAX_COMPLETION_TOKENS: "32000"
+      # Hindsight 0.8.4 does not reliably identify gpt-oss as a reasoning
+      # family, so the same low-effort setting is also supplied in EXTRA_BODY.
+      HINDSIGHT_API_LLM_REASONING_EFFORT: ${HINDSIGHT_API_LLM_REASONING_EFFORT}
+      HINDSIGHT_API_LLM_EXTRA_BODY: '${HINDSIGHT_API_LLM_EXTRA_BODY}'
+      HINDSIGHT_API_LLM_STRICT_SCHEMA: ${HINDSIGHT_API_LLM_STRICT_SCHEMA}
+      HINDSIGHT_API_LLM_MAX_RETRIES: "1"
+      HINDSIGHT_API_WORKER_MAX_RETRIES: "0"
+      HINDSIGHT_API_SKIP_LLM_VERIFICATION: "true"
+      # One retained document can fan out into extraction and consolidation
+      # calls. Keep this at the driver's measured ceiling of three.
+      HINDSIGHT_API_LLM_MAX_CONCURRENT: ${HINDSIGHT_API_LLM_MAX_CONCURRENT}
+      HINDSIGHT_API_ENABLE_AUTO_CONSOLIDATION: "true"
+      HINDSIGHT_API_DATABASE_URL: ${HINDSIGHT_API_DATABASE_URL}
+      HINDSIGHT_API_MIGRATION_DATABASE_URL: ${HINDSIGHT_API_MIGRATION_DATABASE_URL}
+      HINDSIGHT_API_VECTOR_EXTENSION: pgvector
+      # Explicit cost ceiling for extraction and auto-consolidation calls.
+      HINDSIGHT_API_RETAIN_MAX_COMPLETION_TOKENS: ${HINDSIGHT_API_LLM_MAX_COMPLETION_TOKENS}
+      HINDSIGHT_API_CONSOLIDATION_MAX_COMPLETION_TOKENS: ${HINDSIGHT_API_LLM_MAX_COMPLETION_TOKENS}
       # Stable worker identity across restarts (background consolidation jobs).
       HINDSIGHT_API_WORKER_ID: hindsight-node
       # The API ships with NO auth by default — enable the built-in shared-key
@@ -119,11 +639,15 @@ services:
       # Control-plane UI login gate + the bearer it uses toward the API.
       HINDSIGHT_CP_ACCESS_KEY: ${HINDSIGHT_CP_ACCESS_KEY}
       HINDSIGHT_CP_DATAPLANE_API_KEY: ${HINDSIGHT_API_TENANT_API_KEY}
+      # First boot against PG-HA runs migrations before /health becomes ready.
+      HINDSIGHT_API_STARTUP_WAIT_SECONDS: "900"
       # The embedding/reranker models are baked into the full image; these stop
       # huggingface_hub from attempting etag HEAD requests at model load (which
       # would hang under the deny-all egress firewall).
       HF_HUB_OFFLINE: "1"
       TRANSFORMERS_OFFLINE: "1"
+      LITELLM_LOCAL_MODEL_COST_MAP: "True"
+      LITELLM_LOCAL_BLOG_POSTS: "True"
       HINDSIGHT_API_LOG_FORMAT: json
     volumes:
       # Embedded pg0 PostgreSQL data. Named volume → seeded with the image's
@@ -136,8 +660,9 @@ services:
   # --- Egress firewall for Hindsight: deny-all except the pinned LLM host ------
   #     Shares hindsight's netns and sets default-DROP OUTPUT, allowing ONLY
   #     loopback (API↔UI↔pg0 are in-container), established/related, Docker DNS,
-  #     and the LLM host:443. Hindsight initiates nothing else; mesh/bridge
-  #     traffic toward it is inbound and covered by conntrack.
+  #     the sidecar container (for PG-HA forwarders), and the LLM host:443.
+  #     Hindsight initiates nothing else; mesh/bridge traffic toward it is
+  #     inbound and covered by conntrack.
   hindsight-egress-fw:
     image: ghcr.io/attestmesh/agent-egress-fw@sha256:c75c9668e905ca00f86e9583505d52624ba87cb7114a4633f84330bb497ca58f
     restart: unless-stopped
@@ -145,9 +670,9 @@ services:
     depends_on:
       - hindsight
     environment:
-      - LLM_BASE_URL=${HINDSIGHT_API_LLM_BASE_URL}   # the ONE permitted external host (:443)
-      - LLM_ALLOW_CIDRS=66.220.6.0/24                # redpill api.redpill.ai block (resolution-independent)
-      - INTERNAL_HOSTS=                              # hindsight initiates to no internal services
+      - LLM_BASE_URL=${HINDSIGHT_API_LLM_BASE_URL}   # internal budget proxy only
+      - LLM_ALLOW_CIDRS=                             # direct Redpill egress is forbidden
+      - INTERNAL_HOSTS=sidecar budget-proxy          # PG-HA + metered inference
       - ALLOW_DNS=127.0.0.11                         # Docker embedded resolver
       - RERESOLVE_SECONDS=30
     cap_add:
@@ -155,4 +680,6 @@ services:
 
 volumes:
   sidecar-state:
+  agent-sock:
   hindsight-data:
+  hindsight-budget:

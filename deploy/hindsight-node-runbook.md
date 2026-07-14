@@ -24,21 +24,23 @@ other AttestMesh nodes (e.g. Hermes agents using per-agent memory banks).
 | VM | `9190f502-7f67-4224-ba54-d29446df608e` (`hindsight-node`, 4 vcpu / 6144 MB / 40 GB, bridge mode) |
 | Mesh IP | **`10.18.78.76`** (C3 mesh = 10.18.0.0/16) — API `:18888`, UI `:18999` |
 | Image | `ghcr.io/vectorize-io/hindsight:0.8.4` (full image: local embeddings + reranker + tiktoken baked in; embedded pg0 Postgres) |
-| LLM | `openai/gpt-oss-120b` via `https://api.redpill.ai/v1` (OpenAI-compatible), egress-enforced |
+| Models | `openai/gpt-oss-120b` retain/consolidation + `qwen/qwen3-embedding-8b` embeddings through Fugu LB `10.18.133.81:18410`, locally budgeted |
 | State file | `deploy/logs/hindsight-node-hindsight-node.state` (0600 — holds the **TAK/CPK secrets**, do not commit) |
 | Compose hash (bound) | `0x92f374f2ce50939eb88b614807da265ccd2926cddc8b7867575bd15478448655` |
 
 ## 2. Topology and security model
 
-One CVM, five containers:
+One CVM with mesh, PG-HA, inference-guard, and Hindsight services:
 
 | Container | Netns | Role |
 |---|---|---|
 | `sidecar` | own (owns ports) | cluster-mesh-agent: Path-A self-registration, wg mesh, CSK. Publishes `:9090` (health) + `:51900` (wg-over-gateway-TCP ingress) — the ONLY published ports. |
 | `mesh-proxy-api` | `service:sidecar` | socat `:18888` → `hindsight:8888` — binds where the wg iface lives, so only mesh peers reach it. |
 | `mesh-proxy-ui` | `service:sidecar` | socat `:18999` → `hindsight:9999` (control-plane UI). |
-| `hindsight` | own | API `:8888` + Next.js UI `:9999` + embedded pg0. `expose` only — never published. |
-| `hindsight-egress-fw` | `service:hindsight` | default-DROP OUTPUT; allows loopback, established, Docker DNS, and **only** the redpill host `:443` (`LLM_ALLOW_CIDRS=66.220.6.0/24`). |
+| `fugu-router-proxy` | `service:sidecar` | `sidecar:18410` → stable Fugu LB `10.18.133.81:18410`; the only inference upstream. |
+| `budget-proxy` + egress firewall | own/shared | Model allowlist, persistent backfill/monthly ledgers, 401/402 circuit breaker; firewall permits only `sidecar:18410`. |
+| `hindsight` | own | API `:8888` + Next.js UI `:9999`, backed by PG-HA. `expose` only — never published. |
+| `hindsight-egress-fw` | `service:hindsight` | default-DROP OUTPUT; allows only PG-HA forwarders and the internal budget proxy. No provider credential or direct provider route reaches Hindsight. |
 
 Auth layers on top of mesh isolation:
 
@@ -94,7 +96,7 @@ source deploy/env.sh
 deploy/hindsight-node.sh <node-name> all
 ```
 
-Prereqs: `~/.attestmesh/redpill-key` (LLM key), `~/.teesql/ghcr-pull.toml`
+Prereqs: `~/.attestmesh/hindsight-router-key.json` (model-scoped Fugu-router key), `~/.teesql/ghcr-pull.toml`
 (private sidecar/egress-fw images; hindsight itself is public),
 `deploy/logs/matrix-node-matrix-node.state` (CLUSTER + MEMBER_IMPL defaults),
 and a working `attestmesh-mesh-node` ssh alias for the verify steps.
@@ -119,13 +121,25 @@ the node-level stack (sidecar) is the proven common component.
 
 ## 5. Day-2 operations
 
-- **Roll a compose/env change** (disk-preserving; pg0 memory data survives):
+- **Roll a compose/env change** (disk-preserving; PG-HA data is external):
   `deploy/hindsight-node.sh hindsight-node update` — computes the new hash,
   allowlists it on C3 first, then in-place `StopVm → UpgradeApp → StartVm`.
   Follow with `verify-app` / `verify-e2e`.
-- **Swap the LLM model / rotate TAK / CPK / LLM key**: values are sealed, NOT
+- **Permanent provider-concurrency ceiling**:
+  `HINDSIGHT_LLM_MAX_CONCURRENT` defaults to `3`. Agent Sessions remains
+  independently capped at one document in flight because a single document
+  may create multiple provider calls. The recovery guard opens Agent above
+  six provider requests in flight.
+- **Clear a provider 401/402 circuit with no reservation** only after the
+  router key and both production models pass out-of-band preflights. Set
+  `HINDSIGHT_RESET_PROVIDER_AUTH_CIRCUIT_ENABLED=1` and a fresh random
+  `HINDSIGHT_PROVIDER_AUTH_RESET_TOKEN`, then run one update. The token is
+  persisted only as a hash and cannot clear a later circuit; ambiguous
+  in-flight work still uses the separate maximum-charge reconciliation path.
+- **Swap the LLM model / rotate TAK / CPK / router key**: values are sealed, NOT
   measured — same compose hash, so plain `update` (no new allowlist needed).
-  Model: `HINDSIGHT_LLM_MODEL=<redpill model id> … update`. Keys: edit/delete
+  Model: `HINDSIGHT_LLM_MODEL=<router model id> … update`. Router key: rotate
+  `~/.attestmesh/hindsight-router-key.json`. API/UI keys: edit/delete
   the `TAK=`/`CPK=` lines in the state file (empty → regenerated) or export
   `HINDSIGHT_TENANT_API_KEY`/`HINDSIGHT_CP_ACCESS_KEY`, then `update`; hand the
   new TAK to consumers.
@@ -139,6 +153,10 @@ the node-level stack (sidecar) is the proven common component.
 
 ## 6. Hard-won lessons / troubleshooting
 
+- **Do not add a fixed KMS convergence sleep after allowlisting a compose
+  hash.** Deploy sends now subscribe for new heads and confirm the exact
+  transaction receipt, with HTTP receipt polling as a fallback. A reverted or
+  unconfirmed allowlist transaction aborts the roll before the VM is touched.
 - **The sidecar binds `:9090` (and `:51900`) only AFTER bind.** Pre-bind it
   loops `cluster not resolvable yet (awaiting ClusterMember upgrade?)` every
   10 s with all ports closed — a refused `:9090` before bind is NORMAL, not a
@@ -157,13 +175,13 @@ the node-level stack (sidecar) is the proven common component.
   `10.0.100.0/24` first, then match the qemu TAP MAC (the drivers' box-side
   snippets do the MAC→IP mapping; the sweep is the missing first step when a
   probe mysteriously refuses).
-- **Boot-time LLM verification**: hindsight calls the LLM provider at startup
-  (skippable via `HINDSIGHT_API_SKIP_LLM_VERIFICATION` — we deliberately leave
-  it ON as an llm_ok probe). `/health` stays 503 until engine init completes
-  (model load + pg0 + migrations; `HINDSIGHT_API_MODEL_INIT_TIMEOUT` default
+- **Boot-time LLM verification is skipped** so health probes cannot spend money.
+  The deployment driver performs an explicit metered router preflight instead.
+  `/health` stays 503 until engine init completes
+  (model load + PG-HA migrations; `HINDSIGHT_API_MODEL_INIT_TIMEOUT` default
   300 s), then 200 `{"status":"healthy","database":"connected"}`.
 - **Pre-seal validation trick**: `docker run` the exact image+env on the dev
-  box first — proved redpill + `gpt-oss-120b` structured-output extraction
+  box first — proved Fugu-router + `openai/gpt-oss-120b` structured-output extraction
   before anything was sealed into the TEE.
 - `HINDSIGHT_API_RETAIN_MAX_COMPLETION_TOKENS=32000` (default assumes ~64k
   output tokens; must stay > `RETAIN_CHUNK_SIZE`=3000).
