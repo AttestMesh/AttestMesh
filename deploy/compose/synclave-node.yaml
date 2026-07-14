@@ -188,7 +188,7 @@ services:
     # v45 = fleet-control main db9cab8 — operate the Stripe test catalog from the production origin;
     #       test Checkout is allowed while live billing, tax automation, and meter delivery stay off.
     # v44 = fleet-control main 1cb4ebb — sandbox-first Stripe billing foundation.
-    image: ghcr.io/dmvt/synclave-app:prod-db9cab8@sha256:71b90cffc7863e4e8a9c42094bd72b899ee0dedb419412ca1658ac2c504ecf99
+    image: ghcr.io/dmvt/synclave-app:prod-5b45512@sha256:3a79b5e0d393fbef5b149cdc45a8076842b32b73b65802f4d701d1e81126a2bf
     environment:
       API_HOST: 0.0.0.0
       API_PORT: 80
