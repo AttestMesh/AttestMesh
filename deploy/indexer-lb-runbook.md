@@ -1,4 +1,4 @@
-# Indexer Load Balancer / Blue-Green Runbook
+# Indexer Load Balancer / Blue-Green and Stage A HA Runbook
 
 ## Shape
 
@@ -7,15 +7,15 @@
 ```text
 sidecars ── gRPC/TLS ──> <lb-app>-50052.gateway.attestmesh.xyz
                               │
-                              └─ HAProxy TCP ──> active Indexer :50052
+                              └─ HAProxy TCP ──> active Indexer or worker pool :50052
 
 operators ── C3 mesh ──> <lb-mesh-ip>:50053 prepare / commit / abort
 public diagnostics ─────> <lb-app>-9090.gateway.attestmesh.xyz
                               │
-                              └─ HAProxy HTTP ─> active Indexer :9090
+                              └─ HAProxy HTTP ─> same active worker(s) :9090
 ```
 
-The LB has no Indexer signing key and never terminates the gRPC protocol. `IndexerRegistry.current()` keeps the stable LB endpoint but always carries the active backend's compose/code ID and Ed25519 signing pubkey.
+The LB has no Indexer signing key and never terminates the gRPC protocol. `IndexerRegistry.current()` keeps the stable LB endpoint but always carries the active backend or pool's compose/code ID and Ed25519 signing pubkey. The on-chain v1 registry record and its endpoint shape are unchanged by Stage A HA.
 
 ## Current Base deployment
 
@@ -37,14 +37,45 @@ An Indexer backend has an attestation-derived signing key and its own cursor dat
 
 The implemented cutover is:
 
-1. `prepare`: probe candidate `:50052`, require healthy `:9090`, and verify `/status.pubKey`; pause new LB frontend accepts while existing streams continue.
+1. `prepare`: probe the candidate or every pool member and verify its identity/readiness; pause new LB frontend accepts while existing streams continue.
 2. Update `IndexerRegistry` to the stable LB endpoint plus candidate code ID/pubkey.
-3. `commit`: re-probe, switch both HAProxy backends, close old LB streams, and reopen the frontends.
+3. `commit`: re-probe, switch both HAProxy backends to the selected worker(s), close old LB streams, and reopen the frontends.
 4. Sidecars reconnect, re-read the registry, and send their last handled block. The candidate replays that block, so same-block duplicates are possible but gaps are not.
 
 The sidecar persists the last signed checkpoint in `SIDECAR_STATE_DIR/indexer-cursor.v1`. Roll the sidecar image containing this behavior before relying on blue/green Indexer switching.
 
-If the registry transaction fails, the driver aborts the prepare and keeps the old backend. If commit fails after the transaction, it restores the previous registry record before reopening the LB.
+If the registry transaction fails, the driver aborts the prepare and keeps the old backend. If commit fails after the transaction, it restores both the previous registry record and the previous HAProxy pool. Registry rollback happens first so the old data plane is never deliberately reopened against the new identity.
+
+## Stage A shared-identity worker pool
+
+Stage A makes the Indexer workers redundant while retaining the existing stable LB boundary. A pool is two to eight private worker addresses behind the same HAProxy front door. Every worker must report all of the following from `/status`:
+
+- `identityMode="cluster-shared"`
+- the same nonzero `pubKey` and `codeId`
+- the same exact nonzero `indexerCluster`
+- a distinct, nonzero `servingMemberId`
+- an RPC-reachable, caught-up read model
+
+The `indexerCluster` must be a dedicated Dstack-only Indexer cluster. It must not be the main C3 cluster that contains the LB or general workloads. Named worker state is used as the expected cluster and compose hash; the driver rejects a status response that differs from it and requires every replica to have the same hash. Shared named workers must be reachable over the same host's private bridge because the main-C3 LB has no mesh route into the dedicated cluster. Alternatively, pass explicitly private routable IPs together with `INDEXER_BACKEND_CODE_ID` and `INDEXER_HA_CLUSTER`.
+
+Every shared-pool operation also requires `INDEXER_BACKEND_PUBKEY` as a nonzero, independently obtained pin. Obtain and verify this key from trusted enclave serial output or attestation evidence out of band; never copy it from the unauthenticated bridge `/status` response used by the switch. The driver requires every worker's reported key to match the pin before it can prepare the registry transaction.
+
+Select a prepared shared pool with one comma-separated argument:
+
+```bash
+source deploy/env.sh
+
+export INDEXER_BACKEND_PUBKEY='0x<verified 64-hex-character shared key>'
+deploy/indexer-lb-node.sh attestmesh-indexer-lb switch indexer-ha-r1,indexer-ha-r2
+deploy/indexer-lb-node.sh attestmesh-indexer-lb active
+deploy/indexer-lb-node.sh attestmesh-indexer-lb verify-lb
+```
+
+Pool preparation intentionally does not require `grpcAccepting=true`: a worker may keep gRPC closed while the registry still names the old identity. Preparation does require every worker's exact shared identity, code ID, dedicated cluster, distinct member ID, RPC reachability, chain-head lag below ten blocks, and a populated read model. After the unchanged v1 registry record is written, commit waits up to 90 seconds for every prepared worker to report `grpcAccepting=true` and healthy before exposing any of them.
+
+HAProxy round-robins new TCP connections over healthy workers. Existing streams remain pinned to their selected worker until a cutover closes them. `active` reports the exact persisted backend list and identity metadata; `verify-lb` probes every active shared worker, not only the public endpoint.
+
+Stage A removes a single Indexer worker as a serving-path dependency, but the stable LB remains a front-door SPOF. Planned worker maintenance should use a newly prepared pool that omits the drained worker. If compromise of the shared cluster key is suspected, routing eviction is not key rotation: build a fresh dedicated cluster and shared identity, then use the same two-phase switch to rotate the registry and entire pool.
 
 ## One-time migration from a direct endpoint
 
@@ -85,7 +116,7 @@ deploy/indexer-lb-node.sh attestmesh-indexer-lb verify-lb
 FORCE_CLEANUP=1 deploy/indexer-member-node.sh attestmesh-indexer-c3-green stop
 ```
 
-Named candidates default to their same-host bridge IP because it avoids routing the Indexer's public serving path back through the mesh gateway transport. Set `INDEXER_LB_BACKEND_MODE=mesh` to use the candidate's C3 mesh IP, or pass a literal private IP together with `INDEXER_BACKEND_CODE_ID`.
+Named candidates default to their same-host bridge IP because it avoids routing the Indexer's public serving path back through the mesh gateway transport. For a legacy single-C3 candidate only, set `INDEXER_LB_BACKEND_MODE=mesh` to use its C3 mesh IP. Shared pools reject mesh mode; use the same-host bridge or pass a literal private routable IP with the required identity metadata.
 
 ## LB operations
 
