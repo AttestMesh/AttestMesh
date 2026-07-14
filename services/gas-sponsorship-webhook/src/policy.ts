@@ -1,12 +1,14 @@
 /**
- * The sponsorship policy (spec §6). Seven checks, in order, first failure
+ * The sponsorship policy (spec §6). Eight checks, in order, first failure
  * short-circuits. Steps 1-6 are free (string/number/selector compares); only
  * steps 3 and 7 touch the chain, and those go through the cached provenance
- * helpers (one cached eth_call each, rare miss → one RPC roundtrip).
+ * helpers (one cached eth_call each, rare miss → one RPC roundtrip). Step 8
+ * is the per-sender daily cap (one KV read, plus one write per approved op).
  *
  * The reason strings are exactly the §5.1 enumeration:
  *   bad-token, chain-mismatch, not-cluster-member, outer-selector-not-execute,
- *   value-nonzero, inner-selector-not-allowed, target-not-our-cluster, rpc-failure.
+ *   value-nonzero, inner-selector-not-allowed, target-not-our-cluster,
+ *   sender-daily-cap, rpc-failure.
  */
 
 import { fromHex, type Hex } from "viem";
@@ -21,6 +23,7 @@ import {
   RpcFailureError,
   type ProvenanceDeps,
 } from "./provenance.js";
+import { underDailyCap } from "./ratelimit.js";
 
 export type DenyReason =
   | "bad-token"
@@ -30,6 +33,7 @@ export type DenyReason =
   | "value-nonzero"
   | "inner-selector-not-allowed"
   | "target-not-our-cluster"
+  | "sender-daily-cap"
   | "rpc-failure";
 
 export type PolicyDecision = { approved: true } | { approved: false; reason: DenyReason };
@@ -100,14 +104,16 @@ export async function evaluatePolicy(
     return deny("chain-mismatch");
   }
 
-  // 3. Sender provenance (cached eth_call). A sponsorable sender is either a factory-minted
-  //    ClusterMember, or a Path A member — a dstack app upgraded to ClusterMember whose
-  //    cluster has owner-allowlisted its app_id (isOurMember is false for those, since the
-  //    member contract is the dstack-provisioned app_id, not a factory deployment).
+  // 3. Sender provenance (cached eth_call). A sponsorable sender is either a Path A
+  //    member — a dstack app upgraded to ClusterMember whose cluster has owner-
+  //    allowlisted its app_id — or a factory-minted ClusterMember. Path A is checked
+  //    FIRST: every live member today is Path A, so its answer is a positive (24h TTL)
+  //    cache hit, whereas isOurMember for a Path A member is a negative (10-min TTL)
+  //    that a steady sender re-misses — and re-writes — on nearly every request.
   try {
     const sender = input.userOperation.sender;
     const sponsorable =
-      (await isOurMember(provenance, sender)) || (await isAllowlistedAppId(provenance, sender));
+      (await isAllowlistedAppId(provenance, sender)) || (await isOurMember(provenance, sender));
     if (!sponsorable) {
       return deny("not-cluster-member");
     }
@@ -147,6 +153,12 @@ export async function evaluatePolicy(
   } catch (err) {
     if (err instanceof RpcFailureError) return deny("rpc-failure");
     throw err;
+  }
+
+  // 8. Per-sender daily cap (security audit M2). Last, so only otherwise-approved
+  //    ops consume quota and denials never write to KV.
+  if (!(await underDailyCap(provenance, input.userOperation.sender))) {
+    return deny("sender-daily-cap");
   }
 
   return APPROVE;

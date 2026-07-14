@@ -1,0 +1,443 @@
+# Telegram-sync node: syncs the operator's Telegram account into the cluster's pg-ha
+# Postgres, with a co-located Matrix admin agent that owns the Telethon session
+# lifecycle (auth / re-auth / pause-resume). Mesh-only: gateway OFF, bridge networking,
+# nothing published except sidecar :9090 (health) and :51900 (wg transport).
+#
+# Data path: telegram-sync (own netns, egress locked to Telegram DC CIDRs) ->
+# sidecar-netns socat forwarders :15431/2/3 -> each pg-ha node's HAProxy :5432
+# (always the current primary; multi-host DSN survives node rolls/failover).
+# The telegram_sync role+database are ensured at boot by the one-shot pg-provision
+# container, which derives the pg-ha superuser password from the CSK in-CVM
+# (attestmesh.pgha.superuser.v1) — the superuser credential never leaves the mesh.
+#
+# Auth path: the admin agent shares the Telethon session volume with the sync daemon
+# and a control volume for pause/resume; the operator DMs @telegram-admin over Matrix
+# (agent reaches Synapse through the matrix node's mesh listener via matrix-mesh-proxy).
+# Both app containers are deny-all egress except their pinned destinations; the agent's
+# /healthz includes an egress canary so the lock is provable in-TEE.
+#
+# Session-file safety: the sync wrapper below SIGTERMs the daemon while /control/pause
+# exists and reports its phase to /control/status (the TEE blocks container logs).
+# tg-init aligns volume ownership to uid 10001 for both sharers.
+
+services:
+  sidecar:
+    image: ghcr.io/attestmesh/cluster-mesh-agent@sha256:b9e0ae107d9db015c22059c9fecdc28f2b35e09b257eabb4739bd4e46d96f641
+    restart: unless-stopped
+    environment:
+      # MEMBER_CONTRACT intentionally unset: the sidecar self-discovers the app_id.
+      - CHAIN_ID=${CHAIN_ID}
+      - RPC_URL=${RPC_URL}
+      - BUNDLER_URL=${BUNDLER_URL}
+      - GAS_POLICY_ID=${GAS_POLICY_ID}
+      - INDEXER_REGISTRY_ADDR=${INDEXER_REGISTRY_ADDR}
+      - GATEWAY_DOMAIN=${GATEWAY_DOMAIN}
+      - DSTACK_SOCKET=/var/run/dstack.sock
+      - SIDECAR_STATE_DIR=/var/lib/attestmesh
+      - AGENT_GRPC_SOCKET=/var/run/attestmesh/agent.sock
+      - HEALTH_HTTP_ADDR=0.0.0.0:9090
+      - LOG_FORMAT=pretty
+      - LOG_LEVEL=info,cluster_mesh_agent=debug
+    volumes:
+      - /var/run/dstack.sock:/var/run/dstack.sock
+      - sidecar-state:/var/lib/attestmesh
+      - agent-sock:/var/run/attestmesh
+    ports:
+      - "9090:9090"
+      - "51900:51900"
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun
+
+  # Align shared-volume ownership: telegram-sync runs as uid 10001 (compose user:
+  # override) and the admin agent's image user is uid 10001 — both read/write the
+  # session + control volumes. The marker files are load-bearing: the telegram-sync
+  # image bakes /data owned by its own uid (999), and Docker re-copies that ownership
+  # onto the named volume every time it mounts it while EMPTY — silently reverting our
+  # chown. Leaving a file makes the volume non-empty so that copy is skipped.
+  tg-init:
+    image: busybox:1.36
+    restart: "no"
+    command: ["sh", "-c", "touch /data/.tg-init-done /control/.tg-init-done && chown -R 10001:10001 /data /control && chmod 770 /data /control"]
+    volumes:
+      - tg-session:/data
+      - tg-control:/control
+
+  # One-shot: ensure role+database telegram_sync on the pg-ha cluster. Superuser
+  # password is CSK-derived in-CVM; the service password arrives sealed. Idempotent
+  # (create-if-missing + ALTER to converge the password) — re-runs on every boot.
+  # pg mesh IPs from deploy/logs/pg-ha-pg-ha.state (chain-derived, permanent members).
+  pg-provision:
+    image: ghcr.io/attestmesh/pg-ha@sha256:05c6d46c72f6feb444be055e1c12c116ba1334ed6d738e7d649e0ea6e71cabf5 # pinned 2026-07-02 r5
+    restart: on-failure
+    network_mode: service:sidecar
+    depends_on:
+      - sidecar
+    environment:
+      - AGENT_GRPC_SOCKET=/var/run/attestmesh/agent.sock
+      - PGHA_STATUS_FILE=/control/pg-provision.status
+      - PGHA_LOG_TAG=pg-provision
+      - TG_DB_PASSWORD=${TG_DB_PASSWORD}
+      - SEARCH_DB_PASSWORD=${SEARCH_DB_PASSWORD}
+    volumes:
+      - agent-sock:/var/run/attestmesh
+      - tg-control:/control
+    entrypoint: ["/bin/bash", "-ec"]
+    command:
+      - |
+        source /usr/local/bin/pgha-common.sh
+        _st "deriving pg-ha superuser credential (waits for CSK)"
+        SUPW="$$(csk_derive attestmesh.pgha.superuser.v1)"
+        HOSTS="10.18.147.86:5432,10.18.251.71:5432,10.18.172.186:5432"
+        _st "ensuring roles + database telegram_sync"
+        psql "postgresql://postgres:$${SUPW}@$${HOSTS}/postgres?connect_timeout=5" -v ON_ERROR_STOP=1 -v pw="$$TG_DB_PASSWORD" -v spw="$$SEARCH_DB_PASSWORD" <<'SQL'
+        SELECT format('CREATE ROLE telegram_sync LOGIN PASSWORD %L', :'pw')
+        WHERE NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'telegram_sync')
+        \gexec
+        ALTER ROLE telegram_sync WITH LOGIN PASSWORD :'pw';
+        SELECT format('CREATE ROLE telegram_search LOGIN PASSWORD %L', :'spw')
+        WHERE NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'telegram_search')
+        \gexec
+        ALTER ROLE telegram_search WITH LOGIN PASSWORD :'spw';
+        SELECT format('CREATE DATABASE %I OWNER %I', 'telegram_sync', 'telegram_sync')
+        WHERE NOT EXISTS (SELECT FROM pg_database WHERE datname = 'telegram_sync')
+        \gexec
+        GRANT CONNECT ON DATABASE telegram_sync TO telegram_search;
+        SQL
+        _st "granting read-only SELECT to telegram_search"
+        psql "postgresql://postgres:$${SUPW}@$${HOSTS}/telegram_sync?connect_timeout=5" -v ON_ERROR_STOP=1 <<'SQL2'
+        GRANT USAGE ON SCHEMA public TO telegram_search;
+        GRANT SELECT ON ALL TABLES IN SCHEMA public TO telegram_search;
+        ALTER DEFAULT PRIVILEGES FOR ROLE telegram_sync IN SCHEMA public GRANT SELECT ON TABLES TO telegram_search;
+        SQL2
+        psql "postgresql://telegram_sync:$${TG_DB_PASSWORD}@$${HOSTS}/telegram_sync?connect_timeout=5" -c 'select 1' >/dev/null
+        _st "OK: roles telegram_sync + telegram_search (read-only) ensured; login verified"
+
+  # :15431 routes directly to Patroni's writable primary; :15432/3 retain
+  # node-specific HAProxy fallbacks for libpq/asyncpg multi-host reconnects.
+  pg-primary-router:
+    image: haproxy:3.0-alpine@sha256:dee54db8b27cd6c21519ea4f0ba0604f3742e8e7369bc16fb5b69133dec3f47f
+    restart: unless-stopped
+    network_mode: service:sidecar
+    depends_on:
+      - sidecar
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - |
+        cat >/tmp/pg-primary-router.cfg <<'CFG'
+        global
+          maxconn 400
+        defaults
+          mode tcp
+          timeout connect 2s
+          timeout client 30m
+          timeout server 30m
+          timeout check 2s
+          retries 2
+          option redispatch
+        listen primary
+          bind 0.0.0.0:15431
+          option httpchk GET /primary
+          http-check expect status 200
+          default-server inter 1s fall 2 rise 1 on-marked-down shutdown-sessions
+          server pg1 10.18.147.86:5434 check port 8008
+          server pg2 10.18.251.71:5434 check port 8008
+          server pg3 10.18.172.186:5434 check port 8008
+        CFG
+        exec haproxy -f /tmp/pg-primary-router.cfg -db
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+
+  pg2-proxy:
+    image: alpine/socat:1.8.0.0
+    restart: unless-stopped
+    network_mode: service:sidecar
+    depends_on:
+      - sidecar
+    command: ["TCP-LISTEN:15432,fork,reuseaddr,bind=0.0.0.0", "TCP:10.18.251.71:5432"]
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+
+  pg3-proxy:
+    image: alpine/socat:1.8.0.0
+    restart: unless-stopped
+    network_mode: service:sidecar
+    depends_on:
+      - sidecar
+    command: ["TCP-LISTEN:15433,fork,reuseaddr,bind=0.0.0.0", "TCP:10.18.172.186:5432"]
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+
+  # Bridge to the Matrix homeserver's mesh listener on node W3 (mesh IP chain-derived
+  # from its memberId — stable across rolls of the same app).
+  matrix-mesh-proxy:
+    image: alpine/socat:1.8.0.0
+    restart: unless-stopped
+    network_mode: service:sidecar
+    depends_on:
+      - sidecar
+    command: ["TCP-LISTEN:18080,fork,reuseaddr,bind=0.0.0.0", "TCP:10.18.196.231:18080"]
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+
+  # Mesh-only observability (no published ports): sync health on <mesh-ip>:18082,
+  # agent /healthz on <mesh-ip>:18100 — reachable from cluster members only.
+  tg-health-proxy:
+    image: alpine/socat:1.8.0.0
+    restart: unless-stopped
+    network_mode: service:sidecar
+    depends_on:
+      - sidecar
+    entrypoint:
+      - /bin/sh
+      - -ec
+    command:
+      - |
+        while :; do
+          ip="$(ip -4 -o addr show dev attestmesh0 2>/dev/null | awk '{print $$4}' | cut -d/ -f1)"
+          [ -n "$$ip" ] && break
+          sleep 1
+        done
+        exec socat TCP-LISTEN:18082,fork,reuseaddr,bind="$${ip}" TCP:telegram-sync:8082
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+
+  agent-health-proxy:
+    image: alpine/socat:1.8.0.0
+    restart: unless-stopped
+    network_mode: service:sidecar
+    depends_on:
+      - sidecar
+    entrypoint:
+      - /bin/sh
+      - -ec
+    command:
+      - |
+        while :; do
+          ip="$(ip -4 -o addr show dev attestmesh0 2>/dev/null | awk '{print $$4}' | cut -d/ -f1)"
+          [ -n "$$ip" ] && break
+          sleep 1
+        done
+        exec socat TCP-LISTEN:18100,fork,reuseaddr,bind="$${ip}" TCP:telegram-admin-agent:9100
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+
+  # The sync daemon, wrapped for pause/resume + TEE-safe phase reporting. Exit 2 =
+  # unauthorized session (normal until the admin agent completes a login) — backs off
+  # instead of crash-looping so the shared session file stays mostly free.
+  telegram-sync:
+    image: ghcr.io/attestmesh/telegram-sync@sha256:b2d5940f4d50edc2a80645aaee01f95ff7f4931518f9709acde16fceb05c695d
+    restart: unless-stopped
+    user: "10001:10001"
+    depends_on:
+      tg-init:
+        condition: service_completed_successfully
+    environment:
+      - TELEGRAM_API_ID=${TELEGRAM_API_ID}
+      - TELEGRAM_API_HASH=${TELEGRAM_API_HASH}
+      - DATABASE_URL=${DATABASE_URL}
+      - SESSION_DIR=/data
+      - HEALTH_PORT=8082
+      - DIALOG_LIMIT=200
+      - INITIAL_SYNC_LIMIT=500
+      - RECONCILE_INTERVAL=60
+      - LOG_LEVEL=INFO
+      - XAI_API_KEY=${XAI_API_KEY}
+      - XAI_MODEL=${XAI_MODEL:-x-ai/grok-4.1-fast}
+      - XAI_BASE_URL=${XAI_BASE_URL:-https://api.redpill.ai/v1}
+    volumes:
+      - tg-session:/data
+      - tg-control:/control
+    expose:
+      - "8082"
+    entrypoint:
+      - /bin/sh
+      - -c
+    command:
+      - |
+        st() { printf '%s\n' "$$*" > /control/status; printf '%s %s\n' "$$(date -u +%FT%TZ)" "$$*" >> /control/status.log; }
+        while :; do
+          if [ -f /control/pause ]; then st "paused"; sleep 3; continue; fi
+          st "starting"
+          python -m app.main &
+          pid=$$!
+          st "running pid=$$pid"
+          while kill -0 "$$pid" 2>/dev/null; do
+            [ -f /control/pause ] && kill -TERM "$$pid" 2>/dev/null
+            sleep 2
+          done
+          wait "$$pid"; rc=$$?
+          if [ "$$rc" = 2 ]; then st "waiting-auth (exit 2)"; sleep 20
+          elif [ -f /control/pause ]; then st "paused"
+          else st "exited rc=$$rc"; sleep 10
+          fi
+        done
+
+  # Sync egress is deny-by-default: Telegram DC CIDRs on :443 (MTProto), the pg-ha DB
+  # forwarders in the sidecar netns (:15431-3 ONLY — not the Matrix proxy or wg
+  # transport), and Docker DNS. CIDRs from core.telegram.org/resources/cidr.txt
+  # (fetched 2026-07-02). Image understanding is routed through redpill (66.220.6.0/24,
+  # already trusted by the mesh) rather than api.x.ai (Cloudflare-fronted, would need
+  # the whole 104.16/13 + 172.64/13) — so vision reuses the tight redpill pin on :443.
+  sync-egress-fw:
+    image: ghcr.io/attestmesh/agent-egress-fw@sha256:c6c00d1fc5e73dde050c1a8cf2fef43a93cc9cd0dc0f5f368e7c763f1f1c242c
+    restart: unless-stopped
+    network_mode: service:telegram-sync
+    depends_on:
+      - telegram-sync
+    environment:
+      - ALLOW_CIDRS=66.220.6.0/24 149.154.160.0/20 91.108.4.0/22 91.108.8.0/22 91.108.12.0/22 91.108.16.0/22 91.108.20.0/22 91.108.56.0/22 91.105.192.0/23 185.76.151.0/24
+      - ALLOW_PORT=443
+      - INTERNAL_HOSTS=
+      - INTERNAL_HOST_PORTS=sidecar:15431 sidecar:15432 sidecar:15433
+      - ALLOW_DNS=127.0.0.11
+      - RERESOLVE_SECONDS=30
+    cap_add:
+      - NET_ADMIN
+
+  # Matrix chat-ops agent: Telethon session auth/re-auth + sync control. Shares the
+  # session + control volumes with telegram-sync; reaches Matrix via the sidecar-netns
+  # proxy and the sync daemon's health endpoint directly.
+  telegram-admin-agent:
+    image: ghcr.io/attestmesh/telegram-admin-agent@sha256:5d65ff4571482c1af83d1426d976cc1308417c3e346a7b5a5bb92c0edf68e086
+    restart: unless-stopped
+    depends_on:
+      tg-init:
+        condition: service_completed_successfully
+      matrix-mesh-proxy:
+        condition: service_started
+    environment:
+      - TG_API_ID=${TELEGRAM_API_ID}
+      - TG_API_HASH=${TELEGRAM_API_HASH}
+      - TG_PHONE=${TG_PHONE}
+      - TG_SESSION_PATH=/data/telegram_session
+      - SYNC_HEALTH_URL=http://telegram-sync:8082/health
+      - CONTROL_DIR=/control
+      - MATRIX_HOMESERVER_URL=http://sidecar:18080
+      - MATRIX_SSL_VERIFY=0
+      - MATRIX_USER_ID=${MATRIX_USER_ID}
+      - MATRIX_PASSWORD=${MATRIX_PASSWORD}
+      - MATRIX_ROOM_ID=${MATRIX_ROOM_ID}
+      - MATRIX_ADMIN_MXIDS=${MATRIX_ADMIN_MXIDS}
+      - MATRIX_REQUIRE_MENTION=0
+      - LLM_BASE_URL=${LLM_BASE_URL}
+      - LLM_API_KEY=${LLM_API_KEY}
+      - LLM_MODEL=${LLM_MODEL}
+      - EGRESS_CANARY=1.1.1.1:443
+      - HEALTH_HTTP_ADDR=0.0.0.0:9100
+      - RESPONSE_TIMEOUT_SECONDS=90
+      - LLM_TIMEOUT_SECONDS=25
+      - LOG_LEVEL=info
+    volumes:
+      - tg-session:/data
+      - tg-control:/control
+    expose:
+      - "9100"
+
+  # Agent egress: pinned LLM (redpill) + Telegram DC CIDRs (it drives the login flow
+  # with the same Telethon session) + ONLY the Matrix proxy (sidecar:18080) and the
+  # sync daemon's health (telegram-sync:8082) + Docker DNS. Everything else drops; the
+  # agent's /healthz canary proves the lock.
+  agent-egress-fw:
+    image: ghcr.io/attestmesh/agent-egress-fw@sha256:c6c00d1fc5e73dde050c1a8cf2fef43a93cc9cd0dc0f5f368e7c763f1f1c242c
+    restart: unless-stopped
+    network_mode: service:telegram-admin-agent
+    depends_on:
+      - telegram-admin-agent
+    environment:
+      - LLM_BASE_URL=${LLM_BASE_URL}
+      - LLM_ALLOW_CIDRS=66.220.6.0/24 149.154.160.0/20 91.108.4.0/22 91.108.8.0/22 91.108.12.0/22 91.108.16.0/22 91.108.20.0/22 91.108.56.0/22 91.105.192.0/23 185.76.151.0/24
+      - INTERNAL_HOSTS=
+      - INTERNAL_HOST_PORTS=sidecar:18080 telegram-sync:8082
+      - ALLOW_DNS=127.0.0.11
+      - RERESOLVE_SECONDS=15
+    cap_add:
+      - NET_ADMIN
+
+  # Mesh-only MCP server: Postgres full-text search over the telegram archive
+  # (messages + image descriptions). Own netns; reaches the DB via the sidecar-netns
+  # forwarders as the READ-ONLY telegram_search role. Reachable by cluster members at
+  # <mesh-ip>:18085/mcp via mcp-mesh-proxy; nothing published.
+  telegram-fts-mcp:
+    image: ghcr.io/attestmesh/telegram-fts-mcp@sha256:a8fcfd204ed72f91bd2e65995519332fc87dce8a96c61c9bb2c70296ff6cc169
+    restart: unless-stopped
+    depends_on:
+      - sidecar
+    environment:
+      - SEARCH_DATABASE_URL=${SEARCH_DATABASE_URL}
+      - MCP_HOST=0.0.0.0
+      - MCP_PORT=8085
+      - MCP_PATH=/mcp
+      - SEARCH_ROW_LIMIT=50
+      - SEARCH_STATEMENT_TIMEOUT_MS=8000
+      - LOG_LEVEL=info
+    expose:
+      - "8085"
+
+  # MCP egress: DB forwarders ONLY (no LLM, no internet). Read-only search service.
+  mcp-egress-fw:
+    image: ghcr.io/attestmesh/agent-egress-fw@sha256:c6c00d1fc5e73dde050c1a8cf2fef43a93cc9cd0dc0f5f368e7c763f1f1c242c
+    restart: unless-stopped
+    network_mode: service:telegram-fts-mcp
+    depends_on:
+      - telegram-fts-mcp
+    environment:
+      - INTERNAL_HOSTS=
+      - INTERNAL_HOST_PORTS=sidecar:15431 sidecar:15432 sidecar:15433
+      - ALLOW_DNS=127.0.0.11
+      - RERESOLVE_SECONDS=30
+    cap_add:
+      - NET_ADMIN
+
+  # Surfaces the MCP endpoint on the wireguard mesh IP (mesh members reach
+  # <mesh-ip>:18085/mcp). Bound only to attestmesh0 inside the sidecar netns.
+  mcp-mesh-proxy:
+    image: alpine/socat:1.8.0.0
+    restart: unless-stopped
+    network_mode: service:sidecar
+    depends_on:
+      - sidecar
+      - telegram-fts-mcp
+    entrypoint:
+      - /bin/sh
+      - -ec
+    command:
+      - |
+        while :; do
+          ip="$(ip -4 -o addr show dev attestmesh0 2>/dev/null | awk '{print $$4}' | cut -d/ -f1)"
+          [ -n "$$ip" ] && break
+          sleep 1
+        done
+        exec socat TCP-LISTEN:18085,fork,reuseaddr,bind="$${ip}" TCP:telegram-fts-mcp:8085
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+
+volumes:
+  sidecar-state:
+  agent-sock:
+  tg-session:
+  tg-control:

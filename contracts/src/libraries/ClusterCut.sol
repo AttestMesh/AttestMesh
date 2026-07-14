@@ -81,10 +81,12 @@ library ClusterCut {
     }
 
     function _networkSelectors() private pure returns (bytes4[] memory s) {
-        s = new bytes4[](3);
+        s = new bytes4[](5);
         s[0] = INetwork.publishWgKey.selector;
         s[1] = INetwork._setWgPubKey.selector;
         s[2] = INetwork.wgPubKeyOf.selector;
+        s[3] = INetwork.publishEd25519Key.selector;
+        s[4] = INetwork.ed25519KeyOf.selector;
     }
 
     function _dstackSelectors() private pure returns (bytes4[] memory s) {

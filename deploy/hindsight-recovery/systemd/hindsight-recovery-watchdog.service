@@ -1,0 +1,19 @@
+[Unit]
+Description=Independent Hindsight recovery fail-closed watchdog
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+EnvironmentFile=%h/.config/hindsight-recovery/recovery.env
+ExecStart=%h/agent-session-mcp/server/.venv/bin/python /home/ubuntu/teemesh/deploy/hindsight-recovery/recovery.py watchdog
+Restart=always
+RestartSec=2s
+CPUQuota=15%
+MemoryMax=192M
+TasksMax=48
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=default.target

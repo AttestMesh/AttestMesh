@@ -17,7 +17,7 @@ services:
 
   # ── AttestMesh node sidecar (cluster-mesh-agent): registers this CVM into the cluster ──
   sidecar:
-    image: ghcr.io/attestmesh/cluster-mesh-agent:latest
+    image: ghcr.io/attestmesh/cluster-mesh-agent@sha256:b9e0ae107d9db015c22059c9fecdc28f2b35e09b257eabb4739bd4e46d96f641
     restart: unless-stopped
     environment:
       - CHAIN_ID=8453
@@ -27,35 +27,96 @@ services:
       - BUNDLER_URL=${BUNDLER_URL}
       - GAS_POLICY_ID=${GAS_POLICY_ID}
       - DSTACK_SOCKET=/var/run/dstack.sock
+      - SIDECAR_STATE_DIR=/var/lib/attestmesh
+      - AGENT_GRPC_SOCKET=/var/run/attestmesh/agent.sock
       - HEALTH_HTTP_ADDR=0.0.0.0:9090
       - LOG_FORMAT=pretty
       - LOG_LEVEL=info,cluster_mesh_agent=debug
+      - ROLL_ID=20260630T0106Z
     volumes:
       - /var/run/dstack.sock:/var/run/dstack.sock
+      - sidecar-state:/var/lib/attestmesh
+      - agent-sock:/var/run/attestmesh          # app-facing gRPC UDS, shared with matrix-admin-agent
     ports:
-      - "9090:9090"
       - "51900:51900"
     cap_add:
       - NET_ADMIN
     devices:
       - /dev/net/tun
 
+  # ── Mesh-only Matrix listener ──────────────────────────────────────────────
+  # Runs in the sidecar netns, so it binds on the AttestMesh WireGuard interface
+  # and forwards Matrix client traffic to the internal nginx service. This is not
+  # a public dstack gateway or Tailscale listener; only mesh peers can reach it.
+  matrix-mesh-proxy:
+    image: alpine/socat:1.8.0.0
+    restart: unless-stopped
+    network_mode: service:sidecar
+    depends_on:
+      - sidecar
+      - nginx
+    command:
+      - -d
+      - -d
+      - TCP-LISTEN:18080,fork,reuseaddr,bind=0.0.0.0
+      - TCP:nginx:80
+    labels:
+      attestmesh.roll: "20260630T0016Z"
+
   # ── Postgres for Synapse ────────────────────────────────────────────────────
   postgres:
-    image: postgres:16-alpine
+    # postgres-walg = stock Postgres 16 + wal-g + grpcurl. A transparent passthrough to plain postgres
+    # unless BACKUP_ENABLED=true, in which case it ships CSK-encrypted base+WAL PITR backups to R2.
+    # (Replaces postgres:16-alpine; the entrypoint chowns the pre-existing data dir for the uid change.)
+    image: ghcr.io/attestmesh/postgres-walg@sha256:0edf068ddf5f89f73b41a00ffaf94679495c1d67a559f47f2e713036c6a681ad  # pin by digest so in-place rolls pull the exact image (:latest is cached on the CVM); bump on rebuild
     restart: unless-stopped
     environment:
       - POSTGRES_USER=synapse
       - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
       - POSTGRES_DB=synapse
       - POSTGRES_INITDB_ARGS=--encoding=UTF8 --locale=C
+      # ── wal-g backups (OFF unless BACKUP_ENABLED=true). The encryption key is derived from the cluster
+      #    shared key fetched from the sidecar over agent-sock; base+WAL go to Cloudflare R2 (sealed creds).
+      #    See deploy/postgres-walg/ + deploy/matrix-node-deploy.md. ──
+      - BACKUP_ENABLED=${BACKUP_ENABLED}
+      - BACKUP_PREFIX=${BACKUP_PREFIX}
+      - BACKUP_RESTORE=${BACKUP_RESTORE}
+      - BACKUP_RESTORE_TARGET_TIME=${BACKUP_RESTORE_TARGET_TIME}
+      - R2_ENDPOINT=${R2_ENDPOINT}
+      - R2_BUCKET=${R2_BUCKET}
+      - R2_REGION=${R2_REGION}
+      - R2_ACCESS_KEY_ID=${R2_ACCESS_KEY_ID}
+      - R2_SECRET_ACCESS_KEY=${R2_SECRET_ACCESS_KEY}
+      - AGENT_GRPC_SOCKET=/var/run/attestmesh/agent.sock
+      - WALG_KEY_FILE=/run/walg/key
     volumes:
       - pgdata:/var/lib/postgresql/data
+      - agent-sock:/var/run/attestmesh          # read the CSK from the sidecar's Agent gRPC (UDS)
+      - walg-status:/walg-status                # backup-pipeline status, surfaced by nginx /_backup/status
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U synapse -d synapse"]
       interval: 10s
       timeout: 5s
       retries: 18
+
+  # ── Egress firewall for Postgres: shares its netns and (when backups are on) lets it reach ONLY the
+  #    Cloudflare R2 endpoint on :443 for wal-g — deny-all otherwise. Same image/pattern as the agent's
+  #    egress-fw; with backups off Postgres initiates nothing, so this just hard-locks it. ──
+  postgres-egress-fw:
+    image: ghcr.io/attestmesh/agent-egress-fw@sha256:c75c9668e905ca00f86e9583505d52624ba87cb7114a4633f84330bb497ca58f
+    restart: unless-stopped
+    network_mode: service:postgres
+    depends_on:
+      - postgres
+    environment:
+      - ALLOW_BASE_URL=${R2_ENDPOINT}            # the only external host Postgres may reach (R2 S3 API)
+      - ALLOW_PORT=443
+      - ALLOW_CIDRS=104.16.0.0/13 172.64.0.0/13  # Cloudflare ranges R2 resolves into (resolution-independent pins)
+      - INTERNAL_HOSTS=                          # Postgres RECEIVES from internal services; it initiates to none
+      - ALLOW_DNS=127.0.0.11
+      - RERESOLVE_SECONDS=30
+    cap_add:
+      - NET_ADMIN
 
   # ── One-shot init: resolve app_id → server_name, generate Synapse config/keys + well-known ──
   # All logic is in Python (no shell $-vars) to sidestep docker-compose ${} interpolation.
@@ -71,6 +132,7 @@ services:
     volumes:
       - synapse-data:/data
       - wellknown:/wellknown
+      - agent-secrets:/agent-secrets               # scoped registration-secret drop for matrix-admin-agent
       - /var/run/dstack.sock:/var/run/dstack.sock:ro
     entrypoint:
       - /bin/bash
@@ -140,7 +202,8 @@ services:
         signing_key_path: /data/signing.key
         media_store_path: /data/media_store
         report_stats: false
-        public_baseurl: "https://{sn}/"
+        enable_metrics: true
+        public_baseurl: "https://homeserver.invalid/"
         listeners:
           - port: 8008
             tls: false
@@ -150,6 +213,12 @@ services:
             resources:
               - names: [client, federation]
                 compress: false
+          # Internal-only Prometheus metrics listener (scraped by the prometheus service on the
+          # compose bridge as synapse:9000/_synapse/metrics). No host port, not on the tailnet.
+          - port: 9000
+            tls: false
+            type: metrics
+            bind_addresses: ['0.0.0.0']
         database:
           name: psycopg2
           args:
@@ -170,11 +239,27 @@ services:
         """.replace("\n        ", "\n").format(sn=sn, pw=pw, reg=reg, mac=mac, form=form)
         with open(hs, "w") as f: f.write(cfg)
 
-        wkd = os.path.join(WK, ".well-known", "matrix"); os.makedirs(wkd, exist_ok=True)
-        with open(os.path.join(wkd, "server"), "w") as f:
-            f.write(json.dumps({"m.server": sn + ":443"}))
-        with open(os.path.join(wkd, "client"), "w") as f:
-            f.write(json.dumps({"m.homeserver": {"base_url": "https://" + sn + "/"}}))
+        # Scoped copy of just the registration shared secret for the matrix-admin-agent,
+        # so it never needs the whole synapse-data volume (signing key, media, etc.).
+        # The agent-secrets volume is mounted ONLY into synapse-init (here) and the agent.
+        try:
+            os.makedirs("/agent-secrets", exist_ok=True)
+            ap = "/agent-secrets/registration_shared_secret"
+            with open(ap, "w") as f: f.write(reg)
+            os.chmod(ap, 0o444)
+            print("synapse-init: wrote scoped registration secret for matrix-admin-agent", flush=True)
+        except Exception as e:
+            print("synapse-init: WARN could not write agent-secrets:", e, flush=True)
+
+        # PRIVATE node (tailnet-only, gateway-off, non-federating). public_baseurl is the sentinel
+        # host `homeserver.invalid` ON PURPOSE: Synapse echoes public_baseurl back in the LOGIN
+        # response's m.homeserver well_known, and a Matrix client then SWITCHES its base_url to
+        # whatever that says. The real tailnet URL changes every fresh-disk roll, so we can't bake
+        # it in here — instead nginx rewrites `homeserver.invalid` → the client's own Host ($host)
+        # on the way out (see the nginx sub_filter), so the login well_known always sends the client
+        # back to the exact tailnet URL it used — never the dead gateway domain. (No static
+        # well-known files are written; nginx serves the client well-known dynamically. No
+        # federation → no server well-known.)
 
         # Synapse runs as uid 991 in this image.
         for root, dirs, files in os.walk(DATA):
@@ -201,6 +286,148 @@ services:
     volumes:
       - synapse-data:/data
 
+  # ── Matrix admin agent: executes the full Synapse admin surface from (a) on-chain member
+  #     commands delivered by the sidecar app gRPC (deterministic, no LLM) and (b) an LLM bot
+  #     in Matrix for allowlisted operators. Egress is locked by agent-egress-fw (below) to
+  #     Synapse + Postgres + the one pinned LLM host. See docs/specs/matrix-admin-agent.md. ──
+  matrix-admin-agent:
+    image: ghcr.io/attestmesh/matrix-admin-agent@sha256:7917227dacdeb91255049aa96f78cd9333935f3c9572b1178d88b56184d236e8
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      synapse:
+        condition: service_started
+      sidecar:
+        condition: service_started
+    environment:
+      - SYNAPSE_URL=http://synapse:8008
+      - MATRIX_HOMESERVER_URL=http://nginx:80
+      - AGENT_GRPC_SOCKET=/var/run/attestmesh/agent.sock
+      - REG_SECRET_PATH=/agent-secrets/registration_shared_secret
+      - PG_DSN=postgresql://synapse:${POSTGRES_PASSWORD}@postgres:5432/synapse
+      - BOT_USERNAME=${BOT_USERNAME:-matrix-admin-agent}
+      - BOT_PASSWORD=${BOT_PASSWORD}
+      - MATRIX_REQUIRE_MENTION=1
+      - BOOTSTRAP_DEACTIVATE_USERS=admin-agent
+      - MATRIX_ADMIN_MXIDS=${MATRIX_ADMIN_MXIDS}
+      - MATRIX_ADMIN_SENDERS=${MATRIX_ADMIN_SENDERS}
+      - INITIAL_ADMIN=${INITIAL_ADMIN}
+      - INITIAL_ADMIN_PASSWORD=${INITIAL_ADMIN_PASSWORD}
+      - LLM_BASE_URL=${LLM_BASE_URL}
+      - LLM_API_KEY=${LLM_API_KEY}
+      - LLM_MODEL=${LLM_MODEL}
+      # Node infra-health metrics: read-only queries to the INTERNAL prometheus service (no host
+      # port, not on the tailnet). METRICS_WINDOW_MINUTES is the default range-query lookback.
+      - PROMETHEUS_URL=http://prometheus:9090
+      - METRICS_WINDOW_MINUTES=${METRICS_WINDOW_MINUTES:-60}
+      - HEALTH_HTTP_ADDR=0.0.0.0:9100
+      - LOG_LEVEL=info
+    volumes:
+      - agent-sock:/var/run/attestmesh                 # sidecar app-facing gRPC UDS
+      - agent-secrets:/agent-secrets:ro                # scoped registration secret only
+
+  # ── Egress firewall for the agent: shares the agent's netns and sets default-DROP OUTPUT,
+  #     allowing ONLY loopback, established/related, Docker DNS, the compose bridge (Synapse +
+  #     Postgres), and the single pinned LLM host:443. Network-enforced exfiltration control —
+  #     the agent has no self-egress tool, and even a jailbroken LLM cannot reach the internet.
+  #     Logic lives in the image (auditable), not inline compose shell. ──
+  agent-egress-fw:
+    image: ghcr.io/attestmesh/agent-egress-fw@sha256:c75c9668e905ca00f86e9583505d52624ba87cb7114a4633f84330bb497ca58f
+    restart: unless-stopped
+    network_mode: service:matrix-admin-agent
+    depends_on:
+      - matrix-admin-agent
+    environment:
+      - LLM_BASE_URL=${LLM_BASE_URL}                   # the ONE permitted external host (:443)
+      - LLM_ALLOW_CIDRS=66.220.6.0/24                  # redpill api.redpill.ai block — guaranteed LLM reachability (resolution-independent)
+      - INTERNAL_HOSTS=synapse postgres nginx prometheus  # internal services the agent may reach (by resolved IP); prometheus = read-only node metrics
+      - ALLOW_DNS=127.0.0.11                           # Docker embedded resolver
+      - RERESOLVE_SECONDS=15                            # re-resolve pinned + internal hosts (DNS pinning)
+    cap_add:
+      - NET_ADMIN
+
+  # ── Node metrics stack (INTERNAL-ONLY: no `ports:`, NOT on the tailscale/nginx netns) ─────────
+  #   Reachable only on the compose bridge. The matrix-admin-agent answers operator infra-health
+  #   questions by issuing read-only PromQL to prometheus:9090; the agent egress-fw additionally
+  #   pins `prometheus` in INTERNAL_HOSTS. node-exporter = host/CVM metrics; cadvisor = per-container;
+  #   synapse exposes /_synapse/metrics on :9000. Modest retention (a few hours) — this is a live
+  #   health window, not a long-term TSDB.
+
+  # Prometheus: scrapes the exporters + Synapse. prometheus.yml is written at runtime (heredoc, same
+  # pattern as nginx) so there's no build context. retention default 3h (override METRICS_RETENTION_TIME).
+  prometheus:
+    image: prom/prometheus:latest
+    restart: unless-stopped
+    user: root            # write /etc/prometheus + own the /prometheus TSDB dir
+    depends_on:
+      - synapse
+    volumes:
+      - prometheus-data:/prometheus
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        cat > /etc/prometheus/prometheus.yml <<'PROMYML'
+        global:
+          scrape_interval: 15s
+          scrape_timeout: 10s
+        scrape_configs:
+          - job_name: prometheus
+            static_configs:
+              - targets: ['localhost:9090']
+          - job_name: node
+            static_configs:
+              - targets: ['node-exporter:9100']
+          - job_name: cadvisor
+            static_configs:
+              - targets: ['cadvisor:8080']
+          - job_name: synapse
+            metrics_path: /_synapse/metrics
+            static_configs:
+              - targets: ['synapse:9000']
+        PROMYML
+        exec /bin/prometheus \
+          --config.file=/etc/prometheus/prometheus.yml \
+          --storage.tsdb.path=/prometheus \
+          --storage.tsdb.retention.time=${METRICS_RETENTION_TIME:-3h} \
+          --storage.tsdb.retention.size=512MB \
+          --web.listen-address=0.0.0.0:9090
+
+  # node-exporter: host/CVM CPU, memory, disk, filesystem, load. Reads the guest's /proc,/sys,rootfs.
+  node-exporter:
+    image: prom/node-exporter:latest
+    restart: unless-stopped
+    pid: host
+    command:
+      - --path.procfs=/host/proc
+      - --path.sysfs=/host/sys
+      - --path.rootfs=/host/root
+      - --collector.filesystem.mount-points-exclude=^/(sys|proc|dev|host|etc)($$|/)
+      - --web.listen-address=0.0.0.0:9100
+    volumes:
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+      - /:/host/root:ro,rslave
+
+  # cAdvisor: per-container CPU, memory, network for every compose service.
+  cadvisor:
+    image: gcr.io/cadvisor/cadvisor:latest
+    restart: unless-stopped
+    privileged: true
+    command:
+      - --listen_ip=0.0.0.0
+      - --port=8080
+      - --housekeeping_interval=15s
+    volumes:
+      - /:/rootfs:ro
+      - /var/run:/var/run:ro
+      - /sys:/sys:ro
+      - /var/lib/docker/:/var/lib/docker:ro
+      - /dev/disk/:/dev/disk:ro
+    devices:
+      - /dev/kmsg
+
   # ── Reverse proxy: well-known delegation + /_matrix|/_synapse → synapse ──────
   # config written at runtime (avoids needing a build context / BuildKit heredoc).
   nginx:
@@ -208,10 +435,10 @@ services:
     restart: unless-stopped
     depends_on:
       - synapse
-    ports:
-      - "80:80"
+      - matrix-admin-agent
     volumes:
       - wellknown:/usr/share/nginx/wellknown:ro
+      - walg-status:/usr/share/nginx/walg-status:ro
     command:
       - /bin/sh
       - -c
@@ -222,10 +449,16 @@ services:
           server_name _;
           client_max_body_size 50M;
 
-          location /.well-known/matrix/ {
-            root /usr/share/nginx/wellknown;
+          # Private node: serve a self-referential client well-known WITH CORS — and crucially
+          # `add_header ... always` so the header is present on every response, not just 2xx. A bare
+          # 404 here has no CORS header, so Element's browser-side discovery fetch is CORS-blocked
+          # and it reports "not a valid homeserver". base_url reflects the Host the client used
+          # ($host, preserved by tailscale serve) so it tracks the MagicDNS name across rolls.
+          # (No federation → no server well-known.)
+          location = /.well-known/matrix/client {
             default_type application/json;
-            add_header Access-Control-Allow-Origin *;
+            add_header Access-Control-Allow-Origin * always;
+            return 200 '{"m.homeserver": {"base_url": "https://$$host"}}';
           }
 
           location ~ ^(/_matrix|/_synapse/client) {
@@ -233,7 +466,33 @@ services:
             proxy_set_header X-Forwarded-For $$remote_addr;
             proxy_set_header X-Forwarded-Proto https;
             proxy_set_header Host $$host;
+            proxy_set_header Accept-Encoding "";
             proxy_http_version 1.1;
+            # Rewrite Synapse's public_baseurl sentinel to the client's own Host on the way out, so
+            # the LOGIN response's m.homeserver well_known sends the client back to the tailnet URL it
+            # actually used (the real name churns each fresh-disk roll) instead of the dead gateway
+            # domain. Requires the upstream response uncompressed (Accept-Encoding "" above); Synapse's
+            # client listener already sets compress:false. $host is preserved through tailscale serve.
+            sub_filter 'homeserver.invalid' '$$host';
+            sub_filter_once off;
+            sub_filter_types application/json;
+          }
+
+          # agent /healthz over the tailnet (bridge-mode verify-agent; no host port-maps). Health only.
+          location = /_agent/healthz {
+            proxy_pass http://matrix-admin-agent:9100/healthz;
+            proxy_set_header Host $$host;
+          }
+
+          # Diagnostics over the tailnet (the TEE blocks container logs): the wal-g backup pipeline's
+          # status file, and the sidecar's health (phase + csk_acquired). Read-only, no secrets.
+          location = /_backup/status {
+            default_type text/plain;
+            alias /usr/share/nginx/walg-status/state;
+          }
+          location = /_sidecar/healthz {
+            proxy_pass http://sidecar:9090/healthz;
+            proxy_set_header Host $$host;
           }
 
           location = / {
@@ -244,20 +503,44 @@ services:
         NGINX
         exec nginx -g 'daemon off;'
 
-  # ── Tailscale: joins the tailnet sharing nginx's netns, so the node + Matrix are
-  #     reachable over the tailnet at http://<ts-hostname>:80 (tailnet is encrypted). ──
+  # ── Tailscale serve config writer: drops the TS_SERVE_CONFIG the tailscale container consumes
+  #     (HTTPS-terminate on the tailnet :443 → local nginx:80). $${TS_CERT_DOMAIN} is substituted by
+  #     containerboot with this node's MagicDNS name, so it tracks the actual hostname even though
+  #     that changes on each fresh-disk roll. ($$ escapes the literal $ past compose interpolation.) ──
+  ts-serve-init:
+    image: alpine:3.20
+    restart: "no"
+    volumes:
+      - ts-config:/cfg
+    command:
+      - /bin/sh
+      - -c
+      - |
+        cat > /cfg/serve.json <<'JSON'
+        {"TCP":{"443":{"HTTPS":true}},"Web":{"$${TS_CERT_DOMAIN}:443":{"Handlers":{"/":{"Proxy":"http://127.0.0.1:80"}}}}}
+        JSON
+        echo "ts-serve-init: wrote /cfg/serve.json"
+
+  # ── Tailscale: joins the tailnet sharing nginx's netns. Matrix is reachable over the tailnet at
+  #     https://<magicdns-name>/ — `tailscale serve` (TS_SERVE_CONFIG) terminates TLS on :443 and
+  #     proxies to nginx:80; the cert is auto-provisioned by the tailnet's HTTPS feature. ──
   tailscale:
     image: tailscale/tailscale:latest
     restart: unless-stopped
     network_mode: service:nginx
+    depends_on:
+      ts-serve-init:
+        condition: service_completed_successfully
     environment:
       - TS_AUTHKEY=${TS_AUTHKEY}
       - TS_HOSTNAME=matrix-attestmesh
       - TS_STATE_DIR=/var/lib/tailscale
       - TS_USERSPACE=false
       - TS_EXTRA_ARGS=--netfilter-mode=off
+      - TS_SERVE_CONFIG=/cfg/serve.json
     volumes:
       - tailscale-state:/var/lib/tailscale
+      - ts-config:/cfg
     cap_add:
       - NET_ADMIN
       - SYS_MODULE
@@ -284,6 +567,7 @@ services:
         while true; do
           iptables -C INPUT -i tailscale0 -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || iptables -A INPUT -i tailscale0 -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
           iptables -C INPUT -i tailscale0 -p tcp --dport 80 -j ACCEPT 2>/dev/null || iptables -A INPUT -i tailscale0 -p tcp --dport 80 -j ACCEPT
+          iptables -C INPUT -i tailscale0 -p tcp --dport 443 -j ACCEPT 2>/dev/null || iptables -A INPUT -i tailscale0 -p tcp --dport 443 -j ACCEPT
           iptables -C INPUT -i tailscale0 -p icmp -j ACCEPT 2>/dev/null || iptables -A INPUT -i tailscale0 -p icmp -j ACCEPT
           iptables -C INPUT -i tailscale0 -j DROP 2>/dev/null || iptables -A INPUT -i tailscale0 -j DROP
           iptables -C FORWARD -i tailscale0 -j DROP 2>/dev/null || iptables -A FORWARD -i tailscale0 -j DROP
@@ -291,7 +575,13 @@ services:
         done
 
 volumes:
+  sidecar-state:
   pgdata:
   synapse-data:
   wellknown:
   tailscale-state:
+  ts-config:         # tailscale serve config (TS_SERVE_CONFIG → HTTPS on the tailnet)
+  agent-sock:        # sidecar app-facing gRPC UDS, shared sidecar ↔ matrix-admin-agent
+  agent-secrets:     # scoped registration-secret drop, synapse-init → matrix-admin-agent
+  walg-status:       # wal-g backup-pipeline status (postgres-walg → nginx /_backup/status)
+  prometheus-data:   # internal node-metrics TSDB (short retention; reachable only on the bridge)

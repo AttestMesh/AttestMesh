@@ -1,0 +1,90 @@
+# C3 member deployment for the shared AttestMesh indexer.
+#
+# The sidecar joins the main C3 cluster. The Rust indexer shares the sidecar
+# network namespace, so its HTTP read model is reachable over the mesh at
+# http://<member-mesh-ip>:9090/mesh/*, and its gRPC endpoint can also be
+# registered through the dstack gateway for existing sidecars. The sidecar owns
+# mesh peer-control gRPC on :50051, so the indexer uses :50052.
+services:
+  sidecar:
+    image: ghcr.io/attestmesh/cluster-mesh-agent@sha256:e3d53442aa6e52d47227fb3528c1141302ad4fc63c4b3fb6dc38df7ce907d486
+    restart: unless-stopped
+    environment:
+      # MEMBER_CONTRACT intentionally unset. Path A upgrades this stock DstackApp
+      # proxy to ClusterMember, then the sidecar self-discovers its app_id from
+      # the dstack guest agent.
+      - CHAIN_ID=${CHAIN_ID}
+      - RPC_URL=${RPC_URL}
+      - BUNDLER_URL=${BUNDLER_URL}
+      - GAS_POLICY_ID=${GAS_POLICY_ID}
+      - INDEXER_REGISTRY_ADDR=${INDEXER_REGISTRY_ADDR}
+      - GATEWAY_DOMAIN=${GATEWAY_DOMAIN}
+      - DSTACK_SOCKET=/var/run/dstack.sock
+      - SIDECAR_STATE_DIR=/var/lib/attestmesh
+      # The indexer owns :9090 in the shared netns.
+      - HEALTH_HTTP_ADDR=0.0.0.0:9091
+      - LOG_FORMAT=pretty
+      - LOG_LEVEL=info,cluster_mesh_agent=debug
+    volumes:
+      - /var/run/dstack.sock:/var/run/dstack.sock
+      - agent-sock:/var/run/attestmesh
+      - sidecar-state:/var/lib/attestmesh
+    ports:
+      - "51900:51900"
+      - "50051:50051"
+      - "50052:50052"
+      - "9090:9090"
+      - "9091:9091"
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun
+
+  indexer:
+    image: ghcr.io/attestmesh/attestmesh-indexer@sha256:14e9e3f6869ada585642c14e4e2e43bee197978ffc68d146dd6d3cddbc49d2bb
+    restart: unless-stopped
+    network_mode: service:sidecar
+    depends_on:
+      - sidecar
+    environment:
+      - CHAIN_ID=8453
+      # The deployer keeps its transaction RPC separate; the encrypted guest value
+      # is normally the box-local proxyd endpoint supplied through CVM_RPC_URL.
+      - RPC_URL=${RPC_URL}
+      - INDEXER_REGISTRY_ADDR=${INDEXER_REGISTRY_ADDR}
+      - CLUSTER_DIAMOND_FACTORY_ADDR=0xf6E85fD138E3208d3AAE63ce4E2A33f20e82b9fb
+      - INDEXER_CODE_ID=
+      - INDEXER_START_BLOCK=46868742
+      # The box-local RPC backend answers 5k multi-cluster log pages below its
+      # retry timeout; 10k pages routinely cross it and double catch-up time.
+      - BLOCK_BATCH_SIZE=5000
+      - INDEXER_GRPC_ADDR=0.0.0.0:50052
+      - HEALTH_HTTP_ADDR=0.0.0.0:9090
+      - GATEWAY_DOMAIN=${GATEWAY_DOMAIN}
+      - DSTACK_SOCKET=/var/run/dstack.sock
+      - STATE_DIR=/data/indexer-state
+      - LOG_FORMAT=pretty
+      - LOG_LEVEL=info,attestmesh_indexer=debug
+    volumes:
+      - /var/run/dstack.sock:/var/run/dstack.sock
+      - indexer-state:/data/indexer-state
+
+  registration-calldata:
+    image: ghcr.io/attestmesh/attestmesh-indexer@sha256:14e9e3f6869ada585642c14e4e2e43bee197978ffc68d146dd6d3cddbc49d2bb
+    restart: "no"
+    depends_on:
+      - sidecar
+    entrypoint: ["/usr/local/bin/attestmesh-registration-calldata"]
+    environment:
+      - CLUSTER=${CLUSTER}
+      - DSTACK_SOCKET=/var/run/dstack.sock
+      - REGISTRATION_HELPER_ADDR=0.0.0.0:9092
+    ports:
+      - "9092:9092"
+    volumes:
+      - /var/run/dstack.sock:/var/run/dstack.sock
+
+volumes:
+  sidecar-state:
+  agent-sock:
+  indexer-state:

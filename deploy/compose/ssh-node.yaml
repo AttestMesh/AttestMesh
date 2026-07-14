@@ -1,0 +1,143 @@
+# AttestMesh SSH ingress node for the self-hosted dstack box.
+#
+# The node joins an existing ClusterDiamond through the sidecar, and exposes two
+# sshd services through the dstack gateway (TLS-passthrough, SNI = host):
+#
+#   sshd       :1022 — bridge-netns shell (compose services: sidecar:9090 etc.)
+#   sshd-mesh  :1023 — SIDECAR-netns shell: sits ON the WireGuard mesh, so it
+#                      reaches every member's mesh-only services (e.g. the
+#                      hindsight node's :18888/:18999) and `ssh -D <port> …`
+#                      gives the operator a SOCKS route onto the mesh.
+#
+#   ssh root@<alias>
+#   ProxyCommand openssl s_client -quiet -connect <app_id>-102X.<gateway-domain>:443 -servername <same>
+#
+# Both shells are a FULL ubuntu 26.04 workbench (build tools, python, net tools)
+# and share the /root workspace volume (survives in-place rolls; a fresh-disk
+# roll wipes it). SSH public keys are sealed into the CVM as
+# SSH_AUTHORIZED_KEYS_B64 by deploy/ssh-node.sh; no key material is committed.
+services:
+  sidecar:
+    image: ghcr.io/attestmesh/cluster-mesh-agent@sha256:b9e0ae107d9db015c22059c9fecdc28f2b35e09b257eabb4739bd4e46d96f641
+    restart: unless-stopped
+    environment:
+      # MEMBER_CONTRACT intentionally unset. Path A upgrades this stock DstackApp
+      # proxy to ClusterMember, then the sidecar self-discovers its app_id from
+      # the dstack guest agent.
+      - CHAIN_ID=${CHAIN_ID}
+      - RPC_URL=${RPC_URL}
+      - BUNDLER_URL=${BUNDLER_URL}
+      - GAS_POLICY_ID=${GAS_POLICY_ID}
+      - INDEXER_REGISTRY_ADDR=${INDEXER_REGISTRY_ADDR}
+      - GATEWAY_DOMAIN=${GATEWAY_DOMAIN}
+      - DSTACK_SOCKET=/var/run/dstack.sock
+      - SIDECAR_STATE_DIR=/var/lib/attestmesh
+      - HEALTH_HTTP_ADDR=0.0.0.0:9090
+      - LOG_FORMAT=pretty
+      - LOG_LEVEL=info,cluster_mesh_agent=debug
+    volumes:
+      - /var/run/dstack.sock:/var/run/dstack.sock
+      - sidecar-state:/var/lib/attestmesh
+    ports:
+      - "9090:9090"
+      - "51900:51900"
+      # sshd-mesh (below) shares this netns, so its listener is published here:
+      # <app_id>-1023.<gateway-domain>:443 → a shell ON the wg mesh.
+      - "1023:1023"
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun
+
+  sshd:
+    build:
+      context: .
+      dockerfile_inline: |
+        FROM ubuntu:26.04@sha256:53958ec7b67c2c9355df922dd08dbf0360611f8c3cdb656875e81873db9ffdba
+        RUN apt-get update \
+          && DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            ca-certificates openssh-server openssh-client \
+            build-essential git python3 python3-pip python3-venv \
+            curl wget jq ripgrep unzip rsync \
+            iproute2 iputils-ping dnsutils netcat-openbsd socat wireguard-tools \
+            vim nano tmux htop less \
+          && rm -rf /var/lib/apt/lists/*
+        RUN mkdir -p /run/sshd \
+          && sed -i 's/^#\?Port .*/Port 1022/' /etc/ssh/sshd_config \
+          && sed -i 's/^#\?PermitRootLogin .*/PermitRootLogin prohibit-password/' /etc/ssh/sshd_config \
+          && sed -i 's/^#\?PubkeyAuthentication .*/PubkeyAuthentication yes/' /etc/ssh/sshd_config \
+          && sed -i 's/^#\?PasswordAuthentication .*/PasswordAuthentication no/' /etc/ssh/sshd_config \
+          && sed -i 's/^#\?KbdInteractiveAuthentication .*/KbdInteractiveAuthentication no/' /etc/ssh/sshd_config \
+          && sed -i 's/^#\?PermitEmptyPasswords .*/PermitEmptyPasswords no/' /etc/ssh/sshd_config \
+          && sed -i 's@session\s*required\s*pam_loginuid.so@session optional pam_loginuid.so@g' /etc/pam.d/sshd
+        EXPOSE 1022
+    restart: unless-stopped
+    environment:
+      - SSH_AUTHORIZED_KEYS_B64=${SSH_AUTHORIZED_KEYS_B64}
+    volumes:
+      - workspace:/root
+    command:
+      - /bin/bash
+      - -lc
+      - |
+        set -euo pipefail
+        install -d -m 700 /root/.ssh /run/sshd
+        printf '%s' "$SSH_AUTHORIZED_KEYS_B64" | base64 -d > /root/.ssh/authorized_keys
+        chmod 600 /root/.ssh/authorized_keys
+        chown -R root:root /root/.ssh
+        test -s /root/.ssh/authorized_keys
+        exec /usr/sbin/sshd -D -e
+    ports:
+      - "1022:1022"
+
+  # Mesh jump shell: same workbench, but INSIDE the sidecar's netns — where the
+  # WireGuard mesh interface lives. NET_ADMIN is for `wg show` (peer discovery).
+  sshd-mesh:
+    build:
+      context: .
+      dockerfile_inline: |
+        FROM ubuntu:26.04@sha256:53958ec7b67c2c9355df922dd08dbf0360611f8c3cdb656875e81873db9ffdba
+        RUN apt-get update \
+          && DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            ca-certificates openssh-server openssh-client \
+            build-essential git python3 python3-pip python3-venv \
+            curl wget jq ripgrep unzip rsync \
+            iproute2 iputils-ping dnsutils netcat-openbsd socat wireguard-tools \
+            vim nano tmux htop less \
+          && rm -rf /var/lib/apt/lists/*
+        RUN mkdir -p /run/sshd \
+          && sed -i 's/^#\?Port .*/Port 1023/' /etc/ssh/sshd_config \
+          && sed -i 's/^#\?PermitRootLogin .*/PermitRootLogin prohibit-password/' /etc/ssh/sshd_config \
+          && sed -i 's/^#\?PubkeyAuthentication .*/PubkeyAuthentication yes/' /etc/ssh/sshd_config \
+          && sed -i 's/^#\?PasswordAuthentication .*/PasswordAuthentication no/' /etc/ssh/sshd_config \
+          && sed -i 's/^#\?KbdInteractiveAuthentication .*/KbdInteractiveAuthentication no/' /etc/ssh/sshd_config \
+          && sed -i 's/^#\?PermitEmptyPasswords .*/PermitEmptyPasswords no/' /etc/ssh/sshd_config \
+          && sed -i 's@session\s*required\s*pam_loginuid.so@session optional pam_loginuid.so@g' /etc/pam.d/sshd
+        EXPOSE 1023
+    restart: unless-stopped
+    network_mode: service:sidecar
+    depends_on:
+      - sidecar
+    cap_add:
+      - NET_ADMIN
+    environment:
+      - SSH_AUTHORIZED_KEYS_B64=${SSH_AUTHORIZED_KEYS_B64}
+    volumes:
+      - workspace:/root
+    command:
+      - /bin/bash
+      - -lc
+      - |
+        set -euo pipefail
+        install -d -m 700 /root/.ssh /run/sshd
+        printf '%s' "$SSH_AUTHORIZED_KEYS_B64" | base64 -d > /root/.ssh/authorized_keys
+        chmod 600 /root/.ssh/authorized_keys
+        chown -R root:root /root/.ssh
+        test -s /root/.ssh/authorized_keys
+        exec /usr/sbin/sshd -D -e
+
+volumes:
+  sidecar-state:
+  # Shared /root workbench for both shells (bash history, clones, downloads).
+  # Survives in-place rolls; wiped on a fresh-disk roll.
+  workspace:

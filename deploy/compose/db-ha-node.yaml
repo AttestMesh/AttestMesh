@@ -1,0 +1,379 @@
+# Co-tenanted DB HA node (one of N): one AttestMesh sidecar shared by one member each
+# of Postgres HA, Redis HA, and ClickHouse HA. The three HA services use the same CVM
+# resources, measured app, mesh identity, and CVM encryption-key footprint.
+#
+# Peer maps are deliberately service-specific names over the same mesh IPs:
+#   PGHA_PEERS="pg1=<db1-ip>,pg2=<db2-ip>,pg3=<db3-ip>"
+#   REDIS_PEERS="r1=<db1-ip>,r2=<db2-ip>,r3=<db3-ip>"
+#   CH_PEERS="ch1=<db1-ip>,ch2=<db2-ip>,ch3=<db3-ip>"
+#
+# A single mesh-only status server owns :8009 and serves one shared dbha-status
+# volume. Postgres keeps its existing root-level pgha status/log layout because the
+# current image writes Postgres logs under /pgha-status/pglog; Redis and ClickHouse
+# write under /redis and /clickhouse to avoid collisions.
+
+services:
+  sidecar:
+    image: ghcr.io/attestmesh/cluster-mesh-agent@sha256:b9e0ae107d9db015c22059c9fecdc28f2b35e09b257eabb4739bd4e46d96f641
+    restart: unless-stopped
+    environment:
+      # MEMBER_CONTRACT intentionally unset: the sidecar self-discovers the app_id.
+      - CHAIN_ID=${CHAIN_ID}
+      - RPC_URL=${RPC_URL}
+      - BUNDLER_URL=${BUNDLER_URL}
+      - GAS_POLICY_ID=${GAS_POLICY_ID}
+      - INDEXER_REGISTRY_ADDR=${INDEXER_REGISTRY_ADDR}
+      - GATEWAY_DOMAIN=${GATEWAY_DOMAIN}
+      - DSTACK_SOCKET=/var/run/dstack.sock
+      - SIDECAR_STATE_DIR=/var/lib/attestmesh
+      - AGENT_GRPC_SOCKET=/var/run/attestmesh/agent.sock
+      - HEALTH_HTTP_ADDR=0.0.0.0:9090
+      - LOG_FORMAT=pretty
+      - LOG_LEVEL=info,cluster_mesh_agent=debug
+    volumes:
+      - /var/run/dstack.sock:/var/run/dstack.sock
+      - sidecar-state:/var/lib/attestmesh
+      - agent-sock:/var/run/attestmesh
+    ports:
+      - "9090:9090"
+      - "51900:51900"
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun
+
+  # Postgres HA: etcd + Patroni/Postgres + HAProxy.
+
+  pg-etcd:
+    image: ghcr.io/attestmesh/pg-ha@sha256:3cce594b31cc9c57dea6f1b7fc4e6a3e9b31be15853c49e22c4c6423d7a9b066
+    restart: unless-stopped
+    network_mode: service:sidecar
+    entrypoint: ["/usr/local/bin/pgha-etcd-entrypoint.sh"]
+    depends_on:
+      - sidecar
+    environment:
+      - PGHA_NODE_NAME=${PGHA_NODE_NAME}
+      - PGHA_PEERS=${PGHA_PEERS}
+      - PGHA_BOOTSTRAP=${PGHA_BOOTSTRAP}
+      - AGENT_GRPC_SOCKET=/var/run/attestmesh/agent.sock
+    volumes:
+      - pg-etcd-data:/var/lib/etcd
+      - agent-sock:/var/run/attestmesh
+      - dbha-status:/pgha-status
+
+  patroni:
+    image: ghcr.io/attestmesh/pg-ha@sha256:3cce594b31cc9c57dea6f1b7fc4e6a3e9b31be15853c49e22c4c6423d7a9b066
+    restart: unless-stopped
+    network_mode: service:sidecar
+    entrypoint: ["/usr/local/bin/pgha-patroni-entrypoint.sh"]
+    depends_on:
+      - pg-etcd
+    environment:
+      - PGHA_NODE_NAME=${PGHA_NODE_NAME}
+      - PGHA_PEERS=${PGHA_PEERS}
+      - PGHA_MESH_CIDR=${PGHA_MESH_CIDR}
+      - PGHA_VERIFY_PASSWORD=${PGHA_VERIFY_PASSWORD}
+      - AGENT_GRPC_SOCKET=/var/run/attestmesh/agent.sock
+      - BACKUP_ENABLED=${BACKUP_ENABLED}
+      - BACKUP_PREFIX=${BACKUP_PREFIX}
+      - BACKUP_RESTORE=${BACKUP_RESTORE}
+      - R2_ACCESS_KEY_ID=${R2_ACCESS_KEY_ID}
+      - R2_SECRET_ACCESS_KEY=${R2_SECRET_ACCESS_KEY}
+      - R2_ENDPOINT=${R2_ENDPOINT}
+      - R2_BUCKET=${R2_BUCKET}
+      - R2_REGION=${R2_REGION}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - agent-sock:/var/run/attestmesh
+      - dbha-status:/pgha-status
+      - pgha-secrets:/pgha-secrets
+
+  pg-haproxy:
+    image: ghcr.io/attestmesh/pg-ha@sha256:3cce594b31cc9c57dea6f1b7fc4e6a3e9b31be15853c49e22c4c6423d7a9b066
+    restart: unless-stopped
+    network_mode: service:sidecar
+    entrypoint: ["/usr/local/bin/pgha-haproxy-entrypoint.sh"]
+    depends_on:
+      - patroni
+    environment:
+      - PGHA_NODE_NAME=${PGHA_NODE_NAME}
+      - PGHA_PEERS=${PGHA_PEERS}
+    volumes:
+      - dbha-status:/pgha-status
+
+  # Redis HA: redis-server + Sentinel + HAProxy.
+
+  redis:
+    image: ghcr.io/attestmesh/redis-ha@sha256:3b8c7921abafa58cbf9b7f67ff3530254d5dc1cf950e6f159e3c86b4e064763e
+    restart: unless-stopped
+    network_mode: service:sidecar
+    entrypoint: ["/usr/local/bin/redisha-redis-entrypoint.sh"]
+    depends_on:
+      - sidecar
+    environment:
+      - REDISHA_NODE_NAME=${REDISHA_NODE_NAME}
+      - REDIS_PEERS=${REDIS_PEERS}
+      - REDISHA_BOOTSTRAP=${REDISHA_BOOTSTRAP}
+      - REDISHA_VERIFY_PASSWORD=${REDISHA_VERIFY_PASSWORD}
+      - REDISHA_STATUS_FILE=/redisha-status/redis/state
+      - AGENT_GRPC_SOCKET=/var/run/attestmesh/agent.sock
+    volumes:
+      - redisdata:/data
+      - agent-sock:/var/run/attestmesh
+      - dbha-status:/redisha-status
+
+  sentinel:
+    image: ghcr.io/attestmesh/redis-ha@sha256:3b8c7921abafa58cbf9b7f67ff3530254d5dc1cf950e6f159e3c86b4e064763e
+    restart: unless-stopped
+    network_mode: service:sidecar
+    entrypoint: ["/usr/local/bin/redisha-sentinel-entrypoint.sh"]
+    depends_on:
+      - redis
+    environment:
+      - REDISHA_NODE_NAME=${REDISHA_NODE_NAME}
+      - REDIS_PEERS=${REDIS_PEERS}
+      - REDISHA_BOOTSTRAP=${REDISHA_BOOTSTRAP}
+      - REDISHA_VERIFY_PASSWORD=${REDISHA_VERIFY_PASSWORD}
+      - REDISHA_STATUS_FILE=/redisha-status/redis/state
+      - AGENT_GRPC_SOCKET=/var/run/attestmesh/agent.sock
+    volumes:
+      - redis-sentinel-data:/sentinel-data
+      - agent-sock:/var/run/attestmesh
+      - dbha-status:/redisha-status
+
+  redis-haproxy:
+    image: ghcr.io/attestmesh/redis-ha@sha256:3b8c7921abafa58cbf9b7f67ff3530254d5dc1cf950e6f159e3c86b4e064763e
+    restart: unless-stopped
+    network_mode: service:sidecar
+    entrypoint: ["/usr/local/bin/redisha-haproxy-entrypoint.sh"]
+    depends_on:
+      - redis
+    environment:
+      - REDISHA_NODE_NAME=${REDISHA_NODE_NAME}
+      - REDIS_PEERS=${REDIS_PEERS}
+      - REDISHA_STATUS_FILE=/redisha-status/redis/state
+      - AGENT_GRPC_SOCKET=/var/run/attestmesh/agent.sock
+    volumes:
+      - agent-sock:/var/run/attestmesh
+      - dbha-status:/redisha-status
+
+  # ClickHouse HA: Keeper + clickhouse-server + HAProxy.
+
+  keeper:
+    image: ghcr.io/attestmesh/clickhouse-ha@sha256:1c2ccc946afdc1c50354017bef0bbc636e7dbb1dcc6e1e0f5ed728b7e0af7216
+    restart: unless-stopped
+    network_mode: service:sidecar
+    entrypoint: ["/usr/local/bin/chha-keeper-entrypoint.sh"]
+    depends_on:
+      - sidecar
+    environment:
+      - CHHA_NODE_NAME=${CHHA_NODE_NAME}
+      - CH_PEERS=${CH_PEERS}
+      - CHHA_BOOTSTRAP=${CHHA_BOOTSTRAP}
+      - CHHA_STATUS_FILE=/chha-status/clickhouse/state
+      - AGENT_GRPC_SOCKET=/var/run/attestmesh/agent.sock
+    volumes:
+      - keeper-data:/var/lib/clickhouse-keeper
+      - agent-sock:/var/run/attestmesh
+      - dbha-status:/chha-status
+
+  clickhouse-server:
+    image: ghcr.io/attestmesh/clickhouse-ha@sha256:1c2ccc946afdc1c50354017bef0bbc636e7dbb1dcc6e1e0f5ed728b7e0af7216
+    restart: unless-stopped
+    network_mode: service:sidecar
+    entrypoint: ["/usr/local/bin/chha-server-entrypoint.sh"]
+    depends_on:
+      - keeper
+    environment:
+      - CHHA_NODE_NAME=${CHHA_NODE_NAME}
+      - CH_PEERS=${CH_PEERS}
+      - CHHA_BOOTSTRAP=${CHHA_BOOTSTRAP}
+      - CHHA_VERIFY_PASSWORD=${CHHA_VERIFY_PASSWORD}
+      - CHHA_STATUS_FILE=/chha-status/clickhouse/state
+      - AGENT_GRPC_SOCKET=/var/run/attestmesh/agent.sock
+    volumes:
+      - chdata:/var/lib/clickhouse
+      - agent-sock:/var/run/attestmesh
+      - dbha-status:/chha-status
+
+  clickhouse-haproxy:
+    image: ghcr.io/attestmesh/clickhouse-ha@sha256:1c2ccc946afdc1c50354017bef0bbc636e7dbb1dcc6e1e0f5ed728b7e0af7216
+    restart: unless-stopped
+    network_mode: service:sidecar
+    entrypoint: ["/usr/local/bin/chha-haproxy-entrypoint.sh"]
+    depends_on:
+      - clickhouse-server
+    environment:
+      - CHHA_NODE_NAME=${CHHA_NODE_NAME}
+      - CH_PEERS=${CH_PEERS}
+      - CHHA_STATUS_FILE=/chha-status/clickhouse/state
+      - AGENT_GRPC_SOCKET=/var/run/attestmesh/agent.sock
+    volumes:
+      - agent-sock:/var/run/attestmesh
+      - dbha-status:/chha-status
+
+  # Single mesh-only status page for all co-tenanted HA services.
+  status-server:
+    image: ghcr.io/attestmesh/pg-ha@sha256:3cce594b31cc9c57dea6f1b7fc4e6a3e9b31be15853c49e22c4c6423d7a9b066
+    restart: unless-stopped
+    network_mode: service:sidecar
+    entrypoint:
+      - /bin/bash
+      - -ec
+    command:
+      - |
+        while :; do
+          ip="$(ip -4 -o addr show dev attestmesh0 2>/dev/null | awk '{print $$4}' | cut -d/ -f1)"
+          [ -n "$$ip" ] && break
+          sleep 1
+        done
+        exec python3 -m http.server 8009 --bind "$$ip" --directory /dbha-status
+    depends_on:
+      - sidecar
+    volumes:
+      - dbha-status:/dbha-status:ro
+
+  # Optional Postgres chat-ops and local metrics keep the existing pg-ha behaviour. They
+  # run in their own namespaces, so their Prometheus :9090 does not conflict with sidecar.
+  matrix-mesh-proxy:
+    image: alpine/socat:1.8.0.0
+    restart: unless-stopped
+    network_mode: service:sidecar
+    depends_on:
+      - sidecar
+    command:
+      - -d
+      - -d
+      - TCP-LISTEN:18080,fork,reuseaddr,bind=0.0.0.0
+      - TCP:${MATRIX_MESH_IP}:18080
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+
+  postgres-admin-agent:
+    image: ghcr.io/attestmesh/postgres-admin-agent@sha256:3d38a34f7f0858ca45d87e4235881bd24762f7407dfba4a6de3be0fd110da4e3
+    restart: unless-stopped
+    depends_on:
+      matrix-mesh-proxy:
+        condition: service_started
+      prometheus:
+        condition: service_started
+    environment:
+      - PG_DSN=postgresql://postgres@sidecar:5434/postgres
+      - PG_PASSWORD_FILE=/pgha-secrets/pg-superuser
+      - PATRONI_URL=http://sidecar:8008
+      - PATRONI_PASSWORD_FILE=/pgha-secrets/patroni-api
+      - MATRIX_HOMESERVER_URL=http://sidecar:18080
+      - MATRIX_SSL_VERIFY=0
+      - MATRIX_USER_ID=${MATRIX_USER_ID}
+      - MATRIX_PASSWORD=${MATRIX_PASSWORD}
+      - MATRIX_ROOM_ID=${MATRIX_ROOM_ID}
+      - MATRIX_ADMIN_MXIDS=${MATRIX_ADMIN_MXIDS}
+      - MATRIX_REQUIRE_MENTION=1
+      - MATRIX_MENTION_ALIASES=${MATRIX_MENTION_ALIASES}
+      - LLM_BASE_URL=${LLM_BASE_URL}
+      - LLM_API_KEY=${LLM_API_KEY}
+      - LLM_MODEL=${LLM_MODEL}
+      - PROMETHEUS_URL=http://prometheus:9090
+      - METRICS_WINDOW_MINUTES=60
+      - HEALTH_HTTP_ADDR=0.0.0.0:9100
+      - RESPONSE_TIMEOUT_SECONDS=60
+      - LLM_TIMEOUT_SECONDS=25
+      - CONFIRM_WRITES=1
+      - LOG_LEVEL=info
+    volumes:
+      - pgha-secrets:/pgha-secrets:ro
+
+  agent-egress-fw:
+    image: ghcr.io/attestmesh/agent-egress-fw@sha256:c75c9668e905ca00f86e9583505d52624ba87cb7114a4633f84330bb497ca58f
+    restart: unless-stopped
+    network_mode: service:postgres-admin-agent
+    depends_on:
+      - postgres-admin-agent
+    environment:
+      - LLM_BASE_URL=${LLM_BASE_URL}
+      - LLM_ALLOW_CIDRS=66.220.6.0/24
+      - INTERNAL_HOSTS=sidecar prometheus
+      - ALLOW_DNS=127.0.0.11
+      - RERESOLVE_SECONDS=15
+    cap_add:
+      - NET_ADMIN
+
+  prometheus:
+    image: prom/prometheus:latest
+    restart: unless-stopped
+    user: root
+    volumes:
+      - prometheus-data:/prometheus
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        cat > /etc/prometheus/prometheus.yml <<'PROMYML'
+        global:
+          scrape_interval: 15s
+          scrape_timeout: 10s
+        scrape_configs:
+          - job_name: prometheus
+            static_configs:
+              - targets: ['localhost:9090']
+          - job_name: node
+            static_configs:
+              - targets: ['node-exporter:9100']
+          - job_name: cadvisor
+            static_configs:
+              - targets: ['cadvisor:8080']
+        PROMYML
+        exec /bin/prometheus \
+          --config.file=/etc/prometheus/prometheus.yml \
+          --storage.tsdb.path=/prometheus \
+          --storage.tsdb.retention.time=3h \
+          --storage.tsdb.retention.size=512MB \
+          --web.listen-address=0.0.0.0:9090
+
+  node-exporter:
+    image: prom/node-exporter:latest
+    restart: unless-stopped
+    pid: host
+    command:
+      - --path.procfs=/host/proc
+      - --path.sysfs=/host/sys
+      - --path.rootfs=/host/root
+      - --collector.filesystem.mount-points-exclude=^/(sys|proc|dev|host|etc)($$|/)
+      - --web.listen-address=0.0.0.0:9100
+    volumes:
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+      - /:/host/root:ro,rslave
+
+  cadvisor:
+    image: gcr.io/cadvisor/cadvisor:latest
+    restart: unless-stopped
+    privileged: true
+    command:
+      - --listen_ip=0.0.0.0
+      - --port=8080
+      - --housekeeping_interval=15s
+    volumes:
+      - /:/rootfs:ro
+      - /var/run:/var/run:ro
+      - /sys:/sys:ro
+      - /var/lib/docker/:/var/lib/docker:ro
+      - /dev/disk/:/dev/disk:ro
+    devices:
+      - /dev/kmsg
+
+volumes:
+  sidecar-state:
+  agent-sock:
+  dbha-status:
+  pg-etcd-data:
+  pgdata:
+  pgha-secrets:
+  redisdata:
+  redis-sentinel-data:
+  keeper-data:
+  chdata:
+  prometheus-data:

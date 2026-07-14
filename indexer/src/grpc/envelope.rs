@@ -16,11 +16,20 @@
 use crate::chain::repro::ReproStub;
 use crate::chain::watcher::IndexedLog;
 use crate::pb::{PushEnvelope, RpcReproStub};
+use alloy::primitives::Address;
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use sha3::{Digest, Keccak256};
 
 /// Domain separation tag prefixed before the canonical CBOR (proto trailing comment).
 pub const ENVELOPE_DOMAIN: &[u8] = b"attestmesh.indexer.envelope.v1";
+
+/// Sidecar protocol version that understands signed catch-up checkpoints.
+pub const CHECKPOINT_PROTOCOL_VERSION: u32 = 2;
+
+/// Checkpoints use the existing signed envelope wire shape so rolling the Indexer
+/// does not change the Subscribe response type. Empty event/tx/repro fields plus a
+/// maximal log index cannot collide with a real EVM log.
+pub const CHECKPOINT_LOG_INDEX: u64 = u64::MAX;
 
 /// The signable view of an envelope: exactly the fields included in the signature,
 /// in the canonical order. Serialized to deterministic CBOR as a tuple (a CBOR array)
@@ -119,6 +128,29 @@ pub fn build_envelope(log: &IndexedLog, stub: &ReproStub) -> PushEnvelope {
     }
 }
 
+/// Build an unsigned control envelope proving that this subscription has emitted
+/// every relevant event through `indexed_through`. It is signed by the same path as
+/// event envelopes and Ack'd as `(indexed_through, u64::MAX)`.
+pub fn build_checkpoint(cluster: Address, indexed_through: u64) -> PushEnvelope {
+    PushEnvelope {
+        event_data: Vec::new(),
+        cluster_addr: cluster.as_slice().to_vec(),
+        block_number: indexed_through,
+        tx_hash: Vec::new(),
+        log_index: CHECKPOINT_LOG_INDEX,
+        rpc_repro: None,
+        indexer_signature: Vec::new(),
+        indexer_attestation: None,
+    }
+}
+
+pub fn is_checkpoint(envelope: &PushEnvelope) -> bool {
+    envelope.event_data.is_empty()
+        && envelope.tx_hash.is_empty()
+        && envelope.log_index == CHECKPOINT_LOG_INDEX
+        && envelope.rpc_repro.is_none()
+}
+
 /// Sign an envelope in place: computes `signing_input` over the signature-excluded
 /// view and sets `indexer_signature` (spec §11 steps 2–4).
 pub fn sign(key: &SigningKey, envelope: &mut PushEnvelope) {
@@ -160,6 +192,7 @@ mod tests {
             data: vec![9, 8, 7, 6],
             kind: EventKind::WgKeyPublished {
                 member_id: B256::repeat_byte(0x01),
+                wg_pub_key: B256::repeat_byte(0x02),
             },
         }
     }
@@ -168,6 +201,18 @@ mod tests {
         let log = fixture_log();
         let stub = crate::chain::repro::build_stub(&log);
         build_envelope(&log, &stub)
+    }
+
+    #[test]
+    fn checkpoint_has_unambiguous_signed_shape() {
+        let key = SigningKey::generate(&mut OsRng);
+        let cluster = Address::repeat_byte(0xc1);
+        let mut checkpoint = build_checkpoint(cluster, 1234);
+        assert!(is_checkpoint(&checkpoint));
+        sign(&key, &mut checkpoint);
+        assert!(verify(&key.verifying_key(), &checkpoint));
+        checkpoint.block_number += 1;
+        assert!(!verify(&key.verifying_key(), &checkpoint));
     }
 
     #[test]

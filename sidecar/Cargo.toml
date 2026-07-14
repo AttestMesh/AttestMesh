@@ -26,12 +26,14 @@ prost-types = "0.13"
 x25519-dalek = { version = "2", features = ["static_secrets"] }
 ed25519-dalek = { version = "2", features = ["rand_core"] }
 crypto_box = { version = "0.9", features = ["std"] }
+chacha20poly1305 = "0.10"
 blake2 = "0.10"
 zeroize = { version = "1", features = ["derive"] }
 
 # Hashing / encoding
 sha3 = "0.10"
 ciborium = "0.2"
+alloy-rlp = "0.3"
 serde = { version = "1", features = ["derive"] }
 hex = "0.4"
 rand = "0.8"

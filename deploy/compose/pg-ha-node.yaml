@@ -1,0 +1,272 @@
+# Postgres HA node (one of N): Patroni + etcd + HAProxy over the AttestMesh wireguard mesh,
+# plus a Matrix-connected administrative agent. See docs/specs/pg-ha.md.
+#
+# The HA trio (etcd/patroni/haproxy) shares the SIDECAR netns so it can bind the mesh IP and
+# reach the other pg nodes over attestmesh0 — etcd peers, Patroni's DCS + REST, replication,
+# and HAProxy health checks are all mesh flows. Mesh clients connect to ANY node's mesh IP
+# :5432 (current primary) or :5433 (replicas). Postgres itself listens on 5434 so HAProxy can
+# own 5432/5433 in the shared netns. No host `ports:` beyond the sidecar's wg-over-TCP 51900;
+# the host-isolation invariant is asserted by deploy/pg-ha-node.sh verify-isolation-all.
+
+services:
+  sidecar:
+    image: ghcr.io/attestmesh/cluster-mesh-agent@sha256:b9e0ae107d9db015c22059c9fecdc28f2b35e09b257eabb4739bd4e46d96f641
+    restart: unless-stopped
+    environment:
+      # MEMBER_CONTRACT intentionally unset: the sidecar self-discovers the app_id.
+      - CHAIN_ID=${CHAIN_ID}
+      - RPC_URL=${RPC_URL}
+      - BUNDLER_URL=${BUNDLER_URL}
+      - GAS_POLICY_ID=${GAS_POLICY_ID}
+      - INDEXER_REGISTRY_ADDR=${INDEXER_REGISTRY_ADDR}
+      - GATEWAY_DOMAIN=${GATEWAY_DOMAIN}
+      - DSTACK_SOCKET=/var/run/dstack.sock
+      - SIDECAR_STATE_DIR=/var/lib/attestmesh
+      - AGENT_GRPC_SOCKET=/var/run/attestmesh/agent.sock
+      - HEALTH_HTTP_ADDR=0.0.0.0:9090
+      - LOG_FORMAT=pretty
+      - LOG_LEVEL=info,cluster_mesh_agent=debug
+      - ROLL_ID=20260702T0001Z
+    volumes:
+      - /var/run/dstack.sock:/var/run/dstack.sock
+      - sidecar-state:/var/lib/attestmesh
+      - agent-sock:/var/run/attestmesh
+    ports:
+      - "51900:51900"
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun
+
+  # Patroni's DCS. One member per pg node; quorum forms over the mesh. Bootstrap state
+  # machine (new/join/restart) lives in the entrypoint — see docs/specs/pg-ha.md §3.1.
+  etcd:
+    image: ghcr.io/attestmesh/pg-ha@sha256:3cce594b31cc9c57dea6f1b7fc4e6a3e9b31be15853c49e22c4c6423d7a9b066 # pinned 2026-07-07 r6 (pgvector for Hindsight + pg_hba localhost replication entries)
+    restart: unless-stopped
+    network_mode: service:sidecar
+    entrypoint: ["/usr/local/bin/pgha-etcd-entrypoint.sh"]
+    depends_on:
+      - sidecar
+    environment:
+      - PGHA_NODE_NAME=${PGHA_NODE_NAME}
+      - PGHA_PEERS=${PGHA_PEERS}
+      - PGHA_BOOTSTRAP=${PGHA_BOOTSTRAP}
+      - AGENT_GRPC_SOCKET=/var/run/attestmesh/agent.sock
+    volumes:
+      - etcd-data:/var/lib/etcd
+      - agent-sock:/var/run/attestmesh
+      - pgha-status:/pgha-status
+
+  # Patroni-managed Postgres 16 (+ WAL-G). All cluster credentials are HKDF-derived from
+  # the CSK at boot; the superuser/REST creds the admin agent needs are dropped on the
+  # pgha-secrets volume. Data survives disk-preserving rolls (UpgradeApp).
+  patroni:
+    image: ghcr.io/attestmesh/pg-ha@sha256:3cce594b31cc9c57dea6f1b7fc4e6a3e9b31be15853c49e22c4c6423d7a9b066 # pinned 2026-07-07 r6 (pgvector for Hindsight + pg_hba localhost replication entries)
+    restart: unless-stopped
+    network_mode: service:sidecar
+    entrypoint: ["/usr/local/bin/pgha-patroni-entrypoint.sh"]
+    depends_on:
+      - etcd
+    environment:
+      - PGHA_NODE_NAME=${PGHA_NODE_NAME}
+      - PGHA_PEERS=${PGHA_PEERS}
+      - PGHA_MESH_CIDR=${PGHA_MESH_CIDR}
+      - PGHA_VERIFY_PASSWORD=${PGHA_VERIFY_PASSWORD}
+      - AGENT_GRPC_SOCKET=/var/run/attestmesh/agent.sock
+      - BACKUP_ENABLED=${BACKUP_ENABLED}
+      - BACKUP_PREFIX=${BACKUP_PREFIX}
+      - BACKUP_RESTORE=${BACKUP_RESTORE}
+      - R2_ACCESS_KEY_ID=${R2_ACCESS_KEY_ID}
+      - R2_SECRET_ACCESS_KEY=${R2_SECRET_ACCESS_KEY}
+      - R2_ENDPOINT=${R2_ENDPOINT}
+      - R2_BUCKET=${R2_BUCKET}
+      - R2_REGION=${R2_REGION}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - agent-sock:/var/run/attestmesh
+      - pgha-status:/pgha-status
+      - pgha-secrets:/pgha-secrets
+
+  # Primary/replica routing on the mesh IP. Backend health = Patroni's public role GETs.
+  haproxy:
+    image: ghcr.io/attestmesh/pg-ha@sha256:3cce594b31cc9c57dea6f1b7fc4e6a3e9b31be15853c49e22c4c6423d7a9b066 # pinned 2026-07-07 r6 (pgvector for Hindsight + pg_hba localhost replication entries)
+    restart: unless-stopped
+    network_mode: service:sidecar
+    entrypoint: ["/usr/local/bin/pgha-haproxy-entrypoint.sh"]
+    depends_on:
+      - patroni
+    environment:
+      - PGHA_NODE_NAME=${PGHA_NODE_NAME}
+      - PGHA_PEERS=${PGHA_PEERS}
+    volumes:
+      - pgha-status:/pgha-status
+
+  # Mesh-only status page (:8009): the TEE blocks container logs, so every pg-ha entrypoint
+  # self-reports to /pgha-status and this serves it read-only to mesh peers for debugging.
+  status-server:
+    image: ghcr.io/attestmesh/pg-ha@sha256:3cce594b31cc9c57dea6f1b7fc4e6a3e9b31be15853c49e22c4c6423d7a9b066 # pinned 2026-07-07 r6 (pgvector for Hindsight + pg_hba localhost replication entries)
+    restart: unless-stopped
+    network_mode: service:sidecar
+    entrypoint:
+      - /bin/bash
+      - -ec
+    command:
+      - |
+        while :; do
+          ip="$(ip -4 -o addr show dev attestmesh0 2>/dev/null | awk '{print $$4}' | cut -d/ -f1)"
+          [ -n "$$ip" ] && break
+          sleep 1
+        done
+        exec python3 -m http.server 8009 --bind "$$ip" --directory /pgha-status
+    depends_on:
+      - sidecar
+    environment:
+      - PGHA_NODE_NAME=${PGHA_NODE_NAME}
+    volumes:
+      - pgha-status:/pgha-status:ro
+
+  # Local bridge from the admin agent to the Matrix homeserver over AttestMesh.
+  matrix-mesh-proxy:
+    image: alpine/socat:1.8.0.0
+    restart: unless-stopped
+    network_mode: service:sidecar
+    depends_on:
+      - sidecar
+    command:
+      - -d
+      - -d
+      - TCP-LISTEN:18080,fork,reuseaddr,bind=0.0.0.0
+      - TCP:${MATRIX_MESH_IP}:18080
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+
+  # Matrix chat-ops (!pg + Patroni-aware !pgha). Own netns; reaches Postgres/Patroni via the
+  # sidecar service address (Postgres listens 0.0.0.0:5434 CVM-internally) and Matrix via the
+  # mesh proxy. Credentials it needs are read lazily from the pgha-secrets volume, so start
+  # order relative to patroni does not matter.
+  postgres-admin-agent:
+    image: ghcr.io/attestmesh/postgres-admin-agent@sha256:3d38a34f7f0858ca45d87e4235881bd24762f7407dfba4a6de3be0fd110da4e3 # pinned 2026-07-02 (Patroni-aware)
+    restart: unless-stopped
+    depends_on:
+      matrix-mesh-proxy:
+        condition: service_started
+      prometheus:
+        condition: service_started
+    environment:
+      - PG_DSN=postgresql://postgres@sidecar:5434/postgres
+      - PG_PASSWORD_FILE=/pgha-secrets/pg-superuser
+      - PATRONI_URL=http://sidecar:8008
+      - PATRONI_PASSWORD_FILE=/pgha-secrets/patroni-api
+      - MATRIX_HOMESERVER_URL=http://sidecar:18080
+      - MATRIX_SSL_VERIFY=0
+      - MATRIX_USER_ID=${MATRIX_USER_ID}
+      - MATRIX_PASSWORD=${MATRIX_PASSWORD}
+      - MATRIX_ROOM_ID=${MATRIX_ROOM_ID}
+      - MATRIX_ADMIN_MXIDS=${MATRIX_ADMIN_MXIDS}
+      - MATRIX_REQUIRE_MENTION=1
+      - MATRIX_MENTION_ALIASES=${MATRIX_MENTION_ALIASES}
+      - LLM_BASE_URL=${LLM_BASE_URL}
+      - LLM_API_KEY=${LLM_API_KEY}
+      - LLM_MODEL=${LLM_MODEL}
+      - PROMETHEUS_URL=http://prometheus:9090
+      - METRICS_WINDOW_MINUTES=60
+      - HEALTH_HTTP_ADDR=0.0.0.0:9100
+      - RESPONSE_TIMEOUT_SECONDS=60
+      - LLM_TIMEOUT_SECONDS=25
+      - CONFIRM_WRITES=1
+      - LOG_LEVEL=info
+    volumes:
+      - pgha-secrets:/pgha-secrets:ro
+
+  # Agent egress is deny-by-default: local Patroni/Postgres + the sidecar Matrix proxy,
+  # internal Prometheus, Docker DNS, and the pinned LLM endpoint only.
+  agent-egress-fw:
+    image: ghcr.io/attestmesh/agent-egress-fw@sha256:c75c9668e905ca00f86e9583505d52624ba87cb7114a4633f84330bb497ca58f
+    restart: unless-stopped
+    network_mode: service:postgres-admin-agent
+    depends_on:
+      - postgres-admin-agent
+    environment:
+      - LLM_BASE_URL=${LLM_BASE_URL}
+      - LLM_ALLOW_CIDRS=66.220.6.0/24
+      - INTERNAL_HOSTS=sidecar prometheus
+      - ALLOW_DNS=127.0.0.11
+      - RERESOLVE_SECONDS=15
+    cap_add:
+      - NET_ADMIN
+
+  prometheus:
+    image: prom/prometheus:latest
+    restart: unless-stopped
+    user: root
+    volumes:
+      - prometheus-data:/prometheus
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        cat > /etc/prometheus/prometheus.yml <<'PROMYML'
+        global:
+          scrape_interval: 15s
+          scrape_timeout: 10s
+        scrape_configs:
+          - job_name: prometheus
+            static_configs:
+              - targets: ['localhost:9090']
+          - job_name: node
+            static_configs:
+              - targets: ['node-exporter:9100']
+          - job_name: cadvisor
+            static_configs:
+              - targets: ['cadvisor:8080']
+        PROMYML
+        exec /bin/prometheus \
+          --config.file=/etc/prometheus/prometheus.yml \
+          --storage.tsdb.path=/prometheus \
+          --storage.tsdb.retention.time=3h \
+          --storage.tsdb.retention.size=512MB \
+          --web.listen-address=0.0.0.0:9090
+
+  node-exporter:
+    image: prom/node-exporter:latest
+    restart: unless-stopped
+    pid: host
+    command:
+      - --path.procfs=/host/proc
+      - --path.sysfs=/host/sys
+      - --path.rootfs=/host/root
+      - --collector.filesystem.mount-points-exclude=^/(sys|proc|dev|host|etc)($$|/)
+      - --web.listen-address=0.0.0.0:9100
+    volumes:
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+      - /:/host/root:ro,rslave
+
+  cadvisor:
+    image: gcr.io/cadvisor/cadvisor:latest
+    restart: unless-stopped
+    privileged: true
+    command:
+      - --listen_ip=0.0.0.0
+      - --port=8080
+      - --housekeeping_interval=15s
+    volumes:
+      - /:/rootfs:ro
+      - /var/run:/var/run:ro
+      - /sys:/sys:ro
+      - /var/lib/docker/:/var/lib/docker:ro
+      - /dev/disk/:/dev/disk:ro
+    devices:
+      - /dev/kmsg
+
+volumes:
+  sidecar-state:
+  pgdata:
+  etcd-data:
+  agent-sock:
+  pgha-status:
+  pgha-secrets:
+  prometheus-data:

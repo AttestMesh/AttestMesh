@@ -50,7 +50,7 @@ JSON
 # the CVM at first boot (the cold-start fix). Owner-gas (not sponsored).
 seed_appid() {
   local cluster="$1" member="$2"
-  run_step "seed-appid-${member}" cast send "$cluster" "addAllowedAppId(address)" "$member" --rpc-url "$RPC_URL" --private-key "$PRIVATE_KEY"
+  send_with_nonce_retry "seed-appid-${member}" "$cluster" "addAllowedAppId(address)" "$member"
   log "allowedAppIds[$member] = $(cast call "$cluster" 'allowedAppIds(address)(bool)' "$member" --rpc-url "$RPC_URL")"
 }
 

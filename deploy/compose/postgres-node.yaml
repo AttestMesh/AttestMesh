@@ -1,0 +1,243 @@
+# Standalone PostgreSQL node + Matrix-connected administrative agent.
+#
+# No Tailscale runs on this CVM. The node joins the AttestMesh cluster through
+# the sidecar, and Matrix client traffic goes through a local TCP proxy in the
+# sidecar's WireGuard namespace. PostgreSQL has no DB host ports and no tailnet;
+# direct DB access is exposed only on the sidecar's AttestMesh WireGuard IP.
+# The only public ingress is the sidecar's wg-over-TCP transport used to form
+# the AttestMesh network.
+
+services:
+  sidecar:
+    image: ghcr.io/attestmesh/cluster-mesh-agent@sha256:b9e0ae107d9db015c22059c9fecdc28f2b35e09b257eabb4739bd4e46d96f641
+    restart: unless-stopped
+    environment:
+      # MEMBER_CONTRACT intentionally unset: the sidecar self-discovers the app_id.
+      - CHAIN_ID=${CHAIN_ID}
+      - RPC_URL=${RPC_URL}
+      - BUNDLER_URL=${BUNDLER_URL}
+      - GAS_POLICY_ID=${GAS_POLICY_ID}
+      - INDEXER_REGISTRY_ADDR=${INDEXER_REGISTRY_ADDR}
+      - GATEWAY_DOMAIN=${GATEWAY_DOMAIN}
+      - DSTACK_SOCKET=/var/run/dstack.sock
+      - SIDECAR_STATE_DIR=/var/lib/attestmesh
+      - AGENT_GRPC_SOCKET=/var/run/attestmesh/agent.sock
+      - HEALTH_HTTP_ADDR=0.0.0.0:9090
+      - LOG_FORMAT=pretty
+      - LOG_LEVEL=info,cluster_mesh_agent=debug
+      - ROLL_ID=20260630T0106Z
+    volumes:
+      - /var/run/dstack.sock:/var/run/dstack.sock
+      - sidecar-state:/var/lib/attestmesh
+      - agent-sock:/var/run/attestmesh
+    ports:
+      - "51900:51900"
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun
+
+  # Local bridge from the admin agent to the Matrix homeserver over AttestMesh.
+  # The listener is on sidecar's compose-network IP; its outbound leg uses the
+  # sidecar's WireGuard interface to reach Matrix's mesh-only listener.
+  matrix-mesh-proxy:
+    image: alpine/socat:1.8.0.0
+    restart: unless-stopped
+    network_mode: service:sidecar
+    depends_on:
+      - sidecar
+    command:
+      - -d
+      - -d
+      - TCP-LISTEN:18080,fork,reuseaddr,bind=0.0.0.0
+      - TCP:${MATRIX_MESH_IP}:18080
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    labels:
+      attestmesh.roll: "20260630T0008Z"
+
+  # Mesh-only PostgreSQL listener. It shares the sidecar netns so it can bind
+  # specifically to attestmesh0 and forward to the internal postgres service.
+  # There is intentionally no compose `ports:` entry for 5432.
+  postgres-mesh-proxy:
+    image: alpine/socat:1.8.0.0
+    restart: unless-stopped
+    network_mode: service:sidecar
+    depends_on:
+      sidecar:
+        condition: service_started
+      postgres:
+        condition: service_healthy
+    entrypoint:
+      - /bin/sh
+      - -ec
+    command:
+      - |
+        while :; do
+          ip="$(ip -4 -o addr show dev attestmesh0 2>/dev/null | awk '{print $4}' | cut -d/ -f1)"
+          [ -n "$$ip" ] && break
+          sleep 1
+        done
+        exec socat -d -d TCP-LISTEN:5432,fork,reuseaddr,bind="$${ip}" TCP:postgres:5432
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    labels:
+      attestmesh.roll: "20260630T0154Z"
+
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+      - POSTGRES_DB=postgres
+      - POSTGRES_INITDB_ARGS=--encoding=UTF8 --locale=C
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U postgres -d postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 18
+
+  # Postgres initiates no network traffic for this deployment. The firewall runs
+  # in the Postgres netns and switches OUTPUT to default-DROP.
+  postgres-egress-fw:
+    image: ghcr.io/attestmesh/agent-egress-fw@sha256:c75c9668e905ca00f86e9583505d52624ba87cb7114a4633f84330bb497ca58f
+    restart: unless-stopped
+    network_mode: service:postgres
+    depends_on:
+      - postgres
+    environment:
+      - INTERNAL_HOSTS=
+      - ALLOW_BASE_URL=
+      - ALLOW_CIDRS=
+      - ALLOW_DNS=127.0.0.11
+      - RERESOLVE_SECONDS=30
+    cap_add:
+      - NET_ADMIN
+
+  postgres-admin-agent:
+    image: ghcr.io/attestmesh/postgres-admin-agent@sha256:fc5758d423e6c30c96c3b1ff1a6043506f47a2c6e79289723a45a86189e57705
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      matrix-mesh-proxy:
+        condition: service_started
+      prometheus:
+        condition: service_started
+    environment:
+      - PG_DSN=postgresql://postgres:${POSTGRES_PASSWORD}@postgres:5432/postgres
+      - MATRIX_HOMESERVER_URL=http://sidecar:18080
+      - MATRIX_SSL_VERIFY=0
+      - MATRIX_USER_ID=${MATRIX_USER_ID}
+      - MATRIX_PASSWORD=${MATRIX_PASSWORD}
+      - MATRIX_ROOM_ID=${MATRIX_ROOM_ID}
+      - MATRIX_ADMIN_MXIDS=${MATRIX_ADMIN_MXIDS}
+      - MATRIX_REQUIRE_MENTION=1
+      - MATRIX_MENTION_ALIASES=postgres-admin-agent,pg-admin-agent
+      - LLM_BASE_URL=${LLM_BASE_URL}
+      - LLM_API_KEY=${LLM_API_KEY}
+      - LLM_MODEL=${LLM_MODEL}
+      - PROMETHEUS_URL=http://prometheus:9090
+      - METRICS_WINDOW_MINUTES=${METRICS_WINDOW_MINUTES:-60}
+      - HEALTH_HTTP_ADDR=0.0.0.0:9100
+      - RESPONSE_TIMEOUT_SECONDS=60
+      - LLM_TIMEOUT_SECONDS=25
+      - ROLL_ID=20260630T0019Z
+      - CONFIRM_WRITES=1
+      - LOG_LEVEL=info
+
+  # Agent egress is deny-by-default, with only the local database, the sidecar
+  # Matrix proxy, internal Prometheus, Docker DNS, and the pinned LLM endpoint.
+  agent-egress-fw:
+    image: ghcr.io/attestmesh/agent-egress-fw@sha256:c75c9668e905ca00f86e9583505d52624ba87cb7114a4633f84330bb497ca58f
+    restart: unless-stopped
+    network_mode: service:postgres-admin-agent
+    depends_on:
+      - postgres-admin-agent
+    environment:
+      - LLM_BASE_URL=${LLM_BASE_URL}
+      - LLM_ALLOW_CIDRS=66.220.6.0/24
+      - INTERNAL_HOSTS=postgres sidecar prometheus
+      - ALLOW_DNS=127.0.0.11
+      - RERESOLVE_SECONDS=15
+    cap_add:
+      - NET_ADMIN
+
+  prometheus:
+    image: prom/prometheus:latest
+    restart: unless-stopped
+    user: root
+    volumes:
+      - prometheus-data:/prometheus
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        cat > /etc/prometheus/prometheus.yml <<'PROMYML'
+        global:
+          scrape_interval: 15s
+          scrape_timeout: 10s
+        scrape_configs:
+          - job_name: prometheus
+            static_configs:
+              - targets: ['localhost:9090']
+          - job_name: node
+            static_configs:
+              - targets: ['node-exporter:9100']
+          - job_name: cadvisor
+            static_configs:
+              - targets: ['cadvisor:8080']
+        PROMYML
+        exec /bin/prometheus \
+          --config.file=/etc/prometheus/prometheus.yml \
+          --storage.tsdb.path=/prometheus \
+          --storage.tsdb.retention.time=${METRICS_RETENTION_TIME:-3h} \
+          --storage.tsdb.retention.size=512MB \
+          --web.listen-address=0.0.0.0:9090
+
+  node-exporter:
+    image: prom/node-exporter:latest
+    restart: unless-stopped
+    pid: host
+    command:
+      - --path.procfs=/host/proc
+      - --path.sysfs=/host/sys
+      - --path.rootfs=/host/root
+      - --collector.filesystem.mount-points-exclude=^/(sys|proc|dev|host|etc)($$|/)
+      - --web.listen-address=0.0.0.0:9100
+    volumes:
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+      - /:/host/root:ro,rslave
+
+  cadvisor:
+    image: gcr.io/cadvisor/cadvisor:latest
+    restart: unless-stopped
+    privileged: true
+    command:
+      - --listen_ip=0.0.0.0
+      - --port=8080
+      - --housekeeping_interval=15s
+    volumes:
+      - /:/rootfs:ro
+      - /var/run:/var/run:ro
+      - /sys:/sys:ro
+      - /var/lib/docker/:/var/lib/docker:ro
+      - /dev/disk/:/dev/disk:ro
+    devices:
+      - /dev/kmsg
+
+volumes:
+  sidecar-state:
+  pgdata:
+  agent-sock:
+  prometheus-data:

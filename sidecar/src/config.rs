@@ -4,6 +4,7 @@
 
 use alloy::primitives::Address;
 use anyhow::{Context, Result};
+use std::path::PathBuf;
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -21,6 +22,12 @@ pub struct Config {
     /// ingress hostnames are `<app_id>-<port>s.<domain>`. Unset → mesh bring-up
     /// is skipped (registration-only mode).
     pub gateway_domain: Option<String>,
+    /// Send the sponsored PeerEndpoint envelope to a peer whose Ed25519 key is not
+    /// yet on chain (ed25519-onchain-key transitional fallback). Default OFF: mesh
+    /// key distribution is pure chain reads (peers publish `publishEd25519Key`), so
+    /// no sponsored key-messages fire. Set PEER_ENVELOPE_FALLBACK=true only to
+    /// interoperate with un-upgraded (pre-cut / old-sidecar) peers.
+    pub peer_envelope_fallback: bool,
     /// TCP port of the wg-over-TCP ingress (exposed through the gateway).
     /// `0` disables the ingress — only valid for hypothetical native-inbound-UDP
     /// fleets with no gateway in the path (udp-transport-upgrade spec, Open
@@ -39,6 +46,9 @@ pub struct Config {
     /// at 3600 s, so a never-punchable link settles on TCP without churn.
     pub punch_retry_backoff_secs: u64,
     pub dstack_socket: String,
+    /// Optional durable sidecar-only storage. Unset keeps the legacy network-only
+    /// restart behavior; production composes mount a named volume here.
+    pub sidecar_state_dir: Option<PathBuf>,
     pub agent_grpc_socket: String,
     pub health_http_addr: String,
     pub log_format: String,
@@ -71,6 +81,9 @@ impl Config {
                 Ok(s) if !s.trim().is_empty() => Some(s.trim().to_string()),
                 _ => None,
             },
+            peer_envelope_fallback: opt("PEER_ENVELOPE_FALLBACK", "false")
+                .trim()
+                .eq_ignore_ascii_case("true"),
             wg_tcp_port: opt("WG_TCP_PORT", "51900").parse().context("WG_TCP_PORT")?,
             wg_listen_port: opt("WG_LISTEN_PORT", "51821")
                 .parse()
@@ -85,6 +98,10 @@ impl Config {
                 .parse()
                 .context("PUNCH_RETRY_BACKOFF_SECS")?,
             dstack_socket: opt("DSTACK_SOCKET", "/var/run/dstack.sock"),
+            sidecar_state_dir: match std::env::var("SIDECAR_STATE_DIR") {
+                Ok(s) if !s.trim().is_empty() => Some(PathBuf::from(s.trim())),
+                _ => None,
+            },
             agent_grpc_socket: opt("AGENT_GRPC_SOCKET", "/var/run/attestmesh/agent.sock"),
             health_http_addr: opt("HEALTH_HTTP_ADDR", "127.0.0.1:9090"),
             log_format: opt("LOG_FORMAT", "json"),
@@ -132,6 +149,7 @@ mod tests {
             "PUNCH_TIMEOUT_SECS",
             "PUNCH_RETRY_BACKOFF_SECS",
             "DSTACK_SOCKET",
+            "SIDECAR_STATE_DIR",
             "AGENT_GRPC_SOCKET",
             "HEALTH_HTTP_ADDR",
             "LOG_FORMAT",
@@ -160,6 +178,7 @@ mod tests {
             "outer wg port must differ from the in-mesh heartbeat port 51820"
         );
         assert_eq!(c.dstack_socket, "/var/run/dstack.sock");
+        assert_eq!(c.sidecar_state_dir, None);
         assert_eq!(c.health_http_addr, "127.0.0.1:9090");
         assert!(c.wg_udp_punch, "punch upgrade defaults on");
         assert_eq!(c.punch_timeout_secs, 10);
@@ -225,5 +244,22 @@ mod tests {
         std::env::remove_var("RPC_URL");
         assert!(Config::from_env().is_err());
         set_required(); // restore for whoever runs next
+    }
+
+    #[test]
+    fn sidecar_state_dir_is_opt_in_and_blank_disables_it() {
+        let _g = ENV_LOCK.lock().unwrap();
+        set_required();
+        clear_optional();
+
+        std::env::set_var("SIDECAR_STATE_DIR", "   ");
+        assert_eq!(Config::from_env().unwrap().sidecar_state_dir, None);
+
+        std::env::set_var("SIDECAR_STATE_DIR", "/var/lib/attestmesh");
+        assert_eq!(
+            Config::from_env().unwrap().sidecar_state_dir,
+            Some(PathBuf::from("/var/lib/attestmesh"))
+        );
+        std::env::remove_var("SIDECAR_STATE_DIR");
     }
 }

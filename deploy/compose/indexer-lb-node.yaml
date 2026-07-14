@@ -1,0 +1,456 @@
+# Stable public front door for AttestMesh Indexer blue/green cutovers.
+#
+# The LB is itself a C3 member. HAProxy exposes the stable gateway ports:
+#   :50052  gRPC Subscribe stream (TCP/h2c to the active Indexer)
+#   :9090   Indexer HTTP health/status/read model
+# Its authenticated control API binds only to the mesh interface on :50053.
+#
+# A switch is deliberately two-phase. `prepare` probes the candidate and stops
+# accepting new frontend connections while existing gRPC streams continue. The
+# deploy driver then updates IndexerRegistry with the candidate signing key and
+# calls `commit`, which changes both HAProxy backends, closes old streams, and
+# re-enables the frontends. Sidecars reconnect through the stable endpoint.
+
+services:
+  sidecar:
+    image: ghcr.io/attestmesh/cluster-mesh-agent@sha256:e3d53442aa6e52d47227fb3528c1141302ad4fc63c4b3fb6dc38df7ce907d486
+    restart: unless-stopped
+    environment:
+      - CHAIN_ID=${CHAIN_ID}
+      - RPC_URL=${RPC_URL}
+      - BUNDLER_URL=${BUNDLER_URL}
+      - GAS_POLICY_ID=${GAS_POLICY_ID}
+      - INDEXER_REGISTRY_ADDR=${INDEXER_REGISTRY_ADDR}
+      - GATEWAY_DOMAIN=${GATEWAY_DOMAIN}
+      - DSTACK_SOCKET=/var/run/dstack.sock
+      - SIDECAR_STATE_DIR=/var/lib/attestmesh
+      - AGENT_GRPC_SOCKET=/var/run/attestmesh/agent.sock
+      # :9090 belongs to the proxied Indexer HTTP frontend.
+      - HEALTH_HTTP_ADDR=0.0.0.0:9091
+      - LOG_FORMAT=pretty
+      - LOG_LEVEL=info,cluster_mesh_agent=debug
+    volumes:
+      - /var/run/dstack.sock:/var/run/dstack.sock
+      - sidecar-state:/var/lib/attestmesh
+      - agent-sock:/var/run/attestmesh
+    ports:
+      - "51900:51900"
+      - "50051:50051"
+      - "50052:50052"
+      - "50053:50053"
+      - "9090:9090"
+      - "9091:9091"
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun
+
+  registration-calldata:
+    image: ghcr.io/attestmesh/cluster-mesh-agent@sha256:e3d53442aa6e52d47227fb3528c1141302ad4fc63c4b3fb6dc38df7ce907d486
+    restart: "no"
+    depends_on:
+      - sidecar
+    entrypoint: ["/usr/local/bin/attestmesh-registration-calldata"]
+    environment:
+      - CLUSTER=${CLUSTER}
+      - DSTACK_SOCKET=/var/run/dstack.sock
+      - REGISTRATION_HELPER_ADDR=0.0.0.0:9092
+    ports:
+      - "9092:9092"
+    volumes:
+      - /var/run/dstack.sock:/var/run/dstack.sock
+
+  haproxy:
+    image: haproxy:3.0-alpine
+    restart: unless-stopped
+    user: "0:0"
+    network_mode: service:sidecar
+    depends_on:
+      - sidecar
+    environment:
+      - APP_ENV_B64=${APP_ENV_B64}
+    volumes:
+      - haproxy-run:/indexer-lb-run
+      - indexer-lb-state:/indexer-lb-state
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - |
+        set -u
+        printf '%s' "$${APP_ENV_B64:-}" | base64 -d > /tmp/indexer-lb.env
+        set -a
+        . /tmp/indexer-lb.env
+        set +a
+        mkdir -p /indexer-lb-run /indexer-lb-state
+        rm -f /indexer-lb-run/admin.sock
+        active="$${INDEXER_LB_INITIAL_BACKEND:-}"
+        if [ -s /indexer-lb-state/active_backend ]; then
+          active="$$(cat /indexer-lb-state/active_backend)"
+        fi
+        if echo "$$active" | grep -Eq '^([0-9]{1,3}\.){3}[0-9]{1,3}$$'; then
+          grpc_server="server active $${active}:50052 check"
+          http_server="server active $${active}:9090 check"
+        else
+          grpc_server="server active 127.0.0.1:1 check disabled"
+          http_server="server active 127.0.0.1:1 check disabled"
+        fi
+        cat >/tmp/indexer-lb-haproxy.cfg <<CFG
+        global
+          maxconn 4096
+          stats socket /indexer-lb-run/admin.sock mode 660 level admin expose-fd listeners
+          stats timeout 30s
+
+        defaults
+          mode tcp
+          timeout connect 10s
+          timeout client 1h
+          timeout server 1h
+          timeout check 10s
+
+        frontend indexer_grpc
+          mode tcp
+          bind 0.0.0.0:50052
+          default_backend indexer_grpc_active
+
+        backend indexer_grpc_active
+          mode tcp
+          option tcp-check
+          default-server inter 3s fall 2 rise 2 on-marked-down shutdown-sessions
+          $$grpc_server
+
+        frontend indexer_http
+          mode http
+          bind 0.0.0.0:9090
+          option http-keep-alive
+          default_backend indexer_http_active
+
+        backend indexer_http_active
+          mode http
+          option httpchk GET /healthz
+          http-check expect status 200
+          default-server inter 3s fall 2 rise 2 on-marked-down shutdown-sessions
+          $$http_server
+        CFG
+        exec haproxy -f /tmp/indexer-lb-haproxy.cfg -db
+
+  controller:
+    image: python:3.11-alpine
+    restart: unless-stopped
+    network_mode: service:sidecar
+    depends_on:
+      - sidecar
+      - haproxy
+    environment:
+      - APP_ENV_B64=${APP_ENV_B64}
+    volumes:
+      - haproxy-run:/indexer-lb-run
+      - indexer-lb-state:/indexer-lb-state
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - |
+        printf '%s' "$${APP_ENV_B64:-}" | base64 -d > /tmp/indexer-lb.env
+        set -a
+        . /tmp/indexer-lb.env
+        set +a
+        cat >/tmp/indexer_lb_controller.py <<'PY'
+        import fcntl
+        import hmac
+        import ipaddress
+        import json
+        import os
+        import re
+        import socket
+        import struct
+        import time
+        import urllib.request
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+        ADMIN_KEY = os.environ.get("INDEXER_LB_ADMIN_KEY", "")
+        SOCKET_PATH = "/indexer-lb-run/admin.sock"
+        ACTIVE_BACKEND_PATH = "/indexer-lb-state/active_backend"
+        ACTIVE_PUBKEY_PATH = "/indexer-lb-state/active_pubkey"
+        PREPARED_PATH = "/indexer-lb-state/prepared.json"
+        PUBKEY_RE = re.compile(r"^0x[0-9a-fA-F]{64}$")
+
+        if not ADMIN_KEY:
+            raise SystemExit("INDEXER_LB_ADMIN_KEY is required")
+
+        def mesh_ip() -> str:
+            while True:
+                sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                try:
+                    packed = struct.pack("256s", b"attestmesh0"[:15])
+                    return socket.inet_ntoa(
+                        fcntl.ioctl(sock.fileno(), 0x8915, packed)[20:24]
+                    )
+                except OSError:
+                    time.sleep(1)
+                finally:
+                    sock.close()
+
+        def read_text(path: str) -> str:
+            try:
+                with open(path, "r", encoding="utf-8") as fh:
+                    return fh.read().strip()
+            except FileNotFoundError:
+                return ""
+
+        def write_text(path: str, value: str) -> None:
+            tmp = path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as fh:
+                fh.write(value + "\n")
+            os.replace(tmp, path)
+
+        def read_prepared() -> dict:
+            try:
+                with open(PREPARED_PATH, "r", encoding="utf-8") as fh:
+                    value = json.load(fh)
+                    return value if isinstance(value, dict) else {}
+            except (FileNotFoundError, ValueError):
+                return {}
+
+        def write_prepared(value: dict) -> None:
+            tmp = PREPARED_PATH + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as fh:
+                json.dump(value, fh, sort_keys=True)
+            os.replace(tmp, PREPARED_PATH)
+
+        def clear_prepared() -> None:
+            try:
+                os.unlink(PREPARED_PATH)
+            except FileNotFoundError:
+                pass
+
+        def haproxy_cmd(command: str) -> str:
+            sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            sock.settimeout(10)
+            sock.connect(SOCKET_PATH)
+            sock.sendall((command.rstrip() + "\n").encode("utf-8"))
+            sock.shutdown(socket.SHUT_WR)
+            chunks = []
+            while True:
+                chunk = sock.recv(4096)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+            sock.close()
+            output = b"".join(chunks).decode("utf-8", errors="replace")
+            if output.lstrip().startswith("Unknown command"):
+                raise RuntimeError(output.strip())
+            return output
+
+        def validate_backend(value: str) -> str:
+            try:
+                ip = ipaddress.IPv4Address(value)
+            except Exception as exc:
+                raise ValueError("backend must be an IPv4 address") from exc
+            if not ip.is_private:
+                raise ValueError("backend must be a private bridge or mesh address")
+            return str(ip)
+
+        def normalize_pubkey(value: str) -> str:
+            value = value.strip().lower()
+            if not PUBKEY_RE.fullmatch(value):
+                raise ValueError("expected_pubkey must be a 32-byte 0x hex value")
+            return value
+
+        def probe_backend(ip: str, expected_pubkey: str) -> dict:
+            with socket.create_connection((ip, 50052), timeout=10):
+                pass
+            with urllib.request.urlopen(f"http://{ip}:9090/healthz", timeout=10) as resp:
+                health_body = resp.read(2048).decode("utf-8", errors="replace")
+                if resp.status != 200:
+                    raise RuntimeError(
+                        f"health probe returned HTTP {resp.status}: {health_body[:200]}"
+                    )
+            with urllib.request.urlopen(f"http://{ip}:9090/status", timeout=10) as resp:
+                status = json.load(resp)
+            actual_pubkey = normalize_pubkey(str(status.get("pubKey", "")))
+            if actual_pubkey != expected_pubkey:
+                raise RuntimeError(
+                    f"backend pubkey mismatch: expected {expected_pubkey}, got {actual_pubkey}"
+                )
+            health = status.get("health") or {}
+            if health.get("ok") is not True:
+                raise RuntimeError(f"backend status is unhealthy: {health}")
+            return {
+                "health": health_body[:500],
+                "pubkey": actual_pubkey,
+                "status": status,
+            }
+
+        def frontends(enabled: bool) -> None:
+            verb = "enable" if enabled else "disable"
+            haproxy_cmd(f"{verb} frontend indexer_grpc")
+            haproxy_cmd(f"{verb} frontend indexer_http")
+
+        def set_backend(ip: str) -> dict:
+            outputs = {}
+            outputs["grpc_set"] = haproxy_cmd(
+                f"set server indexer_grpc_active/active addr {ip} port 50052"
+            )
+            outputs["http_set"] = haproxy_cmd(
+                f"set server indexer_http_active/active addr {ip} port 9090"
+            )
+            outputs["grpc_enable"] = haproxy_cmd(
+                "enable server indexer_grpc_active/active"
+            )
+            outputs["http_enable"] = haproxy_cmd(
+                "enable server indexer_http_active/active"
+            )
+            return outputs
+
+        def close_sessions() -> dict:
+            return {
+                "grpc": haproxy_cmd(
+                    "shutdown sessions server indexer_grpc_active/active"
+                ),
+                "http": haproxy_cmd(
+                    "shutdown sessions server indexer_http_active/active"
+                ),
+            }
+
+        class Handler(BaseHTTPRequestHandler):
+            def _json(self, status: int, payload: dict) -> None:
+                data = json.dumps(payload, sort_keys=True).encode("utf-8")
+                self.send_response(status)
+                self.send_header("content-type", "application/json")
+                self.send_header("content-length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+
+            def _authorized(self) -> bool:
+                supplied = self.headers.get("authorization", "")
+                return hmac.compare_digest(supplied, f"Bearer {ADMIN_KEY}")
+
+            def _body(self) -> dict:
+                length = min(int(self.headers.get("content-length", "0") or 0), 4096)
+                value = json.loads(self.rfile.read(length).decode("utf-8") or "{}")
+                if not isinstance(value, dict):
+                    raise ValueError("request body must be a JSON object")
+                return value
+
+            def do_GET(self) -> None:
+                if self.path not in ("/healthz", "/active"):
+                    self._json(404, {"error": "not found"})
+                    return
+                socket_ok = os.path.exists(SOCKET_PATH)
+                state = ""
+                if socket_ok:
+                    try:
+                        state = haproxy_cmd("show servers state")[:8000]
+                    except Exception as exc:
+                        state = f"error: {type(exc).__name__}: {exc}"
+                self._json(
+                    200,
+                    {
+                        "active_backend": read_text(ACTIVE_BACKEND_PATH),
+                        "active_pubkey": read_text(ACTIVE_PUBKEY_PATH),
+                        "prepared": read_prepared(),
+                        "haproxy_socket": socket_ok,
+                        "haproxy_state": state,
+                    },
+                )
+
+            def do_POST(self) -> None:
+                if self.path not in ("/prepare", "/commit", "/abort"):
+                    self._json(404, {"error": "not found"})
+                    return
+                if not self._authorized():
+                    self._json(401, {"error": "unauthorized"})
+                    return
+                try:
+                    if self.path == "/prepare":
+                        body = self._body()
+                        backend = validate_backend(str(body.get("backend", "")).strip())
+                        pubkey = normalize_pubkey(
+                            str(body.get("expected_pubkey", ""))
+                        )
+                        probe = probe_backend(backend, pubkey)
+                        prepared = {
+                            "backend": backend,
+                            "pubkey": pubkey,
+                            "prepared_at": int(time.time()),
+                        }
+                        write_prepared(prepared)
+                        try:
+                            frontends(False)
+                        except Exception:
+                            clear_prepared()
+                            frontends(True)
+                            raise
+                        self._json(200, {"prepared": prepared, "probe": probe})
+                        return
+
+                    if self.path == "/abort":
+                        clear_prepared()
+                        frontends(True)
+                        self._json(
+                            200,
+                            {"aborted": True, "active_backend": read_text(ACTIVE_BACKEND_PATH)},
+                        )
+                        return
+
+                    prepared = read_prepared()
+                    if not prepared:
+                        self._json(409, {"error": "no prepared backend"})
+                        return
+                    backend = validate_backend(str(prepared.get("backend", "")))
+                    pubkey = normalize_pubkey(str(prepared.get("pubkey", "")))
+                    # Re-probe after the on-chain registry transaction, immediately
+                    # before changing the data plane.
+                    probe = probe_backend(backend, pubkey)
+                    previous = read_text(ACTIVE_BACKEND_PATH)
+                    try:
+                        changed = set_backend(backend)
+                        sessions = close_sessions()
+                        frontends(True)
+                        write_text(ACTIVE_BACKEND_PATH, backend)
+                        write_text(ACTIVE_PUBKEY_PATH, pubkey)
+                        clear_prepared()
+                    except Exception:
+                        if previous:
+                            set_backend(validate_backend(previous))
+                        frontends(True)
+                        raise
+                    self._json(
+                        200,
+                        {
+                            "active_backend": backend,
+                            "active_pubkey": pubkey,
+                            "previous_backend": previous,
+                            "probe": probe,
+                            "haproxy": changed,
+                            "closed_sessions": sessions,
+                        },
+                    )
+                except Exception as exc:
+                    self._json(400, {"error": f"{type(exc).__name__}: {exc}"})
+
+            def log_message(self, fmt: str, *args) -> None:
+                print(
+                    f"indexer-lb-controller: {self.address_string()} {fmt % args}",
+                    flush=True,
+                )
+
+        for _ in range(120):
+            if os.path.exists(SOCKET_PATH):
+                break
+            time.sleep(1)
+        if not os.path.exists(SOCKET_PATH):
+            raise SystemExit("HAProxy runtime socket did not appear")
+        # A controller restart must never leave frontends paused from an abandoned
+        # prepare operation.
+        if read_prepared():
+            clear_prepared()
+            frontends(True)
+        ip = mesh_ip()
+        print(f"indexer-lb-controller: listening on {ip}:50053", flush=True)
+        ThreadingHTTPServer((ip, 50053), Handler).serve_forever()
+        PY
+        exec python3 /tmp/indexer_lb_controller.py
+
+volumes:
+  sidecar-state:
+  agent-sock:
+  haproxy-run:
+  indexer-lb-state:

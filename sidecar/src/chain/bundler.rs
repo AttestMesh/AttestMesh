@@ -28,36 +28,72 @@ use std::time::Duration;
 /// recovers 0x7E5F…Bdf); the recovered address is irrelevant to estimation.
 const DUMMY_SIGNATURE: &str = "0x6f79009346b958973a8481f680a44b5075d56562b39aff2104395323b6bc666a2302f4e19a7da13bef02c866971d5b35ce8c0ad27542a1c476e103b99a7b6cd61b";
 
+/// Which sponsorship dialect the bundler endpoint speaks. Detected from the URL so
+/// cutover is a pure env change (`BUNDLER_URL`), no new config knob.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SponsorshipMode {
+    /// `alchemy_requestGasAndPaymasterAndData` (policyId keyed).
+    Alchemy,
+    /// Pimlico: `pimlico_getUserOperationGasPrice` + `pm_sponsorUserOperation`
+    /// (sponsorshipPolicyId context). NOTE: Pimlico sponsorships expire ~10 minutes
+    /// after issuance — safe here because `submit` builds + sponsors per attempt and
+    /// nothing caches a signed op (docs/research/paymaster-provider-selection.md).
+    Pimlico,
+}
+
+fn detect_mode(url: &str) -> SponsorshipMode {
+    if url.contains("pimlico.io") {
+        SponsorshipMode::Pimlico
+    } else {
+        SponsorshipMode::Alchemy
+    }
+}
+
 pub struct BundlerClient {
     http: reqwest::Client,
     url: String,
+    /// Node RPC for plain chain reads (`eth_call` for EntryPoint.getNonce). Alchemy
+    /// happened to serve both APIs on one URL; Pimlico is bundler+paymaster ONLY, so
+    /// node methods must never go to the bundler endpoint.
+    node_rpc_url: String,
     entry_point: Address,
     chain_id: u64,
-    /// Alchemy Gas Manager policy id used by `alchemy_requestGasAndPaymasterAndData`.
+    /// Sponsorship policy id: Alchemy Gas Manager `policyId` or Pimlico
+    /// `sponsorshipPolicyId` (`sp_…`), depending on `mode`.
     gas_policy_id: String,
+    mode: SponsorshipMode,
 }
 
 impl BundlerClient {
     pub fn new(
         url: impl Into<String>,
+        node_rpc_url: impl Into<String>,
         entry_point: Address,
         chain_id: u64,
         gas_policy_id: impl Into<String>,
     ) -> Self {
+        let url = url.into();
+        let mode = detect_mode(&url);
         Self {
             http: reqwest::Client::new(),
-            url: url.into(),
+            url,
+            node_rpc_url: node_rpc_url.into(),
             entry_point,
             chain_id,
             gas_policy_id: gas_policy_id.into(),
+            mode,
         }
     }
 
     async fn rpc(&self, method: &str, params: Value) -> Result<Value> {
+        self.rpc_to(&self.url, method, params).await
+    }
+
+    async fn rpc_to(&self, url: &str, method: &str, params: Value) -> Result<Value> {
         let body = json!({ "jsonrpc": "2.0", "id": 1, "method": method, "params": params });
         let resp: Value = self
             .http
-            .post(&self.url)
+            .post(url)
             .json(&body)
             .send()
             .await
@@ -103,9 +139,48 @@ impl BundlerClient {
         self.await_receipt(user_op_hash).await
     }
 
-    /// Ask Alchemy for gas limits + paymaster sponsorship for `op` (using a dummy
-    /// signature), then populate the op. Must run before signing (F2).
+    /// Request gas limits + paymaster sponsorship for `op` (using a dummy signature),
+    /// then populate the op. Must run before signing (F2). Dispatches on the detected
+    /// provider dialect.
     async fn apply_sponsorship(&self, op: &mut UserOperation) -> Result<()> {
+        match self.mode {
+            SponsorshipMode::Alchemy => self.apply_sponsorship_alchemy(op).await,
+            SponsorshipMode::Pimlico => self.apply_sponsorship_pimlico(op).await,
+        }
+    }
+
+    /// Pimlico flow: fees FIRST (the paymaster signature commits to them), then one
+    /// `pm_sponsorUserOperation` call returns gas limits + paymaster fields.
+    async fn apply_sponsorship_pimlico(&self, op: &mut UserOperation) -> Result<()> {
+        let prices = self
+            .rpc("pimlico_getUserOperationGasPrice", json!([]))
+            .await
+            .context("pimlico_getUserOperationGasPrice")?;
+        apply_pimlico_gas_price(op, &prices)?;
+
+        let mut partial = op.clone();
+        partial.signature = DUMMY_SIGNATURE
+            .parse::<Bytes>()
+            .expect("static dummy signature parses");
+        let params = if self.gas_policy_id.is_empty() {
+            json!([userop_json(&partial), self.entry_point])
+        } else {
+            json!([
+                userop_json(&partial),
+                self.entry_point,
+                { "sponsorshipPolicyId": self.gas_policy_id }
+            ])
+        };
+        let resp = self
+            .rpc("pm_sponsorUserOperation", params)
+            .await
+            .context("pm_sponsorUserOperation")?;
+        apply_pimlico_sponsorship_response(op, &resp)
+    }
+
+    /// Alchemy Gas Manager flow: one proprietary call returns fees, gas limits, and
+    /// paymaster fields together.
+    async fn apply_sponsorship_alchemy(&self, op: &mut UserOperation) -> Result<()> {
         let partial = json!({
             "sender": op.sender,
             "nonce": format!("0x{:x}", op.nonce),
@@ -126,10 +201,13 @@ impl BundlerClient {
     }
 
     /// EIP-4337 account nonce: `EntryPoint.getNonce(sender, key=0)` via `eth_call`
-    /// (there is no bundler RPC for this; the Alchemy endpoint serves both APIs).
+    /// against the NODE RPC (there is no bundler RPC for this; paymaster-only
+    /// providers like Pimlico reject node methods — live-found: this call sent to
+    /// the bundler URL failed before any sponsorship request was ever made).
     async fn get_nonce(&self, sender: Address) -> Result<U256> {
         let r = self
-            .rpc(
+            .rpc_to(
+                &self.node_rpc_url,
                 "eth_call",
                 json!([{"to": self.entry_point, "data": get_nonce_calldata(sender)}, "latest"]),
             )
@@ -191,6 +269,54 @@ fn apply_sponsorship_response(op: &mut UserOperation, resp: &Value) -> Result<()
             .context("sponsorship response has paymaster but no paymasterData")?;
         op.paymaster_data = pd.parse::<Bytes>().context("paymasterData")?;
     }
+    Ok(())
+}
+
+/// Set `op`'s fee fields from a `pimlico_getUserOperationGasPrice` result ("standard"
+/// tier). Pure so it is unit-testable without a live endpoint.
+fn apply_pimlico_gas_price(op: &mut UserOperation, resp: &Value) -> Result<()> {
+    let tier = resp
+        .get("standard")
+        .context("gas price response missing 'standard' tier")?;
+    let req_u256 = |k: &str| -> Result<U256> {
+        tier.get(k)
+            .and_then(|v| v.as_str())
+            .and_then(|s| U256::from_str_radix(s.trim_start_matches("0x"), 16).ok())
+            .with_context(|| format!("gas price response missing/invalid standard.{k}"))
+    };
+    op.max_fee_per_gas = req_u256("maxFeePerGas")?;
+    op.max_priority_fee_per_gas = req_u256("maxPriorityFeePerGas")?;
+    Ok(())
+}
+
+/// Populate `op`'s gas limits + paymaster fields from a `pm_sponsorUserOperation`
+/// (v0.7) result. Fee fields were set beforehand and are NOT in this response.
+/// Pure (no I/O) so the F2 invariant stays unit-testable.
+fn apply_pimlico_sponsorship_response(op: &mut UserOperation, resp: &Value) -> Result<()> {
+    let req_u256 = |k: &str| -> Result<U256> {
+        resp.get(k)
+            .and_then(|v| v.as_str())
+            .and_then(|s| U256::from_str_radix(s.trim_start_matches("0x"), 16).ok())
+            .with_context(|| format!("pm_sponsorUserOperation missing/invalid {k}"))
+    };
+    op.call_gas_limit = req_u256("callGasLimit")?;
+    op.verification_gas_limit = req_u256("verificationGasLimit")?;
+    op.pre_verification_gas = req_u256("preVerificationGas")?;
+
+    // Unlike Alchemy's method, a pm_sponsorUserOperation success ALWAYS sponsors:
+    // missing paymaster fields mean a malformed response, not "not sponsored".
+    let pm = resp
+        .get("paymaster")
+        .and_then(|v| v.as_str())
+        .context("pm_sponsorUserOperation response missing paymaster")?;
+    op.paymaster = Some(pm.parse().context("paymaster address")?);
+    op.paymaster_verification_gas_limit = req_u256("paymasterVerificationGasLimit")?;
+    op.paymaster_post_op_gas_limit = req_u256("paymasterPostOpGasLimit")?;
+    let pd = resp
+        .get("paymasterData")
+        .and_then(|v| v.as_str())
+        .context("pm_sponsorUserOperation response missing paymasterData")?;
+    op.paymaster_data = pd.parse::<Bytes>().context("paymasterData")?;
     Ok(())
 }
 
@@ -291,6 +417,71 @@ mod tests {
             without, with_hash,
             "paymasterAndData must change the userOpHash; sign AFTER sponsorship (F2)"
         );
+    }
+}
+
+#[cfg(test)]
+mod pimlico_tests {
+    use super::*;
+
+    #[test]
+    fn mode_detected_from_url() {
+        assert_eq!(
+            detect_mode("https://api.pimlico.io/v2/8453/rpc?apikey=x"),
+            SponsorshipMode::Pimlico
+        );
+        assert_eq!(
+            detect_mode("https://base-mainnet.g.alchemy.com/v2/key"),
+            SponsorshipMode::Alchemy
+        );
+    }
+
+    #[test]
+    fn gas_price_applies_standard_tier() {
+        let mut op = UserOperation::new(Address::repeat_byte(1), U256::ZERO, Bytes::new());
+        let resp = json!({
+            "slow": {"maxFeePerGas": "0x1", "maxPriorityFeePerGas": "0x1"},
+            "standard": {"maxFeePerGas": "0x3b9aca00", "maxPriorityFeePerGas": "0xf4240"},
+            "fast": {"maxFeePerGas": "0x77359400", "maxPriorityFeePerGas": "0x1e8480"}
+        });
+        apply_pimlico_gas_price(&mut op, &resp).unwrap();
+        assert_eq!(op.max_fee_per_gas, U256::from(1_000_000_000u64));
+        assert_eq!(op.max_priority_fee_per_gas, U256::from(1_000_000u64));
+    }
+
+    #[test]
+    fn sponsorship_response_populates_limits_and_paymaster() {
+        let mut op = UserOperation::new(Address::repeat_byte(1), U256::ZERO, Bytes::new());
+        op.max_fee_per_gas = U256::from(7u64); // set beforehand; must survive untouched
+        let resp = json!({
+            "callGasLimit": "0x186a0",
+            "verificationGasLimit": "0x186a0",
+            "preVerificationGas": "0xc350",
+            "paymaster": "0x2222222222222222222222222222222222222222",
+            "paymasterVerificationGasLimit": "0x10000",
+            "paymasterPostOpGasLimit": "0x8000",
+            "paymasterData": "0xdeadbeef"
+        });
+        apply_pimlico_sponsorship_response(&mut op, &resp).unwrap();
+        assert_eq!(op.call_gas_limit, U256::from(100_000u64));
+        assert_eq!(
+            op.max_fee_per_gas,
+            U256::from(7u64),
+            "fees set pre-sponsorship survive"
+        );
+        assert!(op.paymaster.is_some());
+        assert_eq!(op.paymaster_data.len(), 4);
+    }
+
+    #[test]
+    fn sponsorship_response_without_paymaster_is_an_error() {
+        let mut op = UserOperation::new(Address::repeat_byte(1), U256::ZERO, Bytes::new());
+        let resp = json!({
+            "callGasLimit": "0x186a0",
+            "verificationGasLimit": "0x186a0",
+            "preVerificationGas": "0xc350"
+        });
+        assert!(apply_pimlico_sponsorship_response(&mut op, &resp).is_err());
     }
 }
 

@@ -1,0 +1,35 @@
+{
+  "appEnvB64": "UE9TVEdSRVNfREI9cG9zdGdyZXMKUE9TVEdSRVNfSU5JVERCX0FSR1M9LS1lbmNvZGluZz1VVEY4IC0tbG9jYWxlPUMKUE9TVEdSRVNfUEFTU1dPUkQ9cGdfYWYxM2IwN2QxZDcwZTEzMDE4ZTBlY2QzNWY2NDUzNmY2YjdiClBPU1RHUkVTX1VTRVI9cG9zdGdyZXMK",
+  "appId": "0xfc3a43BFf93030451924DEa78F219515c9771d62",
+  "box": {
+    "disk": "160",
+    "mem": "16384",
+    "vcpu": "8"
+  },
+  "catalogId": "postgres",
+  "cluster": "0x07a0adb8F96EeF2D210A74EeBf2Ae2f4E5Beb273",
+  "composeHash": "e4f3d0a1f86927e4563e2edcd839b14dd5e00f1f9a0b3309ea496f3e352d1ed7",
+  "composePath": "/home/ubuntu/teemesh/deploy/orchestrator/compose/net-open-webhost-postgres-38a797.yaml",
+  "connection": {
+    "database": "postgres",
+    "host": "meshIp",
+    "kind": "postgres",
+    "port": 5432,
+    "user": "postgres"
+  },
+  "createdAt": "2026-07-07T06:00:30Z",
+  "error": "interrupted test deployment; VM stopped after replacement succeeded",
+  "flavor": "large",
+  "id": "38a797e61a79416f",
+  "imageRef": "postgres:16-alpine",
+  "logPath": "/home/ubuntu/teemesh/deploy/logs/orchestrator-net-open-webhost-postgres-38a797.log",
+  "logTail": "env loaded: chain=8453 deployer=0x60b174704AdAf2b0BF87B426B364D6EbD81818E1 org_safe=0x60b174704AdAf2b0BF87B426B364D6EbD81818E1 kms_root=0x52d3cf51c8a37a2ccfc79bbb98c7810d7dd4ce51\n[20260707T060030Z] === generic AttestMesh node: net-open-webhost-postgres-38a797 ===\n[20260707T060030Z] ▶ box deploy_app generic node=net-open-webhost-postgres-38a797 compose=/home/ubuntu/teemesh/deploy/orchestrator/compose/net-open-webhost-postgres-38a797.yaml cluster=0x07a0adb8F96EeF2D210A74EeBf2Ae2f4E5Beb273 (create stopped)\nHTTP Request: POST https://127.0.0.1:9101/prpc/KMS.GetAppEnvEncryptPubKey?json \"HTTP/1.1 200 OK\"\nHTTP Request: POST http://127.0.0.1:9080/prpc/CreateVm?json \"HTTP/1.1 200 OK\"\n[20260707T060037Z] ✔ deployed generic node app_id=0xfc3a43BFf93030451924DEa78F219515c9771d62 compose_hash=e4f3d0a1f86927e4563e2edcd839b14dd5e00f1f9a0b3309ea496f3e352d1ed7 vm=2478e6e4-162a-46ad-8f43-aca1a8ad326d\n[20260707T060037Z] === generic AttestMesh node: net-open-webhost-postgres-38a797 ===\n[20260707T060037Z] BUNDLER_URL equals RPC_URL; continuing because some providers multiplex bundler + node RPC\n[20260707T060037Z] FATAL: missing compose file: /home/ubuntu/teemesh/deploy/compose/generic-node.yaml\n[20260707T060037Z] === generic AttestMesh node: net-open-webhost-postgres-38a797 ===\n[20260707T060037Z] BUNDLER_URL equals RPC_URL; continuing because some providers multiplex bundler + node RPC\n[20260707T060037Z] FATAL: missing compose file: /home/ubuntu/teemesh/deploy/compose/generic-node.yaml\n[20260707T060037Z] === generic AttestMesh node: net-open-webhost-postgres-38a797 ===\n[20260707T060037Z] BUNDLER_URL equals RPC_URL; continuing because some providers multiplex bundler + node RPC\n[20260707T060037Z] FATAL: missing compose file: /home/ubuntu/teemesh/deploy/compose/generic-node.yaml\n[20260707T060037Z] === C3 AttestMesh indexer member: net-open-webhost-postgres-38a797 ===\n[20260707T060038Z] … waiting for registration helper calldata (1/60)\n[20260707T060044Z] … waiting for registration helper calldata (2/60)\n[20260707T060049Z] … waiting for registration helper calldata (3/60)\n[20260707T060054Z] … waiting for registration helper calldata (4/60)\n[20260707T060100Z] … waiting for registration helper calldata (5/60)\n[20260707T060106Z] … waiting for registration helper calldata (6/60)\n[20260707T060111Z] … waiting for registration helper calldata (7/60)\n[20260707T060117Z] … waiting for registration helper calldata (8/60)\n[20260707T060122Z] … waiting for registration helper calldata (9/60)\n[20260707T060128Z] … waiting for registration helper calldata (10/60)\n[20260707T060133Z] … waiting for registration helper calldata (11/60)",
+  "memberImpl": "0x7d5536a06b5fbe4c51e6995bdb0543b7887b3da4",
+  "name": "postgres",
+  "networkId": "net_open_webhost",
+  "nodeName": "net-open-webhost-postgres-38a797",
+  "source": "catalog",
+  "status": "failed",
+  "updatedAt": "2026-07-07T06:09:42Z",
+  "vmId": "2478e6e4-162a-46ad-8f43-aca1a8ad326d"
+}

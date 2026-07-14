@@ -36,7 +36,7 @@ jobs:
           file: ./sidecar/Dockerfile
           push: true
           tags: |
-            ghcr.io/attestmesh/cluster-mesh-agent:latest
+            ${{ github.ref == 'refs/heads/main' && 'ghcr.io/attestmesh/cluster-mesh-agent:latest' || '' }}
             ghcr.io/attestmesh/cluster-mesh-agent:${{ github.sha }}
           cache-from: type=gha
           cache-to: type=gha,mode=max

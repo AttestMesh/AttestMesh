@@ -10,6 +10,7 @@ use attestmesh_indexer::health::{self, Health};
 use attestmesh_indexer::identity::Identity;
 use attestmesh_indexer::metrics::Metrics;
 use attestmesh_indexer::pb::indexer_server::IndexerServer;
+use attestmesh_indexer::query::ReadModel;
 use attestmesh_indexer::registry;
 use attestmesh_indexer::runtime::Runtime;
 use attestmesh_indexer::state::cursor::SledCursorStore;
@@ -65,8 +66,30 @@ async fn main() -> Result<()> {
 
     let metrics = Arc::new(Metrics::new());
     let healthstate = Arc::new(Health::new(metrics.clone()));
+    let read_model = Arc::new(ReadModel::new());
 
     let config = Arc::new(config);
+
+    // Start the HTTP surface before catch-up. Catch-up can take a while on a
+    // public RPC, and operators still need /status for the signing pubkey and
+    // diagnostics while the read model is warming.
+    {
+        let addr = config.health_http_addr;
+        let h = healthstate.clone();
+        let m = metrics.clone();
+        let rm = read_model.clone();
+        let chain_id = config.chain_id;
+        let gateway_domain = config.gateway_domain.clone();
+        let identity_pubkey = B256::from_slice(&identity.signing_pubkey());
+        tokio::spawn(async move {
+            if let Err(e) =
+                health::serve(addr, h, m, rm, chain_id, gateway_domain, identity_pubkey).await
+            {
+                tracing::error!(error = %e, "health endpoint exited");
+            }
+        });
+    }
+
     let rt = Runtime {
         config: config.clone(),
         provider: provider.clone(),
@@ -74,6 +97,7 @@ async fn main() -> Result<()> {
         identity: identity.clone(),
         metrics: metrics.clone(),
         health: healthstate.clone(),
+        read_model: read_model.clone(),
     };
 
     // Catch up to head before accepting subscriptions (spec §3).
@@ -81,22 +105,11 @@ async fn main() -> Result<()> {
         tracing::error!(error = %e, "boot catch-up failed; entering loops to retry");
     }
 
-    // Health endpoint.
-    {
-        let addr = config.health_http_addr;
-        let h = healthstate.clone();
-        let m = metrics.clone();
-        tokio::spawn(async move {
-            if let Err(e) = health::serve(addr, h, m).await {
-                tracing::error!(error = %e, "health endpoint exited");
-            }
-        });
-    }
-
     // gRPC listener (spec §8). Built with the provider for subscribe-time catch-up.
     let svc = IndexerService::new(state.clone(), identity.clone(), metrics.clone())
         .with_provider(provider.clone())
-        .with_expected_code_id(code_id);
+        .with_expected_code_id(code_id)
+        .with_catchup_batch_size(config.block_batch_size);
     healthstate.set_grpc_accepting(true);
 
     // Runtime loops (spec §7).

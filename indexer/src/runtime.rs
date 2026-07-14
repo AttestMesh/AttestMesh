@@ -13,6 +13,7 @@ use crate::config::Config;
 use crate::health::Health;
 use crate::identity::Identity;
 use crate::metrics::Metrics;
+use crate::query::{MeshCidr, ReadModel};
 use crate::state::cursor::Cursor;
 use crate::state::IndexerState;
 use alloy::primitives::Address;
@@ -46,6 +47,32 @@ fn events_scan_start(last_indexed: u64, floor: u64) -> u64 {
     last_indexed.saturating_add(1).max(floor)
 }
 
+/// Factory discovery uses the same cursor rule as event indexing. In particular, a
+/// failed boot discovery must retry from the configured factory-deploy floor rather
+/// than accidentally scanning from genesis while `last_factory_block` is still zero.
+fn discovery_scan_start(last_scanned: u64, floor: u64) -> u64 {
+    last_scanned.saturating_add(1).max(floor)
+}
+
+async fn record_discovered_cluster(
+    state: &IndexerState,
+    read_model: &ReadModel,
+    deployment: crate::query::ClusterDeployment,
+    cidr: MeshCidr,
+) -> bool {
+    let inserted = state.add_cluster(deployment.cluster).await;
+    read_model.add_cluster(deployment, cidr).await;
+    inserted
+}
+
+async fn cluster_needs_hydration(
+    state: &IndexerState,
+    read_model: &ReadModel,
+    cluster: Address,
+) -> bool {
+    !state.is_known_cluster(cluster).await || !read_model.contains_cluster(cluster).await
+}
+
 /// Shared handles passed to the loops.
 #[derive(Clone)]
 pub struct Runtime {
@@ -55,6 +82,7 @@ pub struct Runtime {
     pub identity: Arc<Identity>,
     pub metrics: Arc<Metrics>,
     pub health: Arc<Health>,
+    pub read_model: Arc<ReadModel>,
 }
 
 impl Runtime {
@@ -78,11 +106,12 @@ impl Runtime {
                 to,
             )
             .await?;
-            for c in new {
-                self.state.add_cluster(c).await;
+            for d in new {
+                self.add_discovered_cluster(d).await?;
             }
         }
         self.state.set_last_factory_block(head).await;
+        self.read_model.set_scanned_to_block(head).await;
         self.metrics
             .clusters_watched
             .set(self.state.cluster_count().await as i64);
@@ -91,7 +120,12 @@ impl Runtime {
         let clusters = self.state.known_clusters().await;
         let start = events_scan_start(self.state.last_indexed_block().await, floor);
         let batch = self.config.block_batch_size.max(1);
-        tracing::info!(clusters = clusters.len(), start, head, "boot catch-up: paging cluster events");
+        tracing::info!(
+            clusters = clusters.len(),
+            start,
+            head,
+            "boot catch-up: paging cluster events"
+        );
         let mut batches = 0u64;
         if !clusters.is_empty() {
             for (from, to) in scan_ranges(start, head, batch) {
@@ -104,6 +138,7 @@ impl Runtime {
             }
         }
         self.state.set_last_indexed_block(head).await;
+        self.read_model.set_scanned_to_block(head).await;
         self.health.set_head_lag(0);
         tracing::info!(head, "boot catch-up complete");
         Ok(())
@@ -115,16 +150,92 @@ impl Runtime {
     /// subscribe (spec §8.2 step 5).
     async fn ingest_for_cache(&self, logs: &[watcher::IndexedLog]) {
         for log in logs {
-            if let watcher::EventKind::MemberRegistered { member_id } = log.kind {
-                // memberContract is the 2nd indexed topic of MemberRegistered.
-                if let Some(contract_topic) = log.topics.get(2) {
-                    let contract = Address::from_slice(&contract_topic.as_slice()[12..]);
-                    self.state
-                        .record_member(log.cluster_addr, member_id, contract, log.block_number)
-                        .await;
+            let mut registered_at = None;
+            if let watcher::EventKind::MemberRegistered {
+                member_id,
+                member_contract,
+                ..
+            } = log.kind
+            {
+                self.state
+                    .record_member(
+                        log.cluster_addr,
+                        member_id,
+                        member_contract,
+                        log.block_number,
+                    )
+                    .await;
+                match chain::member_registered_at(&self.provider, log.cluster_addr, member_id).await
+                {
+                    Ok(ts) => registered_at = Some(ts),
+                    Err(e) => {
+                        tracing::debug!(
+                            error = %e,
+                            cluster = %log.cluster_addr,
+                            member = %member_id,
+                            "could not read member registeredAt; using block number"
+                        );
+                    }
                 }
             }
+            self.read_model.ingest(log, registered_at).await;
         }
+    }
+
+    async fn add_discovered_cluster(
+        &self,
+        deployment: crate::query::ClusterDeployment,
+    ) -> anyhow::Result<bool> {
+        let cluster = deployment.cluster;
+        // Resolve metadata before mutating the known-cluster set. If this read fails,
+        // the next discovery pass must be able to retry the complete operation.
+        let (ip, prefix) = chain::mesh_cidr(&self.provider, cluster).await?;
+        Ok(record_discovered_cluster(
+            &self.state,
+            &self.read_model,
+            deployment,
+            MeshCidr { ip, prefix },
+        )
+        .await)
+    }
+
+    /// Hydrate a cluster found by the background discovery loop before making it
+    /// visible to the global watcher. The global event cursor may already be at head,
+    /// so a newly discovered cluster needs its own historical backfill or its members
+    /// and prior messages would be skipped forever.
+    async fn hydrate_discovered_cluster(
+        &self,
+        deployment: crate::query::ClusterDeployment,
+        indexed_through: u64,
+    ) -> anyhow::Result<bool> {
+        let cluster = deployment.cluster;
+        if !cluster_needs_hydration(&self.state, &self.read_model, cluster).await {
+            return Ok(false);
+        }
+
+        let (ip, prefix) = chain::mesh_cidr(&self.provider, cluster).await?;
+        let start = deployment.deployed_at_block.max(self.config.start_block);
+        let batch = self.config.block_batch_size.max(1);
+        let mut history = Vec::new();
+        for (from, to) in scan_ranges(start, indexed_through, batch) {
+            history.extend(watcher::poll_cluster_logs(&self.provider, &[cluster], from, to).await?);
+        }
+
+        let inserted = record_discovered_cluster(
+            &self.state,
+            &self.read_model,
+            deployment,
+            MeshCidr { ip, prefix },
+        )
+        .await;
+        self.ingest_for_cache(&history).await;
+        tracing::info!(
+            cluster = %cluster,
+            events = history.len(),
+            indexed_through,
+            "hydrated discovered cluster history"
+        );
+        Ok(inserted)
     }
 
     /// The block-watcher loop (spec §7.1) + inline dispatch (§7.3).
@@ -163,12 +274,16 @@ impl Runtime {
         let clusters = self.state.known_clusters().await;
         if !clusters.is_empty() {
             let batch = self.config.block_batch_size.max(1);
-            let mut from = last + 1;
+            let mut from = events_scan_start(last, self.config.start_block);
             while from <= head {
                 let to = (from + batch - 1).min(head);
                 let logs = watcher::poll_cluster_logs(&self.provider, &clusters, from, to).await?;
                 self.ingest_for_cache(&logs).await;
-                self.dispatch(&logs).await;
+                // Publish the indexed watermark before delivery. A subscription that
+                // races this batch may replay duplicates, but exact cursor filtering
+                // makes duplicates harmless and prevents a missed prefix.
+                self.state.set_last_indexed_block(to).await;
+                self.dispatch(&logs, &clusters, to).await;
                 from = to + 1;
             }
         }
@@ -178,7 +293,12 @@ impl Runtime {
     }
 
     /// Fan a chain-ordered batch of logs out to every relevant subscriber (spec §7.3).
-    async fn dispatch(&self, logs: &[watcher::IndexedLog]) {
+    async fn dispatch(
+        &self,
+        logs: &[watcher::IndexedLog],
+        clusters: &[Address],
+        indexed_through: u64,
+    ) {
         for log in logs {
             let subs = self
                 .state
@@ -198,14 +318,29 @@ impl Runtime {
                 // are per-session, but the signature bytes are identical across
                 // sessions for the same envelope — the attestation differs).
                 let env = sub.finalize(&self.identity, base.clone());
-                if sub.try_send(env) {
+                if sub.send_live(env).await {
                     self.metrics.inc_pushed(log.cluster_addr, log.kind.label());
                 } else {
                     self.metrics.inc_dropped(log.cluster_addr, sub.member_id);
                     tracing::warn!(
                         cluster = %log.cluster_addr, member = %sub.member_id,
-                        "subscriber channel full; dropped envelope (will replay on reconnect)"
+                        "subscriber channel unavailable; closing stream for replay"
                     );
+                }
+            }
+        }
+
+        // A signed checkpoint advances cursors across blocks with no relevant logs.
+        // It is queued after every event in this indexed page for each v2 subscriber.
+        for cluster in clusters {
+            let subs = self.state.subscribers().subscribers_of(*cluster).await;
+            for sub in subs.into_iter().filter(|sub| sub.supports_checkpoints()) {
+                let checkpoint = crate::grpc::envelope::build_checkpoint(*cluster, indexed_through);
+                let checkpoint = sub.finalize(&self.identity, checkpoint);
+                if sub.send_live(checkpoint).await {
+                    self.metrics.inc_pushed(*cluster, "Checkpoint");
+                } else {
+                    self.metrics.inc_dropped(*cluster, sub.member_id);
                 }
             }
         }
@@ -224,21 +359,28 @@ impl Runtime {
 
     async fn discovery_tick(&self) -> anyhow::Result<()> {
         let head = chain::block_number(&self.provider).await?;
-        let from = self.state.last_factory_block().await.saturating_add(1);
+        let from = discovery_scan_start(
+            self.state.last_factory_block().await,
+            self.config.start_block,
+        );
         if from <= head {
-            let new = watcher::poll_new_clusters(
-                &self.provider,
-                self.config.cluster_diamond_factory_addr,
-                from,
-                head,
-            )
-            .await?;
-            for c in new {
-                if self.state.add_cluster(c).await {
-                    tracing::info!(cluster = %c, "discovered new cluster");
+            for (start, end) in scan_ranges(from, head, DISCOVERY_CHUNK) {
+                let new = watcher::poll_new_clusters(
+                    &self.provider,
+                    self.config.cluster_diamond_factory_addr,
+                    start,
+                    end,
+                )
+                .await?;
+                for d in new {
+                    let cluster = d.cluster;
+                    if self.hydrate_discovered_cluster(d, head).await? {
+                        tracing::info!(cluster = %cluster, "discovered new cluster");
+                    }
                 }
             }
             self.state.set_last_factory_block(head).await;
+            self.read_model.set_scanned_to_block(head).await;
             self.metrics
                 .clusters_watched
                 .set(self.state.cluster_count().await as i64);
@@ -285,13 +427,20 @@ mod tests {
     #[test]
     fn scan_ranges_single_block_and_empty() {
         assert_eq!(scan_ranges(5, 5, 10).collect::<Vec<_>>(), vec![(5, 5)]);
-        assert_eq!(scan_ranges(6, 5, 10).count(), 0, "start past head scans nothing");
+        assert_eq!(
+            scan_ranges(6, 5, 10).count(),
+            0,
+            "start past head scans nothing"
+        );
     }
 
     #[test]
     fn scan_ranges_tolerate_zero_chunk() {
         // A misconfigured chunk must not loop forever on the same block.
-        assert_eq!(scan_ranges(1, 3, 0).collect::<Vec<_>>(), vec![(1, 1), (2, 2), (3, 3)]);
+        assert_eq!(
+            scan_ranges(1, 3, 0).collect::<Vec<_>>(),
+            vec![(1, 1), (2, 2), (3, 3)]
+        );
     }
 
     /// Regression (live bug 8 in docs/deployment.md): with the factory-deploy floor
@@ -310,8 +459,90 @@ mod tests {
 
     #[test]
     fn events_scan_start_resumes_past_cursor_but_not_below_floor() {
-        assert_eq!(events_scan_start(0, 500), 500, "fresh store starts at the floor");
-        assert_eq!(events_scan_start(700, 500), 701, "persisted cursor wins past the floor");
+        assert_eq!(
+            events_scan_start(0, 500),
+            500,
+            "fresh store starts at the floor"
+        );
+        assert_eq!(
+            events_scan_start(700, 500),
+            701,
+            "persisted cursor wins past the floor"
+        );
         assert_eq!(events_scan_start(u64::MAX, 0), u64::MAX, "no overflow");
+    }
+
+    #[test]
+    fn discovery_retry_never_scans_before_factory_floor() {
+        assert_eq!(discovery_scan_start(0, 46_868_742), 46_868_742);
+        assert_eq!(discovery_scan_start(46_900_000, 46_868_742), 46_900_001);
+    }
+
+    #[tokio::test]
+    async fn known_cluster_is_rehydrated_into_a_fresh_read_model() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let cursors = Arc::new(
+            crate::state::cursor::SledCursorStore::open(dir.path().to_str().unwrap()).unwrap(),
+        );
+        let state = IndexerState::new(cursors);
+        let read_model = ReadModel::new();
+        let cluster = Address::repeat_byte(0x42);
+        state.add_cluster(cluster).await;
+
+        let inserted = record_discovered_cluster(
+            &state,
+            &read_model,
+            crate::query::ClusterDeployment {
+                cluster,
+                cluster_owner: Address::repeat_byte(0x11),
+                salt: alloy::primitives::B256::repeat_byte(0x22),
+                deployed_at_block: 123,
+                deployment_tx_hash: alloy::primitives::B256::repeat_byte(0x33),
+                deployment_log_index: 4,
+            },
+            MeshCidr {
+                ip: u32::from_be_bytes([10, 18, 0, 0]),
+                prefix: 16,
+            },
+        )
+        .await;
+
+        assert!(!inserted, "the durable cluster set was already populated");
+        assert_eq!(read_model.snapshots(8453, None).await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn hydration_is_required_until_state_and_read_model_agree() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let cursors = Arc::new(
+            crate::state::cursor::SledCursorStore::open(dir.path().to_str().unwrap()).unwrap(),
+        );
+        let state = IndexerState::new(cursors);
+        let read_model = ReadModel::new();
+        let cluster = Address::repeat_byte(0x55);
+
+        assert!(cluster_needs_hydration(&state, &read_model, cluster).await);
+        state.add_cluster(cluster).await;
+        assert!(
+            cluster_needs_hydration(&state, &read_model, cluster).await,
+            "known state alone must not suppress read-model recovery"
+        );
+        read_model
+            .add_cluster(
+                crate::query::ClusterDeployment {
+                    cluster,
+                    cluster_owner: Address::ZERO,
+                    salt: alloy::primitives::B256::ZERO,
+                    deployed_at_block: 1,
+                    deployment_tx_hash: alloy::primitives::B256::ZERO,
+                    deployment_log_index: 0,
+                },
+                MeshCidr {
+                    ip: u32::from_be_bytes([10, 18, 0, 0]),
+                    prefix: 16,
+                },
+            )
+            .await;
+        assert!(!cluster_needs_hydration(&state, &read_model, cluster).await);
     }
 }

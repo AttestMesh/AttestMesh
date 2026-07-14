@@ -1,0 +1,348 @@
+# AttestMesh Hermes agent node ("deploy more agents") for the self-hosted dstack box.
+#
+# One CVM = one Hermes Agent (Nous Research) with its own identity everywhere:
+#   - its own Matrix account   (@<agent>:<matrix-server>, provisioned via the
+#                                matrix-admin-agent by deploy/hermes-node.sh)
+#   - its own Hindsight bank   (bank_id = agent name, on the Hindsight node)
+#   - its own email mailbox    (Fastmail IMAP/SMTP creds, operator-provisioned)
+#   - its own GitHub identity  (machine-account PAT, operator-provisioned)
+#   - its own model endpoint   (fugu-router by default, direct custom endpoints allowed)
+#
+# The node joins the ClusterDiamond through the sidecar (Path A), which puts the
+# agent services ON the WireGuard mesh — that is how they reach the Matrix
+# node's mesh-only Synapse listener and the Hindsight memory API.
+#
+# Services (all app services share ONE image, ghcr.io/attestmesh/hermes-workbench,
+# built by .github/workflows/build-hermes-workbench.yml):
+#   sshd           :1022 — bridge-netns workbench shell (gateway TLS-passthrough)
+#   sshd-mesh      :1023 — sidecar-netns workbench shell (ON the mesh; ssh -D = SOCKS)
+#   hermes-gateway       — supervised `hermes gateway` (Matrix + email connectors)
+#   paseo                — Paseo daemon :6767 (mesh-reachable only; ACP driver)
+#
+# First-boot seeding: hermes-gateway renders /root/.hermes/{.env,config.yaml,
+# SOUL.md,hindsight/config.json} + git/gh credentials from the SEALED env, but
+# ONLY where a file does not already exist — after that, /root (the `workspace`
+# volume) is the source of truth and the operator tunes everything over ssh.
+# Sealed values are used once at seed time; in-place rolls never clobber edits.
+# ($$ = literal $ for the runtime shell; single $ is compose interpolation.)
+services:
+  sidecar:
+    image: ghcr.io/attestmesh/cluster-mesh-agent@sha256:b9e0ae107d9db015c22059c9fecdc28f2b35e09b257eabb4739bd4e46d96f641
+    restart: unless-stopped
+    environment:
+      # MEMBER_CONTRACT intentionally unset. Path A upgrades this stock DstackApp
+      # proxy to ClusterMember, then the sidecar self-discovers its app_id from
+      # the dstack guest agent.
+      - CHAIN_ID=${CHAIN_ID}
+      - RPC_URL=${RPC_URL}
+      - BUNDLER_URL=${BUNDLER_URL}
+      - GAS_POLICY_ID=${GAS_POLICY_ID}
+      - INDEXER_REGISTRY_ADDR=${INDEXER_REGISTRY_ADDR}
+      - GATEWAY_DOMAIN=${GATEWAY_DOMAIN}
+      - DSTACK_SOCKET=/var/run/dstack.sock
+      - SIDECAR_STATE_DIR=/var/lib/attestmesh
+      - HEALTH_HTTP_ADDR=0.0.0.0:9090
+      - LOG_FORMAT=pretty
+      - LOG_LEVEL=info,cluster_mesh_agent=debug
+    volumes:
+      - /var/run/dstack.sock:/var/run/dstack.sock
+      - sidecar-state:/var/lib/attestmesh
+    ports:
+      - "9090:9090"
+      - "51900:51900"
+      # sshd-mesh shares this netns, so its listener is published here:
+      # <app_id>-1023.<gateway-domain>:443 → a shell ON the wg mesh.
+      - "1023:1023"
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun
+
+  sshd:
+    image: ghcr.io/attestmesh/hermes-workbench@sha256:856568473706c0db44ce2685f9058b364598946082112fb146a3950e2a68d3b6
+    restart: unless-stopped
+    environment:
+      - SSH_AUTHORIZED_KEYS_B64=${SSH_AUTHORIZED_KEYS_B64}
+    volumes:
+      - workspace:/root
+    command:
+      - /bin/bash
+      - -lc
+      - |
+        set -euo pipefail
+        install -d -m 700 /root/.ssh /root/.ssh-host /run/sshd
+        printf '%s' "$$SSH_AUTHORIZED_KEYS_B64" | base64 -d > /root/.ssh/authorized_keys
+        chmod 600 /root/.ssh/authorized_keys
+        chown -R root:root /root/.ssh
+        test -s /root/.ssh/authorized_keys
+        k=/root/.ssh-host/ssh_host_ed25519_key_1022
+        [ -s "$$k" ] || ssh-keygen -q -t ed25519 -N '' -f "$$k"
+        exec /usr/sbin/sshd -D -e -o Port=1022 -h "$$k"
+    ports:
+      - "1022:1022"
+
+  # Mesh jump shell: same workbench, but INSIDE the sidecar's netns — where the
+  # WireGuard mesh interface lives. NET_ADMIN is for `wg show` (peer discovery).
+  sshd-mesh:
+    image: ghcr.io/attestmesh/hermes-workbench@sha256:856568473706c0db44ce2685f9058b364598946082112fb146a3950e2a68d3b6
+    restart: unless-stopped
+    network_mode: service:sidecar
+    depends_on:
+      - sidecar
+    cap_add:
+      - NET_ADMIN
+    environment:
+      - SSH_AUTHORIZED_KEYS_B64=${SSH_AUTHORIZED_KEYS_B64}
+    volumes:
+      - workspace:/root
+    command:
+      - /bin/bash
+      - -lc
+      - |
+        set -euo pipefail
+        install -d -m 700 /root/.ssh /root/.ssh-host /run/sshd
+        printf '%s' "$$SSH_AUTHORIZED_KEYS_B64" | base64 -d > /root/.ssh/authorized_keys
+        chmod 600 /root/.ssh/authorized_keys
+        chown -R root:root /root/.ssh
+        test -s /root/.ssh/authorized_keys
+        k=/root/.ssh-host/ssh_host_ed25519_key_1023
+        [ -s "$$k" ] || ssh-keygen -q -t ed25519 -N '' -f "$$k"
+        exec /usr/sbin/sshd -D -e -o Port=1023 -h "$$k"
+
+  # Hermes platform gateway (Matrix + email connectors). Seeds /root/.hermes
+  # from the sealed env on first boot, then defers to whatever is on the volume.
+  hermes-gateway:
+    image: ghcr.io/attestmesh/hermes-workbench@sha256:856568473706c0db44ce2685f9058b364598946082112fb146a3950e2a68d3b6
+    restart: unless-stopped
+    network_mode: service:sidecar
+    depends_on:
+      - sidecar
+    environment:
+      - AGENT_NAME=${AGENT_NAME}
+      - MODEL_PROVIDER_NAME=${MODEL_PROVIDER_NAME}
+      - MODEL_BASE_URL=${MODEL_BASE_URL}
+      - MODEL_NAME=${MODEL_NAME}
+      - MODEL_API_KEY=${MODEL_API_KEY}
+      - MATRIX_HOMESERVER=${MATRIX_HOMESERVER}
+      - MATRIX_USER_ID=${MATRIX_USER_ID}
+      - MATRIX_ACCESS_TOKEN=${MATRIX_ACCESS_TOKEN}
+      - MATRIX_ALLOWED_USERS=${MATRIX_ALLOWED_USERS}
+      - MATRIX_ENCRYPTION=${MATRIX_ENCRYPTION}
+      - HINDSIGHT_API_URL=${HINDSIGHT_API_URL}
+      - HINDSIGHT_API_KEY=${HINDSIGHT_API_KEY}
+      - HINDSIGHT_BANK_ID=${HINDSIGHT_BANK_ID}
+      - HINDSIGHT_RETAIN_TAGS=${HINDSIGHT_RETAIN_TAGS}
+      - EMAIL_ADDRESS=${EMAIL_ADDRESS}
+      - EMAIL_PASSWORD=${EMAIL_PASSWORD}
+      - EMAIL_IMAP_HOST=${EMAIL_IMAP_HOST}
+      - EMAIL_SMTP_HOST=${EMAIL_SMTP_HOST}
+      - EMAIL_HOME_ADDRESS=${EMAIL_HOME_ADDRESS}
+      - GITHUB_TOKEN=${GITHUB_TOKEN}
+      - GIT_USER_NAME=${GIT_USER_NAME}
+      - GIT_USER_EMAIL=${GIT_USER_EMAIL}
+      - HERMES_SOUL_B64=${HERMES_SOUL_B64}
+      - WORKSPACE_GIT_URL=${WORKSPACE_GIT_URL}
+    volumes:
+      - workspace:/root
+    command:
+      - /bin/bash
+      - -lc
+      - |
+        set -euo pipefail
+        install -d -m 700 /root/.hermes /root/.hermes/hindsight
+        provider_slug="$$(printf '%s' "$${MODEL_PROVIDER_NAME:-}" | tr '[:upper:]' '[:lower:]' | tr '_' '-')"
+
+        # ── first-boot seeding: sealed env → files, only where missing ──
+        if [ ! -s /root/.hermes/.env ]; then
+          umask 077
+          {
+            echo "MATRIX_HOMESERVER=$$MATRIX_HOMESERVER"
+            echo "MATRIX_USER_ID=$$MATRIX_USER_ID"
+            echo "MATRIX_ACCESS_TOKEN=$$MATRIX_ACCESS_TOKEN"
+            echo "MATRIX_ALLOWED_USERS=$$MATRIX_ALLOWED_USERS"
+            echo "MATRIX_ENCRYPTION=$${MATRIX_ENCRYPTION:-true}"
+            echo "HINDSIGHT_API_KEY=$$HINDSIGHT_API_KEY"
+            [ -n "$$EMAIL_ADDRESS" ] && echo "EMAIL_ADDRESS=$$EMAIL_ADDRESS"
+            [ -n "$$EMAIL_PASSWORD" ] && echo "EMAIL_PASSWORD=$$EMAIL_PASSWORD"
+            [ -n "$$EMAIL_IMAP_HOST" ] && echo "EMAIL_IMAP_HOST=$$EMAIL_IMAP_HOST"
+            [ -n "$$EMAIL_SMTP_HOST" ] && echo "EMAIL_SMTP_HOST=$$EMAIL_SMTP_HOST"
+            if [ -n "$$EMAIL_HOME_ADDRESS" ]; then
+              echo "EMAIL_HOME_ADDRESS=$$EMAIL_HOME_ADDRESS"
+              # Operator "home" defaults: digest + allowed senders = the home
+              # address (tune per-agent over ssh afterwards).
+              echo "EMAIL_ALLOWED_USERS=$$EMAIL_HOME_ADDRESS"
+              echo "DIGEST_RECIPIENT_EMAIL=$$EMAIL_HOME_ADDRESS"
+            fi
+            [ -n "$$EMAIL_ADDRESS" ] && {
+              echo "EMAIL_IMAP_PORT=993"
+              echo "EMAIL_SMTP_PORT=587"
+              echo "EMAIL_POLL_INTERVAL=15"
+            }
+            [ -n "$$GITHUB_TOKEN" ] && echo "GH_TOKEN=$$GITHUB_TOKEN"
+            case "$$provider_slug" in
+              fugu-router|fugu|sakana-fugu-router)
+                echo "FUGU_ROUTER_API_KEY=$$MODEL_API_KEY"
+                echo "FUGU_ROUTER_BASE_URL=$$MODEL_BASE_URL"
+                # xai-class tools (web search via grok-4.x) through the router:
+                # API-key mode, NO per-agent xai OAuth and no shared refresh
+                # token. Image gen still needs a grok-imagine route on fugu.
+                echo "XAI_BASE_URL=$$MODEL_BASE_URL"
+                echo "XAI_API_KEY=$$MODEL_API_KEY"
+                ;;
+            esac
+            true
+          } > /root/.hermes/.env
+        fi
+
+        if [ ! -s /root/.hermes/config.yaml ]; then
+          # hermes has no native "fugu-router" provider type — every OpenAI-
+          # compatible endpoint (fugu-router LB included) is provider: custom
+          # with a custom_providers entry (proven on the tessera maiden deploy;
+          # a bare provider: fugu-router fails `hermes doctor` as unknown).
+          cat > /root/.hermes/config.yaml <<EOF
+        model:
+          default: $$MODEL_NAME
+          provider: custom
+          base_url: $$MODEL_BASE_URL
+          api_key: $$MODEL_API_KEY
+        custom_providers:
+          - name: $${MODEL_PROVIDER_NAME:-custom}
+            base_url: $$MODEL_BASE_URL
+            api_key: $$MODEL_API_KEY
+            model: $$MODEL_NAME
+        memory:
+          memory_enabled: true
+          user_profile_enabled: true
+          provider: hindsight
+          memory_char_limit: 2200
+          user_char_limit: 1375
+          nudge_interval: 10
+          flush_min_turns: 6
+        EOF
+          case "$$provider_slug" in
+            fugu-router|fugu|sakana-fugu-router)
+              printf 'web:\n  backend: xai\n  use_gateway: false\n' >> /root/.hermes/config.yaml
+              ;;
+          esac
+        fi
+
+        if [ ! -s /root/.hermes/hindsight/config.json ]; then
+          umask 077
+          cat > /root/.hermes/hindsight/config.json <<EOF
+        {
+          "mode": "local_external",
+          "apiKey": "$$HINDSIGHT_API_KEY",
+          "timeout": 120,
+          "idle_timeout": 300,
+          "retain_tags": "$${HINDSIGHT_RETAIN_TAGS:-attestmesh}",
+          "banks": {
+            "hermes": {"bankId": "$$HINDSIGHT_BANK_ID", "budget": "high", "enabled": true}
+          },
+          "api_url": "$$HINDSIGHT_API_URL",
+          "bank_id": "$$HINDSIGHT_BANK_ID",
+          "recall_budget": "high",
+          "recall_max_tokens": 12288,
+          "recall_max_input_chars": 2000
+        }
+        EOF
+        fi
+
+        if [ -n "$$HERMES_SOUL_B64" ] && [ ! -s /root/.hermes/SOUL.md ]; then
+          printf '%s' "$$HERMES_SOUL_B64" | base64 -d > /root/.hermes/SOUL.md
+        fi
+
+        # GitHub machine-account identity for git + gh (idempotent).
+        if [ -n "$$GITHUB_TOKEN" ] && [ ! -s /root/.git-credentials ]; then
+          umask 077
+          printf 'https://%s:%s@github.com\n' "$${GIT_USER_NAME:-$$AGENT_NAME}" "$$GITHUB_TOKEN" > /root/.git-credentials
+          git config --global credential.helper store
+          git config --global user.name "$${GIT_USER_NAME:-$$AGENT_NAME}"
+          [ -n "$$GIT_USER_EMAIL" ] && git config --global user.email "$$GIT_USER_EMAIL"
+          true
+        fi
+
+        if [ -n "$$WORKSPACE_GIT_URL" ]; then
+          d="/root/$$(basename "$$WORKSPACE_GIT_URL" .git)"
+          [ -d "$$d" ] || git clone "$$WORKSPACE_GIT_URL" "$$d" || echo "workspace clone failed (fix over ssh): $$WORKSPACE_GIT_URL"
+        fi
+
+        # ── run ──
+        until grep -q '^MATRIX_ACCESS_TOKEN=.\+' /root/.hermes/.env 2>/dev/null; do
+          echo "hermes-gateway: no MATRIX_ACCESS_TOKEN yet (provision, or edit /root/.hermes/.env via ssh)"
+          sleep 60
+        done
+        exec hermes gateway
+
+  # Paseo daemon: ACP driver for Hermes (`paseo run --provider hermes …`,
+  # app.paseo.sh via its relay). Listens on :6767 in the sidecar netns —
+  # reachable from mesh peers only; NOT published through the dstack gateway.
+  paseo:
+    image: ghcr.io/attestmesh/hermes-workbench@sha256:856568473706c0db44ce2685f9058b364598946082112fb146a3950e2a68d3b6
+    restart: unless-stopped
+    network_mode: service:sidecar
+    depends_on:
+      - sidecar
+    volumes:
+      - workspace:/root
+    command:
+      - /bin/bash
+      - -lc
+      - |
+        set -euo pipefail
+        if [ ! -s /root/.paseo/config.json ]; then
+          install -d -m 700 /root/.paseo
+          cat > /root/.paseo/config.json <<'EOF'
+        {
+          "version": 1,
+          "daemon": {
+            "listen": "0.0.0.0:6767",
+            "mcp": {"injectIntoAgents": true},
+            "appendSystemPrompt": "When creating subagents, use paseo mcp tools.",
+            "relay": {"enabled": true}
+          },
+          "agents": {
+            "providers": {
+              "hermes": {
+                "extends": "acp",
+                "label": "Hermes",
+                "description": "Nous Research self-improving AI agent",
+                "command": ["hermes", "acp"]
+              },
+              "claude": {"enabled": false},
+              "codex": {"enabled": false},
+              "copilot": {"enabled": false},
+              "opencode": {"enabled": false},
+              "pi": {"enabled": false}
+            }
+          }
+        }
+        EOF
+        fi
+        exec paseo daemon start --foreground
+
+  # One-shot registration helper (interim, while there is no live EIP-4337
+  # bundler): derives the node's keys + dstack proof and emits the direct
+  # `dstack_register` calldata as `ATTESTMESH_DIRECT_REGISTER {json}` for the
+  # operator to send (deploy/hermes-node.sh register-direct), and serves it on
+  # :9092. Same block as pocket-mcp / db-ha / indexer-member nodes.
+  registration-calldata:
+    image: ghcr.io/dmvt/attestmesh-indexer@sha256:d99b1d207e0df8bfdf6fbac5b001142307475ac9a5b1b88b730b7edabd4283e5
+    restart: "no"
+    depends_on:
+      - sidecar
+    entrypoint: ["/usr/local/bin/attestmesh-registration-calldata"]
+    environment:
+      - CLUSTER=${CLUSTER}
+      - DSTACK_SOCKET=/var/run/dstack.sock
+      - REGISTRATION_HELPER_ADDR=0.0.0.0:9092
+    ports:
+      - "9092:9092"
+    volumes:
+      - /var/run/dstack.sock:/var/run/dstack.sock
+
+volumes:
+  sidecar-state:
+  # Shared /root for the shells + hermes + paseo (bash history, clones,
+  # ~/.hermes, ~/.paseo, sshd host keys, workspace repo).
+  # Survives in-place rolls; wiped on a fresh-disk roll.
+  workspace:

@@ -1,0 +1,141 @@
+# ClickHouse HA node (one of N): ClickHouse Keeper + clickhouse-server + HAProxy over the
+# AttestMesh wireguard mesh (pg-ha pattern, minimal v1: NO admin agent / prometheus /
+# matrix proxy — future work, see deploy/fugu-router-runbook.md).
+#
+# The trio (keeper/server/haproxy) shares the SIDECAR netns so it can bind the mesh IP and
+# reach the other ch nodes over attestmesh0 — the keeper raft (:9234), keeper client
+# traffic (:9181), interserver replication, and HAProxy health checks are all mesh flows.
+# Mesh clients connect to ANY node's mesh IP :8123 (http) or :9000 (native); the server
+# itself listens on :18123/:19001 internally so HAProxy can own 8123/9000 in the shared
+# netns. Cluster `default` = 1 shard x 3 replicas, ReplicatedMergeTree by default — every
+# replica is writable, HAProxy round-robins across healthy backends (httpchk GET /ping).
+# No host `ports:` beyond the sidecar's :9090 health + :51900 wg transport; host isolation
+# is asserted by deploy/clickhouse-ha-node.sh verify-isolation.
+#
+# Auth: the `default` user password + interserver credentials are HKDF-derived from the
+# CSK inside the entrypoints (csk_derive attestmesh.chha.{client,interserver}.v1 —
+# chha-common.sh) — zero secret exchange; any C3 member derives the client password
+# in-CVM (Langfuse on fugu-router does). CHHA_VERIFY_PASSWORD (sealed) is the driver-side
+# verification credential: the server entrypoint creates a `meshverify` user with it
+# (granted CREATE/INSERT/SELECT/DROP on the verify db ON CLUSTER) so verify-ha /
+# verify-failover can run from the mesh shell without the CSK. Telemetry off.
+
+services:
+  sidecar:
+    image: ghcr.io/attestmesh/cluster-mesh-agent@sha256:b9e0ae107d9db015c22059c9fecdc28f2b35e09b257eabb4739bd4e46d96f641
+    restart: unless-stopped
+    environment:
+      # MEMBER_CONTRACT intentionally unset: the sidecar self-discovers the app_id.
+      - CHAIN_ID=${CHAIN_ID}
+      - RPC_URL=${RPC_URL}
+      - BUNDLER_URL=${BUNDLER_URL}
+      - GAS_POLICY_ID=${GAS_POLICY_ID}
+      - INDEXER_REGISTRY_ADDR=${INDEXER_REGISTRY_ADDR}
+      - GATEWAY_DOMAIN=${GATEWAY_DOMAIN}
+      - DSTACK_SOCKET=/var/run/dstack.sock
+      - SIDECAR_STATE_DIR=/var/lib/attestmesh
+      - AGENT_GRPC_SOCKET=/var/run/attestmesh/agent.sock
+      - HEALTH_HTTP_ADDR=0.0.0.0:9090
+      - LOG_FORMAT=pretty
+      - LOG_LEVEL=info,cluster_mesh_agent=debug
+    volumes:
+      - /var/run/dstack.sock:/var/run/dstack.sock
+      - sidecar-state:/var/lib/attestmesh
+      - agent-sock:/var/run/attestmesh
+    ports:
+      - "9090:9090"
+      - "51900:51900"
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun
+
+  # ClickHouse Keeper (bundled — no zookeeper image): client :9181, raft :9234, static
+  # 3-node ensemble from CH_PEERS (sealed at CreateVm); server_id = own position in the
+  # peer list. keeper-data survives rolls (no_instance_id=true, app-bound disk key).
+  keeper:
+    image: ghcr.io/attestmesh/clickhouse-ha@sha256:1c2ccc946afdc1c50354017bef0bbc636e7dbb1dcc6e1e0f5ed728b7e0af7216 # pinned 2026-07-03
+    restart: unless-stopped
+    network_mode: service:sidecar
+    entrypoint: ["/usr/local/bin/chha-keeper-entrypoint.sh"]
+    depends_on:
+      - sidecar
+    environment:
+      - CHHA_NODE_NAME=${CHHA_NODE_NAME}
+      - CH_PEERS=${CH_PEERS}
+      - CHHA_BOOTSTRAP=${CHHA_BOOTSTRAP}
+      - AGENT_GRPC_SOCKET=/var/run/attestmesh/agent.sock
+    volumes:
+      - keeper-data:/var/lib/clickhouse-keeper
+      - agent-sock:/var/run/attestmesh
+      - chha-status:/chha-status
+
+  # clickhouse-server: cluster `default` (1 shard x 3 replicas), ReplicatedMergeTree
+  # default, macros per node, interserver over the mesh (interserver_http_host = own mesh
+  # IP, credentials CSK-derived). Internal ports :18123 (http) / :19001 (native) — HAProxy
+  # owns the mesh :8123/:9000.
+  server:
+    image: ghcr.io/attestmesh/clickhouse-ha@sha256:1c2ccc946afdc1c50354017bef0bbc636e7dbb1dcc6e1e0f5ed728b7e0af7216 # pinned 2026-07-03
+    restart: unless-stopped
+    network_mode: service:sidecar
+    entrypoint: ["/usr/local/bin/chha-server-entrypoint.sh"]
+    depends_on:
+      - keeper
+    environment:
+      - CHHA_NODE_NAME=${CHHA_NODE_NAME}
+      - CH_PEERS=${CH_PEERS}
+      - CHHA_BOOTSTRAP=${CHHA_BOOTSTRAP}
+      - CHHA_VERIFY_PASSWORD=${CHHA_VERIFY_PASSWORD}
+      - AGENT_GRPC_SOCKET=/var/run/attestmesh/agent.sock
+    volumes:
+      - chdata:/var/lib/clickhouse
+      - agent-sock:/var/run/attestmesh
+      - chha-status:/chha-status
+
+  # Healthy-replica routing on the mesh IP: :8123 (http) + :9000 (native) round-robin
+  # across all three backends, option httpchk GET /ping against each peer's :18123.
+  haproxy:
+    image: ghcr.io/attestmesh/clickhouse-ha@sha256:1c2ccc946afdc1c50354017bef0bbc636e7dbb1dcc6e1e0f5ed728b7e0af7216 # pinned 2026-07-03
+    restart: unless-stopped
+    network_mode: service:sidecar
+    entrypoint: ["/usr/local/bin/chha-haproxy-entrypoint.sh"]
+    depends_on:
+      - server
+    environment:
+      - CHHA_NODE_NAME=${CHHA_NODE_NAME}
+      - CH_PEERS=${CH_PEERS}
+      - AGENT_GRPC_SOCKET=/var/run/attestmesh/agent.sock
+    volumes:
+      - agent-sock:/var/run/attestmesh
+      - chha-status:/chha-status
+
+  # Mesh-only status page (:8009): the TEE blocks container logs, so every chha entrypoint
+  # self-reports to /chha-status and this serves it read-only to mesh peers for debugging.
+  status-server:
+    image: ghcr.io/attestmesh/clickhouse-ha@sha256:1c2ccc946afdc1c50354017bef0bbc636e7dbb1dcc6e1e0f5ed728b7e0af7216 # pinned 2026-07-03
+    restart: unless-stopped
+    network_mode: service:sidecar
+    entrypoint:
+      - /bin/bash
+      - -ec
+    command:
+      - |
+        while :; do
+          ip="$(ip -4 -o addr show dev attestmesh0 2>/dev/null | awk '{print $$4}' | cut -d/ -f1)"
+          [ -n "$$ip" ] && break
+          sleep 1
+        done
+        exec python3 -m http.server 8009 --bind "$$ip" --directory /chha-status
+    depends_on:
+      - sidecar
+    environment:
+      - CHHA_NODE_NAME=${CHHA_NODE_NAME}
+    volumes:
+      - chha-status:/chha-status:ro
+
+volumes:
+  sidecar-state:
+  chdata:
+  keeper-data:
+  agent-sock:
+  chha-status:

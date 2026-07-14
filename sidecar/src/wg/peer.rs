@@ -140,9 +140,13 @@ impl PeerTable {
         }
     }
 
-    pub fn mark_configured(&mut self, member_id: &MemberId) {
+    pub fn mark_configured(&mut self, member_id: &MemberId) -> bool {
         if let Some(p) = self.peers.get_mut(member_id) {
+            let changed = !p.configured;
             p.configured = true;
+            changed
+        } else {
+            false
         }
     }
 

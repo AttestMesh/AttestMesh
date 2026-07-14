@@ -12,5 +12,13 @@ interface INetwork {
     ///         the MemberStorage mirror via IAttest._setWgMirror.
     function _setWgPubKey(bytes32 memberId, bytes32 wgPubKey) external;
 
+    /// @notice Member publishes / rotates its Ed25519 heartbeat verification key.
+    ///         Public key — on-chain publication leaks nothing heartbeat signatures
+    ///         don't already. Lets peers learn it via a chain read instead of a
+    ///         sponsored PeerEndpoint envelope (ed25519-onchain-key spec).
+    function publishEd25519Key(bytes32 ed25519Key) external;
+    function ed25519KeyOf(bytes32 memberId) external view returns (bytes32);
+
     event WgKeyPublished(bytes32 indexed memberId, bytes32 wgPubKey);
+    event Ed25519KeyPublished(bytes32 indexed memberId, bytes32 ed25519Key);
 }

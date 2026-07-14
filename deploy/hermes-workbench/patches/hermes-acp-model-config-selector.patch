@@ -1,0 +1,126 @@
+diff --git a/acp_adapter/server.py b/acp_adapter/server.py
+index df77329..1d76736 100644
+--- a/acp_adapter/server.py
++++ b/acp_adapter/server.py
+@@ -45,6 +45,8 @@ from acp.schema import (
+     SetSessionModelResponse,
+     SetSessionModeResponse,
+     ResourceContentBlock,
++    SessionConfigOptionSelect,
++    SessionConfigSelectOption,
+     SessionCapabilities,
+     SessionForkCapabilities,
+     SessionInfoUpdate,
+@@ -505,6 +507,7 @@ class HermesACPAgent(acp.Agent):
+     )
+ 
+     _EDIT_APPROVAL_POLICY_CONFIG_ID = "edit_approval_policy"
++    _MODEL_CONFIG_ID = "hermes_model"
+     _EDIT_APPROVAL_POLICY_DEFAULT = "ask"
+     _MODE_DEFAULT = "default"
+     _MODE_ACCEPT_EDITS = "accept_edits"
+@@ -642,17 +645,53 @@ class HermesACPAgent(acp.Agent):
+             current_model_id=fallback_choice,
+         )
+ 
++    def _build_model_config_options(self, state: SessionState) -> list[SessionConfigOptionSelect]:
++        """Return a stable ACP model selector.
++
++        Some ACP clients still do not expose the unstable `session/set_model`
++        method even when they can render model choices. Advertising models as a
++        standard `config_options` selector keeps model switching on the stable
++        `session/set_config_option` path.
++        """
++
++        model_state = self._build_model_state(state)
++        if model_state is None or not model_state.available_models:
++            return []
++
++        return [
++            SessionConfigOptionSelect(
++                type="select",
++                id=self._MODEL_CONFIG_ID,
++                name="Model",
++                category="model",
++                description="Hermes model",
++                current_value=model_state.current_model_id,
++                options=[
++                    SessionConfigSelectOption(
++                        value=model.model_id,
++                        name=model.name,
++                        description=model.description,
++                    )
++                    for model in model_state.available_models
++                ],
++            )
++        ]
++
+     @staticmethod
+     def _resolve_model_selection(raw_model: str, current_provider: str) -> tuple[str, str]:
+         """Resolve ``provider:model`` input into the provider and normalized model id."""
+         target_provider = current_provider
+         new_model = raw_model.strip()
++        explicit_provider = False
++        if ":" in new_model:
++            provider_prefix, _ = new_model.split(":", 1)
++            explicit_provider = bool(provider_prefix.strip())
+ 
+         try:
+             from hermes_cli.models import detect_provider_for_model, parse_model_input
+ 
+             target_provider, new_model = parse_model_input(new_model, current_provider)
+-            if target_provider == current_provider:
++            if not explicit_provider and target_provider == current_provider:
+                 detected = detect_provider_for_model(new_model, current_provider)
+                 if detected:
+                     target_provider, new_model = detected
+@@ -1123,7 +1162,7 @@ class HermesACPAgent(acp.Agent):
+         self._schedule_usage_update(state)
+         return NewSessionResponse(
+             session_id=state.session_id,
+-            models=self._build_model_state(state),
++            config_options=self._build_model_config_options(state),
+             modes=self._session_modes(state),
+             field_meta=self._provenance_meta(
+                 state.session_id, getattr(state.agent, "session_id", state.session_id)
+@@ -1170,7 +1209,7 @@ class HermesACPAgent(acp.Agent):
+         self._schedule_available_commands_update(session_id)
+         self._schedule_usage_update(state)
+         return LoadSessionResponse(
+-            models=self._build_model_state(state),
++            config_options=self._build_model_config_options(state),
+             modes=self._session_modes(state),
+             field_meta=self._provenance_meta(
+                 session_id, getattr(state.agent, "session_id", session_id)
+@@ -1205,7 +1244,7 @@ class HermesACPAgent(acp.Agent):
+         self._schedule_available_commands_update(state.session_id)
+         self._schedule_usage_update(state)
+         return ResumeSessionResponse(
+-            models=self._build_model_state(state),
++            config_options=self._build_model_config_options(state),
+             modes=self._session_modes(state),
+             field_meta=self._provenance_meta(
+                 state.session_id, getattr(state.agent, "session_id", state.session_id)
+@@ -1242,7 +1281,7 @@ class HermesACPAgent(acp.Agent):
+             self._schedule_available_commands_update(new_id)
+         return ForkSessionResponse(
+             session_id=new_id,
+-            models=self._build_model_state(state) if state is not None else None,
++            config_options=self._build_model_config_options(state) if state is not None else None,
+             modes=self._session_modes(state) if state is not None else None,
+         )
+ 
+@@ -2051,6 +2090,13 @@ class HermesACPAgent(acp.Agent):
+             logger.warning("Session %s: config update requested for missing session", session_id)
+             return None
+ 
++        if str(config_id) == self._MODEL_CONFIG_ID:
++            await self.set_session_model(model_id=str(value), session_id=session_id)
++            refreshed = self.session_manager.get_session(session_id)
++            return SetSessionConfigOptionResponse(
++                config_options=self._build_model_config_options(refreshed) if refreshed else []
++            )
++
+         if str(config_id) == self._EDIT_APPROVAL_POLICY_CONFIG_ID:
+             mode = self._EDIT_APPROVAL_POLICY_TO_MODE.get(str(value), self._MODE_DEFAULT)
+             setattr(state, "mode", mode)

@@ -4,7 +4,10 @@ env.local.sh
 .smithers/
 logs/
 node_modules/
-bun.lock
 bun.lockb
 smithers.db*
 __pycache__/
+*.state
+
+# Operational backups and database exports must remain local.
+/backups/

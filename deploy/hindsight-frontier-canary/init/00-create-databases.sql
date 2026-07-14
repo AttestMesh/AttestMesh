@@ -1,0 +1,3 @@
+CREATE DATABASE hindsight_frontier_grok;
+CREATE DATABASE hindsight_frontier_fugu;
+CREATE DATABASE hindsight_frontier_fugu_plain;

@@ -30,6 +30,7 @@ export const ALLOWED_SIGNATURES = [
   // Member-driven operations:
   `dstack_register(${DSTACK_PROOF_TUPLE},address,bytes32,bytes32)`,
   "publishWgKey(bytes32)",
+  "publishEd25519Key(bytes32)", // member publishes its heartbeat key on chain (ed25519-onchain-key)
   "send(bytes32,bytes32,bytes)",
   "setCskCommitment(bytes32)", // originator publishes keccak256(CSK) once (master §8.1)
 

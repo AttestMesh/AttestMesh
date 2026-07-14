@@ -1,0 +1,287 @@
+# AttestMesh Synclave node for the self-hosted dstack box.
+#
+# Synclave (console.attestmesh.xyz + tenant apps at *.app.attestmesh.xyz) as a
+# full, on-chain-anchored AttestMesh node. Same Path-A shape as ssh-node.yaml /
+# matrix-node.yaml: the `sidecar` (cluster-mesh-agent) self-registers the CVM's
+# app_id on-chain after deploy/ssh-node.sh primes the cluster and upgrades the
+# stock DstackApp proxy to ClusterMember.
+#
+#   - PRIVATE ghcr.io/dmvt/* + attestmesh images are pulled via an in-guest
+#     `docker login` (pre_launch_script wired by synclave-node-box.py from the
+#     sealed DSTACK_DOCKER_* env — see the box helper).
+#   - Public ingress is tlsproxy:443. With the dstack gateway ON, the CVM is also
+#     reachable at <app_id>-443s.gateway.attestmesh.xyz; console.attestmesh.xyz is
+#     fronted by the box haproxy SNI-passthrough → the CVM's dstack-br0 IP :443
+#     (re-point that backend post-deploy). Unlike matrix-node (tailnet-only), :443
+#     here is *intended* to be reachable from the box — that is not a host-isolation
+#     violation, it is the product surface.
+#   - DAEMON_VOLUME_NAME is now set on tee-daemon (the fix that motivated this
+#     redeploy): without it the daemon could not resolve its data volume, breaking
+#     app builds (ERR_PNPM_NO_PKG_MANIFEST / empty /app).
+#
+# No secrets are committed here; all ${VAR} values are sealed into the CVM by
+# deploy/synclave-node.sh (key NAMES are measured into the compose_hash, VALUES
+# are sealed to the app's X25519 key).
+services:
+  # --- AttestMesh sidecar: on-chain self-registration + wg mesh (Path A) --------
+  sidecar:
+    image: ghcr.io/attestmesh/cluster-mesh-agent@sha256:b9e0ae107d9db015c22059c9fecdc28f2b35e09b257eabb4739bd4e46d96f641
+    restart: unless-stopped
+    environment:
+      # MEMBER_CONTRACT intentionally unset. Path A upgrades this stock DstackApp
+      # proxy to ClusterMember, then the sidecar self-discovers its app_id from
+      # the dstack guest agent and registers via a sponsored 4337 UserOp.
+      - CHAIN_ID=${CHAIN_ID}
+      - RPC_URL=${RPC_URL}
+      - BUNDLER_URL=${BUNDLER_URL}
+      - GAS_POLICY_ID=${GAS_POLICY_ID}
+      - INDEXER_REGISTRY_ADDR=${INDEXER_REGISTRY_ADDR}
+      - GATEWAY_DOMAIN=${GATEWAY_DOMAIN}
+      - DSTACK_SOCKET=/var/run/dstack.sock
+      - SIDECAR_STATE_DIR=/var/lib/attestmesh
+      - AGENT_GRPC_SOCKET=/var/run/attestmesh/agent.sock
+      - HEALTH_HTTP_ADDR=0.0.0.0:9090
+      - LOG_FORMAT=pretty
+      - LOG_LEVEL=info,cluster_mesh_agent=debug
+    volumes:
+      - /var/run/dstack.sock:/var/run/dstack.sock
+      - sidecar-state:/var/lib/attestmesh
+      - agent-sock:/var/run/attestmesh
+    ports:
+      - "9090:9090"
+      - "51900:51900"
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun
+
+  # --- PG-HA over the AttestMesh WireGuard mesh ---------------------------------
+  # Synclave's product DB lives in the shared pg-ha cluster. :15431 routes
+  # directly to Patroni's writable primary; :15432/3 remain node fallbacks.
+  pg-primary-router:
+    image: haproxy:3.0-alpine@sha256:dee54db8b27cd6c21519ea4f0ba0604f3742e8e7369bc16fb5b69133dec3f47f
+    restart: unless-stopped
+    network_mode: service:sidecar
+    depends_on:
+      - sidecar
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - |
+        cat >/tmp/pg-primary-router.cfg <<'CFG'
+        global
+          maxconn 400
+        defaults
+          mode tcp
+          timeout connect 2s
+          timeout client 30m
+          timeout server 30m
+          timeout check 2s
+          retries 2
+          option redispatch
+        listen primary
+          bind 0.0.0.0:15431
+          option httpchk GET /primary
+          http-check expect status 200
+          default-server inter 1s fall 2 rise 1 on-marked-down shutdown-sessions
+          server pg1 10.18.147.86:5434 check port 8008
+          server pg2 10.18.251.71:5434 check port 8008
+          server pg3 10.18.172.186:5434 check port 8008
+        CFG
+        exec haproxy -f /tmp/pg-primary-router.cfg -db
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+
+  pg2-proxy:
+    image: alpine/socat:1.8.0.0
+    restart: unless-stopped
+    network_mode: service:sidecar
+    depends_on:
+      - sidecar
+    command: ["TCP-LISTEN:15432,fork,reuseaddr,bind=0.0.0.0", "TCP:10.18.251.71:5432"]
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+
+  pg3-proxy:
+    image: alpine/socat:1.8.0.0
+    restart: unless-stopped
+    network_mode: service:sidecar
+    depends_on:
+      - sidecar
+    command: ["TCP-LISTEN:15433,fork,reuseaddr,bind=0.0.0.0", "TCP:10.18.172.186:5432"]
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+
+  # One-shot: ensure role+database synclave on pg-ha. The pg-ha superuser password
+  # is CSK-derived inside the CVM; POSTGRES_PASSWORD is the sealed Synclave DB role
+  # password. Idempotent: create-if-missing and ALTER to converge the password.
+  pg-provision:
+    image: ghcr.io/attestmesh/pg-ha@sha256:05c6d46c72f6feb444be055e1c12c116ba1334ed6d738e7d649e0ea6e71cabf5
+    restart: on-failure
+    network_mode: service:sidecar
+    depends_on:
+      - sidecar
+    environment:
+      - AGENT_GRPC_SOCKET=/var/run/attestmesh/agent.sock
+      - PGHA_LOG_TAG=pg-provision
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+    volumes:
+      - agent-sock:/var/run/attestmesh
+    entrypoint: ["/bin/bash", "-ec"]
+    command:
+      - |
+        source /usr/local/bin/pgha-common.sh
+        _st "deriving pg-ha superuser credential (waits for CSK)"
+        SUPW="$$(csk_derive attestmesh.pgha.superuser.v1)"
+        HOSTS="10.18.147.86:5432,10.18.251.71:5432,10.18.172.186:5432"
+        _st "ensuring role + database synclave"
+        psql "postgresql://postgres:$${SUPW}@$${HOSTS}/postgres?connect_timeout=5" -v ON_ERROR_STOP=1 -v pw="$$POSTGRES_PASSWORD" <<'SQL'
+        SELECT format('CREATE ROLE synclave LOGIN PASSWORD %L', :'pw')
+        WHERE NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'synclave')
+        \gexec
+        ALTER ROLE synclave WITH LOGIN PASSWORD :'pw';
+        SELECT format('CREATE DATABASE %I OWNER %I', 'synclave', 'synclave')
+        WHERE NOT EXISTS (SELECT FROM pg_database WHERE datname = 'synclave')
+        \gexec
+        SQL
+        psql "postgresql://synclave:$${POSTGRES_PASSWORD}@$${HOSTS}/synclave?connect_timeout=5" -c 'select 1' >/dev/null
+        _st "OK: role + database synclave ensured; login verified"
+
+  # NOTE: no tee-daemon here anymore. App-Hosting (the daemon) now runs in the ISOLATED webhost
+  # cluster (Cluster 2, webhost-node.yaml). This node is control-plane only: UI + API + auth/
+  # billing. The API reaches Cluster 2 solely via its gateway-exposed, token-gated control API
+  # (DAEMON_URL below). Tenant apps + the concierge are served by Cluster 2 under its own domain.
+
+  app:
+    # v6 = cluster API bridge: logged-in users see the live C3 members as CVM
+    # graph nodes, with the API URL sealed to the dstack bridge listener.
+    # Digest-pinned: in-place UpgradeApp rolls never re-pull a same-tag image.
+    # v41 = fleet-control main b25d38c — Overview dashboard wired to real feeds (was mock) + sandboxes health;
+    # v40 = fleet-control main 4f35fb8 — API tokens + confidential Attested Sandboxes + landing naming + resetDb fix;
+    # v39 = rebuilt from fleet-control main 9ed8065 + API tokens / Agent Runtime merge;
+    # v38 = API tokens + Agent Runtime / Attested Sandboxes merged with landing/nav/Overview main;
+    # v29 = API-token permission catalog + account settings token management;
+    # v43 = turned-away waitlist gate: capture the email + ping the Synclave Telegram channel;
+    #       TELEGRAM_BOT_TOKEN/TELEGRAM_WAITLIST_CHAT_ID forwarded+sealed (both optional).
+    # v42 = view-as-user impersonation for platform superadmins + served Fumadocs docs site;
+    #       PLATFORM_ADMIN_EMAILS now forwarded+sealed (box.py ENV_KEYS + synclave-node.sh).
+    # v28 = Team menu carries team settings/actions; account menu is account-only;
+    # v27 = team terminology + Vercel-style team/account settings IA;
+    # v26 = team-first onboarding + contextual network setup gate;
+    # v25 = v24 rebuilt with VITE_PRIVY_APP_ID baked into the web SPA;
+    # v24 = nameserver routes + active deployment visibility + clearer deployment failure state;
+    # v23 = v22 plus clearer mesh-registration timeout errors;
+    # v22 = v21 plus redacted orchestrator log details;
+    # v21 = user-visible orchestrator failure details in enclave deploys;
+    # v20 = CLUSTER_NETWORKS-only live mesh config + structured orchestrator errors;
+    # v19 = Apps → Sandboxes rename (labels only, wire stays app).
+    image: ghcr.io/dmvt/synclave-app:webhost-contracts-900fb9a@sha256:4750764d561b0929afb8ee4c841ad82dae6f420b6025f281e5e83a1771426f7b
+    environment:
+      API_HOST: 0.0.0.0
+      API_PORT: 80
+      AUTH_MODE: privy
+      DATABASE_URL: ${DATABASE_URL}
+      SESSION_SECRET: ${SESSION_SECRET}
+      PRIVY_APP_ID: ${PRIVY_APP_ID}
+      PRIVY_APP_SECRET: ${PRIVY_APP_SECRET}
+      GITHUB_CLIENT_ID: ${GITHUB_CLIENT_ID}
+      GITHUB_CLIENT_SECRET: ${GITHUB_CLIENT_SECRET}
+      GITHUB_OAUTH_CALLBACK_URL: ${GITHUB_OAUTH_CALLBACK_URL}
+      # Cluster-2 webhost-control gateway URL (token-gated). Sealed at deploy.
+      DAEMON_URL: ${DAEMON_URL}
+      TEE_DAEMON_TOKEN: ${TEE_DAEMON_TOKEN}
+      # confidential-sandboxes (sandboxd) — Cluster-2 gateway URL + token-gated control API, plus the
+      # default one-click workload image/plan. Sealed at deploy. Powers the "Provision sandbox" button.
+      SANDBOX_DAEMON_URL: ${SANDBOX_DAEMON_URL}
+      SANDBOX_DAEMON_TOKEN: ${SANDBOX_DAEMON_TOKEN}
+      SANDBOX_DEFAULT_IMAGE: ${SANDBOX_DEFAULT_IMAGE}
+      SANDBOX_DEFAULT_PLAN: ${SANDBOX_DEFAULT_PLAN}
+      # Webhost admin panel operators (comma-separated emails).
+      PLATFORM_ADMIN_EMAILS: ${PLATFORM_ADMIN_EMAILS:-}
+      # Waitlist → Telegram bot: turned-away sign-ups post to the Synclave channel. Both optional
+      # (unset ⇒ the send is a no-op; the email is still captured in the DB).
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
+      TELEGRAM_WAITLIST_CHAT_ID: ${TELEGRAM_WAITLIST_CHAT_ID:-}
+      # Billing (Stripe) — LIVE-mode keys for prod (config.ts refuses test keys under
+      # NODE_ENV=production unless STRIPE_ALLOW_TEST_MODE=true, and hard-requires the webhook
+      # secret in live mode). Unset ⇒ billing routes stay dark. REQUIRES synclave-app built
+      # from fleet-control ≥ 63bd1b2 (empty string counts as unset; older images crash on "").
+      STRIPE_SECRET_KEY: ${STRIPE_SECRET_KEY:-}
+      STRIPE_WEBHOOK_SECRET: ${STRIPE_WEBHOOK_SECRET:-}
+      STRIPE_ALLOW_TEST_MODE: ${STRIPE_ALLOW_TEST_MODE:-}
+      PUBLIC_BASE_URL: ${PUBLIC_BASE_URL}
+      APP_DOMAIN: ${APP_DOMAIN}
+      INDEXER_URL: ${INDEXER_URL}
+      CLUSTER_NETWORKS: ${CLUSTER_NETWORKS:-}
+      CLUSTER_ORCHESTRATOR_URL: ${CLUSTER_ORCHESTRATOR_URL:-}
+      CLUSTER_ORCHESTRATOR_TOKEN: ${CLUSTER_ORCHESTRATOR_TOKEN:-}
+      CORS_ORIGIN: ${CORS_ORIGIN}
+      CLOUDFLARE_API_TOKEN: ${CLOUDFLARE_API_TOKEN}
+      # CF app-fronting: each tenant deploy creates a PROXIED <slug>.app DNS
+      # record in this zone pointing at the origin (the box haproxy).
+      CLOUDFLARE_ZONE_ID: ${CLOUDFLARE_ZONE_ID}
+      CLOUDFLARE_ORIGIN_IP: ${CLOUDFLARE_ORIGIN_IP}
+      ADMIN_API_KEY: ${ADMIN_API_KEY}
+      # Nameserver service tokens (member naming ingest/rename for box-admin — spec §G).
+      LABELS_WRITE_TOKENS: ${LABELS_WRITE_TOKENS:-}
+    expose:
+      - "80"
+    depends_on:
+      pg-provision:
+        condition: service_completed_successfully
+      pg-primary-router:
+        condition: service_started
+      pg2-proxy:
+        condition: service_started
+      pg3-proxy:
+        condition: service_started
+    restart: unless-stopped
+
+  # Control-plane only: fronts the console host → the app (UI + API). Tenant-app and concierge
+  # traffic is NOT served here (that lives in Cluster 2), so the daemon/concierge upstreams point
+  # back at the app as harmless placeholders — no <slug>.app or /concierge route reaches this node.
+  frontproxy:
+    image: ghcr.io/dmvt/webhost-frontproxy:unverified-v1
+    environment:
+      APP_DOMAIN: ${APP_DOMAIN}
+      CONSOLE_HOST: ${CONSOLE_HOST}
+      CONSOLE_UPSTREAM: http://app:80
+      DAEMON_UPSTREAM: http://app:80
+      CONCIERGE_UPSTREAM: http://app:80
+      FRONTPROXY_PORT: "8088"
+    expose:
+      - "8088"
+    depends_on:
+      - app
+    restart: unless-stopped
+
+  tlsproxy:
+    image: ghcr.io/dmvt/synclave-tlsproxy:v4@sha256:2f9686cd836e15aba287e6412a1612145c1658616a581e4b817f65a20042be09
+    environment:
+      CLOUDFLARE_API_TOKEN: ${CLOUDFLARE_API_TOKEN}
+      TLS_FULLCHAIN_B64: ${TLS_FULLCHAIN_B64}
+      TLS_KEY_B64: ${TLS_KEY_B64}
+    ports:
+      - "443:443"
+    volumes:
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - frontproxy
+    restart: unless-stopped
+
+volumes:
+  sidecar-state:
+  agent-sock:
+  caddy_data:
+  caddy_config:

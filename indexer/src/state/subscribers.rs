@@ -1,21 +1,19 @@
 //! Per-cluster subscriber registry (spec §7.3, §8.4).
 //!
 //! Each subscription is a bounded mpsc channel (capacity 1024) to a single member's
-//! send loop. The dispatch loop iterates a cluster's subscribers and pushes the
-//! envelopes relevant to each. Backpressure policy (spec §8.4): on a full channel the
-//! dispatch loop does not block — it drops the oldest unsent envelope and records a
-//! metric. Here we model the registry and the per-subscriber try-send + drop-oldest
-//! behaviour; the metric increment is wired in by the caller.
+//! send loop. Replay uses bounded backpressure; live delivery is non-blocking. A full
+//! live channel explicitly terminates that subscription so reconnect replays from the
+//! last durable Ack instead of silently advancing across a gap.
 
+use crate::grpc::envelope::CHECKPOINT_PROTOCOL_VERSION;
 use crate::grpc::subscribe::SessionAttestation;
 use crate::identity::Identity;
 use crate::pb::PushEnvelope;
 use alloy::primitives::{Address, B256};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
-use tokio::sync::mpsc;
-use tokio::sync::RwLock;
+use tokio::sync::{mpsc, watch, Mutex, OwnedMutexGuard, RwLock};
 
 /// Per-subscription channel capacity (spec §8.4).
 pub const SUBSCRIBER_CHANNEL_CAPACITY: usize = 1024;
@@ -29,6 +27,11 @@ pub struct Subscriber {
     pub session_id: u64,
     sender: mpsc::Sender<PushEnvelope>,
     dropped: Arc<AtomicU64>,
+    overflowed: Arc<AtomicBool>,
+    overflow_tx: watch::Sender<bool>,
+    /// Serializes the replay prefix, its checkpoint, and subsequent live delivery.
+    delivery_gate: Arc<Mutex<()>>,
+    protocol_version: u32,
     /// Per-session attestation gate (spec §11 step 5): attaches the indexer quote to
     /// the first push of this session only. Shared so both the subscribe-time catch-up
     /// and the live dispatch loop emit through one gate.
@@ -36,21 +39,44 @@ pub struct Subscriber {
 }
 
 impl Subscriber {
-    /// Try to deliver `env`. On a full channel, apply the spec §8.4 policy: drop the
-    /// oldest unsent envelope (by draining one) and retry once; if still full, count a
-    /// drop. Returns `true` if the envelope was enqueued, `false` if dropped.
-    pub fn try_send(&self, env: PushEnvelope) -> bool {
+    pub fn supports_checkpoints(&self) -> bool {
+        self.protocol_version >= CHECKPOINT_PROTOCOL_VERSION
+    }
+
+    pub async fn replay_guard(&self) -> OwnedMutexGuard<()> {
+        self.delivery_gate.clone().lock_owned().await
+    }
+
+    /// Replay uses backpressure rather than dropping. The caller holds
+    /// [`Self::replay_guard`] for the whole replay + checkpoint prefix.
+    pub async fn send_replay(&self, env: PushEnvelope) -> bool {
+        if self.overflowed.load(Ordering::SeqCst) {
+            return false;
+        }
+        self.sender.send(env).await.is_ok()
+    }
+
+    /// Deliver one live item in per-session order. A full channel is an explicit
+    /// delivery gap: terminate the stream so the client reconnects from its last Ack.
+    pub async fn send_live(&self, env: PushEnvelope) -> bool {
+        let _guard = self.delivery_gate.lock().await;
+        self.try_send_unlocked(env)
+    }
+
+    pub fn abort(&self) {
+        self.overflowed.store(true, Ordering::SeqCst);
+        let _ = self.overflow_tx.send(true);
+    }
+
+    fn try_send_unlocked(&self, env: PushEnvelope) -> bool {
+        if self.overflowed.load(Ordering::SeqCst) {
+            return false;
+        }
         match self.sender.try_send(env) {
             Ok(()) => true,
-            Err(mpsc::error::TrySendError::Full(env)) => {
-                // Channel full: the receiver (a closed/slow stream) keeps the oldest
-                // items. We cannot pop from the producer side of a tokio mpsc, so the
-                // documented behaviour ("drop oldest") is realized by the receiver
-                // side which reads FIFO; from the producer's vantage we record the
-                // drop of the *new* item and signal the gap. Either way the subscriber
-                // sees an explicit gap and closes it on reconnect from its cursor.
+            Err(mpsc::error::TrySendError::Full(_)) => {
                 self.dropped.fetch_add(1, Ordering::Relaxed);
-                let _ = env;
+                self.abort();
                 false
             }
             Err(mpsc::error::TrySendError::Closed(_)) => {
@@ -66,7 +92,7 @@ impl Subscriber {
     }
 
     pub fn is_closed(&self) -> bool {
-        self.sender.is_closed()
+        self.sender.is_closed() || self.overflowed.load(Ordering::SeqCst)
     }
 
     /// Sign `env` with the indexer key and attach the session attestation iff this is
@@ -81,17 +107,27 @@ impl Subscriber {
 pub fn channel(
     member_id: B256,
     session_id: u64,
+    protocol_version: u32,
     session_att: Arc<SessionAttestation>,
-) -> (Subscriber, mpsc::Receiver<PushEnvelope>) {
+) -> (
+    Subscriber,
+    mpsc::Receiver<PushEnvelope>,
+    watch::Receiver<bool>,
+) {
     let (tx, rx) = mpsc::channel(SUBSCRIBER_CHANNEL_CAPACITY);
+    let (overflow_tx, overflow_rx) = watch::channel(false);
     let sub = Subscriber {
         member_id,
         session_id,
         sender: tx,
         dropped: Arc::new(AtomicU64::new(0)),
+        overflowed: Arc::new(AtomicBool::new(false)),
+        overflow_tx,
+        delivery_gate: Arc::new(Mutex::new(())),
+        protocol_version,
         session_att,
     };
-    (sub, rx)
+    (sub, rx, overflow_rx)
 }
 
 /// All subscribers across all clusters, indexed by cluster then session.
@@ -203,7 +239,7 @@ mod tests {
         let member = B256::repeat_byte(0xa1);
 
         let sid = reg.next_session_id();
-        let (sub, _rx) = channel(member, sid, test_session_att());
+        let (sub, _rx, _overflow) = channel(member, sid, 2, test_session_att());
         reg.add(cluster, sub).await;
 
         assert_eq!(reg.count_of(cluster).await, 1);
@@ -223,7 +259,7 @@ mod tests {
         let cluster = Address::repeat_byte(0xc1);
         for i in 0..3u8 {
             let sid = reg.next_session_id();
-            let (sub, _rx) = channel(B256::repeat_byte(i), sid, test_session_att());
+            let (sub, _rx, _overflow) = channel(B256::repeat_byte(i), sid, 2, test_session_att());
             reg.add(cluster, sub).await;
             std::mem::forget(_rx); // keep the channel open for the count assertion
         }
@@ -239,19 +275,36 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn try_send_delivers_until_full_then_drops() {
+    async fn live_overflow_marks_stream_for_reconnect() {
         let member = B256::repeat_byte(0xa1);
-        let (sub, mut rx) = channel(member, 0, test_session_att());
+        let (sub, mut rx, overflow) = channel(member, 0, 2, test_session_att());
         // Fill the channel to capacity.
         for i in 0..SUBSCRIBER_CHANNEL_CAPACITY {
-            assert!(sub.try_send(dummy_env(i as u64)));
+            assert!(sub.send_live(dummy_env(i as u64)).await);
         }
         // Next send overflows → dropped, metric increments.
-        assert!(!sub.try_send(dummy_env(9999)));
+        assert!(!sub.send_live(dummy_env(9999)).await);
         assert_eq!(sub.dropped_count(), 1);
+        assert!(*overflow.borrow());
+        assert!(sub.is_closed());
         // Receiver still drains the buffered FIFO items.
         let first = rx.recv().await.unwrap();
         assert_eq!(first.block_number, 0);
+    }
+
+    #[tokio::test]
+    async fn replay_prefix_cannot_be_overtaken_by_live_delivery() {
+        let member = B256::repeat_byte(0xa1);
+        let (sub, mut rx, _overflow) = channel(member, 0, 2, test_session_att());
+        let guard = sub.replay_guard().await;
+        let live_sub = sub.clone();
+        let live = tokio::spawn(async move { live_sub.send_live(dummy_env(20)).await });
+        tokio::task::yield_now().await;
+        assert!(sub.send_replay(dummy_env(10)).await);
+        drop(guard);
+        assert!(live.await.unwrap());
+        assert_eq!(rx.recv().await.unwrap().block_number, 10);
+        assert_eq!(rx.recv().await.unwrap().block_number, 20);
     }
 
     #[tokio::test]
@@ -259,7 +312,7 @@ mod tests {
         let reg = SubscriberRegistry::new();
         let cluster = Address::repeat_byte(0xc1);
         let sid = reg.next_session_id();
-        let (sub, rx) = channel(B256::repeat_byte(0x01), sid, test_session_att());
+        let (sub, rx, _overflow) = channel(B256::repeat_byte(0x01), sid, 2, test_session_att());
         reg.add(cluster, sub).await;
         assert_eq!(reg.count_of(cluster).await, 1);
 
@@ -277,7 +330,8 @@ mod tests {
             let reg = reg.clone();
             handles.push(tokio::spawn(async move {
                 let sid = reg.next_session_id();
-                let (sub, rx) = channel(B256::repeat_byte(i as u8), sid, test_session_att());
+                let (sub, rx, _overflow) =
+                    channel(B256::repeat_byte(i as u8), sid, 2, test_session_att());
                 reg.add(cluster, sub).await;
                 std::mem::forget(rx);
                 reg.remove(cluster, sid).await;

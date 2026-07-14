@@ -5,12 +5,15 @@
 //! `GET /metrics` → Prometheus exposition.
 
 use crate::metrics::Metrics;
-use axum::extract::State;
+use crate::query::{build_health, build_topology, ReadModel};
+use alloy::primitives::B256;
+use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
 use serde_json::json;
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -69,6 +72,10 @@ impl Health {
 struct HttpState {
     health: Arc<Health>,
     metrics: Arc<Metrics>,
+    read_model: Arc<ReadModel>,
+    chain_id: u64,
+    gateway_domain: Option<String>,
+    identity_pubkey: B256,
 }
 
 /// Serve `/healthz` + `/metrics` until the process exits or the future is dropped.
@@ -76,11 +83,28 @@ pub async fn serve(
     addr: SocketAddr,
     health: Arc<Health>,
     metrics: Arc<Metrics>,
+    read_model: Arc<ReadModel>,
+    chain_id: u64,
+    gateway_domain: Option<String>,
+    identity_pubkey: B256,
 ) -> anyhow::Result<()> {
-    let state = HttpState { health, metrics };
+    let state = HttpState {
+        health,
+        metrics,
+        read_model,
+        chain_id,
+        gateway_domain,
+        identity_pubkey,
+    };
     let app = Router::new()
         .route("/healthz", get(healthz))
+        .route("/status", get(status))
         .route("/metrics", get(metrics_handler))
+        .route("/mesh/clusters", get(mesh_clusters))
+        .route("/mesh/members", get(mesh_members))
+        .route("/mesh/topology", get(mesh_topology))
+        .route("/mesh/health", get(mesh_health))
+        .route("/mesh/timeline", get(mesh_timeline))
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
@@ -100,8 +124,157 @@ async fn healthz(State(s): State<HttpState>) -> Response {
     }
 }
 
+async fn status(State(s): State<HttpState>) -> Response {
+    let lag = s.health.chain_head_lag.load(Ordering::Relaxed);
+    let grpc_accepting = s.health.grpc_accepting.load(Ordering::Relaxed);
+    let rpc_reachable = s.health.rpc_reachable.load(Ordering::Relaxed);
+    let health_reason = s.health.evaluate().err();
+    let snapshots = s
+        .read_model
+        .snapshots(s.chain_id, s.gateway_domain.as_deref())
+        .await;
+    let member_count: usize = snapshots.iter().map(|s| s.member_count).sum();
+    (
+        StatusCode::OK,
+        Json(json!({
+            "chainId": s.chain_id,
+            "pubKey": format!("{:#x}", s.identity_pubkey),
+            "health": {
+                "ok": health_reason.is_none(),
+                "reason": health_reason,
+                "chainHeadLagBlocks": lag,
+                "grpcAccepting": grpc_accepting,
+                "rpcReachable": rpc_reachable,
+            },
+            "readModel": {
+                "clusterCount": snapshots.len(),
+                "memberCount": member_count,
+                "atBlock": snapshots.iter().map(|s| s.at_block).max(),
+            }
+        })),
+    )
+        .into_response()
+}
+
 async fn metrics_handler(State(s): State<HttpState>) -> Response {
     (StatusCode::OK, s.metrics.render()).into_response()
+}
+
+async fn mesh_clusters(State(s): State<HttpState>) -> Response {
+    let snapshots = s
+        .read_model
+        .snapshots(s.chain_id, s.gateway_domain.as_deref())
+        .await;
+    let at_block = snapshots.iter().map(|s| s.at_block).max();
+    let member_count: usize = snapshots.iter().map(|s| s.member_count).sum();
+    (
+        StatusCode::OK,
+        Json(json!({
+            "chainId": snapshots.first().map(|s| s.chain_id),
+            "atBlock": at_block,
+            "clusterCount": snapshots.len(),
+            "memberCount": member_count,
+            "clusters": snapshots,
+        })),
+    )
+        .into_response()
+}
+
+async fn mesh_members(
+    State(s): State<HttpState>,
+    Query(params): Query<HashMap<String, String>>,
+) -> Response {
+    let snapshots = s
+        .read_model
+        .snapshots(s.chain_id, s.gateway_domain.as_deref())
+        .await;
+    if let Some(cluster) = params.get("cluster") {
+        let cluster_lc = cluster.to_ascii_lowercase();
+        if let Some(snapshot) = snapshots
+            .into_iter()
+            .find(|s| s.cluster.to_ascii_lowercase() == cluster_lc)
+        {
+            return (StatusCode::OK, Json(json!(snapshot))).into_response();
+        }
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": "unknown_cluster", "message": format!("unknown cluster {cluster}")})),
+        )
+            .into_response();
+    }
+    mesh_clusters(State(s)).await
+}
+
+async fn mesh_topology(State(s): State<HttpState>) -> Response {
+    let snapshots = s
+        .read_model
+        .snapshots(s.chain_id, s.gateway_domain.as_deref())
+        .await;
+    let topologies = snapshots.iter().map(build_topology).collect::<Vec<_>>();
+    let at_block = topologies.iter().map(|t| t.at_block).max();
+    (
+        StatusCode::OK,
+        Json(json!({
+            "chainId": snapshots.first().map(|s| s.chain_id),
+            "atBlock": at_block,
+            "clusterCount": topologies.len(),
+            "clusters": topologies,
+        })),
+    )
+        .into_response()
+}
+
+async fn mesh_health(State(s): State<HttpState>) -> Response {
+    let snapshots = s
+        .read_model
+        .snapshots(s.chain_id, s.gateway_domain.as_deref())
+        .await;
+    let health = snapshots.iter().map(build_health).collect::<Vec<_>>();
+    let at_block = health.iter().map(|h| h.at_block).max();
+    let member_count: usize = health.iter().map(|h| h.member_count).sum();
+    (
+        StatusCode::OK,
+        Json(json!({
+            "chainId": snapshots.first().map(|s| s.chain_id),
+            "atBlock": at_block,
+            "clusterCount": health.len(),
+            "memberCount": member_count,
+            "cskCommitted": !health.is_empty() && health.iter().all(|h| h.csk_committed),
+            "clusters": health,
+        })),
+    )
+        .into_response()
+}
+
+async fn mesh_timeline(State(s): State<HttpState>) -> Response {
+    let timelines = s.read_model.timelines().await;
+    let mut events = timelines
+        .iter()
+        .flat_map(|t| {
+            t.events.iter().cloned().map(|mut e| {
+                e.args.insert(
+                    "cluster".into(),
+                    serde_json::Value::String(t.cluster.clone()),
+                );
+                e
+            })
+        })
+        .collect::<Vec<_>>();
+    events.sort_by_key(|e| (e.block, e.log_index));
+    let from_block = timelines.iter().map(|t| t.from_block).min();
+    let to_block = timelines.iter().map(|t| t.to_block).max();
+    (
+        StatusCode::OK,
+        Json(json!({
+            "clusterCount": timelines.len(),
+            "fromBlock": from_block,
+            "toBlock": to_block,
+            "eventCount": events.len(),
+            "events": events,
+            "clusters": timelines,
+        })),
+    )
+        .into_response()
 }
 
 #[cfg(test)]

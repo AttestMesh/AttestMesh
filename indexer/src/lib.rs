@@ -17,6 +17,7 @@ pub mod grpc;
 pub mod health;
 pub mod identity;
 pub mod metrics;
+pub mod query;
 pub mod registry;
 pub mod runtime;
 pub mod state;

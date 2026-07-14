@@ -23,9 +23,9 @@ describe("selectors", () => {
     expect(ALLOWED_SELECTORS.has(expanded)).toBe(true);
   });
 
-  it("contains exactly the 17 allowlisted operations with no collisions", () => {
-    expect(ALLOWED_SIGNATURES).toHaveLength(17);
-    expect(ALLOWED_SELECTORS.size).toBe(17); // distinct selectors, no hash collisions
+  it("contains exactly the 18 allowlisted operations with no collisions", () => {
+    expect(ALLOWED_SIGNATURES).toHaveLength(18);
+    expect(ALLOWED_SELECTORS.size).toBe(18); // distinct selectors, no hash collisions
   });
 
   it("known selectors are present", () => {

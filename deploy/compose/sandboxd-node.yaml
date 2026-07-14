@@ -1,0 +1,151 @@
+# confidential-sandboxes daemon, enrolled as a Path-A member of net_open_webhost.
+services:
+  sidecar:
+    image: ghcr.io/attestmesh/cluster-mesh-agent@sha256:b9e0ae107d9db015c22059c9fecdc28f2b35e09b257eabb4739bd4e46d96f641
+    restart: unless-stopped
+    environment:
+      - CHAIN_ID=${CHAIN_ID}
+      - RPC_URL=${RPC_URL}
+      - BUNDLER_URL=${BUNDLER_URL}
+      - GAS_POLICY_ID=${GAS_POLICY_ID}
+      - INDEXER_REGISTRY_ADDR=${INDEXER_REGISTRY_ADDR}
+      - GATEWAY_DOMAIN=${GATEWAY_DOMAIN}
+      - DSTACK_SOCKET=/var/run/dstack.sock
+      - SIDECAR_STATE_DIR=/var/lib/attestmesh
+      - PEER_ENVELOPE_FALLBACK=true
+      - HEALTH_HTTP_ADDR=0.0.0.0:9090
+      - LOG_FORMAT=pretty
+      - LOG_LEVEL=info,cluster_mesh_agent=debug
+    volumes:
+      - /var/run/dstack.sock:/var/run/dstack.sock
+      - sidecar-state:/var/lib/attestmesh
+    ports:
+      - "9090:9090"
+      - "51900:51900"
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun
+
+  sandboxd:
+    image: ghcr.io/dmvt/confidential-sandboxes@sha256:5850401851fc30a91299ed1e097f7e4d60f6f5648a581bae9ecd02fbb978ded7
+    restart: unless-stopped
+    environment:
+      SANDBOX_DAEMON_TOKEN: ${SANDBOX_DAEMON_TOKEN:?set in the CVM env; gateway-exposed control API}
+      PUBLIC_BASE_URL: ${PUBLIC_BASE_URL}
+      ONCHAIN_CLUSTER_DIAMOND: ${ONCHAIN_CLUSTER_DIAMOND}
+      DSTACK_SOCKET: /var/run/dstack.sock
+      # Durable state on the named sandboxd-state volume: sandbox store + org/handle/uid ledger share
+      # one sqlite file; SANDBOX_STATE_DB points at the same path so whichever the core reads resolves
+      # to the durable volume. No private key material (identity keys are re-derived from KMS).
+      SANDBOX_ALLOCATION_DB: /var/lib/sandboxd/state.sqlite3
+      SANDBOX_STATE_DB: /var/lib/sandboxd/state.sqlite3
+      # Shared bridge the daemon + every tenant join → Docker DNS resolves http://cs_<id16>:<port>/…
+      SANDBOX_INGRESS_NETWORK: cs-ingress
+      # Preview URLs (/app/{id}/…) are capability URLs reachable without the daemon bearer; /_api/*
+      # stays bearer-gated.
+      SANDBOX_APP_PUBLIC: "1"
+      # One-shot image to chown a fresh per-sandbox /data volume to the tenant uid (65534) so the
+      # attested durable writable area is writable under read-only rootfs + non-root user.
+      SANDBOX_VOLUME_INIT_IMAGE: busybox:stable
+      # Host capacity ceilings so admission can't oversell the CVM (BOX_VCPU=4 / BOX_MEM=8192 /
+      # BOX_DISK=80 in sandboxd-node-box.py). Headroom left for daemon/OS/backups; overcommit stays at
+      # the code default 1.0. NOTE: the core reads HOST_CPU_MILLIS (not HOST_VCPU_MILLIS).
+      HOST_CPU_MILLIS: "3500"
+      HOST_MEMORY_MB: "6144"
+      HOST_DISK_MB: "40960"
+      HOST_MAX_SANDBOXES: "20"     # documented ceiling (not yet enforced by the core; forward-compat)
+      # Registry creds (CVM-sealed) so the daemon can pull PRIVATE images for runsc workloads.
+      DSTACK_DOCKER_USERNAME: ${DSTACK_DOCKER_USERNAME}
+      DSTACK_DOCKER_PASSWORD: ${DSTACK_DOCKER_PASSWORD}
+      DSTACK_DOCKER_REGISTRY: ${DSTACK_DOCKER_REGISTRY}
+    networks:
+      - cs-ingress
+    volumes:
+      - /var/run/dstack.sock:/var/run/dstack.sock:ro
+      - /var/run/docker.sock:/var/run/docker.sock
+      # Durable daemon state — survives restart (H4). Metadata + manifests, no tenant secrets.
+      - sandboxd-state:/var/lib/sandboxd
+    cap_add:
+      - SYS_ADMIN
+    security_opt:
+      - seccomp=unconfined
+      - apparmor=unconfined
+    ports:
+      - "8080:8080"
+
+  # State backup sidecar — hourly online-backup snapshot of the sandboxd-state sqlite to a SEPARATE
+  # named volume, using the already-pinned sandboxd image. Metadata only (no tenant secrets). Per-
+  # sandbox tenant data volumes are NOT backed up in MVP (roadmap). See deploy/README.md.
+  sandboxd-backup:
+    image: ghcr.io/dmvt/confidential-sandboxes@sha256:5850401851fc30a91299ed1e097f7e4d60f6f5648a581bae9ecd02fbb978ded7
+    restart: unless-stopped
+    environment:
+      STATE_DB: /var/lib/sandboxd/state.sqlite3
+      BACKUP_DIR: /backups
+      BACKUP_INTERVAL_SECONDS: "3600"
+      BACKUP_KEEP: "48"
+    entrypoint:
+      - python
+      - -c
+      - |
+        import sqlite3, time, os, glob, datetime
+        src = os.environ.get("STATE_DB", "/var/lib/sandboxd/state.sqlite3")
+        dst_dir = os.environ.get("BACKUP_DIR", "/backups")
+        keep = int(os.environ.get("BACKUP_KEEP", "48") or "0")
+        interval = int(os.environ.get("BACKUP_INTERVAL_SECONDS", "3600") or "3600")
+        os.makedirs(dst_dir, exist_ok=True)
+        print(f"[backup] snapshotting {src} -> {dst_dir} every {interval}s (keep {keep})", flush=True)
+        while True:
+            if os.path.exists(src):
+                ts = datetime.datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+                out = os.path.join(dst_dir, f"state-{ts}.sqlite3")
+                try:
+                    s = sqlite3.connect(src)
+                    d = sqlite3.connect(out)
+                    with d:
+                        s.backup(d)
+                    d.close(); s.close()
+                    print(f"[backup] ok {out}", flush=True)
+                except Exception as e:  # noqa: BLE001 — best-effort loop, never crash the sidecar
+                    print(f"[backup] FAILED {e}", flush=True)
+                if keep > 0:
+                    snaps = sorted(glob.glob(os.path.join(dst_dir, "state-*.sqlite3")))
+                    for old in snaps[:-keep]:
+                        try:
+                            os.remove(old)
+                        except OSError:
+                            pass
+            else:
+                print(f"[backup] source {src} not present yet; waiting", flush=True)
+            time.sleep(interval)
+    volumes:
+      - sandboxd-state:/var/lib/sandboxd
+      - sandboxd-backups:/backups
+
+  registration-calldata:
+    image: ghcr.io/dmvt/attestmesh-indexer@sha256:d99b1d207e0df8bfdf6fbac5b001142307475ac9a5b1b88b730b7edabd4283e5
+    restart: "no"
+    depends_on:
+      - sidecar
+    entrypoint: ["/usr/local/bin/attestmesh-registration-calldata"]
+    environment:
+      - CLUSTER=${CLUSTER}
+      - DSTACK_SOCKET=/var/run/dstack.sock
+      - REGISTRATION_HELPER_ADDR=0.0.0.0:9092
+    ports:
+      - "9092:9092"
+    volumes:
+      - /var/run/dstack.sock:/var/run/dstack.sock
+
+networks:
+  # Fixed literal name so tenant containers launched by the daemon with `--network cs-ingress` join
+  # the SAME network sandboxd is on. Plain bridge (egress enforcement is CUT for MVP; the attested
+  # manifest declares the network open/unconfined). The entrypoint also creates it belt-and-suspenders.
+  cs-ingress:
+    name: cs-ingress
+
+volumes:
+  sidecar-state:
+  sandboxd-state:
+  sandboxd-backups:

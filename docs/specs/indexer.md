@@ -1,10 +1,10 @@
 # AttestMesh Indexer — Component Spec
 
-**Status**: Implemented v1 — **live on Base mainnet (8453)**, deployed + registered; see [`docs/deployment.md`](../deployment.md)
+**Status**: Implemented v1 + protocol-v2 cursor/checkpoint delivery — Base rollout pending; see [`docs/deployment.md`](../deployment.md)
 **Parent spec**: [`attestmesh-coordination-layer.md`](./attestmesh-coordination-layer.md) (especially §6)
 **Component**: `indexer/`
 **Binary**: `attestmesh-indexer`
-**Last updated**: 2026-06-10
+**Last updated**: 2026-07-11
 
 ---
 
@@ -12,7 +12,7 @@
 
 The Indexer is the off-chain event distribution layer. It watches every AttestMesh ClusterDiamond on its target chain (any diamond it has been asked to follow), and pushes events to the specific members of the cluster that emitted them — eliminating the need for each node sidecar to maintain its own chain RPC subscription. Master spec §6 defines *what* it does at the architectural level; this spec defines *what gets built*.
 
-Each push is signed by the Indexer's attestation-bound key and paired with an `eth_getLogs`-style "repro stub" so subscribing members can independently verify any individual push against any chain RPC provider they trust. The Indexer is therefore trusted by members for liveness and completeness of event delivery, but not for correctness of event contents.
+Each push is signed by the Indexer's attestation-bound key and paired with an `eth_getLogs`-style "repro stub" for diagnostics or a future sampling policy. Protocol-v2 sidecars verify the registry-pinned signature and trust the Indexer for event correctness, liveness, and completeness; they do not execute the repro stub or maintain a direct-log fallback.
 
 ---
 
@@ -52,7 +52,7 @@ Runtime requirements:
 - Listens on TCP for inbound gRPC subscriptions from member sidecars (`INDEXER_GRPC_ADDR`, default `0.0.0.0:50051`). Externally TLS-terminated at a load balancer; the worker process itself speaks h2c.
 - Holds open one EVM RPC connection per chain (HTTP/2 against `RPC_URL`; WebSocket fallback in milestone B).
 - Reads its own `IndexerRegistry` record once at boot to verify it matches its own attested identity (sanity check; logs at warn on mismatch).
-- Persistent state: per-(clusterAddress, memberId) cursor (highest delivered `(blockNumber, logIndex)`), stored in a local key-value store sealed via dstack.
+- Persistent state: per-(clusterAddress, memberId) cursor (highest acknowledged `(blockNumber, logIndex)`), stored in local sled on the persistent volume; it contains no secrets and is not sealed.
 
 Process lifecycle:
 
@@ -213,16 +213,22 @@ Each log emitted from the block-watcher is routed to the cluster's local queue. 
 
 ```
 loop {
-    let log = cluster.queue.recv().await;
-    let push = build_envelope(log, cluster.address);   // signs with indexer key + adds repro stub
-    for subscriber in cluster.subscribers() {
-        if log.is_relevant_for(subscriber.member_id) {
-            subscriber.send_with_backpressure(push.clone()).await;
-            cursor.advance(cluster.address, subscriber.member_id, log.block_number, log.log_index);
+    let batch = watcher.next_indexed_batch().await;
+    for log in batch.logs {
+        let push = build_envelope(log, cluster.address); // signed + repro stub
+        for subscriber in cluster.subscribers() {
+            if log.is_relevant_for(subscriber.member_id) {
+                subscriber.send_live_or_close(push.clone()).await;
+            }
         }
+    }
+    for protocol_v2_subscriber in cluster.subscribers() {
+        protocol_v2_subscriber.send_signed_checkpoint(batch.indexed_through).await;
     }
 }
 ```
+
+The send path never advances a cursor. Only the inbound Ack handler does so, after the sidecar reports handler completion; a crash before Ack therefore causes intentional at-least-once replay.
 
 "Relevant for this member" filters per master spec §6.2:
 
@@ -258,7 +264,8 @@ message Hello {
   bytes32 cluster_addr = 1;
   bytes32 member_id = 2;
   bytes attestation = 3;       // sidecar's attestation proof; unused by v1 indexer (see §8.3)
-  uint64 from_block = 4;       // resume cursor; 0 means "from this member's MemberRegistered"
+  uint64 from_block = 4;       // 0 on first boot; last handled block on reconnect/backend change
+  uint32 protocol_version = 5; // 2 = signed checkpoints + head initialization for an empty cursor
 }
 
 message Ack {
@@ -298,11 +305,9 @@ For each incoming `Subscribe(stream)`:
    - `cluster_addr` is in the discovered-clusters set. Else close with `NotFound`.
    - `member_id` exists in that cluster's MemberStorage. (Done via cached read of `AttestFacet.memberOf` indexed by the on-chain MemberRecord at the time of `MemberRegistered`.) Else close with `NotFound`.
    - `from_block` is `0` or `>= the member's MemberRegistered block` (no rewinding past their join). Else clamp to the floor and log at warn.
-3. Determine the effective cursor:
-   - If a persistent cursor exists for `(cluster_addr, member_id)`, use `max(persistent, hello.from_block)`.
-   - Else use `member's MemberRegistered block` (master spec §6.4).
-4. Register the subscription in the cluster's subscriber set.
-5. Send `PushEnvelope`s for all events in `[cursor, latest_indexed]` that are relevant for this member, with `indexer_attestation` populated on the first envelope only.
+3. Determine the effective cursor. Resume strictly after the full persisted `(blockNumber, logIndex)` tuple. For a protocol-v2 subscriber with no cursor and `from_block = 0`, durably initialize at `latest_indexed` instead of replaying legacy pre-upgrade history; legacy clients retain the MemberRegistered floor.
+4. Register the subscription behind its per-session ordering gate.
+5. Page and send relevant events after the cursor, then send a signed checkpoint through `latest_indexed`. Checkpoints use empty event/tx/repro fields and `(blockNumber, logIndex) = (indexedThrough, uint64::MAX)`.
 6. Continue streaming new events as they're indexed.
 7. Process inbound `Ack` messages to advance the persistent cursor.
 
@@ -312,13 +317,15 @@ v1 takes the subscribing member's claim at face value. The on-chain MemberStorag
 
 ### 8.4 Backpressure
 
-Each subscription has a bounded mpsc channel (capacity 1024 push envelopes). On full channel, the per-cluster dispatch loop **does not block** — it logs at warn and drops the *oldest unsent* envelope from that subscriber's queue. The subscriber will see a gap in its event stream and can request catchup by reconnecting (which resumes from its persisted cursor + the gap is replayed).
-
-Per master spec §6.1, the Indexer must not silently drop within its subscription window. The "oldest dropped + reconnect-replays" approach satisfies this — a slow subscriber gets explicit gaps in the live stream, but every event it has ever seen via `Ack` is durably tracked, and reconnect closes the gap. Operators monitor a `subscriber_dropped_events_total` metric.
+Each subscription has a bounded channel (capacity 1024). Catch-up applies backpressure and is serialized before live delivery. A full live channel emits `ResourceExhausted` and closes the stream; no subsequent checkpoint can pass the gap, so reconnect resumes from the last durable Ack. The Indexer never silently drops an envelope while continuing the stream.
 
 ### 8.5 Reconnects
 
-A dropped TCP connection terminates the stream. The subscriber's persistent cursor is unaffected. On reconnect, the subscriber sends a fresh `Hello` with `from_block` = their last Ack'd block + 1 (or 0 to let the server decide). The server resumes from the persistent cursor (which is at the higher of the two values) and streams the gap before catching up to head.
+A dropped TCP connection terminates the stream. The sidecar reconnects with its last handled block (durably, the last signed checkpoint). When this Indexer already has an exact persistent cursor, the full tuple filters same-block events precisely. A newly selected Indexer has no cursor and replays the supplied boundary block inclusively, producing safe duplicates instead of a gap. Only a genuinely fresh sidecar sends `from_block = 0` and receives head initialization. Catch-up ends with a checkpoint Ack before live delivery continues.
+
+### 8.6 Stable load-balancer endpoint
+
+Production blue/green deployments register the stable `indexer-lb` gRPC gateway endpoint, not a candidate's direct endpoint. Each candidate retains its own signing key and cursor store. The cutover driver probes the candidate, pauses new LB accepts, updates `IndexerRegistry` with the candidate code ID/pubkey, commits the HAProxy backend, and closes old streams so sidecars re-discover the key and reconnect with their checkpoint block. The public HTTP read model is switched in the same commit. See the [Indexer LB runbook](../../deploy/indexer-lb-runbook.md).
 
 ---
 
@@ -342,7 +349,7 @@ Milestone B (HA): if multiple Indexer replicas share the cursor store across ins
 
 ### 9.3 Ack durability
 
-`Ack` does not flush to disk immediately on every message. Indexer batches writes every 100 ms or every 32 acks (whichever is sooner). A crash between ack and flush can re-deliver a few seconds of events on reconnect — subscriber must dedup off `(block_number, log_index)`. The sidecar's envelope handlers are already idempotent off the on-chain `envelopeId` so this is benign.
+Event Acks advance monotonically; a crash before Ack causes re-delivery (at-least-once semantics). Checkpoint Acks flush immediately because they certify the complete ordered prefix through a block, including empty blocks. The sidecar suppresses repeated positions within one stream, while a reconnect may deliberately invoke the handler again; applications retain request-level idempotency across those deliveries.
 
 ---
 
@@ -362,9 +369,7 @@ For every push, build an `RpcReproStub` that lets any member with an RPC endpoin
 }
 ```
 
-The member runs this against its own trusted RPC, gets back a logs array, finds the one with matching `logIndex`, and confirms the bytes match `event_data`. Any mismatch is grounds to drop the Indexer subscription and re-discover via IndexerRegistry.
-
-v1 sidecar does this opt-in only (master spec §11 was deferred to milestone B; sidecar default is to trust signature verification alone). The repro stub is generated regardless so the verification path is always available.
+A diagnostic tool or future sampling policy can run this against a trusted RPC, find the matching `logIndex`, and compare the bytes with `event_data`. Protocol-v2 sidecars retain the signed stub but do not execute it; their default and only current correctness check is the registry-pinned Indexer signature.
 
 ---
 
@@ -417,8 +422,10 @@ HTTP at `HEALTH_HTTP_ADDR`:
 
 - `chain::repro::build_stub` against fixture logs.
 - `grpc::envelope::sign_and_verify` round-trip.
+- Signed checkpoint construction and tamper rejection.
+- Full-tuple same-block replay filtering and empty-cursor protocol-version selection.
 - `state::cursor` advance / persist / restore.
-- `state::subscribers` add / remove / iteration under concurrent mutation.
+- `state::subscribers` add / remove / iteration, replay-before-live ordering, and overflow termination.
 - `chain::watcher::filter` against fixture logs.
 
 ### 14.2 Integration
@@ -431,9 +438,9 @@ HTTP at `HEALTH_HTTP_ADDR`:
 4. Asserts:
    - All three subscribers receive `MemberRegistered` events for the other two.
    - A `MessageSent` event with recipient_member_id=A is received by A but not by B or C.
-   - Reconnecting a subscriber with `from_block = 0` after disconnect replays from the persisted cursor (no duplicate Acks land).
-   - Killing the Indexer process and restarting it preserves cursors; subscribers reconnect and resume.
-   - A subscriber that doesn't Ack for 5s and then receives 2048 events sees the oldest 1024 dropped and the rest delivered with the `indexer_events_dropped_total` metric incremented.
+   - Reconnecting a subscriber with `from_block = 0` resumes strictly after the persisted full cursor; a crash before Ack deliberately replays the event.
+   - Killing the Indexer process and restarting it preserves cursors; subscribers reconnect, replay any unacknowledged suffix, and resume.
+   - A subscriber whose live queue fills receives `ResourceExhausted`; the stream closes and reconnect replays from the last Ack instead of advancing across a dropped event.
 5. Cleanup.
 
 No mainnet-fork tests. No fuzz tests for v1.

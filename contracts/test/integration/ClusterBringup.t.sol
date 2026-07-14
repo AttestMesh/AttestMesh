@@ -113,6 +113,35 @@ contract ClusterBringupTest is Test {
         IMessage(cluster).send(idC, env, ct);
     }
 
+    // ── Scenario 1b: on-chain Ed25519 heartbeat key (ed25519-onchain-key spec) ──
+    // Members publish their heartbeat key on chain so peers read it instead of
+    // exchanging a sponsored PeerEndpoint envelope. Mirrors publishWgKey.
+
+    function test_publishEd25519Key() public {
+        (address mA, bytes32 idA) = _register(COMP3, 3, "xpub-A", "wg-A", 0);
+
+        // Unset until published.
+        assertEq(INetwork(cluster).ed25519KeyOf(idA), bytes32(0));
+
+        // Member publishes; event carries (memberId, key); read returns it.
+        vm.prank(mA);
+        vm.expectEmit(true, true, true, true, cluster);
+        emit INetwork.Ed25519KeyPublished(idA, bytes32("ed-A"));
+        INetwork(cluster).publishEd25519Key(bytes32("ed-A"));
+        assertEq(INetwork(cluster).ed25519KeyOf(idA), bytes32("ed-A"));
+
+        // Rotation: unconditional overwrite.
+        vm.prank(mA);
+        INetwork(cluster).publishEd25519Key(bytes32("ed-A2"));
+        assertEq(INetwork(cluster).ed25519KeyOf(idA), bytes32("ed-A2"));
+    }
+
+    function test_publishEd25519KeyNonMemberReverts() public {
+        vm.prank(address(0xDEAD));
+        vm.expectRevert(NotClusterMember.selector);
+        INetwork(cluster).publishEd25519Key(bytes32("ed-x"));
+    }
+
     // ── Scenario 2: the KMS boot gate rejects a non-allowed compose hash ───────
     // Compose hash is no longer self-asserted at registration (it is not part of the
     // signed KMS chain); it is the boot-gate policy the dstack KMS enforces before the

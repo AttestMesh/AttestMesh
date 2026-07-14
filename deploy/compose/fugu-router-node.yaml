@@ -1,0 +1,503 @@
+# Fugu-router node: LiteLLM proxy pooling Sakana Fugu subscription keys
+# as ONE strictly MESH-ONLY AttestMesh node on C3. No tailnet: the LiteLLM Admin UI is
+# unused, and the Langfuse dashboard lives on its own CVM (langfuse-node). Data services
+# are EXTERNAL cluster nodes reached over the wireguard mesh via sidecar-netns socat
+# forwarders: pg-ha (Postgres) and redis-ha (router state). Langfuse trace ingest goes
+# OUTBOUND through the :18420 forwarder to the langfuse-node CVM. Gateway OFF, bridge
+# networking; nothing published except sidecar :9090 (health) + :51900 (wg transport).
+#
+# Mesh endpoints:  <mesh-ip>:18410 = Fugu session router + LiteLLM-compatible API
+#                                      (Hermes base URL, LITELLM_MASTER_KEY auth)
+#                                      dashboard: /fugu/dashboard
+#                  (:18430 reserved: future ACP adapter)
+# Langfuse:        litellm -> sidecar:18420 -> ${LANGFUSE_NODE_IP}:18420 (langfuse-node).
+#                  The langfuse-specific risks (r2 multipart, presigned media URLs)
+#                  moved to langfuse-node with the langfuse stack.
+#
+# ── RISKS (from the deployment plan — keep in sync with deploy/fugu-router-runbook.md) ──
+# 2. The Sakana API is likely CDN-fronted — SAKANA_CIDRS must be the NARROWEST observed
+#    CIDRs for litellm-egress-fw; re-resolve on a short interval.
+# 4. C3 membership is PERMANENT (no removeMember) — the driver runs a `hash`-mode
+#    pre-check before bind.
+# 5. Redis client libs here do NOT follow sentinel: redis-ha's HAProxy indirection means
+#    LiteLLM just sees a single endpoint that always points at the master.
+#
+# Auth derivation: the pg-ha superuser + redis-ha client passwords are HKDF-derived from
+# the CSK IN-CVM (csk_derive attestmesh.{pgha.superuser,redisha.auth}.v1) — they never
+# ride the sealed env. The fugu-router image's entrypoint derives the redis password
+# itself (agent gRPC) before exec'ing litellm; no derived-secrets volume needed.
+
+services:
+  sidecar:
+    image: ghcr.io/attestmesh/cluster-mesh-agent@sha256:b9e0ae107d9db015c22059c9fecdc28f2b35e09b257eabb4739bd4e46d96f641
+    restart: unless-stopped
+    environment:
+      - MEMBER_CONTRACT=${APP_ID}
+      - CHAIN_ID=${CHAIN_ID}
+      - RPC_URL=${RPC_URL}
+      - BUNDLER_URL=${BUNDLER_URL}
+      - GAS_POLICY_ID=${GAS_POLICY_ID}
+      - INDEXER_REGISTRY_ADDR=${INDEXER_REGISTRY_ADDR}
+      - GATEWAY_DOMAIN=${GATEWAY_DOMAIN}
+      - DSTACK_SOCKET=/var/run/dstack.sock
+      - SIDECAR_STATE_DIR=/var/lib/attestmesh
+      - AGENT_GRPC_SOCKET=/var/run/attestmesh/agent.sock
+      - HEALTH_HTTP_ADDR=0.0.0.0:9090
+      - LOG_FORMAT=pretty
+      - LOG_LEVEL=info,cluster_mesh_agent=debug
+    volumes:
+      - /var/run/dstack.sock:/var/run/dstack.sock
+      - sidecar-state:/var/lib/attestmesh
+      - agent-sock:/var/run/attestmesh
+      - sidecar-log:/sidecar-log
+    ports:
+      - "9090:9090"
+      - "51900:51900"
+      - "18410:18410"
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - |
+        mkdir -p /sidecar-log
+        {
+          echo "diag: sidecar wrapper starting at $$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          echo "diag: MEMBER_CONTRACT=$${MEMBER_CONTRACT:-}"
+          echo "diag: CHAIN_ID=$${CHAIN_ID:-}"
+          redacted_rpc="$$(printf '%s' "$${RPC_URL:-}" | sed -E 's#(https?://[^/]+/)[0-9a-f]{32}#\1<redacted>#g; s#(v2/)[A-Za-z0-9_-]+#\1<redacted>#g; s#([?&]apikey=)[^&]+#\1<redacted>#g')"
+          echo "diag: RPC_URL=$$redacted_rpc"
+          redacted_bundler="$$(printf '%s' "$${BUNDLER_URL:-}" | sed -E 's/([?&]apikey=)[^&]+/\1<redacted>/g; s#(v2/)[A-Za-z0-9_-]+#\1<redacted>#g')"
+          echo "diag: BUNDLER_URL=$$redacted_bundler"
+          echo "diag: GAS_POLICY_ID=$${GAS_POLICY_ID:+set}"
+          echo "diag: INDEXER_REGISTRY_ADDR=$${INDEXER_REGISTRY_ADDR:-}"
+          echo "diag: GATEWAY_DOMAIN=$${GATEWAY_DOMAIN:-}"
+          echo "diag: dstack socket:"
+          ls -l /var/run/dstack.sock || true
+          echo "diag: agent socket dir:"
+          ls -ld /var/run/attestmesh || true
+          echo "diag: tun device:"
+          ls -l /dev/net/tun || true
+          echo "diag: launching cluster-mesh-agent"
+          /usr/local/bin/cluster-mesh-agent
+          rc=$$?
+          echo "diag: cluster-mesh-agent exited rc=$$rc at $$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+        } > /sidecar-log/sidecar.log 2>&1
+        sleep infinity
+
+  sidecar-log-server:
+    image: python:3.11-alpine
+    restart: unless-stopped
+    volumes:
+      - sidecar-log:/logs/sidecar:ro
+      - docker-diag:/logs/docker-diag:ro
+    ports:
+      - "19090:19090"
+    working_dir: /logs
+    command: ["python3", "-m", "http.server", "19090", "--bind", "0.0.0.0"]
+
+  docker-diag-server:
+    image: docker:27-cli
+    restart: unless-stopped
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - docker-diag:/docker-diag
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - |
+        mkdir -p /docker-diag
+        (
+          while :; do
+            date -u +%Y-%m-%dT%H:%M:%SZ > /docker-diag/last-snapshot.txt
+            docker ps -a --no-trunc > /docker-diag/docker-ps.txt 2>&1 || true
+            for service in \
+              sidecar \
+              sidecar-log-server \
+              registration-calldata \
+              pg-provision \
+              litellm \
+              session-router \
+              litellm-egress-fw \
+              mesh-proxy-litellm \
+              bridge-proxy-litellm; do
+              docker logs --tail 500 "dstack-$${service}-1" > "/docker-diag/$${service}.log" 2>&1 || true
+            done
+            sleep 5
+          done
+        ) &
+        exec tail -f /dev/null
+
+  # One-shot registration helper for environments where the EIP-4337 bundler is
+  # unavailable: emits dstack_register calldata for operator submission.
+  registration-calldata:
+    image: ghcr.io/dmvt/attestmesh-indexer@sha256:d99b1d207e0df8bfdf6fbac5b001142307475ac9a5b1b88b730b7edabd4283e5
+    restart: "no"
+    depends_on:
+      - sidecar
+    entrypoint: ["/usr/local/bin/attestmesh-registration-calldata"]
+    environment:
+      - CLUSTER=${CLUSTER}
+      - DSTACK_SOCKET=/var/run/dstack.sock
+      - REGISTRATION_HELPER_ADDR=0.0.0.0:9092
+    ports:
+      - "9092:9092"
+    volumes:
+      - /var/run/dstack.sock:/var/run/dstack.sock
+
+  # ── :15431 follows Patroni's writable primary; :15432/3 remain node fallbacks. ──
+  pg-primary-router:
+    image: haproxy:3.0-alpine@sha256:dee54db8b27cd6c21519ea4f0ba0604f3742e8e7369bc16fb5b69133dec3f47f
+    restart: unless-stopped
+    network_mode: service:sidecar
+    depends_on:
+      - sidecar
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - |
+        cat >/tmp/pg-primary-router.cfg <<'CFG'
+        global
+          maxconn 400
+        defaults
+          mode tcp
+          timeout connect 2s
+          timeout client 30m
+          timeout server 30m
+          timeout check 2s
+          retries 2
+          option redispatch
+        listen primary
+          bind 0.0.0.0:15431
+          option httpchk GET /primary
+          http-check expect status 200
+          default-server inter 1s fall 2 rise 1 on-marked-down shutdown-sessions
+          server pg1 10.18.147.86:5434 check port 8008
+          server pg2 10.18.251.71:5434 check port 8008
+          server pg3 10.18.172.186:5434 check port 8008
+        CFG
+        exec haproxy -f /tmp/pg-primary-router.cfg -db
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+
+  pg2-proxy:
+    image: alpine/socat:1.8.0.0
+    restart: unless-stopped
+    network_mode: service:sidecar
+    depends_on:
+      - sidecar
+    command: ["TCP-LISTEN:15432,fork,reuseaddr,bind=0.0.0.0", "TCP:10.18.251.71:5432"]
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+
+  pg3-proxy:
+    image: alpine/socat:1.8.0.0
+    restart: unless-stopped
+    network_mode: service:sidecar
+    depends_on:
+      - sidecar
+    command: ["TCP-LISTEN:15433,fork,reuseaddr,bind=0.0.0.0", "TCP:10.18.172.186:5432"]
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+
+  # ── redis-ha forwarders: :16379-81 -> each redis node's HAProxy :6379 (any = master).
+  #    Three forwarders for node-failure tolerance. IPs spliced in by the driver after
+  #    redis-ha compute-peers (Wave 2). ──
+  redis1-proxy:
+    image: alpine/socat:1.8.0.0
+    restart: unless-stopped
+    network_mode: service:sidecar
+    depends_on:
+      - sidecar
+    command: ["TCP-LISTEN:16379,fork,reuseaddr,bind=0.0.0.0", "TCP:${REDIS_HA_IP_1}:6379"]
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+
+  redis2-proxy:
+    image: alpine/socat:1.8.0.0
+    restart: unless-stopped
+    network_mode: service:sidecar
+    depends_on:
+      - sidecar
+    command: ["TCP-LISTEN:16380,fork,reuseaddr,bind=0.0.0.0", "TCP:${REDIS_HA_IP_2}:6379"]
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+
+  redis3-proxy:
+    image: alpine/socat:1.8.0.0
+    restart: unless-stopped
+    network_mode: service:sidecar
+    depends_on:
+      - sidecar
+    command: ["TCP-LISTEN:16381,fork,reuseaddr,bind=0.0.0.0", "TCP:${REDIS_HA_IP_3}:6379"]
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+
+  # ── langfuse-node forwarder: :18420 -> the langfuse-node CVM's mesh-only Langfuse
+  #    endpoint (trace ingest for litellm's callback). IP spliced in by the driver from
+  #    the langfuse-node state file. ──
+  langfuse-proxy:
+    image: alpine/socat:1.8.0.0
+    restart: unless-stopped
+    network_mode: service:sidecar
+    depends_on:
+      - sidecar
+    command: ["TCP-LISTEN:18420,fork,reuseaddr,bind=0.0.0.0", "TCP:${LANGFUSE_NODE_IP}:18420"]
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+
+  # One-shot: ensure role+database `litellm` on the pg-ha cluster (langfuse-node's own
+  # pg-provision handles the langfuse role/db). Superuser password is CSK-derived
+  # in-CVM; the service password arrives sealed. Idempotent (create-if-missing + ALTER
+  # to converge) — re-runs on every boot.
+  # (Copy of telegram-sync's pg-provision; pg IPs from deploy/logs/pg-ha-pg-ha.state.)
+  pg-provision:
+    image: ghcr.io/attestmesh/pg-ha@sha256:05c6d46c72f6feb444be055e1c12c116ba1334ed6d738e7d649e0ea6e71cabf5 # pinned 2026-07-02 r5
+    restart: on-failure
+    network_mode: service:sidecar
+    depends_on:
+      - sidecar
+    environment:
+      - AGENT_GRPC_SOCKET=/var/run/attestmesh/agent.sock
+      - PGHA_STATUS_FILE=/tmp/pg-provision.status
+      - PGHA_LOG_TAG=pg-provision
+      - LITELLM_DB_PASSWORD=${LITELLM_DB_PASSWORD}
+    volumes:
+      - agent-sock:/var/run/attestmesh
+    entrypoint: ["/bin/bash", "-ec"]
+    command:
+      - |
+        source /usr/local/bin/pgha-common.sh
+        _st "deriving pg-ha superuser credential (waits for CSK)"
+        SUPW="$$(csk_derive attestmesh.pgha.superuser.v1)"
+        HOSTS="10.18.147.86:5432,10.18.251.71:5432,10.18.172.186:5432"
+        _st "ensuring role + database litellm"
+        psql "postgresql://postgres:$${SUPW}@$${HOSTS}/postgres?connect_timeout=5" -v ON_ERROR_STOP=1 -v lpw="$$LITELLM_DB_PASSWORD" <<'SQL'
+        SELECT format('CREATE ROLE litellm LOGIN PASSWORD %L', :'lpw')
+        WHERE NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'litellm')
+        \gexec
+        ALTER ROLE litellm WITH LOGIN PASSWORD :'lpw';
+        SELECT format('CREATE DATABASE %I OWNER %I', 'litellm', 'litellm')
+        WHERE NOT EXISTS (SELECT FROM pg_database WHERE datname = 'litellm')
+        \gexec
+        SQL
+        psql "postgresql://litellm:$${LITELLM_DB_PASSWORD}@$${HOSTS}/litellm?connect_timeout=5" -c 'select 1' >/dev/null
+        _st "OK: role+database litellm ensured; login verified"
+
+  # ── LiteLLM proxy (fugu-router image: bakes config.yaml + fugu_telemetry callback).
+  #    Its entrypoint CSK-derives the redis password over the agent gRPC before exec.
+  #    DSN is the multi-host pg-ha forwarder path (survives node rolls/failover). ──
+  litellm:
+    image: ghcr.io/attestmesh/fugu-router@sha256:20f07c4b825919c8fe51a58a2936a3d21348aabf0bf805adadfb02034f9c74ff # bounded DB retry + Hindsight direct models
+    restart: unless-stopped
+    depends_on:
+      - sidecar
+      - redis1-proxy
+      - langfuse-proxy
+    environment:
+      - LITELLM_MASTER_KEY=${LITELLM_MASTER_KEY}
+      - LITELLM_SALT_KEY=${LITELLM_SALT_KEY}
+      # Single-host DSN: LiteLLM uses Prisma, which cannot parse a multi-host postgres URL
+      # (would leave migrations unrun). sidecar:15431 forwards to pg1's HAProxy :5432 =
+      # current primary, so this still survives pg-ha failover; only pg1 node-down loses it.
+      - DATABASE_URL=postgresql://litellm:${LITELLM_DB_PASSWORD}@sidecar:15431/litellm
+      - SAKANA_API_BASE=${SAKANA_API_BASE}
+      - SAKANA_SUB_1_KEY=${SAKANA_SUB_1_KEY}
+      - SAKANA_SUB_2_KEY=${SAKANA_SUB_2_KEY}
+      - SAKANA_SUB_3_KEY=${SAKANA_SUB_3_KEY}
+      - REDPILL_API_BASE=${REDPILL_API_BASE}
+      - REDPILL_API_KEY=${REDPILL_API_KEY}
+      - XAI_API_BASE=${XAI_API_BASE}
+      - XAI_API_KEY=${XAI_API_KEY}
+      - FUGU_ACCOUNT_COUNT=3
+      - FUGU_SUB_1_ENABLED=true
+      - FUGU_SUB_2_ENABLED=true
+      - FUGU_SUB_3_ENABLED=${FUGU_SUB_3_ENABLED}
+      - FUGU_SUB_1_LABEL=${FUGU_SUB_1_LABEL}
+      - FUGU_SUB_2_LABEL=${FUGU_SUB_2_LABEL}
+      - FUGU_SUB_3_LABEL=${FUGU_SUB_3_LABEL}
+      - FUGU_SUB_1_BILLING_PLAN=${FUGU_SUB_1_BILLING_PLAN}
+      - FUGU_SUB_2_BILLING_PLAN=${FUGU_SUB_2_BILLING_PLAN}
+      - FUGU_SUB_3_BILLING_PLAN=${FUGU_SUB_3_BILLING_PLAN}
+      - FUGU_SUB_1_5H_RESET_ANCHOR=${FUGU_SUB_1_5H_RESET_ANCHOR}
+      - FUGU_SUB_2_5H_RESET_ANCHOR=${FUGU_SUB_2_5H_RESET_ANCHOR}
+      - FUGU_SUB_3_5H_RESET_ANCHOR=${FUGU_SUB_3_5H_RESET_ANCHOR}
+      - FUGU_SUB_1_WEEKLY_RESET_ANCHOR=${FUGU_SUB_1_WEEKLY_RESET_ANCHOR}
+      - FUGU_SUB_2_WEEKLY_RESET_ANCHOR=${FUGU_SUB_2_WEEKLY_RESET_ANCHOR}
+      - FUGU_SUB_3_WEEKLY_RESET_ANCHOR=${FUGU_SUB_3_WEEKLY_RESET_ANCHOR}
+      - FUGU_SUB_1_MONTHLY_RESET_ANCHOR=${FUGU_SUB_1_MONTHLY_RESET_ANCHOR}
+      - FUGU_SUB_2_MONTHLY_RESET_ANCHOR=${FUGU_SUB_2_MONTHLY_RESET_ANCHOR}
+      - FUGU_SUB_3_MONTHLY_RESET_ANCHOR=${FUGU_SUB_3_MONTHLY_RESET_ANCHOR}
+      - FUGU_SUB_1_5H_ALLOWANCE_USAGE_UNITS=${FUGU_SUB_1_5H_ALLOWANCE_USAGE_UNITS}
+      - FUGU_SUB_2_5H_ALLOWANCE_USAGE_UNITS=${FUGU_SUB_2_5H_ALLOWANCE_USAGE_UNITS}
+      - FUGU_SUB_3_5H_ALLOWANCE_USAGE_UNITS=${FUGU_SUB_3_5H_ALLOWANCE_USAGE_UNITS}
+      - FUGU_SUB_1_WEEKLY_ALLOWANCE_USAGE_UNITS=${FUGU_SUB_1_WEEKLY_ALLOWANCE_USAGE_UNITS}
+      - FUGU_SUB_2_WEEKLY_ALLOWANCE_USAGE_UNITS=${FUGU_SUB_2_WEEKLY_ALLOWANCE_USAGE_UNITS}
+      - FUGU_SUB_3_WEEKLY_ALLOWANCE_USAGE_UNITS=${FUGU_SUB_3_WEEKLY_ALLOWANCE_USAGE_UNITS}
+      - FUGU_SUB_1_MONTHLY_ALLOWANCE_USAGE_UNITS=${FUGU_SUB_1_MONTHLY_ALLOWANCE_USAGE_UNITS}
+      - FUGU_SUB_2_MONTHLY_ALLOWANCE_USAGE_UNITS=${FUGU_SUB_2_MONTHLY_ALLOWANCE_USAGE_UNITS}
+      - FUGU_SUB_3_MONTHLY_ALLOWANCE_USAGE_UNITS=${FUGU_SUB_3_MONTHLY_ALLOWANCE_USAGE_UNITS}
+      # Router state (usage-based-routing-v2): redis-ha via the sidecar forwarders,
+      # db 0. Password derived in-CVM by the entrypoint.
+      - REDIS_HOST=sidecar
+      - REDIS_PORT=16379
+      - AGENT_GRPC_SOCKET=/var/run/attestmesh/agent.sock
+      # Langfuse callback credentials: langfuse-node's deterministic LANGFUSE_INIT_*
+      # project keys; the host is the sidecar-netns forwarder to the langfuse-node CVM.
+      - LANGFUSE_HOST=http://sidecar:18420
+      - LANGFUSE_PUBLIC_KEY=${LANGFUSE_INIT_PROJECT_PUBLIC_KEY}
+      - LANGFUSE_SECRET_KEY=${LANGFUSE_INIT_PROJECT_SECRET_KEY}
+    volumes:
+      - agent-sock:/var/run/attestmesh
+    expose:
+      - "4000"
+
+  # Front door: OpenAI-compatible API with sticky per-session subscription placement,
+  # quota/rate-limit retry across subscription keys, and the /fugu/dashboard UI. It
+  # shares LiteLLM's network namespace so the egress firewall governs both processes.
+  session-router:
+    image: ghcr.io/attestmesh/fugu-router@sha256:20f07c4b825919c8fe51a58a2936a3d21348aabf0bf805adadfb02034f9c74ff # bounded DB retry + Hindsight direct models
+    restart: unless-stopped
+    network_mode: service:litellm
+    depends_on:
+      - litellm
+    working_dir: /app
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - |
+        export DATABASE_URL="postgresql://litellm:$${LITELLM_DB_PASSWORD}@sidecar:15431/litellm"
+        exec python3 -m uvicorn fugu_session_router:app --host 0.0.0.0 --port 4010
+    environment:
+      - PYTHONPATH=/app
+      - LITELLM_MASTER_KEY=${LITELLM_MASTER_KEY}
+      - LITELLM_DB_PASSWORD=${LITELLM_DB_PASSWORD}
+      - FUGU_LITELLM_UPSTREAM=http://127.0.0.1:4000
+      - FUGU_ACCOUNT_COUNT=3
+      - FUGU_SUB_1_ENABLED=true
+      - FUGU_SUB_2_ENABLED=true
+      - FUGU_SUB_3_ENABLED=${FUGU_SUB_3_ENABLED}
+      - FUGU_SUB_1_LABEL=${FUGU_SUB_1_LABEL}
+      - FUGU_SUB_2_LABEL=${FUGU_SUB_2_LABEL}
+      - FUGU_SUB_3_LABEL=${FUGU_SUB_3_LABEL}
+      - FUGU_SUB_1_BILLING_PLAN=${FUGU_SUB_1_BILLING_PLAN}
+      - FUGU_SUB_2_BILLING_PLAN=${FUGU_SUB_2_BILLING_PLAN}
+      - FUGU_SUB_3_BILLING_PLAN=${FUGU_SUB_3_BILLING_PLAN}
+      - FUGU_SUB_1_5H_RESET_ANCHOR=${FUGU_SUB_1_5H_RESET_ANCHOR}
+      - FUGU_SUB_2_5H_RESET_ANCHOR=${FUGU_SUB_2_5H_RESET_ANCHOR}
+      - FUGU_SUB_3_5H_RESET_ANCHOR=${FUGU_SUB_3_5H_RESET_ANCHOR}
+      - FUGU_SUB_1_WEEKLY_RESET_ANCHOR=${FUGU_SUB_1_WEEKLY_RESET_ANCHOR}
+      - FUGU_SUB_2_WEEKLY_RESET_ANCHOR=${FUGU_SUB_2_WEEKLY_RESET_ANCHOR}
+      - FUGU_SUB_3_WEEKLY_RESET_ANCHOR=${FUGU_SUB_3_WEEKLY_RESET_ANCHOR}
+      - FUGU_SUB_1_MONTHLY_RESET_ANCHOR=${FUGU_SUB_1_MONTHLY_RESET_ANCHOR}
+      - FUGU_SUB_2_MONTHLY_RESET_ANCHOR=${FUGU_SUB_2_MONTHLY_RESET_ANCHOR}
+      - FUGU_SUB_3_MONTHLY_RESET_ANCHOR=${FUGU_SUB_3_MONTHLY_RESET_ANCHOR}
+      - FUGU_SUB_1_5H_ALLOWANCE_USAGE_UNITS=${FUGU_SUB_1_5H_ALLOWANCE_USAGE_UNITS}
+      - FUGU_SUB_2_5H_ALLOWANCE_USAGE_UNITS=${FUGU_SUB_2_5H_ALLOWANCE_USAGE_UNITS}
+      - FUGU_SUB_3_5H_ALLOWANCE_USAGE_UNITS=${FUGU_SUB_3_5H_ALLOWANCE_USAGE_UNITS}
+      - FUGU_SUB_1_WEEKLY_ALLOWANCE_USAGE_UNITS=${FUGU_SUB_1_WEEKLY_ALLOWANCE_USAGE_UNITS}
+      - FUGU_SUB_2_WEEKLY_ALLOWANCE_USAGE_UNITS=${FUGU_SUB_2_WEEKLY_ALLOWANCE_USAGE_UNITS}
+      - FUGU_SUB_3_WEEKLY_ALLOWANCE_USAGE_UNITS=${FUGU_SUB_3_WEEKLY_ALLOWANCE_USAGE_UNITS}
+      - FUGU_SUB_1_MONTHLY_ALLOWANCE_USAGE_UNITS=${FUGU_SUB_1_MONTHLY_ALLOWANCE_USAGE_UNITS}
+      - FUGU_SUB_2_MONTHLY_ALLOWANCE_USAGE_UNITS=${FUGU_SUB_2_MONTHLY_ALLOWANCE_USAGE_UNITS}
+      - FUGU_SUB_3_MONTHLY_ALLOWANCE_USAGE_UNITS=${FUGU_SUB_3_MONTHLY_ALLOWANCE_USAGE_UNITS}
+
+  # LiteLLM egress is deny-by-default: ONLY the dynamically resolved xAI API
+  # host, static Sakana/RedPill/xAI API CIDRs on :443, the internal
+  # pg/redis/langfuse forwarders, and Docker DNS.
+  litellm-egress-fw:
+    image: ghcr.io/attestmesh/agent-egress-fw@sha256:c6c00d1fc5e73dde050c1a8cf2fef43a93cc9cd0dc0f5f368e7c763f1f1c242c
+    restart: unless-stopped
+    network_mode: service:litellm
+    depends_on:
+      - litellm
+    environment:
+      - ALLOW_BASE_URL=${XAI_API_BASE}
+      - ALLOW_CIDRS=${SAKANA_CIDRS} ${REDPILL_CIDRS} ${XAI_CIDRS}
+      - ALLOW_PORT=443
+      - INTERNAL_HOSTS=
+      - INTERNAL_HOST_PORTS=sidecar:15431 sidecar:15432 sidecar:15433 sidecar:16379 sidecar:16380 sidecar:16381 sidecar:18420
+      - ALLOW_DNS=127.0.0.11
+      - RERESOLVE_SECONDS=15
+    cap_add:
+      - NET_ADMIN
+
+  # Mesh-only endpoint, bound to the wireguard IP inside the sidecar netns.
+  mesh-proxy-litellm:
+    image: alpine/socat:1.8.0.0
+    restart: unless-stopped
+    network_mode: service:sidecar
+    depends_on:
+      - sidecar
+      - litellm
+      - session-router
+    entrypoint:
+      - /bin/sh
+      - -ec
+    command:
+      - |
+        while :; do
+          ip="$(ip -4 -o addr show dev attestmesh0 2>/dev/null | awk '{print $$4}' | cut -d/ -f1)"
+          [ -n "$$ip" ] && break
+          sleep 1
+        done
+        exec socat TCP-LISTEN:18410,fork,reuseaddr,bind="$${ip}" TCP:litellm:4010
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+
+  # Same-host LB backend path: publish the router on the CVM bridge IP only.
+  # HAProxy can use this when gateway TCP transport for router peers is unavailable.
+  bridge-proxy-litellm:
+    image: alpine/socat:1.8.0.0
+    restart: unless-stopped
+    network_mode: service:sidecar
+    depends_on:
+      - sidecar
+      - litellm
+      - session-router
+    entrypoint:
+      - /bin/sh
+      - -ec
+    command:
+      - |
+        while :; do
+          ip="$(ip -4 -o addr show dev eth0 2>/dev/null | awk '{print $$4}' | cut -d/ -f1)"
+          [ -n "$$ip" ] && break
+          sleep 1
+        done
+        exec socat TCP-LISTEN:18410,fork,reuseaddr,bind="$${ip}" TCP:litellm:4010
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+
+volumes:
+  sidecar-state:
+  agent-sock:
+  sidecar-log:
+  docker-diag:

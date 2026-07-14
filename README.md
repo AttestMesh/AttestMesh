@@ -95,6 +95,17 @@ This project uses Holodeck methodology — work flows through specs that live in
 /audit                        # health check
 ```
 
+Install the repository's staged-only security hook once per clone:
+
+```bash
+deploy/install-precommit-security.sh
+```
+
+Every commit then rejects backup artifacts and high-confidence credential shapes locally before
+running an ephemeral Smithers review with `gpt-5.6-sol` at Ultra reasoning. The model receives only
+a locally redacted snapshot of added lines in Git's index; unstaged files, deleted text, and the
+worktree are excluded. See [`docs/precommit-security.md`](docs/precommit-security.md).
+
 See [`CLAUDE.md`](CLAUDE.md) for development guidelines.
 
 ## License

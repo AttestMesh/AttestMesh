@@ -11,6 +11,8 @@ use alloy::providers::{Provider, RootProvider};
 use alloy::sol;
 use alloy::transports::http::Http;
 use anyhow::{Context, Result};
+use std::future::Future;
+use std::time::Duration;
 
 /// HTTP read provider type (matches the sidecar's validated alloy 0.8 pattern).
 pub type HttpProvider = RootProvider<Http<reqwest::Client>>;
@@ -31,6 +33,9 @@ sol! {
 
     #[derive(Debug)]
     event WgKeyPublished(bytes32 indexed memberId, bytes32 wgPubKey);
+
+    #[derive(Debug)]
+    event CskCommitmentSet(bytes32 commitment);
 
     #[derive(Debug)]
     event MessageSent(
@@ -55,7 +60,9 @@ sol! {
             uint64 registeredAt;
         }
         function memberOf(address account) external view returns (MemberRecord memory);
+        function memberById(bytes32 memberId) external view returns (MemberRecord memory);
         function memberCount() external view returns (uint256);
+        function meshCidr() external view returns (uint32 ip, uint8 prefix);
     }
 
     // ── IndexerRegistry self-check (spec §6.2) ────────────────────────────────
@@ -101,5 +108,51 @@ pub async fn read_registry(provider: &HttpProvider, registry: Address) -> Result
 
 /// Current chain head (`eth_blockNumber`).
 pub async fn block_number(provider: &HttpProvider) -> Result<u64> {
-    provider.get_block_number().await.context("eth_blockNumber")
+    retry_rpc("eth_blockNumber", || provider.get_block_number()).await
+}
+
+/// Read `meshCidr()` for a freshly discovered cluster.
+pub async fn mesh_cidr(provider: &HttpProvider, cluster: Address) -> Result<(u32, u8)> {
+    let c = IAttest::new(cluster, provider);
+    let r = retry_rpc("meshCidr()", || async { c.meshCidr().call().await }).await?;
+    Ok((r.ip, r.prefix))
+}
+
+/// Read the on-chain registration timestamp for a member.
+pub async fn member_registered_at(
+    provider: &HttpProvider,
+    cluster: Address,
+    member_id: B256,
+) -> Result<u64> {
+    let c = IAttest::new(cluster, provider);
+    let r = retry_rpc("memberById()", || async {
+        c.memberById(member_id).call().await
+    })
+    .await?;
+    Ok(r._0.registeredAt)
+}
+
+async fn retry_rpc<T, E, Fut, F>(label: &'static str, mut f: F) -> Result<T>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = std::result::Result<T, E>>,
+    E: std::error::Error + Send + Sync + 'static,
+{
+    let mut delay = Duration::from_millis(500);
+    let mut last_error = None;
+    for attempt in 1..=8 {
+        match f().await {
+            Ok(v) => return Ok(v),
+            Err(e) => {
+                last_error = Some(e);
+                if attempt == 8 {
+                    break;
+                }
+                tracing::warn!(label, attempt, error = ?last_error, "RPC read failed; retrying");
+                tokio::time::sleep(delay).await;
+                delay = (delay * 2).min(Duration::from_secs(10));
+            }
+        }
+    }
+    Err(anyhow::Error::new(last_error.expect("retry loop ran"))).context(label)
 }
