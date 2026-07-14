@@ -95,17 +95,44 @@ services:
         psql -w "postgresql://agent_sessions:$${APP_DB_PASSWORD}@$${HOSTS}/agent_sessions?connect_timeout=5" -c 'select 1' >/dev/null
         _st "OK: role + database agent_sessions + pgvector ensured; login verified"
 
-  # Forwarders to each pg-ha node's HAProxy :5432 (current-primary port). They live in
-  # the sidecar netns because only it has the wireguard mesh interface; the app reaches
-  # them at sidecar:1543N over the compose bridge network. Multi-host DSN survives rolls.
-  pg1-proxy:
-    image: alpine/socat:1.8.0.0
+  # :15431 routes directly to Patroni's writable primary; :15432/3 retain
+  # node-specific HAProxy fallbacks for libpq multi-host reconnects.
+  pg-primary-router:
+    image: haproxy:3.0-alpine@sha256:dee54db8b27cd6c21519ea4f0ba0604f3742e8e7369bc16fb5b69133dec3f47f
     restart: unless-stopped
     network_mode: service:sidecar
     depends_on:
       - sidecar
-    command: ["TCP-LISTEN:15431,fork,reuseaddr,bind=0.0.0.0", "TCP:10.18.147.86:5432"]
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - |
+        cat >/tmp/pg-primary-router.cfg <<'CFG'
+        global
+          maxconn 400
+        defaults
+          mode tcp
+          timeout connect 2s
+          timeout client 30m
+          timeout server 30m
+          timeout check 2s
+          retries 2
+          option redispatch
+        listen primary
+          bind 0.0.0.0:15431
+          option httpchk GET /primary
+          http-check expect status 200
+          # Require three consecutive Patroni misses before terminating client
+          # sessions.  A single transient mesh/API miss must not look like a PG
+          # failover; 1s/3 still detects a real role loss within a few seconds.
+          default-server inter 1s fastinter 500ms downinter 1s fall 3 rise 2 on-marked-down shutdown-sessions
+          server pg1 10.18.147.86:5434 check port 8008
+          server pg2 10.18.251.71:5434 check port 8008
+          server pg3 10.18.172.186:5434 check port 8008
+        CFG
+        exec haproxy -f /tmp/pg-primary-router.cfg -db
     read_only: true
+    tmpfs:
+      - /tmp
     cap_drop:
       - ALL
     security_opt:
@@ -145,24 +172,20 @@ services:
     network_mode: service:sidecar
     depends_on:
       - sidecar
-    command: ["TCP-LISTEN:18888,fork,reuseaddr,bind=0.0.0.0", "TCP:10.18.78.76:18888"]
+    command: ["TCP-LISTEN:18888,fork,reuseaddr,bind=0.0.0.0", "TCP:${HINDSIGHT_MESH_IP}:18888"]
     read_only: true
     cap_drop:
       - ALL
     security_opt:
       - no-new-privileges:true
 
-  # Forwarder to the fugu-router-lb mesh endpoint (10.18.133.81:18410) — LiteLLM-
-  # compatible embeddings (qwen/qwen3-embedding-8b, same model/space as the prior
-  # RedPill path). App reaches it at sidecar:14410 (EMBEDDING_URL) with the LiteLLM
-  # master key. Keeps embedding text fully in-mesh — no external egress.
-  fugu-embed-proxy:
+  budget-proxy-forwarder:
     image: alpine/socat:1.8.0.0
     restart: unless-stopped
     network_mode: service:sidecar
     depends_on:
       - sidecar
-    command: ["TCP-LISTEN:14410,fork,reuseaddr,bind=0.0.0.0", "TCP:10.18.133.81:18410"]
+    command: ["TCP-LISTEN:18889,fork,reuseaddr,bind=0.0.0.0", "TCP:${HINDSIGHT_MESH_IP}:18889"]
     read_only: true
     cap_drop:
       - ALL
@@ -172,12 +195,12 @@ services:
   # One-shot: apply Layer-1 migrations (schema_migrations tracked; idempotent). Runs in
   # the SIDECAR netns — like pg-provision — NOT ingest's, so ingest/mcp can hard-wait on
   # it (condition: service_completed_successfully) without a netns dependency cycle. It
-  # needs the FULL sealed env (load_settings requires DATABASE_URL/HINDSIGHT_URL/
-  # HINDSIGHT_TOKEN/INGEST_TOKEN and renders vector(EMBEDDING_DIM)); reaches pg via
+  # needs the sealed database/ingest/vector configuration and renders
+  # vector(EMBEDDING_DIM); it reaches pg via
   # sidecar:1543N. Egress is unlocked here, but migrate only runs DDL — no session text
   # or embeddings flow during migration.
   migrate:
-    image: ghcr.io/attestmesh/agent-session-mcp@sha256:5c3087be20488bbe0058894c8db58acf752b276e5869510e51ade6e7cd20e2bd
+    image: ghcr.io/attestmesh/agent-session-mcp@sha256:0592224f1cb046bd79da5767703ba702050c9c98b8ca6dfb4b0dc4997e823fce
     restart: on-failure
     network_mode: service:sidecar
     depends_on:
@@ -188,6 +211,7 @@ services:
       - HINDSIGHT_URL=${HINDSIGHT_URL}
       - HINDSIGHT_TOKEN=${HINDSIGHT_TOKEN}
       - HINDSIGHT_BANK=${HINDSIGHT_BANK}
+      - HINDSIGHT_SYNC_ENABLED=${HINDSIGHT_SYNC_ENABLED}
       - INGEST_TOKEN=${INGEST_TOKEN}
       - EMBEDDING_URL=${EMBEDDING_URL}
       - EMBEDDING_API_KEY=${EMBEDDING_API_KEY}
@@ -197,10 +221,10 @@ services:
     command: ["python", "db.py"]
 
   # Ingest API (:8080). Owns the app netns; mcp/app-egress-fw join it. Reaches pg via
-  # sidecar:1543N and Hindsight via sidecar:18888; embeds via RedPill. Hard-waits on the
+  # sidecar:1543N and embeds via Redpill. Hard-waits on the
   # migration barrier — ingest does NOT tolerate a missing schema.
   ingest:
-    image: ghcr.io/attestmesh/agent-session-mcp@sha256:5c3087be20488bbe0058894c8db58acf752b276e5869510e51ade6e7cd20e2bd
+    image: ghcr.io/attestmesh/agent-session-mcp@sha256:0592224f1cb046bd79da5767703ba702050c9c98b8ca6dfb4b0dc4997e823fce
     restart: unless-stopped
     depends_on:
       migrate:
@@ -210,6 +234,7 @@ services:
       - HINDSIGHT_URL=${HINDSIGHT_URL}
       - HINDSIGHT_TOKEN=${HINDSIGHT_TOKEN}
       - HINDSIGHT_BANK=${HINDSIGHT_BANK}
+      - HINDSIGHT_SYNC_ENABLED=${HINDSIGHT_SYNC_ENABLED}
       - INGEST_TOKEN=${INGEST_TOKEN}
       - EMBEDDING_URL=${EMBEDDING_URL}
       - EMBEDDING_API_KEY=${EMBEDDING_API_KEY}
@@ -224,7 +249,7 @@ services:
 
   # MCP server (:8081) over streamable-HTTP. Joins ingest's netns/egress; waits on migrate.
   mcp:
-    image: ghcr.io/attestmesh/agent-session-mcp@sha256:5c3087be20488bbe0058894c8db58acf752b276e5869510e51ade6e7cd20e2bd
+    image: ghcr.io/attestmesh/agent-session-mcp@sha256:0592224f1cb046bd79da5767703ba702050c9c98b8ca6dfb4b0dc4997e823fce
     restart: unless-stopped
     network_mode: service:ingest
     depends_on:
@@ -237,6 +262,8 @@ services:
       - HINDSIGHT_URL=${HINDSIGHT_URL}
       - HINDSIGHT_TOKEN=${HINDSIGHT_TOKEN}
       - HINDSIGHT_BANK=${HINDSIGHT_BANK}
+      - HINDSIGHT_SYNC_ENABLED=${HINDSIGHT_SYNC_ENABLED}
+      - RECALL_BACKEND=${RECALL_BACKEND}
       - INGEST_TOKEN=${INGEST_TOKEN}
       - EMBEDDING_URL=${EMBEDDING_URL}
       - EMBEDDING_API_KEY=${EMBEDDING_API_KEY}
@@ -249,11 +276,12 @@ services:
       - LOG_LEVEL=info
     command: ["python", "mcp_server.py"]
 
-  # Periodic reconciliation: re-retain any Postgres session missing from Hindsight and
-  # drain async retain operations. Closes the best-effort/no-retry + async gaps in the
-  # ingest path (see server/reconcile.py). Same egress-locked netns; pg + Hindsight only.
-  reconcile:
-    image: ghcr.io/attestmesh/agent-session-mcp@sha256:5c3087be20488bbe0058894c8db58acf752b276e5869510e51ade6e7cd20e2bd
+  # The sole Hindsight writer.  It is deployed disabled during Postgres-only recovery;
+  # when explicitly enabled it uses the transactional outbox, a bank advisory lock,
+  # a two-document concurrency cap, and a 30-second tick.
+  # Failed work requires explicit retry.
+  hindsight-outbox:
+    image: ghcr.io/attestmesh/agent-session-mcp@sha256:0592224f1cb046bd79da5767703ba702050c9c98b8ca6dfb4b0dc4997e823fce
     restart: unless-stopped
     network_mode: service:ingest
     depends_on:
@@ -266,25 +294,22 @@ services:
       - HINDSIGHT_URL=${HINDSIGHT_URL}
       - HINDSIGHT_TOKEN=${HINDSIGHT_TOKEN}
       - HINDSIGHT_BANK=${HINDSIGHT_BANK}
+      - HINDSIGHT_SYNC_ENABLED=${HINDSIGHT_SYNC_ENABLED}
+      - HINDSIGHT_OUTBOX_MAX_IN_FLIGHT=${HINDSIGHT_OUTBOX_MAX_IN_FLIGHT}
+      - HINDSIGHT_OUTBOX_TICK_SECONDS=${HINDSIGHT_OUTBOX_TICK_SECONDS}
+      - HINDSIGHT_OUTBOX_RUN_LIMIT=${HINDSIGHT_OUTBOX_RUN_LIMIT}
       - INGEST_TOKEN=${INGEST_TOKEN}
       - EMBEDDING_URL=${EMBEDDING_URL}
       - EMBEDDING_API_KEY=${EMBEDDING_API_KEY}
       - EMBEDDING_MODEL=${EMBEDDING_MODEL}
       - EMBEDDING_DIM=${EMBEDDING_DIM}
-      - RECONCILE_INTERVAL=300
       - LOG_LEVEL=info
-    entrypoint: ["/bin/sh", "-ec"]
-    command:
-      - |
-        while :; do
-          python reconcile.py --wait-seconds 60 || true
-          sleep "$${RECONCILE_INTERVAL:-300}"
-        done
+    command: ["python", "outbox.py"]
 
-  # App egress is deny-by-default and now FULLY IN-MESH: the pg-ha DB forwarders, the
-  # Hindsight forwarder, and the fugu-router-lb embeddings forwarder (all sidecar-netns,
-  # specific ports ONLY — not the wg transport) + Docker DNS. No external allow: embedding
-  # text no longer leaves the mesh (switched off RedPill). Network-enforced exfil control.
+  # App egress is deny-by-default: the pg-ha DB forwarders + the Hindsight forwarder
+  # (sidecar netns, specific ports ONLY — not the wg transport) + the single external
+  # embeddings host (RedPill :443) + Docker DNS. ALLOW_BASE_URL = EMBEDDING_URL host
+  # (api.redpill.ai). Network-enforced exfil control: text egresses only to RedPill.
   app-egress-fw:
     # c6c00d1f (telegram-sync-proven) supports INTERNAL_HOST_PORTS; c75c9668 (hindsight,
     # external-only) silently ignores it → internal pg/hindsight forwarders get dropped.
@@ -294,8 +319,12 @@ services:
     depends_on:
       - ingest
     environment:
+      - ALLOW_BASE_URL=${ALLOW_BASE_URL}
+      - ALLOW_PORT=443
+      # Embeddings are reachable only through the metered sidecar forwarder.
+      - ALLOW_CIDRS=
       - INTERNAL_HOSTS=
-      - INTERNAL_HOST_PORTS=sidecar:15431 sidecar:15432 sidecar:15433 sidecar:18888 sidecar:14410
+      - INTERNAL_HOST_PORTS=sidecar:15431 sidecar:15432 sidecar:15433 sidecar:18888 sidecar:18889
       - ALLOW_DNS=127.0.0.11
       - RERESOLVE_SECONDS=30
     cap_add:
