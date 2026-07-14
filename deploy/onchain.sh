@@ -7,7 +7,7 @@ set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$HERE/.." && pwd)"
 source "$HERE/lib.sh"
-: "${RPC_URL:?source deploy/env.sh first}"; require PRIVATE_KEY RPC_URL CHAIN_ID KMS_ROOT COMPOSE_HASH DEPLOYER_ADDR
+: "${RPC_URL:?source deploy/env.sh first}"; require PRIVATE_KEY RPC_URL CHAIN_ID KMS_ROOT DEPLOYER_ADDR
 
 RECEIPT="$ROOT/contracts/script/deployments/${CHAIN_ID}.json"
 
@@ -33,6 +33,7 @@ infra() {
 # cluster: deploy a ClusterDiamond from a generated config (KMS root + compose hash seeded).
 cluster() {
   local name="${1:-attestmesh-1}"
+  require COMPOSE_HASH
   export CLUSTER_FACTORY MEMBER_FACTORY CLUSTER_CONFIG
   CLUSTER_FACTORY=$(jq -r .clusterDiamondFactory "$RECEIPT"); MEMBER_FACTORY=$(jq -r .clusterMemberFactory "$RECEIPT")
   CLUSTER_CONFIG="script/clusters/${name}.json"
@@ -58,13 +59,29 @@ JSON
 indexer_cluster() {
   local name="${1:-attestmesh-indexer-ha}"
   require INDEXER_COMPOSE_HASH INDEXER_DEVICE_IDS_JSON INDEXER_CLUSTER_OWNER
+  echo "$name" | grep -Eq '^[a-zA-Z0-9._-]+$' \
+    || die "indexer cluster name may contain only letters, digits, dot, underscore, and dash"
   echo "$INDEXER_COMPOSE_HASH" | grep -Eq '^0x[0-9a-fA-F]{64}$' \
     || die "INDEXER_COMPOSE_HASH must be a bytes32 hex value"
+  [ "$INDEXER_COMPOSE_HASH" != "0x$(printf '0%.0s' {1..64})" ] \
+    || die "INDEXER_COMPOSE_HASH must be nonzero"
   echo "$INDEXER_DEVICE_IDS_JSON" | jq -e \
-    'type == "array" and length > 0 and all(.[]; test("^0x[0-9a-fA-F]{64}$"))' \
+    '. as $ids
+     | type == "array"
+       and length > 0
+       and all(.[];
+         test("^0x[0-9a-fA-F]{64}$")
+         and ascii_downcase != ("0x" + ("0" * 64)))
+       and (($ids | map(ascii_downcase) | unique | length) == ($ids | length))' \
     >/dev/null || die "INDEXER_DEVICE_IDS_JSON must be a non-empty bytes32 JSON array"
   echo "$INDEXER_CLUSTER_OWNER" | grep -Eq '^0x[0-9a-fA-F]{40}$' \
     || die "INDEXER_CLUSTER_OWNER must be an address"
+  [ "${INDEXER_CLUSTER_OWNER,,}" != "0x$(printf '0%.0s' {1..40})" ] \
+    || die "INDEXER_CLUSTER_OWNER must be nonzero"
+  echo "$KMS_ROOT" | grep -Eq '^0x[0-9a-fA-F]{40}$' \
+    || die "KMS_ROOT must be an address"
+  [ "${KMS_ROOT,,}" != "0x$(printf '0%.0s' {1..40})" ] \
+    || die "KMS_ROOT must be nonzero"
 
   export CLUSTER_FACTORY MEMBER_FACTORY CLUSTER_CONFIG
   CLUSTER_FACTORY=$(jq -r .clusterDiamondFactory "$RECEIPT")
@@ -109,7 +126,7 @@ case "${1:-all}" in
   preflight) preflight ;;
   infra)     preflight; infra ;;
   cluster)   cluster "${2:-attestmesh-1}" ;;
-  indexer-cluster) indexer_cluster "${2:-attestmesh-indexer-ha}" ;;
+  indexer-cluster) preflight; indexer_cluster "${2:-attestmesh-indexer-ha}" ;;
   patha-upgrade) patha_upgrade "$2" ;;
   seed-appid) seed_appid "$2" "$3" ;;
   all)       preflight; infra; cluster "${2:-attestmesh-1}" ;;
