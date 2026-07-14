@@ -15,7 +15,7 @@ source "$HERE/lib.sh"
 : "${RPC_URL:?source deploy/env.sh first}"
 require PRIVATE_KEY RPC_URL CHAIN_ID DEPLOYER_ADDR
 
-NODE="${1:?usage: pg-ha-node.sh <name> [deploy-all|prime-all|bind-all|verify-all|verify-ha|verify-failover|verify-isolation-all|verify-agent|update <pgN>|update-all|all|register-all|compute-peers|create-all|deploy|prime|bind|verify <pgN>]}"
+NODE="${1:?usage: pg-ha-node.sh <name> [deploy-all|prime-all|bind-all|verify-all|verify-ha|verify-failover|verify-isolation-all|verify-agent|switchover <pgN>|cycle-replica <pgN>|resize <pgN>|resize-all|update <pgN>|update-all|all|register-all|compute-peers|create-all|deploy|prime|bind|verify <pgN>]}"
 ACTION="${2:-all}"
 ARG3="${3:-}"
 BOX_HOST="${BOX_HOST:-ubuntu@173.231.234.133}"
@@ -27,7 +27,7 @@ MATRIX_STATE="${MATRIX_STATE:-$LOGDIR/matrix-node-matrix-node.state}"
 SSH_STATE="${SSH_STATE:-$LOGDIR/ssh-node-ssh-node.state}"
 SECRETS_FILE="${SECRETS_FILE:-$HOME/.attestmesh/pg-ha.env}"
 [ -f "$SECRETS_FILE" ] && source "$SECRETS_FILE"
-export BOX_VCPU="${BOX_VCPU:-2}" BOX_MEM="${BOX_MEM:-4096}" BOX_DISK="${BOX_DISK:-40}"
+export BOX_VCPU="${BOX_VCPU:-8}" BOX_MEM="${BOX_MEM:-65536}" BOX_DISK="${BOX_DISK:-256}"
 export BOX_PORTS="${BOX_PORTS:-[]}" BOX_GATEWAY_ENABLED="${BOX_GATEWAY_ENABLED:-true}" BOX_NET_MODE="${BOX_NET_MODE:-bridge}"
 GATEWAY_DOMAIN="${GATEWAY_DOMAIN:-gateway.attestmesh.xyz}"
 TS_SUFFIX="${TS_SUFFIX:-tail39cb2e.ts.net}"
@@ -666,6 +666,74 @@ verify_agent() {
   _matrix_expect_reply "pgha-admin-agent status" "$bot" "$bot !pgha status" "HA cluster"
 }
 
+switchover() {
+  local candidate="${1:?usage: pg-ha-node.sh <name> switchover <pgN>}" bot fqdn
+  _load_cluster; _default_matrix_env; _matrix_verify_credentials
+  case " $(_nodes | tr '\n' ' ') " in
+    *" $candidate "*) ;;
+    *) die "unknown switchover candidate: $candidate" ;;
+  esac
+  bot="$(_bot_user_id pg1)"
+  fqdn="$(_matrix_fqdn)" || die "could not find live Matrix tailnet FQDN"
+  log "▶ controlled Patroni switchover to $candidate via $bot"
+  MATRIX_PROBE_FQDN="$fqdn" \
+    MATRIX_PROBE_ROOM_ID="$MATRIX_ROOM_ID" \
+    MATRIX_PROBE_USER="$MATRIX_VERIFY_LOCALPART" \
+    MATRIX_PROBE_PASSWORD="$MATRIX_VERIFY_PASSWORD_RESOLVED" \
+    MATRIX_PROBE_BOT="$bot" \
+    MATRIX_PROBE_COMMAND="$bot !pgha switchover $candidate" \
+    MATRIX_PROBE_EXPECT_RE='confirm ([a-f0-9]{6,12})' \
+    MATRIX_PROBE_FOLLOWUP_TEMPLATE='confirm {1}' \
+    MATRIX_PROBE_FOLLOWUP_EXPECT_RE='Switchover requested' \
+    python3 "$HERE/matrix-probe.py" || die "controlled switchover request failed"
+
+  local first_ip leader
+  first_ip="${PGHA_PEERS#*=}"; first_ip="${first_ip%%,*}"
+  for i in $(seq 1 30); do
+    leader=$(_mesh_ssh "curl -fsS --max-time 5 http://${first_ip}:8008/cluster" 2>/dev/null \
+      | jq -r '.members[]? | select(.role == "leader") | .name' || true)
+    if [ "$leader" = "$candidate" ]; then
+      verify_ha
+      log "✔ controlled switchover complete: leader=$candidate"
+      return 0
+    fi
+    log "… waiting for leader=$candidate (current=${leader:-none}, $i/30)"
+    sleep 2
+  done
+  die "Patroni did not make $candidate leader within 60s"
+}
+
+cycle_replica() {
+  local target="${1:?usage: pg-ha-node.sh <name> cycle-replica <pgN>}" first_ip leader state role
+  _load_cluster
+  first_ip="${PGHA_PEERS#*=}"; first_ip="${first_ip%%,*}"
+  leader=$(_mesh_ssh "curl -fsS --max-time 5 http://${first_ip}:8008/cluster" \
+    | jq -r '.members[]? | select(.role == "leader") | .name')
+  [ -n "$leader" ] && [ "$leader" != null ] || die "no current Patroni leader"
+  [ "$target" != "$leader" ] || die "refusing to cycle leader $target; choose a replica"
+  _nload "$target"
+  [ -n "$VM_ID" ] || die "no VM_ID recorded for $target"
+
+  log "▶ stopping replica $target (vm=$VM_ID) for the client ingress-node gate"
+  _box_run stop "$target" "$VM_ID" >/dev/null || die "StopVm failed for replica $target"
+  sleep 15
+  log "▶ starting replica $target (vm=$VM_ID)"
+  _box_run start "$target" "$VM_ID" >/dev/null || die "StartVm failed for replica $target"
+
+  for i in $(seq 1 60); do
+    read -r role state < <(_mesh_ssh "curl -fsS --max-time 5 http://${first_ip}:8008/cluster" 2>/dev/null \
+      | jq -r --arg n "$target" '.members[]? | select(.name == $n) | [.role,.state] | @tsv' || true)
+    if [ "$role" = replica ] && { [ "$state" = streaming ] || [ "$state" = running ]; }; then
+      verify_ha
+      log "✔ replica cycle complete: $target is $role/$state"
+      return 0
+    fi
+    log "… waiting for $target to rejoin (role=${role:-?} state=${state:-?}, $i/60)"
+    sleep 5
+  done
+  die "$target did not rejoin as a streaming replica within 300s"
+}
+
 # ── day-2 ────────────────────────────────────────────────────────────────────────────────
 
 update_member() {
@@ -713,6 +781,119 @@ update_all() {
   log "✔ rolled all $PGHA_COUNT nodes"
 }
 
+host_storage_guard() {
+  local used
+  used=$(ssh_box "df -P /srv/data/dstack | awk 'NR==2 {gsub(/%/,\"\",\$5); print \$5}'")
+  [ -n "$used" ] || die "could not read dstack host filesystem usage"
+  [ "$used" -lt 85 ] || die "host storage is ${used}% used; refusing resize at the 15% free-space guard"
+  [ "$used" -lt 80 ] || log "⚠ host storage is ${used}% used (20% free-space alert threshold crossed)"
+}
+
+vm_info_json() {
+  local node="$1" vm_id="$2"
+  _box_run info "$node" "$vm_id" | grep -E '^\{.*"vm_id"' | tail -1
+}
+
+resize_member() {
+  local target="${1:?usage: pg-ha-node.sh <name> resize <pgN>}" first_ip role before status out after evidence
+  _load_cluster
+  verify_ha
+  first_ip="${PGHA_PEERS#*=}"; first_ip="${first_ip%%,*}"
+  role=$(_mesh_ssh "curl -fsS --max-time 5 http://${first_ip}:8008/cluster" \
+    | jq -r --arg n "$target" '.members[]? | select(.name == $n) | .role')
+  [ "$role" = replica ] || die "refusing to resize $target while role=${role:-unknown}; switch it to a replica first"
+  _nload "$target"
+  [ -n "$VM_ID" ] || die "no VM_ID recorded for $target"
+  host_storage_guard
+
+  before="$(vm_info_json "$target" "$VM_ID")"
+  [ -n "$before" ] || die "could not read VMM resources for $target"
+  if [ "$(jq -r .vcpu <<<"$before")" = "$BOX_VCPU" ] \
+    && [ "$(jq -r .memory <<<"$before")" = "$BOX_MEM" ] \
+    && [ "$(jq -r .disk_size <<<"$before")" = "$BOX_DISK" ]; then
+    log "· $target already at ${BOX_VCPU} vCPU / ${BOX_MEM} MB / ${BOX_DISK} GB"
+    return 0
+  fi
+
+  log "▶ stopping replica $target for resource-only resize to ${BOX_VCPU} vCPU / ${BOX_MEM} MB / ${BOX_DISK} GB"
+  _box_run stop "$target" "$VM_ID" >/dev/null || die "StopVm failed for $target"
+  status=""
+  for i in $(seq 1 60); do
+    status=$(vm_info_json "$target" "$VM_ID" | jq -r '.status // ""')
+    if [ "$status" = stopped ] || [ "$status" = exited ]; then break; fi
+    sleep 2
+  done
+  if [ "$status" != stopped ] && [ "$status" != exited ]; then
+    _box_run start "$target" "$VM_ID" >/dev/null 2>&1 || true
+    die "$target did not stop cleanly; resize was not attempted"
+  fi
+
+  out=$(_box_run resize "$target" "$VM_ID") || {
+    _box_run start "$target" "$VM_ID" >/dev/null 2>&1 || true
+    die "resource-only ResizeVm failed for $target"
+  }
+  echo "$out"
+  _box_run start "$target" "$VM_ID" >/dev/null || die "StartVm failed after resizing $target"
+
+  after=""
+  for i in $(seq 1 120); do
+    after="$(vm_info_json "$target" "$VM_ID")"
+    status=$(jq -r '.status // ""' <<<"$after")
+    if [ -n "$(jq -r '.boot_error // empty' <<<"$after")" ]; then
+      die "$target boot failed after resize: $(jq -r .boot_error <<<"$after")"
+    fi
+    evidence=$(jq -r '.disk_boot_evidence[]?' <<<"$after")
+    if [ "$status" = running ] \
+      && [ "$(jq -r .vcpu <<<"$after")" = "$BOX_VCPU" ] \
+      && [ "$(jq -r .memory <<<"$after")" = "$BOX_MEM" ] \
+      && [ "$(jq -r .disk_size <<<"$after")" = "$BOX_DISK" ] \
+      && grep -Eq '[[:space:]]2[0-9]{2}(\.[0-9]+)?G[[:space:]]' <<<"$evidence"; then
+      break
+    fi
+    [ $((i % 6)) -ne 0 ] || log "… waiting for $target boot/filesystem expansion ($i/120)"
+    sleep 5
+  done
+  evidence=$(jq -r '.disk_boot_evidence[]?' <<<"$after")
+  [ "$status" = running ] || die "$target did not return to running after resize"
+  [ "$(jq -r .vcpu <<<"$after")" = "$BOX_VCPU" ] || die "$target vCPU readback mismatch"
+  [ "$(jq -r .memory <<<"$after")" = "$BOX_MEM" ] || die "$target memory readback mismatch"
+  [ "$(jq -r .disk_size <<<"$after")" = "$BOX_DISK" ] || die "$target disk readback mismatch"
+  grep -Eq '[[:space:]]2[0-9]{2}(\.[0-9]+)?G[[:space:]]' <<<"$evidence" \
+    || die "$target guest filesystem did not report expanded 2xx GB capacity"
+
+  verify_ha
+  if [ "${SKIP_CLIENT_PROBES:-0}" != 1 ]; then
+    "$HERE/pg-ha-client-failover.sh" probe-once
+  fi
+  host_storage_guard
+  log "✔ $target resized and verified at ${BOX_VCPU} vCPU / ${BOX_MEM} MB / ${BOX_DISK} GB"
+}
+
+resize_all() {
+  local first_ip topology leader candidate
+  local -a replicas
+  _load_cluster
+  verify_ha
+  first_ip="${PGHA_PEERS#*=}"; first_ip="${first_ip%%,*}"
+  topology=$(_mesh_ssh "curl -fsS --max-time 5 http://${first_ip}:8008/cluster")
+  leader=$(jq -r '.members[] | select(.role == "leader") | .name' <<<"$topology")
+  mapfile -t replicas < <(jq -r '.members[] | select(.role == "replica") | .name' <<<"$topology" | sort)
+  [ -n "$leader" ] && [ "${#replicas[@]}" -eq $((PGHA_COUNT - 1)) ] \
+    || die "unexpected Patroni topology before resize"
+
+  for candidate in "${replicas[@]}"; do
+    resize_member "$candidate"
+  done
+  candidate="${replicas[0]}"
+  switchover "$candidate"
+  resize_member "$leader"
+  verify_ha
+  if [ "${SKIP_CLIENT_PROBES:-0}" != 1 ]; then
+    "$HERE/pg-ha-client-failover.sh" probe-once
+  fi
+  log "✔ pg-ha fleet resize complete; leader=$candidate targets=${BOX_VCPU}/${BOX_MEM}/${BOX_DISK}"
+}
+
 case "$ACTION" in
   register-all) register_all ;;
   compute-peers) compute_peers ;;
@@ -725,6 +906,10 @@ case "$ACTION" in
   verify-failover) verify_failover ;;
   verify-isolation-all) verify_isolation_all ;;
   verify-agent) verify_agent ;;
+  switchover) switchover "$ARG3" ;;
+  cycle-replica) cycle_replica "$ARG3" ;;
+  resize) resize_member "$ARG3" ;;
+  resize-all) resize_all ;;
   update) update_member "$ARG3"; verify_ha ;;
   update-only) update_member "$ARG3" ;;   # diagnostic roll without the verify-ha gate
   update-all) update_all ;;

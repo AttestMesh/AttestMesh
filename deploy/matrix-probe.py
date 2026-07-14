@@ -11,14 +11,17 @@ Extracted from the inline heredoc in postgres-node.sh so multi-bot drivers
   MATRIX_PROBE_BOT        bot MXID whose reply we await
   MATRIX_PROBE_COMMAND    message body to send
   MATRIX_PROBE_EXPECT_RE  regex the bot reply must match
+  MATRIX_PROBE_FOLLOWUP_TEMPLATE  optional second message; ``{1}`` expands to
+                                  capture group 1 from the first reply
+  MATRIX_PROBE_FOLLOWUP_EXPECT_RE regex the second bot reply must match
 
-Exit 0 on a matching reply within 90s; raises SystemExit otherwise.
+Exit 0 after the requested matching reply/replies within 90s each; raises
+SystemExit otherwise.
 """
 
 import json
 import os
 import re
-import sys
 import time
 import urllib.error
 import urllib.parse
@@ -68,29 +71,47 @@ if not token:
     raise SystemExit("Matrix login did not return an access token")
 
 room_path = urllib.parse.quote(room_id, safe="")
-txn = uuid.uuid4().hex
-sent = request("PUT", f"/_matrix/client/v3/rooms/{room_path}/send/m.room.message/{txn}", {
-    "msgtype": "m.text",
-    "body": command,
-}, token=token)
-sent_event_id = sent.get("event_id")
-if not sent_event_id:
-    raise SystemExit("Matrix send did not return an event_id")
 
-deadline = time.time() + 90
-while time.time() < deadline:
-    qs = urllib.parse.urlencode({"dir": "b", "limit": "100"})
-    events = request(
-        "GET", f"/_matrix/client/v3/rooms/{room_path}/messages?" + qs, token=token, timeout=12
-    ).get("chunk", [])
-    for event in events:
-        if event.get("event_id") == sent_event_id:
-            break
-        if event.get("type") != "m.room.message" or event.get("sender") != bot:
-            continue
-        body = str(event.get("content", {}).get("body", ""))
-        if expect.search(body):
-            print(body[:800])
-            sys.exit(0)
-    time.sleep(3)
-raise SystemExit(f"timed out waiting for {bot} reply matching /{expect.pattern}/")
+
+def send_and_wait(message, expected):
+    txn = uuid.uuid4().hex
+    sent = request(
+        "PUT",
+        f"/_matrix/client/v3/rooms/{room_path}/send/m.room.message/{txn}",
+        {"msgtype": "m.text", "body": message},
+        token=token,
+    )
+    sent_event_id = sent.get("event_id")
+    if not sent_event_id:
+        raise SystemExit("Matrix send did not return an event_id")
+
+    deadline = time.time() + 90
+    while time.time() < deadline:
+        qs = urllib.parse.urlencode({"dir": "b", "limit": "100"})
+        events = request(
+            "GET", f"/_matrix/client/v3/rooms/{room_path}/messages?" + qs, token=token, timeout=12
+        ).get("chunk", [])
+        for event in events:
+            if event.get("event_id") == sent_event_id:
+                break
+            if event.get("type") != "m.room.message" or event.get("sender") != bot:
+                continue
+            body = str(event.get("content", {}).get("body", ""))
+            match = expected.search(body)
+            if match:
+                print(body[:800])
+                return match
+        time.sleep(3)
+    raise SystemExit(f"timed out waiting for {bot} reply matching /{expected.pattern}/")
+
+
+first_match = send_and_wait(command, expect)
+followup_template = os.environ.get("MATRIX_PROBE_FOLLOWUP_TEMPLATE", "")
+if followup_template:
+    followup_expect_raw = os.environ.get("MATRIX_PROBE_FOLLOWUP_EXPECT_RE", "")
+    if not followup_expect_raw:
+        raise SystemExit("MATRIX_PROBE_FOLLOWUP_EXPECT_RE is required with a follow-up template")
+    followup = followup_template
+    for index, value in enumerate(first_match.groups(), start=1):
+        followup = followup.replace("{" + str(index) + "}", value or "")
+    send_and_wait(followup, re.compile(followup_expect_raw, re.I | re.S))
