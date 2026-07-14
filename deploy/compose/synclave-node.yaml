@@ -185,7 +185,8 @@ services:
     # v21 = user-visible orchestrator failure details in enclave deploys;
     # v20 = CLUSTER_NETWORKS-only live mesh config + structured orchestrator errors;
     # v19 = Apps → Sandboxes rename (labels only, wire stays app).
-    image: ghcr.io/dmvt/synclave-app:webhost-contracts-900fb9a@sha256:4750764d561b0929afb8ee4c841ad82dae6f420b6025f281e5e83a1771426f7b
+    # Fleet Control 9ed5bd2: production containment release. Gate A launch paths remain disabled.
+    image: ghcr.io/dmvt/synclave-app:prod-9ed5bd2@sha256:8d51135aa7ac57dbaea243a015c69f640b7268a4104b5985c0f142a44af45d58
     environment:
       API_HOST: 0.0.0.0
       API_PORT: 80
