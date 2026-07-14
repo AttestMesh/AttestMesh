@@ -1,0 +1,18 @@
+[Unit]
+Description=Hindsight recovery authoritative read tunnel
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+Environment=RECOVERY_CONFIG=%h/.config/hindsight-recovery/recovery.env
+ExecStart=/home/ubuntu/teemesh/deploy/hindsight-recovery/tunnel.sh
+Restart=always
+RestartSec=2s
+MemoryMax=96M
+TasksMax=32
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,20 @@
+[Unit]
+Description=Hindsight recovery authoritative fail-closed guard
+After=network-online.target hindsight-recovery-tunnel.service
+Wants=network-online.target
+Requires=hindsight-recovery-tunnel.service
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+EnvironmentFile=%h/.config/hindsight-recovery/recovery.env
+ExecStart=%h/agent-session-mcp/server/.venv/bin/python /home/ubuntu/teemesh/deploy/hindsight-recovery/recovery.py guard
+Restart=always
+RestartSec=2s
+CPUQuota=25%
+MemoryMax=256M
+TasksMax=64
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=default.target
