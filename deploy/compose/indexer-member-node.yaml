@@ -27,8 +27,8 @@ services:
       - LOG_LEVEL=info,cluster_mesh_agent=debug
     volumes:
       - /var/run/dstack.sock:/var/run/dstack.sock
-      - sidecar-state:/var/lib/attestmesh
       - agent-sock:/var/run/attestmesh
+      - sidecar-state:/var/lib/attestmesh
     ports:
       - "51900:51900"
       - "50051:50051"
