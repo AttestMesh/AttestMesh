@@ -25,6 +25,10 @@ if box_rpc := os.environ.get("E_BOX_RPC", "").strip():
     m.RPC = box_rpc
 
 NAME = os.environ.get("BOX_NAME", "generic-node")
+# A deployment may need distinct VM/state names while intentionally sharing one
+# measured workload identity (for example an active-active Indexer replica pool).
+# Defaulting to NAME preserves every existing generic-node compose hash.
+COMPOSE_NAME = os.environ.get("BOX_COMPOSE_NAME", "").strip() or NAME
 COMPOSE_PATH = os.environ.get("BOX_COMPOSE", "/tmp/generic-node.yaml")
 VCPU = int(os.environ.get("BOX_VCPU", "2"))
 MEM = int(os.environ.get("BOX_MEM", "4096"))
@@ -61,11 +65,13 @@ def build_env() -> dict[str, str]:
 
 
 def app_compose_and_hash(env_keys: list[str]) -> tuple[str, str]:
+    with open(COMPOSE_PATH, encoding="utf-8") as compose:
+        docker_compose_file = compose.read()
     app_compose = {
         "manifest_version": 2,
-        "name": NAME,
+        "name": COMPOSE_NAME,
         "runner": "docker-compose",
-        "docker_compose_file": open(COMPOSE_PATH).read(),
+        "docker_compose_file": docker_compose_file,
         "kms_enabled": True,
         "gateway_enabled": GATEWAY_ENABLED,
         "local_key_provider_enabled": False,

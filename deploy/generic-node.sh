@@ -103,8 +103,15 @@ _box_run() {
     printf 'E_DSTACK_DOCKER_USERNAME=%q\n' "${guser:-dmvt}"
     printf 'E_DSTACK_DOCKER_PASSWORD=%q\n' "$gtok"
     printf 'E_DSTACK_DOCKER_REGISTRY=%q\n' "ghcr.io"
-  } | ssh_box "sudo BOX_NAME='$NODE' BOX_COMPOSE='/tmp/${NODE}.yaml' BOX_VCPU=$BOX_VCPU BOX_MEM=$BOX_MEM BOX_DISK=$BOX_DISK BOX_PORTS='$BOX_PORTS' BOX_GATEWAY_ENABLED='$BOX_GATEWAY_ENABLED' BOX_NET_MODE='$BOX_NET_MODE' \
+  } | ssh_box "sudo BOX_NAME='$NODE' BOX_COMPOSE_NAME='${BOX_COMPOSE_NAME:-$NODE}' BOX_COMPOSE='/tmp/${NODE}.yaml' BOX_VCPU=$BOX_VCPU BOX_MEM=$BOX_MEM BOX_DISK=$BOX_DISK BOX_PORTS='$BOX_PORTS' BOX_GATEWAY_ENABLED='$BOX_GATEWAY_ENABLED' BOX_NET_MODE='$BOX_NET_MODE' \
     bash -c 'set -a; . /dev/stdin; set +a; exec $BOX_PY /tmp/generic-node-box.py $mode $app_id $vm_id'"
+}
+
+compose_hash() {
+  _require_tools
+  [ -s "$COMPOSE" ] || die "missing compose file: $COMPOSE"
+  APP_ENV_B64="${APP_ENV_B64:-}"
+  _box_run hash
 }
 
 _box_stop_vm() {
@@ -298,7 +305,9 @@ cleanup() {
     log "cleanup no-op: no VM_ID in $STATE"
   fi
 
-  if [ -n "${CLUSTER:-}" ] && [ -n "${X:-}" ] && [ -n "${RPC_URL:-}" ] && [ -n "${PRIVATE_KEY:-}" ]; then
+  if [ "${SKIP_APP_ALLOWLIST_CLEANUP:-0}" != 1 ] \
+    && [ -n "${CLUSTER:-}" ] && [ -n "${X:-}" ] \
+    && [ -n "${RPC_URL:-}" ] && [ -n "${PRIVATE_KEY:-}" ]; then
     allowed_app=$(cast call "$CLUSTER" 'allowedAppIds(address)(bool)' "$X" --rpc-url "$RPC_URL" 2>/dev/null || true)
     if [ "$allowed_app" = true ] && { [ -z "$id" ] || [ "$id" = "$ZERO32" ]; }; then
       send_seq "generic-removeApp-${NODE}" "$CLUSTER" "removeAllowedAppId(address)" "$X" || log "removeAllowedAppId failed; app remains allowlisted"
@@ -339,6 +348,7 @@ register_direct() {
 log "=== generic AttestMesh node: $NODE ==="
 case "$ACTION" in
   preflight) preflight ;;
+  hash) compose_hash ;;
   deploy) deploy_cvm ;;
   start) start_cvm ;;
   prime) prime_gate ;;
@@ -348,5 +358,5 @@ case "$ACTION" in
   update) update_member ;;
   cleanup|stop) cleanup ;;
   all) preflight; deploy_cvm; prime_gate; bind_member; start_cvm; register_direct; verify ;;
-  *) die "usage: generic-node.sh <node-name> [preflight|deploy|start|prime|bind|verify|register-direct|update|cleanup|stop|all]" ;;
+  *) die "usage: generic-node.sh <node-name> [hash|preflight|deploy|start|prime|bind|verify|register-direct|update|cleanup|stop|all]" ;;
 esac
