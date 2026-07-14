@@ -100,7 +100,8 @@ indexer_cluster() {
       meshCidrIp:169279488, meshCidrPrefix:16, salt:$salt}' \
     > "$ROOT/contracts/$CLUSTER_CONFIG"
   run_step "deploy-indexer-cluster-${name}" bash -c \
-    "cd '$ROOT/contracts' && forge script script/DeployCluster.s.sol:DeployCluster --rpc-url '$RPC_URL' --broadcast"
+    "cd '$ROOT/contracts' && forge script script/DeployCluster.s.sol:DeployCluster --rpc-url '$RPC_URL' --broadcast" \
+    || die "dedicated Indexer cluster deployment failed"
   log "dedicated Indexer cluster deployed with closed device policy; config=$CLUSTER_CONFIG"
 }
 
