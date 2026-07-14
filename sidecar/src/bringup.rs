@@ -267,6 +267,7 @@ pub async fn launch(
         &shared.self_member_id,
     )
     .await
+    .context("load durable Indexer cursor")?
     {
         shared.set_indexer_progress(block, log_index, false).await;
         tracing::info!(block, log_index, "loaded durable Indexer replay checkpoint");

@@ -247,7 +247,8 @@ async fn signed_indexer_message_delivery_acks_only_after_dispatch_and_checkpoint
             shared.cluster,
             &shared.self_member_id,
         )
-        .await,
+        .await
+        .unwrap(),
         Some((77, 3)),
         "the exact event cursor must be durable before its Ack reaches the server"
     );
@@ -263,7 +264,8 @@ async fn signed_indexer_message_delivery_acks_only_after_dispatch_and_checkpoint
             shared.cluster,
             &shared.self_member_id,
         )
-        .await,
+        .await
+        .unwrap(),
         Some((78, u64::MAX))
     );
 
@@ -285,6 +287,7 @@ async fn signed_indexer_message_delivery_acks_only_after_dispatch_and_checkpoint
         &restarted.self_member_id,
     )
     .await
+    .unwrap()
     .unwrap();
     restarted
         .set_indexer_progress(saved_block, saved_log_index, false)

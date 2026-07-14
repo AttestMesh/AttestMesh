@@ -25,33 +25,36 @@ const CURSOR_FILE: &str = "indexer-cursor.v1";
 const CURSOR_BYTES: u64 = 69;
 
 /// Load the last durably handled cursor. A missing file is a genuinely fresh
-/// subscription; malformed state is ignored conservatively and logged.
+/// subscription. Existing but unreadable, malformed, or mis-bound state fails
+/// closed: treating it as fresh could skip events by initializing at chain head.
 pub async fn load_cursor(
     state_dir: Option<&Path>,
     cluster: alloy::primitives::Address,
     member_id: &[u8; 32],
-) -> Option<(u64, u64)> {
-    let bytes = match crate::storage::read_optional(state_dir, CURSOR_FILE, CURSOR_BYTES).await {
-        Ok(Some(bytes)) => bytes,
-        Ok(None) => return None,
-        Err(error) => {
-            tracing::warn!(error = ?error, "Indexer cursor cache read failed; replay baseline reset");
-            return None;
-        }
+) -> Result<Option<(u64, u64)>> {
+    let bytes = match crate::storage::read_optional(state_dir, CURSOR_FILE, CURSOR_BYTES)
+        .await
+        .context("read durable Indexer cursor")?
+    {
+        Some(bytes) => bytes,
+        None => return Ok(None),
     };
-    if bytes.len() != CURSOR_BYTES as usize || bytes[0] != 1 {
-        tracing::warn!("Indexer cursor cache has an unknown or truncated format; ignoring");
-        return None;
-    }
-    if bytes[1..21] != cluster.as_slice()[..] || bytes[21..53] != member_id[..] {
-        tracing::warn!("Indexer cursor cache belongs to another cluster/member; ignoring");
-        return None;
-    }
+    anyhow::ensure!(
+        bytes.len() == CURSOR_BYTES as usize && bytes[0] == 1,
+        "durable Indexer cursor has an unknown or truncated format"
+    );
+    anyhow::ensure!(
+        bytes[1..21] == cluster.as_slice()[..] && bytes[21..53] == member_id[..],
+        "durable Indexer cursor belongs to another cluster/member"
+    );
     let mut block = [0u8; 8];
     let mut log_index = [0u8; 8];
     block.copy_from_slice(&bytes[53..61]);
     log_index.copy_from_slice(&bytes[61..69]);
-    Some((u64::from_be_bytes(block), u64::from_be_bytes(log_index)))
+    Ok(Some((
+        u64::from_be_bytes(block),
+        u64::from_be_bytes(log_index),
+    )))
 }
 
 async fn store_cursor(
@@ -495,11 +498,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn checkpoint_cursor_round_trips_and_corruption_is_ignored() {
+    async fn checkpoint_cursor_round_trips_and_corruption_fail_closed() {
         let temp = tempfile::tempdir().unwrap();
         let cluster = Address::repeat_byte(0xc1);
         let member = [0xa1; 32];
-        assert_eq!(load_cursor(Some(temp.path()), cluster, &member).await, None);
+        assert_eq!(
+            load_cursor(Some(temp.path()), cluster, &member)
+                .await
+                .unwrap(),
+            None
+        );
         store_cursor(
             Some(temp.path()),
             cluster,
@@ -510,16 +518,21 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(
-            load_cursor(Some(temp.path()), cluster, &member).await,
+            load_cursor(Some(temp.path()), cluster, &member)
+                .await
+                .unwrap(),
             Some((123, CHECKPOINT_LOG_INDEX))
         );
-        assert_eq!(
-            load_cursor(Some(temp.path()), Address::repeat_byte(0xc2), &member).await,
-            None
+        assert!(
+            load_cursor(Some(temp.path()), Address::repeat_byte(0xc2), &member)
+                .await
+                .is_err()
         );
         tokio::fs::write(temp.path().join(CURSOR_FILE), b"bad")
             .await
             .unwrap();
-        assert_eq!(load_cursor(Some(temp.path()), cluster, &member).await, None);
+        assert!(load_cursor(Some(temp.path()), cluster, &member)
+            .await
+            .is_err());
     }
 }
