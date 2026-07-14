@@ -111,9 +111,8 @@ register() {
   [ -n "$hash" ] || die "could not read compose_hash for CVM $CVM_ID"
   local endpoint="${INDEXER_ENDPOINT:-https://${APP_ID}-50051.${GW_DOMAIN}}"
   log "registering: endpoint=$endpoint codeId=0x$hash pubKey=$pubkey"
-  run_step "setIndexer-${NAME}" cast send "$REGISTRY" \
-    "setIndexer((string,bytes32,bytes32,uint64))" "($endpoint,0x$hash,$pubkey,$(date +%s))" \
-    --rpc-url "$RPC_URL" --private-key "$PRIVATE_KEY"
+  send_with_nonce_retry "setIndexer-${NAME}" "$REGISTRY" \
+    "setIndexer((string,bytes32,bytes32,uint64))" "($endpoint,0x$hash,$pubkey,$(date +%s))"
 }
 
 verify() {

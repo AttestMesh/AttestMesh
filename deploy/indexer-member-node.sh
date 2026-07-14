@@ -57,13 +57,7 @@ _current_registry_cluster_count() {
 
 send_seq() {
   local label="$1"; shift
-  local nonce
-  nonce=$(cast nonce "$DEPLOYER_ADDR" --rpc-url "$RPC_URL")
-  run_step "$label" cast send "$@" --nonce "$nonce" --rpc-url "$RPC_URL" --private-key "$PRIVATE_KEY" && return 0
-  log "↻ $label: refetching nonce + retrying"
-  sleep 4
-  nonce=$(cast nonce "$DEPLOYER_ADDR" --rpc-url "$RPC_URL")
-  run_step "${label}-retry" cast send "$@" --nonce "$nonce" --rpc-url "$RPC_URL" --private-key "$PRIVATE_KEY"
+  send_with_nonce_retry "$label" "$@"
 }
 
 _pubkey_from_serial() {
@@ -93,10 +87,9 @@ register_indexer() {
   [ -n "$pubkey" ] || die "indexer pubkey not found via /status or CVM serial logs; check VM_ID=$VM_ID"
   endpoint="https://$(_app_host_prefix)-${INDEXER_GRPC_GATEWAY_PORT}.${GATEWAY_DOMAIN}"
   log "registering C3 indexer endpoint=$endpoint codeId=0x${H#0x}"
-  run_step "setIndexer-${NODE}" cast send "$REGISTRY" \
+  send_with_nonce_retry "setIndexer-${NODE}" "$REGISTRY" \
     "setIndexer((string,bytes32,bytes32,uint64))" \
-    "($endpoint,0x${H#0x},$pubkey,$(date +%s))" \
-    --rpc-url "$RPC_URL" --private-key "$PRIVATE_KEY"
+    "($endpoint,0x${H#0x},$pubkey,$(date +%s))"
 }
 
 _direct_register_payload() {
