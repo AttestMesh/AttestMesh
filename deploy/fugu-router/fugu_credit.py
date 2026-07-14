@@ -12,6 +12,7 @@ import json
 import math
 import os
 import re
+import time
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Any
@@ -29,6 +30,59 @@ except Exception:  # pragma: no cover - import failure is reported at runtime.
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
 ACCOUNT_COUNT = int(os.environ.get("FUGU_ACCOUNT_COUNT", "3"))
 MODEL_PUBLIC_NAMES = ("fugu-ultra", "fugu")
+DB_CONNECT_ATTEMPTS = max(1, int(os.environ.get("FUGU_DB_CONNECT_ATTEMPTS", "4")))
+DB_CONNECT_BACKOFF_SECONDS = max(
+    0.0, float(os.environ.get("FUGU_DB_CONNECT_BACKOFF_SECONDS", "0.1"))
+)
+DIRECT_MODEL_ALIASES = {
+    "glm-5.2": "glm-5.2",
+    "z-ai/glm-5.2": "glm-5.2",
+    "openai/z-ai/glm-5.2": "glm-5.2",
+    "qwen/qwen3-embedding-8b": "qwen/qwen3-embedding-8b",
+    "openai/qwen/qwen3-embedding-8b": "qwen/qwen3-embedding-8b",
+    "openai/gpt-oss-120b": "openai/gpt-oss-120b",
+    "openai/openai/gpt-oss-120b": "openai/gpt-oss-120b",
+    "grok-4.5": "grok-4.5",
+    "xai/grok-4.5": "grok-4.5",
+    "grok-4.3": "grok-4.3",
+    "xai/grok-4.3": "grok-4.3",
+    "grok-imagine-image-quality": "grok-imagine-image-quality",
+    "xai/grok-imagine-image-quality": "grok-imagine-image-quality",
+    "grok-imagine-image": "grok-imagine-image",
+    "xai/grok-imagine-image": "grok-imagine-image",
+}
+DIRECT_MODEL_PRICES = {
+    # RedPill pricing, per token: GLM 5.2 $1.40/M input, $4.40/M output, $0.70/M cache read.
+    "glm-5.2": {
+        "input": Decimal("0.0000014"),
+        "output": Decimal("0.0000044"),
+        "cache_read": Decimal("0.0000007"),
+    },
+    # RedPill pricing, per token: Qwen3 Embedding 8B $0.01/M input, $0.00/M output.
+    "qwen/qwen3-embedding-8b": {
+        "input": Decimal("0.00000001"),
+        "output": Decimal("0"),
+        "cache_read": Decimal("0"),
+    },
+    # RedPill pricing, per token: GPT-OSS-120B $0.15/M input, $0.60/M output/reasoning.
+    "openai/gpt-oss-120b": {
+        "input": Decimal("0.00000015"),
+        "output": Decimal("0.0000006"),
+        "cache_read": Decimal("0.00000015"),
+    },
+    # xAI pricing, per token: Grok 4.5 $2.00/M input, $6.00/M output, $0.50/M cache read.
+    "grok-4.5": {
+        "input": Decimal("0.000002"),
+        "output": Decimal("0.000006"),
+        "cache_read": Decimal("0.0000005"),
+    },
+    # xAI pricing, per token: Grok 4.3 $1.25/M input, $2.50/M output, $0.20/M cache read.
+    "grok-4.3": {
+        "input": Decimal("0.00000125"),
+        "output": Decimal("0.0000025"),
+        "cache_read": Decimal("0.0000002"),
+    },
+}
 WINDOWS = {
     "5h": "5 hours",
     "week": "7 days",
@@ -123,11 +177,41 @@ def account_from_model(model: str | None) -> str | None:
 def requested_model_from_upstream(model: str | None) -> str | None:
     if not model:
         return None
+    if model in DIRECT_MODEL_ALIASES:
+        return DIRECT_MODEL_ALIASES[model]
+    if model.startswith("openai/") and model[len("openai/") :] in DIRECT_MODEL_ALIASES:
+        return DIRECT_MODEL_ALIASES[model[len("openai/") :]]
     if model.startswith("fugu-ultra"):
         return "fugu-ultra"
     if model.startswith("fugu"):
         return "fugu"
     return model
+
+
+def _direct_model_name(*models: str | None) -> str | None:
+    for model in models:
+        if not model:
+            continue
+        if model in DIRECT_MODEL_ALIASES:
+            return DIRECT_MODEL_ALIASES[model]
+        if model.startswith("openai/") and model[len("openai/") :] in DIRECT_MODEL_ALIASES:
+            return DIRECT_MODEL_ALIASES[model[len("openai/") :]]
+    return None
+
+
+def _direct_estimated_cost(model: str | None, usage_values: dict[str, Any]) -> Decimal | None:
+    if not model or model not in DIRECT_MODEL_PRICES:
+        return None
+    prices = DIRECT_MODEL_PRICES[model]
+    input_tokens = usage_values.get("input_tokens") or usage_values.get("prompt_tokens") or 0
+    output_tokens = usage_values.get("output_tokens") or usage_values.get("completion_tokens") or 0
+    cached_input_tokens = usage_values.get("cached_input_tokens") or 0
+    noncached_input = max(int(input_tokens) - int(cached_input_tokens), 0)
+    return (
+        Decimal(noncached_input) * prices["input"]
+        + Decimal(int(cached_input_tokens)) * prices["cache_read"]
+        + Decimal(int(output_tokens)) * prices["output"]
+    )
 
 
 def upstream_model(requested_model: str, account_id: str) -> str:
@@ -151,6 +235,7 @@ def extract_usage(response_obj: Any) -> dict[str, Any]:
         or usage.get("output_tokens_details")
         or usage.get("output_token_details")
     )
+    cost_in_usd_ticks = _decimal(usage.get("cost_in_usd_ticks"))
 
     input_tokens = _number(usage.get("input_tokens"), usage.get("prompt_tokens"))
     output_tokens = _number(usage.get("output_tokens"), usage.get("completion_tokens"))
@@ -209,7 +294,13 @@ def extract_usage(response_obj: Any) -> dict[str, Any]:
         + Decimal(orchestration_output_tokens or 0) * Decimal("6")
     )
 
-    estimated_cost_usd = usage_units * Decimal("0.000005")
+    # xAI Imagine responses report exact cost as USD ticks. The examples map
+    # 200000000 ticks to $0.02, i.e. 10^10 ticks per USD.
+    estimated_cost_usd = (
+        cost_in_usd_ticks / Decimal("10000000000")
+        if cost_in_usd_ticks is not None
+        else usage_units * Decimal("0.000005")
+    )
 
     return {
         "raw_usage": usage,
@@ -235,7 +326,20 @@ def _conn():
         raise RuntimeError("psycopg is not installed")
     if not DATABASE_URL:
         raise RuntimeError("DATABASE_URL is empty")
-    return psycopg.connect(DATABASE_URL, autocommit=True, row_factory=dict_row)
+    for attempt in range(DB_CONNECT_ATTEMPTS):
+        try:
+            return psycopg.connect(
+                DATABASE_URL,
+                autocommit=True,
+                row_factory=dict_row,
+                connect_timeout=1,
+                options="-c statement_timeout=5000 -c lock_timeout=3000",
+            )
+        except psycopg.OperationalError:
+            if attempt + 1 == DB_CONNECT_ATTEMPTS:
+                raise
+            time.sleep(DB_CONNECT_BACKOFF_SECONDS * (2**attempt))
+    raise RuntimeError("unreachable")
 
 
 def init_schema(conn) -> None:
@@ -584,6 +688,10 @@ def write_ledger(
     request_id = _request_id(kwargs, response_obj)
     upstream = str(kwargs.get("model") or std.get("model_group") or meta.get("fugu_upstream_model") or "")
     requested_model = str(meta.get("fugu_requested_model") or requested_model_from_upstream(upstream) or "")
+    direct_model = _direct_model_name(upstream, std.get("model_group"), std.get("model"), requested_model)
+    direct_cost = _direct_estimated_cost(direct_model, usage_values)
+    if direct_cost is not None:
+        usage_values["estimated_cost_usd"] = direct_cost
     account_id = str(meta.get("fugu_account_id") or account_from_model(upstream) or "") or None
     headers = _request_headers(kwargs)
     proxy_req = _jsonable(kwargs.get("proxy_server_request"))

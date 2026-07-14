@@ -30,6 +30,9 @@ RUN python3 -m pip install --no-cache-dir "langfuse<3" "psycopg[binary]>=3.1" "h
 COPY agent.proto /etc/fugu-router/agent.proto
 COPY config.yaml fugu_telemetry.py fugu_credit.py fugu_session_router.py /app/
 COPY fugu-router-entrypoint.sh /usr/local/bin/fugu-router-entrypoint.sh
-RUN chmod 755 /usr/local/bin/fugu-router-entrypoint.sh
+RUN chmod 755 /usr/local/bin/fugu-router-entrypoint.sh; \
+    python3 -m py_compile /app/fugu_credit.py /app/fugu_session_router.py; \
+    DATABASE_URL=postgresql://contract.invalid/fugu python3 -c \
+      'from fugu_session_router import app; paths = {r.path for r in app.routes}; assert {"/health/process", "/health/liveliness"} <= paths; print("fugu LB health contract ok")'
 
 ENTRYPOINT ["/usr/local/bin/fugu-router-entrypoint.sh"]
