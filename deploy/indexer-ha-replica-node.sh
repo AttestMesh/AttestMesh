@@ -23,7 +23,9 @@ GATEWAY_DOMAIN="${GATEWAY_DOMAIN:-gateway.attestmesh.xyz}"
 ZERO_ADDRESS=0x0000000000000000000000000000000000000000
 ZERO32=0x0000000000000000000000000000000000000000000000000000000000000000
 ENTRY_POINT_V07=0x0000000071727De22E5E9d8BAf0edAc6f37da032
-TEMPORARY_INDEXER_DIGEST=14e9e3f6869ada585642c14e4e2e43bee197978ffc68d146dd6d3cddbc49d2bb
+DSTACK_REGISTER_SELECTOR=0x537d491c
+STAGE_A_SIDECAR_DIGEST=cc8aaa13ae356de28f2e02df777adc56754a9b52e7b81e718e755969e8804943
+STAGE_A_INDEXER_DIGEST=0d7cbbdb049e1c7606d169ea69f890cf05d3384bc1777c5dac3e1237ebaaa68c
 
 export COMPOSE GATEWAY_DOMAIN
 export BOX_COMPOSE_NAME="$MEASURED_COMPOSE_NAME"
@@ -42,12 +44,17 @@ _tools() {
   done
 }
 
-_reject_temporary_images() {
+_require_reviewed_images() {
+  local sidecar_count indexer_count
   [ -s "$COMPOSE" ] || die "missing compose file: $COMPOSE"
-  if grep -Eq "^[[:space:]]*image:.*attestmesh-indexer@sha256:${TEMPORARY_INDEXER_DIGEST}([[:space:]]|$)" \
-    "$COMPOSE"; then
-    die "temporary production Indexer digest cannot boot cluster-shared identity; replace it with this branch's CI digest before cluster state, deploy, admission, or start"
-  fi
+  sidecar_count=$(grep -Ec \
+    "^[[:space:]]*image:[[:space:]]*ghcr.io/attestmesh/cluster-mesh-agent@sha256:${STAGE_A_SIDECAR_DIGEST}([[:space:]]|$)" \
+    "$COMPOSE" || true)
+  indexer_count=$(grep -Ec \
+    "^[[:space:]]*image:[[:space:]]*ghcr.io/attestmesh/attestmesh-indexer@sha256:${STAGE_A_INDEXER_DIGEST}([[:space:]]|$)" \
+    "$COMPOSE" || true)
+  [ "$sidecar_count" = 1 ] && [ "$indexer_count" = 2 ] \
+    || die "compose must use the reviewed Stage-A sidecar and Indexer OCI digests before cluster state, deploy, admission, or start"
 }
 
 _address() {
@@ -68,9 +75,10 @@ _state_value() {
 }
 
 _validate_cluster_values() {
-  require CHAIN_ID RPC_URL CLUSTER MEMBER_IMPL INDEXER_COMPOSE_HASH INDEXER_CLUSTER_OWNER KMS_ROOT
+  require CHAIN_ID RPC_URL CLUSTER DSTACK_FACET MEMBER_IMPL INDEXER_COMPOSE_HASH INDEXER_CLUSTER_OWNER KMS_ROOT
   [[ "$CHAIN_ID" =~ ^[1-9][0-9]*$ ]] || die "CHAIN_ID must be a positive decimal integer"
   _address CLUSTER "$CLUSTER"
+  _address DSTACK_FACET "$DSTACK_FACET"
   _address MEMBER_IMPL "$MEMBER_IMPL"
   _address INDEXER_CLUSTER_OWNER "$INDEXER_CLUSTER_OWNER"
   _address KMS_ROOT "$KMS_ROOT"
@@ -92,14 +100,21 @@ _verify_safe_owner() {
 }
 
 _verify_cluster_policy() {
-  local actual_owner solidstate_owner main_cluster chain accept_calldata
+  local actual_owner solidstate_owner actual_dstack_facet main_cluster chain accept_calldata
   _validate_cluster_values
   chain=$(cast chain-id --rpc-url "$RPC_URL") || die "RPC_URL is unavailable"
   [ "$chain" = "$CHAIN_ID" ] || die "RPC chain $chain does not match CHAIN_ID=$CHAIN_ID"
   cast code "$CLUSTER" --rpc-url "$RPC_URL" | grep -Eq '^0x[0-9a-fA-F]{4,}$' \
     || die "dedicated CLUSTER has no code"
+  cast code "$DSTACK_FACET" --rpc-url "$RPC_URL" | grep -Eq '^0x[0-9a-fA-F]{4,}$' \
+    || die "DSTACK_FACET has no code"
   cast code "$MEMBER_IMPL" --rpc-url "$RPC_URL" | grep -Eq '^0x[0-9a-fA-F]{4,}$' \
     || die "MEMBER_IMPL has no code"
+  actual_dstack_facet=$(cast call "$CLUSTER" 'facetAddress(bytes4)(address)' \
+    "$DSTACK_REGISTER_SELECTOR" --rpc-url "$RPC_URL") \
+    || die "CLUSTER does not expose ERC-2535 facetAddress(bytes4)"
+  [ "${actual_dstack_facet,,}" = "${DSTACK_FACET,,}" ] \
+    || die "CLUSTER dstack_register facet $actual_dstack_facet does not match prepared Path-A DSTACK_FACET"
   actual_owner=$(cast call "$CLUSTER" 'clusterOwner()(address)' --rpc-url "$RPC_URL") \
     || die "CLUSTER does not expose clusterOwner()"
   [ "${actual_owner,,}" = "${INDEXER_CLUSTER_OWNER,,}" ] \
@@ -133,7 +148,7 @@ _verify_cluster_policy() {
 
 save_cluster_state() {
   _tools
-  _reject_temporary_images
+  _require_reviewed_images
   _verify_cluster_policy
   if [ -e "$CLUSTER_STATE" ] && [ "${FORCE:-0}" != 1 ]; then
     die "$CLUSTER_STATE already exists; set FORCE=1 only for an intentional replacement"
@@ -145,6 +160,7 @@ save_cluster_state() {
 UPDATED_AT=$(ts)
 CHAIN_ID=$CHAIN_ID
 CLUSTER=$CLUSTER
+DSTACK_FACET=$DSTACK_FACET
 MEMBER_IMPL=$MEMBER_IMPL
 INDEXER_COMPOSE_HASH=${INDEXER_COMPOSE_HASH,,}
 INDEXER_CLUSTER_OWNER=$INDEXER_CLUSTER_OWNER
@@ -169,7 +185,7 @@ _load_cluster_state() {
   )}"
   require INDEXER_REGISTRY_ADDR GATEWAY_DOMAIN
   _address INDEXER_REGISTRY_ADDR "$INDEXER_REGISTRY_ADDR"
-  export CHAIN_ID CLUSTER MEMBER_IMPL INDEXER_COMPOSE_HASH INDEXER_CLUSTER_OWNER KMS_ROOT
+  export CHAIN_ID CLUSTER DSTACK_FACET MEMBER_IMPL INDEXER_COMPOSE_HASH INDEXER_CLUSTER_OWNER KMS_ROOT
   export INDEXER_REGISTRY_ADDR GATEWAY_DOMAIN
 }
 
@@ -248,7 +264,7 @@ preflight() {
   _tools
   _load_cluster_state
   _runtime_env
-  _reject_temporary_images
+  _require_reviewed_images
   preflight_guest_rpc
   preflight_bundler
   _verify_cluster_policy
@@ -288,7 +304,7 @@ deploy_replica() {
 
 safe_admission() {
   _load_cluster_state
-  _reject_temporary_images
+  _require_reviewed_images
   _verify_cluster_policy
   local dedicated_cluster="$CLUSTER" calldata created
   _load_replica_state
@@ -355,7 +371,7 @@ start_replica() {
   local dedicated_cluster="$CLUSTER" current
   _load_replica_state
   _runtime_env
-  _reject_temporary_images
+  _require_reviewed_images
   preflight_guest_rpc
   preflight_bundler
   wait_admission
@@ -450,15 +466,18 @@ Dedicated cluster handoff (state path: $CLUSTER_STATE):
   1. Compute INDEXER_COMPOSE_HASH with: $0 $NODE hash
   2. Run deploy/onchain.sh indexer-cluster and capture its "Cluster deployed:" address.
   3. Have INDEXER_CLUSTER_OWNER execute acceptOwnership() on that cluster.
-  4. Complete the Safe-controlled Path-A upgrade and capture "new ClusterMember impl:".
+  4. Complete the Safe-controlled Path-A upgrade and capture both the new
+     DstackFacet and ClusterMember implementation addresses.
   5. Persist the exact handoff with:
-     CLUSTER=<Cluster-deployed-address> MEMBER_IMPL=<new-ClusterMember-impl> \\
+     CLUSTER=<Cluster-deployed-address> DSTACK_FACET=<new-DstackFacet> \\
+     MEMBER_IMPL=<new-ClusterMember-impl> \\
      INDEXER_COMPOSE_HASH=<hash> INDEXER_CLUSTER_OWNER=<Safe> KMS_ROOT=<root> \\
      $0 $NODE save-cluster-state
 
-The persisted schema is CHAIN_ID, CLUSTER, MEMBER_IMPL, INDEXER_COMPOSE_HASH,
-INDEXER_CLUSTER_OWNER, KMS_ROOT, and MEASURED_COMPOSE_NAME. Replica actions never
-fall back to Matrix state.
+The persisted schema is CHAIN_ID, CLUSTER, DSTACK_FACET, MEMBER_IMPL,
+INDEXER_COMPOSE_HASH, INDEXER_CLUSTER_OWNER, KMS_ROOT, and
+MEASURED_COMPOSE_NAME. Replica actions never fall back to Matrix state, and
+verify that dstack_register resolves to the exact persisted Path-A facet.
 EOF
 }
 

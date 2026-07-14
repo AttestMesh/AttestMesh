@@ -22,6 +22,7 @@ CHAIN_ID = "8453"
 CLUSTER = "0x" + ("a" * 40)
 SAFE = "0x" + ("b" * 40)
 MEMBER_IMPL = "0x" + ("c" * 40)
+DSTACK_FACET = "0x" + ("f" * 40)
 APP_ID = "0x" + ("d" * 40)
 KMS_ROOT = "0x" + ("e" * 40)
 COMPOSE_HASH = "0x" + ("1" * 64)
@@ -30,6 +31,7 @@ PUBKEY = "0x" + ("3" * 64)
 MEASURED_NAME = "attestmesh-indexer-ha-replica"
 ENTRY_POINT_V07 = "0x0000000071727De22E5E9d8BAf0edAc6f37da032"
 OLD_INDEXER_DIGEST = "14e9e3f6869ada585642c14e4e2e43bee197978ffc68d146dd6d3cddbc49d2bb"
+STAGE_A_INDEXER_DIGEST = "0d7cbbdb049e1c7606d169ea69f890cf05d3384bc1777c5dac3e1237ebaaa68c"
 ADD_APP_CALLDATA = "0x64e985f8" + ("0" * 24) + APP_ID[2:]
 ACCEPT_OWNERSHIP_CALLDATA = "0x79ba5097"
 
@@ -59,6 +61,7 @@ def write_cluster_state(path: Path) -> None:
             UPDATED_AT=20260714T000000Z
             CHAIN_ID={CHAIN_ID}
             CLUSTER={CLUSTER}
+            DSTACK_FACET={DSTACK_FACET}
             MEMBER_IMPL={MEMBER_IMPL}
             INDEXER_COMPOSE_HASH={COMPOSE_HASH}
             INDEXER_CLUSTER_OWNER={SAFE}
@@ -89,7 +92,12 @@ def write_replica_state(logdir: Path, node: str) -> None:
     )
 
 
-def cast_stub(*, solidstate_owner: str = SAFE, guest_chain_id: str = CHAIN_ID) -> str:
+def cast_stub(
+    *,
+    solidstate_owner: str = SAFE,
+    guest_chain_id: str = CHAIN_ID,
+    dstack_facet: str = DSTACK_FACET,
+) -> str:
     return textwrap.dedent(
         f"""\
         #!/bin/sh
@@ -115,6 +123,7 @@ def cast_stub(*, solidstate_owner: str = SAFE, guest_chain_id: str = CHAIN_ID) -
             case "$3" in
               'clusterOwner()(address)') echo {SAFE} ;;
               'owner()(address)') echo {solidstate_owner} ;;
+              'facetAddress(bytes4)(address)') echo {dstack_facet} ;;
               'getThreshold()(uint256)') echo 2 ;;
               'allowAnyDevice()(bool)') echo false ;;
               'requireTcbUpToDate()(bool)') echo true ;;
@@ -142,12 +151,7 @@ def wrapper_env(tmp: Path, node: str, *, create_state: bool = True) -> dict[str,
         write_cluster_state(cluster_state)
         write_replica_state(logdir, node)
     compose = tmp / "indexer-ha-replica-node.yaml"
-    compose.write_text(
-        COMPOSE.read_text(encoding="utf-8").replace(
-            OLD_INDEXER_DIGEST, "7" * 64
-        ),
-        encoding="utf-8",
-    )
+    compose.write_text(COMPOSE.read_text(encoding="utf-8"), encoding="utf-8")
     write_executable(bindir / "cast", cast_stub())
     write_executable(bindir / "curl", "#!/bin/sh\nexit 95\n")
     return {
@@ -252,6 +256,7 @@ class IndexerHaReplicaTests(unittest.TestCase):
                 {
                     "CHAIN_ID": CHAIN_ID,
                     "CLUSTER": CLUSTER,
+                    "DSTACK_FACET": DSTACK_FACET,
                     "MEMBER_IMPL": MEMBER_IMPL,
                     "INDEXER_COMPOSE_HASH": COMPOSE_HASH,
                     "INDEXER_CLUSTER_OWNER": SAFE,
@@ -281,6 +286,20 @@ class IndexerHaReplicaTests(unittest.TestCase):
 
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("missing dedicated state", result.stderr)
+
+    def test_cluster_must_have_the_persisted_path_a_facet_installed(self) -> None:
+        node = "indexer-ha-r1"
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            tmp = Path(raw_tmp)
+            env = wrapper_env(tmp, node)
+            old_facet = "0x" + ("6" * 40)
+            write_executable(
+                tmp / "bin" / "cast", cast_stub(dstack_facet=old_facet)
+            )
+            result = run_wrapper(node, "verify-cluster", env)
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("does not match prepared Path-A DSTACK_FACET", result.stderr)
 
     def test_bundler_must_not_equal_node_rpc(self) -> None:
         node = "indexer-ha-r1"
@@ -332,16 +351,23 @@ class IndexerHaReplicaTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("sealed CVM_RPC_URL chain 1", result.stderr)
 
-    def test_temporary_indexer_image_is_a_hard_deployment_failure(self) -> None:
+    def test_legacy_non_shared_indexer_image_is_a_hard_deployment_failure(self) -> None:
         node = "indexer-ha-r1"
         with tempfile.TemporaryDirectory() as raw_tmp:
             tmp = Path(raw_tmp)
             env = wrapper_env(tmp, node)
-            env["COMPOSE"] = str(COMPOSE)
+            legacy_compose = tmp / "legacy-indexer.yaml"
+            legacy_compose.write_text(
+                COMPOSE.read_text(encoding="utf-8").replace(
+                    STAGE_A_INDEXER_DIGEST, OLD_INDEXER_DIGEST
+                ),
+                encoding="utf-8",
+            )
+            env["COMPOSE"] = str(legacy_compose)
             result = run_wrapper(node, "preflight", env)
 
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("temporary production Indexer digest", result.stderr)
+        self.assertIn("reviewed Stage-A sidecar and Indexer OCI digests", result.stderr)
 
     def test_stop_requires_explicit_lb_drain_confirmation(self) -> None:
         node = "indexer-ha-r1"
@@ -362,10 +388,10 @@ class IndexerHaReplicaTests(unittest.TestCase):
 
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn('capture its "Cluster deployed:" address', result.stdout)
-        self.assertIn('capture "new ClusterMember impl:"', result.stdout)
+        self.assertIn("DstackFacet and ClusterMember", result.stdout)
         self.assertIn("save-cluster-state", result.stdout)
         self.assertIn(
-            "CHAIN_ID, CLUSTER, MEMBER_IMPL, INDEXER_COMPOSE_HASH", result.stdout
+            "CHAIN_ID, CLUSTER, DSTACK_FACET, MEMBER_IMPL", result.stdout
         )
 
     def test_warmed_candidate_may_keep_grpc_closed_before_registry_rotation(self) -> None:

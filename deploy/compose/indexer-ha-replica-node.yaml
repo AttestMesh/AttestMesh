@@ -2,12 +2,11 @@
 # same dedicated signer cluster and must be rendered with the constant measured
 # compose name selected by deploy/indexer-ha-replica-node.sh.
 #
-# The sidecar pin is the protocol-v3 build from source SHA 89bb728. The Indexer
-# pin below is still temporary and is rejected by the deployment wrapper until a
-# CI-built shared-identity digest replaces it.
+# Both multi-architecture OCI indexes were published by CI from source commit
+# 9641e99c1450cde84383932ff4cb982e97c4477b.
 services:
   sidecar:
-    image: ghcr.io/attestmesh/cluster-mesh-agent@sha256:0f47ab837095c7c6ea470ce069035d99af038a6e729d305dfcc4a2e48b72e4bd
+    image: ghcr.io/attestmesh/cluster-mesh-agent@sha256:cc8aaa13ae356de28f2e02df777adc56754a9b52e7b81e718e755969e8804943
     restart: unless-stopped
     environment:
       # MEMBER_CONTRACT is intentionally absent: Path A discovers the dstack app_id.
@@ -42,9 +41,7 @@ services:
       - /dev/net/tun
 
   indexer:
-    # TEMPORARY: replace with the CI digest containing cluster-shared identity and
-    # protocol v3 before using the rendered compose hash in a signer-cluster policy.
-    image: ghcr.io/attestmesh/attestmesh-indexer@sha256:14e9e3f6869ada585642c14e4e2e43bee197978ffc68d146dd6d3cddbc49d2bb
+    image: ghcr.io/attestmesh/attestmesh-indexer@sha256:0d7cbbdb049e1c7606d169ea69f890cf05d3384bc1777c5dac3e1237ebaaa68c
     restart: unless-stopped
     network_mode: service:sidecar
     depends_on:
@@ -78,8 +75,8 @@ services:
       - agent-sock:/var/run/attestmesh
 
   registration-calldata:
-    # TEMPORARY: keep this pin in lockstep with the Indexer pin above.
-    image: ghcr.io/attestmesh/attestmesh-indexer@sha256:14e9e3f6869ada585642c14e4e2e43bee197978ffc68d146dd6d3cddbc49d2bb
+    # Keep this pin in lockstep with the Indexer pin above.
+    image: ghcr.io/attestmesh/attestmesh-indexer@sha256:0d7cbbdb049e1c7606d169ea69f890cf05d3384bc1777c5dac3e1237ebaaa68c
     restart: "no"
     network_mode: service:sidecar
     depends_on:
