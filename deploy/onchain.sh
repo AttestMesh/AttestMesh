@@ -46,6 +46,47 @@ JSON
   run_step "deploy-cluster-${name}" bash -c "cd '$ROOT/contracts' && forge script script/DeployCluster.s.sol:DeployCluster --rpc-url '$RPC_URL' --broadcast"
 }
 
+# indexer-cluster: create the dedicated signer cluster used by the active-active
+# Indexer pool. This intentionally has a stricter boot policy than the general
+# development cluster helper above: the CSK becomes the fleet-wide envelope
+# signing key, so admitting a device is equivalent to admitting a signer.
+#
+# Required env:
+#   INDEXER_COMPOSE_HASH      exact rendered dstack compose hash shared by replicas
+#   INDEXER_DEVICE_IDS_JSON   JSON array of explicitly approved bytes32 device ids
+#   INDEXER_CLUSTER_OWNER     org Safe that owns both cluster policy surfaces
+indexer_cluster() {
+  local name="${1:-attestmesh-indexer-ha}"
+  require INDEXER_COMPOSE_HASH INDEXER_DEVICE_IDS_JSON INDEXER_CLUSTER_OWNER
+  echo "$INDEXER_COMPOSE_HASH" | grep -Eq '^0x[0-9a-fA-F]{64}$' \
+    || die "INDEXER_COMPOSE_HASH must be a bytes32 hex value"
+  echo "$INDEXER_DEVICE_IDS_JSON" | jq -e \
+    'type == "array" and length > 0 and all(.[]; test("^0x[0-9a-fA-F]{64}$"))' \
+    >/dev/null || die "INDEXER_DEVICE_IDS_JSON must be a non-empty bytes32 JSON array"
+  echo "$INDEXER_CLUSTER_OWNER" | grep -Eq '^0x[0-9a-fA-F]{40}$' \
+    || die "INDEXER_CLUSTER_OWNER must be an address"
+
+  export CLUSTER_FACTORY MEMBER_FACTORY CLUSTER_CONFIG
+  CLUSTER_FACTORY=$(jq -r .clusterDiamondFactory "$RECEIPT")
+  MEMBER_FACTORY=$(jq -r .clusterMemberFactory "$RECEIPT")
+  CLUSTER_CONFIG="script/clusters/${name}.json"
+  local salt; salt=$(cast keccak "attestmesh-indexer-cluster-${name}")
+  jq -n \
+    --arg owner "$INDEXER_CLUSTER_OWNER" \
+    --arg kms "$KMS_ROOT" \
+    --arg compose "$INDEXER_COMPOSE_HASH" \
+    --argjson devices "$INDEXER_DEVICE_IDS_JSON" \
+    --arg salt "$salt" \
+    '{clusterOwner:$owner, kmsRootSigner:$kms,
+      initialComposeHashes:[$compose], initialDeviceIds:$devices,
+      allowAnyDevice:false, requireTcbUpToDate:true,
+      meshCidrIp:169279488, meshCidrPrefix:16, salt:$salt}' \
+    > "$ROOT/contracts/$CLUSTER_CONFIG"
+  run_step "deploy-indexer-cluster-${name}" bash -c \
+    "cd '$ROOT/contracts' && forge script script/DeployCluster.s.sol:DeployCluster --rpc-url '$RPC_URL' --broadcast"
+  log "dedicated Indexer cluster deployed with closed device policy; config=$CLUSTER_CONFIG"
+}
+
 # seed-appid <cluster> <memberAddr>: owner pre-approves an app_id so the KMS gate admits
 # the CVM at first boot (the cold-start fix). Owner-gas (not sponsored).
 seed_appid() {
@@ -68,8 +109,9 @@ case "${1:-all}" in
   preflight) preflight ;;
   infra)     preflight; infra ;;
   cluster)   cluster "${2:-attestmesh-1}" ;;
+  indexer-cluster) indexer_cluster "${2:-attestmesh-indexer-ha}" ;;
   patha-upgrade) patha_upgrade "$2" ;;
   seed-appid) seed_appid "$2" "$3" ;;
   all)       preflight; infra; cluster "${2:-attestmesh-1}" ;;
-  *) die "usage: onchain.sh {preflight|infra|cluster [name]|patha-upgrade <cluster>|seed-appid <cluster> <member>|all}" ;;
+  *) die "usage: onchain.sh {preflight|infra|cluster [name]|indexer-cluster [name]|patha-upgrade <cluster>|seed-appid <cluster> <member>|all}" ;;
 esac
