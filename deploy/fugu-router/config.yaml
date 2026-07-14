@@ -1,8 +1,10 @@
 # fugu-router LiteLLM proxy config — docs/research/fugu-subscription-pooling.md §3.4.
 # Public clients should call the fugu_session_router front door with model=fugu or
-# model=fugu-ultra. LiteLLM only exposes account-specific upstream model names so the
-# router can make sticky session assignments and retry a different subscription on
-# quota/rate-limit errors. PAYG is intentionally absent from the serving path.
+# model=fugu-ultra for Sakana subscription-pooled calls. Direct provider models are
+# exposed on the same front door but pass through to LiteLLM unchanged. LiteLLM only
+# exposes account-specific upstream model names for Fugu so the router can make sticky
+# session assignments and retry a different subscription on quota/rate-limit errors.
+# PAYG is intentionally absent from the serving path.
 # The entrypoint prunes any deployment whose api_key env var is unset at runtime
 # (SAKANA_SUB_3_KEY is optional).
 # Custom Fugu pricing is mandatory: LiteLLM's built-in price table has no Sakana entries,
@@ -78,6 +80,79 @@ model_list:
       id: fugu-sub-3
       fugu_account_id: sub3
       fugu_requested_model: fugu
+
+  # ---- RedPill direct models: no Fugu subscription placement, served by LiteLLM pass-through ----
+  - model_name: glm-5.2
+    litellm_params:
+      model: openai/z-ai/glm-5.2
+      api_base: os.environ/REDPILL_API_BASE
+      api_key: os.environ/REDPILL_API_KEY
+    model_info:
+      id: glm-5.2
+      input_cost_per_token: 1.4e-6 # RedPill $1.40/M input tokens
+      output_cost_per_token: 4.4e-6 # RedPill $4.40/M output tokens
+      cache_read_input_token_cost: 7e-7 # RedPill $0.70/M cache read tokens
+  - model_name: qwen/qwen3-embedding-8b
+    litellm_params:
+      model: openai/qwen/qwen3-embedding-8b
+      api_base: os.environ/REDPILL_API_BASE
+      api_key: os.environ/REDPILL_API_KEY
+      # LiteLLM otherwise sends encoding_format=null; RedPill accepts explicit float.
+      encoding_format: float
+    model_info:
+      id: qwen/qwen3-embedding-8b
+      mode: embedding
+      input_cost_per_token: 1e-8 # RedPill $0.01/M input tokens
+      output_cost_per_token: 0 # RedPill $0.00/M output tokens
+  - model_name: openai/gpt-oss-120b
+    litellm_params:
+      # The first `openai/` selects LiteLLM's OpenAI-compatible adapter; the
+      # second is part of RedPill's upstream model id.
+      model: openai/openai/gpt-oss-120b
+      api_base: os.environ/REDPILL_API_BASE
+      api_key: os.environ/REDPILL_API_KEY
+    model_info:
+      id: openai/gpt-oss-120b
+      input_cost_per_token: 1.5e-7 # RedPill $0.15/M input tokens
+      output_cost_per_token: 6e-7 # RedPill $0.60/M output/reasoning tokens
+
+  # ---- xAI direct models: no Fugu subscription placement, served by LiteLLM pass-through ----
+  - model_name: grok-4.5
+    litellm_params:
+      model: xai/grok-4.5
+      api_key: os.environ/XAI_API_KEY
+    model_info:
+      id: grok-4.5
+      input_cost_per_token: 2e-6 # xAI $2.00/M input tokens
+      output_cost_per_token: 6e-6 # xAI $6.00/M output tokens
+      cache_read_input_token_cost: 5e-7 # xAI $0.50/M cached input tokens
+  - model_name: grok-4.3
+    litellm_params:
+      model: xai/grok-4.3
+      api_key: os.environ/XAI_API_KEY
+    model_info:
+      id: grok-4.3
+      input_cost_per_token: 1.25e-6 # xAI $1.25/M input tokens
+      output_cost_per_token: 2.5e-6 # xAI $2.50/M output tokens
+      cache_read_input_token_cost: 2e-7 # xAI $0.20/M cached input tokens
+  - model_name: grok-imagine-image-quality
+    litellm_params:
+      model: xai/grok-imagine-image-quality
+      api_key: os.environ/XAI_API_KEY
+    model_info:
+      id: grok-imagine-image-quality
+      mode: image_generation
+      input_cost_per_image: 0.01 # xAI image input $0.01/image
+      output_cost_per_image: 0.05 # xAI quality image output $0.05/image at 1K; 2K is $0.07
+  - model_name: grok-imagine-image
+    litellm_params:
+      model: xai/grok-imagine-image
+      api_key: os.environ/XAI_API_KEY
+    model_info:
+      id: grok-imagine-image
+      mode: image_generation
+      input_cost_per_image: 0.002 # xAI image input $0.002/image
+      output_cost_per_image: 0.02 # xAI standard image output $0.02/image
 
 router_settings:
   # The fugu_session_router chooses subscription placement. LiteLLM stays single-model

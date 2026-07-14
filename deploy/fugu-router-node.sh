@@ -11,15 +11,16 @@
 # runbook + risks.
 #
 #   setup   (ONCE, BEFORE deploy: generate ~/.attestmesh/fugu-router.env — all
-#     secrets except the Sakana keys, which Dan pastes at the gate; prints the
-#     Sakana training-opt-out reminder and exits nonzero while keys are missing)
+#     secrets except provider keys, which Dan pastes at the gate or sources from
+#     ~/.attestmesh/redpill-key and ~/.attestmesh/xai-key; prints the Sakana
+#     training-opt-out reminder and exits nonzero while keys are missing)
 #   -> deploy (stock DstackApp + sealed env + bridge CreateVm, gateway OFF)
 #   -> prime (allowlist compose_hash + app_id on the cluster)
 #   -> bind  (hash pre-check — C3 membership is permanent — then upgradeToAndCall)
 #   -> verify (sidecar self-registers -> memberIdOf(X) != 0)
 #   -> verify-health (box-side :9090; the port only binds POST-bind)
 #   -> verify-db / verify-redis (data planes)
-#   -> verify-proxy (real fugu-ultra completion through :18410)
+#   -> verify-proxy (real fugu-ultra + direct provider calls through :18410)
 #   -> verify-langfuse-trace (the completion's trace, with orchestration-token
 #      metadata, visible via the langfuse-node public API — callback->langfuse-node)
 #   -> verify-isolation
@@ -34,7 +35,7 @@ source "$HERE/lib.sh"
 : "${RPC_URL:?source deploy/env.sh first}"
 require PRIVATE_KEY RPC_URL CHAIN_ID DEPLOYER_ADDR
 
-NODE="${1:?usage: fugu-router-node.sh <node-name> [setup|deploy|prime|bind|verify|verify-health|verify-db|verify-redis|verify-proxy|verify-langfuse-trace|verify-isolation|update|all]}"
+NODE="${1:?usage: fugu-router-node.sh <node-name> [setup|deploy|prime|bind|start|register-direct|verify|verify-health|verify-db|verify-redis|verify-proxy|verify-langfuse-trace|verify-isolation|update|stop|all]}"
 ACTION="${2:-all}"
 BOX_HOST="${BOX_HOST:-ubuntu@173.231.234.133}"
 BOX_PY="${BOX_PY:-/opt/dstack-mcp/venv/bin/python}"
@@ -49,6 +50,9 @@ GATEWAY_DOMAIN="${GATEWAY_DOMAIN:-gateway.attestmesh.xyz}"
 MESH_SSH_HOST="${MESH_SSH_HOST:-attestmesh-mesh-node}"
 
 SECRETS_FILE="${SECRETS_FILE:-$HOME/.attestmesh/fugu-router.env}"
+FUGU_RPC_FILE="${FUGU_RPC_FILE:-$HOME/.attestmesh/fugu-router-rpc.env}"
+REDPILL_KEY_FILE="${REDPILL_KEY_FILE:-$HOME/.attestmesh/redpill-key}"
+XAI_KEY_FILE="${XAI_KEY_FILE:-$HOME/.attestmesh/xai-key}"
 
 # Sibling cluster/node state (for the redis/langfuse mesh IPs + verify credentials).
 REDISHA_CSTATE="${REDISHA_CSTATE:-$LOGDIR/redis-ha-redis-ha.state}"
@@ -62,7 +66,7 @@ PG1_MESH_IP="${PG1_MESH_IP:-10.18.147.86}"
 export BOX_VCPU="${BOX_VCPU:-2}" BOX_MEM="${BOX_MEM:-4096}" BOX_DISK="${BOX_DISK:-30}"
 # No host port-forwards; bridge mode; gateway OFF; app-bound disk key.
 export BOX_PORTS="${BOX_PORTS:-[]}" BOX_GATEWAY_ENABLED="${BOX_GATEWAY_ENABLED:-false}" BOX_NET_MODE="${BOX_NET_MODE:-bridge}"
-export BOX_NO_INSTANCE_ID="${BOX_NO_INSTANCE_ID:-true}"
+export BOX_NO_INSTANCE_ID="${BOX_NO_INSTANCE_ID:-false}"
 
 STATE="$LOGDIR/fugu-router-node-${NODE}.state"
 ZERO32=0x0000000000000000000000000000000000000000000000000000000000000000
@@ -121,7 +125,8 @@ _langfuse_ip() {
 
 # Generated ONCE into the 0600 secrets file and re-read every run. Existing values
 # always win (regenerating would desync the DB role + Langfuse project credentials).
-# The Sakana keys are the ONLY fields left blank for Dan (deploy gate).
+# Provider keys are left blank for the operator; RedPill and xAI can also be sourced
+# from ~/.attestmesh/*-key files at deploy time.
 _ensure_secrets() {
   umask 077
   mkdir -p "$(dirname "$SECRETS_FILE")"
@@ -129,6 +134,8 @@ _ensure_secrets() {
     cat > "$SECRETS_FILE" <<EOF
 # fugu-router node secrets — generated $(date -u +%FT%TZ) by fugu-router-node.sh setup.
 # Sakana keys are pasted by the operator (deploy gate). Do the training opt-out FIRST.
+# RedPill API key may be pasted here or sourced from ~/.attestmesh/redpill-key.
+# xAI API key may be pasted here or sourced from ~/.attestmesh/xai-key.
 # LANGFUSE_INIT_PROJECT_* are the callback credentials litellm sends to langfuse-node —
 # they MUST match the langfuse-node deployment's LANGFUSE_INIT project keys.
 SAKANA_API_BASE=
@@ -136,6 +143,12 @@ SAKANA_SUB_1_KEY=
 SAKANA_SUB_2_KEY=
 SAKANA_SUB_3_KEY=
 SAKANA_CIDRS=
+REDPILL_API_BASE=https://api.redpill.ai/v1
+REDPILL_API_KEY=
+REDPILL_CIDRS=66.220.6.0/24
+XAI_API_BASE=https://api.x.ai/v1
+XAI_API_KEY=
+XAI_CIDRS=
 FUGU_SUB_1_LABEL=Subscription 1
 FUGU_SUB_2_LABEL=Subscription 2
 FUGU_SUB_3_LABEL=Subscription 3
@@ -170,8 +183,24 @@ LANGFUSE_INIT_PROJECT_SECRET_KEY=sk-lf-$(openssl rand -hex 16)
 EOF
     log "generated fresh fugu-router secrets -> $SECRETS_FILE (sync LANGFUSE_INIT_PROJECT_* with langfuse-node)"
   fi
+  grep -q '^XAI_API_BASE=' "$SECRETS_FILE" || printf '\nXAI_API_BASE=https://api.x.ai/v1\n' >> "$SECRETS_FILE"
+  grep -q '^XAI_API_KEY=' "$SECRETS_FILE" || printf 'XAI_API_KEY=\n' >> "$SECRETS_FILE"
+  grep -q '^XAI_CIDRS=' "$SECRETS_FILE" || printf 'XAI_CIDRS=\n' >> "$SECRETS_FILE"
   # shellcheck disable=SC1090
   source "$SECRETS_FILE"
+  if [ -f "$FUGU_RPC_FILE" ]; then
+    # shellcheck disable=SC1090
+    source "$FUGU_RPC_FILE"
+  fi
+  REDPILL_API_BASE="${REDPILL_API_BASE:-https://api.redpill.ai/v1}"
+  REDPILL_CIDRS="${REDPILL_CIDRS:-66.220.6.0/24}"
+  XAI_API_BASE="${XAI_API_BASE:-https://api.x.ai/v1}"
+  if [ -z "${REDPILL_API_KEY:-}" ] && [ -s "$REDPILL_KEY_FILE" ]; then
+    REDPILL_API_KEY="$(tr -d '[:space:]' < "$REDPILL_KEY_FILE")"
+  fi
+  if [ -z "${XAI_API_KEY:-}" ] && [ -s "$XAI_KEY_FILE" ]; then
+    XAI_API_KEY="$(tr -d '[:space:]' < "$XAI_KEY_FILE")"
+  fi
   [ -n "${LITELLM_MASTER_KEY:-}" ] && [ -n "${LANGFUSE_INIT_PROJECT_SECRET_KEY:-}" ] || die "incomplete secrets in $SECRETS_FILE"
 }
 
@@ -191,6 +220,18 @@ _require_sakana() {
   [ -n "${SAKANA_CIDRS:-}" ] || die "SAKANA_CIDRS empty in $SECRETS_FILE (litellm-egress-fw allowlist — Wave-1 agent D resolves these)"
 }
 
+_require_redpill() {
+  [ -n "${REDPILL_API_BASE:-}" ] || die "REDPILL_API_BASE empty in $SECRETS_FILE"
+  [ -n "${REDPILL_API_KEY:-}" ] || die "REDPILL_API_KEY empty (set it in $SECRETS_FILE or create $REDPILL_KEY_FILE)"
+  [ -n "${REDPILL_CIDRS:-}" ] || die "REDPILL_CIDRS empty in $SECRETS_FILE (litellm-egress-fw RedPill allowlist)"
+}
+
+_require_xai() {
+  [ -n "${XAI_API_BASE:-}" ] || die "XAI_API_BASE empty in $SECRETS_FILE"
+  [ -n "${XAI_API_KEY:-}" ] || die "XAI_API_KEY empty (set it in $SECRETS_FILE or create $XAI_KEY_FILE)"
+  [ -n "${XAI_CIDRS:-}" ] || die "XAI_CIDRS empty in $SECRETS_FILE (litellm-egress-fw xAI allowlist)"
+}
+
 _require_env() {
   local indexer
   indexer=$(jq -r .indexerRegistry "$ROOT/contracts/script/deployments/${CHAIN_ID}.json" 2>/dev/null)
@@ -199,6 +240,8 @@ _require_env() {
   [ -n "$INDEXER_REGISTRY_ADDR" ] && [ "$INDEXER_REGISTRY_ADDR" != null ] || die "missing INDEXER_REGISTRY_ADDR"
   _ensure_secrets
   _require_sakana
+  _require_redpill
+  _require_xai
   _ha_ips
   _langfuse_ip
 }
@@ -211,7 +254,13 @@ send_seq() {
 # Forward compose + helper to the box and run a box-side mode. Secrets ride ssh
 # STDIN as printf-%q'd assignments sourced by the remote shell (webhost pattern).
 _box_run() {
-  local mode="$1" app_id="${2:-}" vm_id="${3:-}" guser gtok
+  local mode="$1" app_id="${2:-}" vm_id="${3:-}" guser gtok rpc_url_for_cvm
+  rpc_url_for_cvm="${FUGU_RPC_URL:-}"
+  if [ -s "$FUGU_RPC_FILE" ]; then
+    rpc_url_for_cvm="$(awk -F= '$1=="FUGU_RPC_URL"{print substr($0,index($0,"=")+1)}' "$FUGU_RPC_FILE" | tail -1)"
+  fi
+  rpc_url_for_cvm="${rpc_url_for_cvm:-${CVM_RPC_URL:-$RPC_URL}}"
+  [ -n "$rpc_url_for_cvm" ] || die "missing Fugu CVM RPC URL"
   guser=$(grep -E '^\s*username\s*=' "$HOME/.teesql/ghcr-pull.toml" 2>/dev/null | head -1 | sed -E 's/.*=\s*//' | tr -d "\"' ")
   gtok=$(grep  -E '^\s*token\s*='    "$HOME/.teesql/ghcr-pull.toml" 2>/dev/null | head -1 | sed -E 's/.*=\s*//' | tr -d "\"' ")
   [ -n "$gtok" ] || die "no ghcr token in ~/.teesql/ghcr-pull.toml"
@@ -219,11 +268,12 @@ _box_run() {
   scp -o BatchMode=yes -q "$HERE/fugu-router-node-box.py" "$BOX_HOST:/tmp/fugu-router-node-box.py"
   {
     printf 'E_CHAIN_ID=%q\n' "$CHAIN_ID"
-    printf 'E_RPC_URL=%q\n' "${CVM_RPC_URL:-$RPC_URL}"
-    printf 'E_BUNDLER_URL=%q\n' "${CVM_BUNDLER_URL:-${BUNDLER_URL:-$RPC_URL}}"
+    printf 'E_RPC_URL=%q\n' "$rpc_url_for_cvm"
+    printf 'E_BUNDLER_URL=%q\n' "${BUNDLER_URL:-${CVM_BUNDLER_URL:-$RPC_URL}}"
     printf 'E_GAS_POLICY_ID=%q\n' "${GAS_POLICY_ID:-}"
     printf 'E_INDEXER_REGISTRY_ADDR=%q\n' "$INDEXER_REGISTRY_ADDR"
     printf 'E_GATEWAY_DOMAIN=%q\n' "$GATEWAY_DOMAIN"
+    printf 'E_CLUSTER=%q\n' "${CLUSTER:-}"
     printf 'E_REDIS_HA_IP_1=%q\n' "${REDIS_HA_IP_1:-}"
     printf 'E_REDIS_HA_IP_2=%q\n' "${REDIS_HA_IP_2:-}"
     printf 'E_REDIS_HA_IP_3=%q\n' "${REDIS_HA_IP_3:-}"
@@ -233,6 +283,12 @@ _box_run() {
     printf 'E_SAKANA_SUB_2_KEY=%q\n' "${SAKANA_SUB_2_KEY:-}"
     printf 'E_SAKANA_SUB_3_KEY=%q\n' "${SAKANA_SUB_3_KEY:-}"
     printf 'E_SAKANA_CIDRS=%q\n' "${SAKANA_CIDRS:-}"
+    printf 'E_REDPILL_API_BASE=%q\n' "${REDPILL_API_BASE:-}"
+    printf 'E_REDPILL_API_KEY=%q\n' "${REDPILL_API_KEY:-}"
+    printf 'E_REDPILL_CIDRS=%q\n' "${REDPILL_CIDRS:-}"
+    printf 'E_XAI_API_BASE=%q\n' "${XAI_API_BASE:-}"
+    printf 'E_XAI_API_KEY=%q\n' "${XAI_API_KEY:-}"
+    printf 'E_XAI_CIDRS=%q\n' "${XAI_CIDRS:-}"
     printf 'E_FUGU_SUB_1_ENABLED=%q\n' "true"
     printf 'E_FUGU_SUB_2_ENABLED=%q\n' "true"
     printf 'E_FUGU_SUB_3_ENABLED=%q\n' "$([ -n "${SAKANA_SUB_3_KEY:-}" ] && echo true || echo false)"
@@ -272,6 +328,18 @@ _box_run() {
     bash -c 'set -a; . /dev/stdin; set +a; exec $BOX_PY /tmp/fugu-router-node-box.py $mode $app_id $vm_id'"
 }
 
+_box_stop_vm() {
+  [ -n "${VM_ID:-}" ] || die "need VM_ID (run deploy first)"
+  scp -o BatchMode=yes -q "$HERE/fugu-router-node-box.py" "$BOX_HOST:/tmp/fugu-router-node-box.py"
+  ssh_box "sudo BOX_NAME='$NODE' $BOX_PY /tmp/fugu-router-node-box.py stop '$VM_ID'"
+}
+
+_box_start_vm() {
+  [ -n "${VM_ID:-}" ] || die "need VM_ID (run deploy first)"
+  scp -o BatchMode=yes -q "$HERE/fugu-router-node-box.py" "$BOX_HOST:/tmp/fugu-router-node-box.py"
+  ssh_box "sudo BOX_NAME='$NODE' $BOX_PY /tmp/fugu-router-node-box.py start '$VM_ID'"
+}
+
 # ONCE, BEFORE deploy: generate the secrets file. Exits nonzero while the Sakana keys
 # (the deploy gate) are missing so orchestration can block on it visibly.
 setup() {
@@ -286,6 +354,13 @@ setup() {
     log "REMINDER: complete the Sakana TRAINING OPT-OUT before pasting any key."
     exit 2
   fi
+  _require_redpill
+  if [ -z "${XAI_API_KEY:-}" ] || [ -z "${XAI_CIDRS:-}" ]; then
+    log "setup: xAI direct models still need:"
+    [ -z "${XAI_API_KEY:-}" ] && log "  - XAI_API_KEY (or create $XAI_KEY_FILE)"
+    [ -z "${XAI_CIDRS:-}" ]    && log "  - XAI_CIDRS (narrowest observed api.x.ai egress CIDRs)"
+  fi
+  _require_xai
   log "✔ setup complete — all secrets present in $SECRETS_FILE"
 }
 
@@ -353,6 +428,43 @@ SCRIPT
   log "✔ bound fugu-router node X -> $CLUSTER"
 }
 
+register_direct() {
+  _load; _default_cluster_env
+  [ -n "${X:-}" ] && [ -n "${VM_ID:-}" ] && [ -n "${CLUSTER:-}" ] || die "need X/VM_ID/CLUSTER"
+  local id payload member calldata i
+  id=$(cast call "$CLUSTER" "memberIdOf(address)(bytes32)" "$X" --rpc-url "$RPC_URL" 2>/dev/null || true)
+  if [ -n "$id" ] && [ "$id" != "$ZERO32" ]; then
+    log "fugu-router node already registered: memberId=$id"
+    return 0
+  fi
+  for i in $(seq 1 60); do
+    payload=$(ssh_box "sudo bash -s" <<SCRIPT 2>/dev/null
+set -u
+VMID="$VM_ID"
+$(_bridge_ip_snippet)
+p=\$(curl -sfm 8 "http://\$IP:9092/registration-calldata" 2>/dev/null || true)
+if [ -n "\$p" ]; then
+  printf '%s\n' "\$p"
+elif [ -f "/srv/data/dstack/vm/$VM_ID/serial.log" ] || [ -f "/srv/data/dstack/vm/$VM_ID/serial.history.log" ]; then
+  sed 's/\\x1b\\[[0-9;]*m//g' "/srv/data/dstack/vm/$VM_ID/serial.log" "/srv/data/dstack/vm/$VM_ID/serial.history.log" 2>/dev/null \
+    | grep 'ATTESTMESH_DIRECT_REGISTER ' | sed 's/^.*ATTESTMESH_DIRECT_REGISTER //' | tail -1
+fi
+SCRIPT
+)
+    if [ -n "$payload" ] && echo "$payload" | jq -e '.calldata and .member' >/dev/null 2>&1; then
+      member=$(echo "$payload" | jq -r .member)
+      calldata=$(echo "$payload" | jq -r .calldata)
+      [ "${member,,}" = "${X,,}" ] || die "registration helper emitted member=$member, expected X=$X"
+      log "▶ direct dstack_register for $NODE member=$member via operator tx"
+      send_seq "direct-dstack-register-${NODE}" "$CLUSTER" --data "$calldata"
+      return 0
+    fi
+    log "… waiting for registration helper calldata ($i/60)"
+    sleep 5
+  done
+  die "registration helper calldata not found on bridge helper or CVM serial logs"
+}
+
 verify() {
   _load; _default_cluster_env
   [ -n "${X:-}" ] && [ -n "${CLUSTER:-}" ] || die "need X+cluster"
@@ -373,11 +485,27 @@ verify() {
 # Box-side bridge-IP resolver for this VM (qemu args -> TAP MAC -> ip neigh).
 _bridge_ip_snippet() {
   cat <<'SNIP'
-MAC=$(ps -eo args | grep -F "$VMID" | grep -v grep | grep -oE 'mac=[0-9a-f:]+' | head -1 | cut -d= -f2)
+MAC=$(ps axww -o args | grep -F "$VMID" | grep -v grep | grep -oE 'mac=[0-9a-f:]+' | head -1 | cut -d= -f2)
 [ -n "$MAC" ] || { echo "NO_QEMU"; exit 3; }
 IP=$(ip neigh show dev dstack-br0 | grep -i "$MAC" | grep -oE '^10\.0\.[0-9]+\.[0-9]+' | head -1)
 [ -n "$IP" ] || { echo "NO_IP"; exit 4; }
 SNIP
+}
+
+_member_mesh_ip() {
+  local app="${1:-${X:-}}" cluster="${2:-${CLUSTER:-}}" member_id raw mesh_int
+  [ -n "$app" ] && [ -n "$cluster" ] || return 1
+  member_id=$(cast call "$cluster" "memberIdOf(address)(bytes32)" "$app" --rpc-url "$RPC_URL" 2>/dev/null) || return 1
+  [ -n "$member_id" ] && [ "$member_id" != "$ZERO32" ] || return 1
+  raw=$(cast call "$cluster" "meshIpOf(bytes32)(uint32)" "$member_id" --rpc-url "$RPC_URL" 2>/dev/null) || return 1
+  mesh_int=$(echo "$raw" | grep -oE '^[0-9]+' | head -1)
+  [ -n "$mesh_int" ] || return 1
+  python3 - "$mesh_int" <<'PY'
+import ipaddress
+import sys
+
+print(ipaddress.IPv4Address(int(sys.argv[1])))
+PY
 }
 
 # POST-BIND observability: the sidecar binds :9090 only AFTER member.cluster()
@@ -427,6 +555,12 @@ SNIP
 
 _discover_mesh_ip() {
   [ -n "${MESH_IP:-}" ] && return 0
+  _default_cluster_env
+  local resolved
+  if resolved=$(_member_mesh_ip "${X:-}" "${CLUSTER:-}"); then
+    MESH_IP="$resolved"; _save
+    return 0
+  fi
   local i out ip
   for i in $(seq 1 45); do
     out=$(ssh_mesh "bash -s" <<SCRIPT 2>/dev/null
@@ -486,26 +620,116 @@ SCRIPT
   log "✔ redis path live: write via the CVM forwarder, readback via redis-ha directly"
 }
 
-# LiteLLM: /v1/models + /health/liveliness with the master key, then ONE real
-# fugu-ultra completion (max_tokens 16 — this is a paid call, deliberately tiny).
+# LiteLLM: /v1/models + /health/liveliness with the master key, then tiny real
+# fugu-ultra + RedPill GLM completions and one RedPill Qwen embedding call.
 verify_proxy() {
   _load; _ensure_secrets
-  _discover_mesh_ip || die "node not discoverable on the mesh"
-  local out
-  out=$(ssh_mesh "bash -s" <<SCRIPT 2>/dev/null
-models=\$(curl -fsS --max-time 10 -H "Authorization: Bearer ${LITELLM_MASTER_KEY}" "http://$MESH_IP:18410/v1/models" 2>&1)
+  local mode="${FUGU_ROUTER_VERIFY_BACKEND:-bridge}" target_url out bridge_ip
+  if [ "$mode" = mesh ]; then
+    _discover_mesh_ip || die "node not discoverable on the mesh"
+    target_url="http://$MESH_IP:18410"
+    out=$(ssh_mesh "bash -s" <<SCRIPT 2>/dev/null
+BASE_URL="$target_url"
+models=\$(curl -fsS --max-time 10 -H "Authorization: Bearer ${LITELLM_MASTER_KEY}" "\$BASE_URL/v1/models" 2>&1)
 echo "\$models" | grep -q '"fugu-ultra"' || { echo "PROXY: FAIL - /v1/models missing fugu-ultra: \$models"; exit 2; }
-curl -fsS --max-time 10 "http://$MESH_IP:18410/health/liveliness" >/dev/null 2>&1 || { echo "PROXY: FAIL - liveliness"; exit 3; }
-comp=\$(curl -fsS --max-time 120 -H "Authorization: Bearer ${LITELLM_MASTER_KEY}" -H 'Content-Type: application/json' \
-  -X POST "http://$MESH_IP:18410/v1/chat/completions" \
+echo "\$models" | grep -q '"glm-5.2"' || { echo "PROXY: FAIL - /v1/models missing glm-5.2: \$models"; exit 2; }
+echo "\$models" | grep -q '"qwen/qwen3-embedding-8b"' || { echo "PROXY: FAIL - /v1/models missing qwen/qwen3-embedding-8b: \$models"; exit 2; }
+echo "\$models" | grep -q '"grok-4.5"' || { echo "PROXY: FAIL - /v1/models missing grok-4.5: \$models"; exit 2; }
+echo "\$models" | grep -q '"grok-4.3"' || { echo "PROXY: FAIL - /v1/models missing grok-4.3: \$models"; exit 2; }
+echo "\$models" | grep -q '"grok-imagine-image-quality"' || { echo "PROXY: FAIL - /v1/models missing grok-imagine-image-quality: \$models"; exit 2; }
+echo "\$models" | grep -q '"grok-imagine-image"' || { echo "PROXY: FAIL - /v1/models missing grok-imagine-image: \$models"; exit 2; }
+curl -fsS --max-time 10 "\$BASE_URL/health/liveliness" >/dev/null 2>&1 || { echo "PROXY: FAIL - liveliness"; exit 3; }
+fugu_comp=\$(curl -fsS --max-time 120 -H "Authorization: Bearer ${LITELLM_MASTER_KEY}" -H 'Content-Type: application/json' \
+  -X POST "\$BASE_URL/v1/chat/completions" \
   -d '{"model":"fugu-ultra","messages":[{"role":"user","content":"Say OK."}],"max_tokens":16,"metadata":{"tags":["verify-proxy"]}}' 2>&1)
-echo "\$comp" | grep -q '"choices"' || { echo "PROXY: FAIL - completion: \$comp"; exit 4; }
+echo "\$fugu_comp" | grep -q '"choices"' || { echo "PROXY: FAIL - fugu-ultra completion: \$fugu_comp"; exit 4; }
+glm_comp=\$(curl -fsS --max-time 120 -H "Authorization: Bearer ${LITELLM_MASTER_KEY}" -H 'Content-Type: application/json' \
+  -X POST "\$BASE_URL/v1/chat/completions" \
+  -d '{"model":"glm-5.2","messages":[{"role":"user","content":"Say OK."}],"max_tokens":16,"metadata":{"tags":["verify-proxy","redpill-glm"]}}' 2>&1)
+echo "\$glm_comp" | grep -q '"choices"' || { echo "PROXY: FAIL - glm-5.2 completion: \$glm_comp"; exit 5; }
+emb=\$(curl -fsS --max-time 120 -H "Authorization: Bearer ${LITELLM_MASTER_KEY}" -H 'Content-Type: application/json' \
+  -X POST "\$BASE_URL/v1/embeddings" \
+  -d '{"model":"qwen/qwen3-embedding-8b","input":"fugu-router verify-proxy embedding smoke"}' 2>&1)
+echo "\$emb" | grep -q '"embedding"' || { echo "PROXY: FAIL - qwen embedding: \$emb"; exit 6; }
+grok45_comp=\$(curl -fsS --max-time 180 -H "Authorization: Bearer ${LITELLM_MASTER_KEY}" -H 'Content-Type: application/json' \
+  -X POST "\$BASE_URL/v1/chat/completions" \
+  -d '{"model":"grok-4.5","messages":[{"role":"user","content":"Say OK."}],"max_tokens":16,"metadata":{"tags":["verify-proxy","xai-grok-4.5"]}}' 2>&1)
+echo "\$grok45_comp" | grep -q '"choices"' || { echo "PROXY: FAIL - grok-4.5 completion: \$grok45_comp"; exit 7; }
+grok43_comp=\$(curl -fsS --max-time 180 -H "Authorization: Bearer ${LITELLM_MASTER_KEY}" -H 'Content-Type: application/json' \
+  -X POST "\$BASE_URL/v1/chat/completions" \
+  -d '{"model":"grok-4.3","messages":[{"role":"user","content":"Say OK."}],"max_tokens":16,"metadata":{"tags":["verify-proxy","xai-grok-4.3"]}}' 2>&1)
+echo "\$grok43_comp" | grep -q '"choices"' || { echo "PROXY: FAIL - grok-4.3 completion: \$grok43_comp"; exit 8; }
+img_quality=\$(curl -fsS --max-time 240 -H "Authorization: Bearer ${LITELLM_MASTER_KEY}" -H 'Content-Type: application/json' \
+  -X POST "\$BASE_URL/v1/images/generations" \
+  -d '{"model":"grok-imagine-image-quality","prompt":"A tiny plain red square icon on a white background.","n":1,"response_format":"url","metadata":{"tags":["verify-proxy","xai-grok-imagine-image-quality"]}}' 2>&1)
+echo "\$img_quality" | grep -q '"data"' || { echo "PROXY: FAIL - grok-imagine-image-quality image generation: \$img_quality"; exit 9; }
+dash45=\$(curl -fsS --max-time 10 -H "Authorization: Bearer ${LITELLM_MASTER_KEY}" "\$BASE_URL/fugu/api/summary?window=5h&model=grok-4.5" 2>&1)
+echo "\$dash45" | grep -q '"account_id":"direct:grok-4.5"' || { echo "PROXY: FAIL - dashboard filter missing direct grok-4.5 route: \$dash45"; exit 10; }
+dash43=\$(curl -fsS --max-time 10 -H "Authorization: Bearer ${LITELLM_MASTER_KEY}" "\$BASE_URL/fugu/api/summary?window=5h&model=grok-4.3" 2>&1)
+echo "\$dash43" | grep -q '"account_id":"direct:grok-4.3"' || { echo "PROXY: FAIL - dashboard filter missing direct grok-4.3 route: \$dash43"; exit 11; }
+dash_img_quality=\$(curl -fsS --max-time 10 -H "Authorization: Bearer ${LITELLM_MASTER_KEY}" "\$BASE_URL/fugu/api/summary?window=5h&model=grok-imagine-image-quality" 2>&1)
+echo "\$dash_img_quality" | grep -q '"account_id":"direct:grok-imagine-image-quality"' || { echo "PROXY: FAIL - dashboard filter missing direct grok-imagine-image-quality route: \$dash_img_quality"; exit 12; }
 echo "PROXY: PASS"
 SCRIPT
 )
+  else
+    [ -n "${VM_ID:-}" ] || die "need VM_ID for bridge verify-proxy"
+    bridge_ip=$(ssh_box "sudo bash -s" <<SCRIPT 2>/dev/null
+VMID="$VM_ID"
+$(_bridge_ip_snippet)
+printf '%s\n' "\$IP"
+SCRIPT
+)
+    echo "$bridge_ip" | grep -Eq '^10\.0\.[0-9]+\.[0-9]+$' || die "could not resolve bridge IP for $NODE (got: $bridge_ip)"
+    target_url="http://$bridge_ip:18410"
+    out=$(ssh_box "bash -s" <<SCRIPT 2>/dev/null
+BASE_URL="$target_url"
+models=\$(curl -fsS --max-time 10 -H "Authorization: Bearer ${LITELLM_MASTER_KEY}" "\$BASE_URL/v1/models" 2>&1)
+echo "\$models" | grep -q '"fugu-ultra"' || { echo "PROXY: FAIL - /v1/models missing fugu-ultra: \$models"; exit 2; }
+echo "\$models" | grep -q '"glm-5.2"' || { echo "PROXY: FAIL - /v1/models missing glm-5.2: \$models"; exit 2; }
+echo "\$models" | grep -q '"qwen/qwen3-embedding-8b"' || { echo "PROXY: FAIL - /v1/models missing qwen/qwen3-embedding-8b: \$models"; exit 2; }
+echo "\$models" | grep -q '"grok-4.5"' || { echo "PROXY: FAIL - /v1/models missing grok-4.5: \$models"; exit 2; }
+echo "\$models" | grep -q '"grok-4.3"' || { echo "PROXY: FAIL - /v1/models missing grok-4.3: \$models"; exit 2; }
+echo "\$models" | grep -q '"grok-imagine-image-quality"' || { echo "PROXY: FAIL - /v1/models missing grok-imagine-image-quality: \$models"; exit 2; }
+echo "\$models" | grep -q '"grok-imagine-image"' || { echo "PROXY: FAIL - /v1/models missing grok-imagine-image: \$models"; exit 2; }
+curl -fsS --max-time 10 "\$BASE_URL/health/liveliness" >/dev/null 2>&1 || { echo "PROXY: FAIL - liveliness"; exit 3; }
+fugu_comp=\$(curl -fsS --max-time 120 -H "Authorization: Bearer ${LITELLM_MASTER_KEY}" -H 'Content-Type: application/json' \
+  -X POST "\$BASE_URL/v1/chat/completions" \
+  -d '{"model":"fugu-ultra","messages":[{"role":"user","content":"Say OK."}],"max_tokens":16,"metadata":{"tags":["verify-proxy"]}}' 2>&1)
+echo "\$fugu_comp" | grep -q '"choices"' || { echo "PROXY: FAIL - fugu-ultra completion: \$fugu_comp"; exit 4; }
+glm_comp=\$(curl -fsS --max-time 120 -H "Authorization: Bearer ${LITELLM_MASTER_KEY}" -H 'Content-Type: application/json' \
+  -X POST "\$BASE_URL/v1/chat/completions" \
+  -d '{"model":"glm-5.2","messages":[{"role":"user","content":"Say OK."}],"max_tokens":16,"metadata":{"tags":["verify-proxy","redpill-glm"]}}' 2>&1)
+echo "\$glm_comp" | grep -q '"choices"' || { echo "PROXY: FAIL - glm-5.2 completion: \$glm_comp"; exit 5; }
+emb=\$(curl -fsS --max-time 120 -H "Authorization: Bearer ${LITELLM_MASTER_KEY}" -H 'Content-Type: application/json' \
+  -X POST "\$BASE_URL/v1/embeddings" \
+  -d '{"model":"qwen/qwen3-embedding-8b","input":"fugu-router verify-proxy embedding smoke"}' 2>&1)
+echo "\$emb" | grep -q '"embedding"' || { echo "PROXY: FAIL - qwen embedding: \$emb"; exit 6; }
+grok45_comp=\$(curl -fsS --max-time 180 -H "Authorization: Bearer ${LITELLM_MASTER_KEY}" -H 'Content-Type: application/json' \
+  -X POST "\$BASE_URL/v1/chat/completions" \
+  -d '{"model":"grok-4.5","messages":[{"role":"user","content":"Say OK."}],"max_tokens":16,"metadata":{"tags":["verify-proxy","xai-grok-4.5"]}}' 2>&1)
+echo "\$grok45_comp" | grep -q '"choices"' || { echo "PROXY: FAIL - grok-4.5 completion: \$grok45_comp"; exit 7; }
+grok43_comp=\$(curl -fsS --max-time 180 -H "Authorization: Bearer ${LITELLM_MASTER_KEY}" -H 'Content-Type: application/json' \
+  -X POST "\$BASE_URL/v1/chat/completions" \
+  -d '{"model":"grok-4.3","messages":[{"role":"user","content":"Say OK."}],"max_tokens":16,"metadata":{"tags":["verify-proxy","xai-grok-4.3"]}}' 2>&1)
+echo "\$grok43_comp" | grep -q '"choices"' || { echo "PROXY: FAIL - grok-4.3 completion: \$grok43_comp"; exit 8; }
+img_quality=\$(curl -fsS --max-time 240 -H "Authorization: Bearer ${LITELLM_MASTER_KEY}" -H 'Content-Type: application/json' \
+  -X POST "\$BASE_URL/v1/images/generations" \
+  -d '{"model":"grok-imagine-image-quality","prompt":"A tiny plain red square icon on a white background.","n":1,"response_format":"url","metadata":{"tags":["verify-proxy","xai-grok-imagine-image-quality"]}}' 2>&1)
+echo "\$img_quality" | grep -q '"data"' || { echo "PROXY: FAIL - grok-imagine-image-quality image generation: \$img_quality"; exit 9; }
+dash45=\$(curl -fsS --max-time 10 -H "Authorization: Bearer ${LITELLM_MASTER_KEY}" "\$BASE_URL/fugu/api/summary?window=5h&model=grok-4.5" 2>&1)
+echo "\$dash45" | grep -q '"account_id":"direct:grok-4.5"' || { echo "PROXY: FAIL - dashboard filter missing direct grok-4.5 route: \$dash45"; exit 10; }
+dash43=\$(curl -fsS --max-time 10 -H "Authorization: Bearer ${LITELLM_MASTER_KEY}" "\$BASE_URL/fugu/api/summary?window=5h&model=grok-4.3" 2>&1)
+echo "\$dash43" | grep -q '"account_id":"direct:grok-4.3"' || { echo "PROXY: FAIL - dashboard filter missing direct grok-4.3 route: \$dash43"; exit 11; }
+dash_img_quality=\$(curl -fsS --max-time 10 -H "Authorization: Bearer ${LITELLM_MASTER_KEY}" "\$BASE_URL/fugu/api/summary?window=5h&model=grok-imagine-image-quality" 2>&1)
+echo "\$dash_img_quality" | grep -q '"account_id":"direct:grok-imagine-image-quality"' || { echo "PROXY: FAIL - dashboard filter missing direct grok-imagine-image-quality route: \$dash_img_quality"; exit 12; }
+echo "PROXY: PASS"
+SCRIPT
+)
+  fi
   echo "$out" | tee "$LOGDIR/fugu-proxy-${NODE}.$(ts).log" >&2
   echo "$out" | grep -q '^PROXY: PASS' || die "verify-proxy failed"
-  log "✔ LiteLLM live on :18410 — models listed + one real fugu-ultra completion returned"
+  log "✔ LiteLLM live at $target_url — fugu-ultra, glm-5.2, qwen embeddings, Grok chat/image, and dashboard filters verified"
 }
 
 # Poll the langfuse-node public API until verify-proxy's completion appears as a trace
@@ -570,7 +794,8 @@ update_member() {
   if [ "$allowed" = true ]; then
     log "compose hash already allowlisted"
   else
-    send_seq "fugu-update-addHash-${NODE}" "$CLUSTER" "addComposeHash(bytes32)" "0x$nh"
+    send_seq "fugu-update-addHash-${NODE}" "$CLUSTER" "addComposeHash(bytes32)" "0x$nh" \
+      || die "failed to allowlist compose hash 0x$nh"
   fi
   out=$(_box_run update "$X" "$VM_ID") || die "in-place update failed"
   echo "$out"
@@ -583,12 +808,32 @@ update_member() {
   log "✔ fugu-router node update complete mode=$mode vm=$VM_ID"
 }
 
+stop_member() {
+  _load
+  [ -n "${VM_ID:-}" ] || die "need VM_ID in $STATE"
+  local out
+  out=$(_box_stop_vm) || die "failed to stop VM $VM_ID"
+  echo "$out"
+  log "✔ fugu-router node VM stop requested vm=$VM_ID"
+}
+
+start_member() {
+  _load
+  [ -n "${VM_ID:-}" ] || die "need VM_ID in $STATE"
+  local out
+  out=$(_box_start_vm) || die "failed to start VM $VM_ID"
+  echo "$out"
+  log "✔ fugu-router node VM start requested vm=$VM_ID"
+}
+
 log "=== Fugu-router AttestMesh node: $NODE ==="
 case "$ACTION" in
   setup) setup ;;
   deploy) deploy_cvm ;;
   prime) prime_gate ;;
   bind) bind_member ;;
+  start) start_member ;;
+  register-direct) register_direct ;;
   verify) verify ;;
   verify-health) verify_health ;;
   verify-db) verify_db ;;
@@ -597,6 +842,7 @@ case "$ACTION" in
   verify-langfuse-trace) verify_langfuse_trace ;;
   verify-isolation) verify_isolation ;;
   update) update_member ;;
-  all) setup; deploy_cvm; prime_gate; bind_member; verify; verify_health; verify_db; verify_redis; verify_isolation; verify_proxy; verify_langfuse_trace ;;
-  *) die "usage: fugu-router-node.sh <node-name> [setup|deploy|prime|bind|verify|verify-health|verify-db|verify-redis|verify-proxy|verify-langfuse-trace|verify-isolation|update|all]" ;;
+  stop) stop_member ;;
+  all) setup; deploy_cvm; prime_gate; bind_member; start_member; register_direct; verify; verify_health; verify_db; verify_redis; verify_isolation; verify_proxy; verify_langfuse_trace ;;
+  *) die "usage: fugu-router-node.sh <node-name> [setup|deploy|prime|bind|start|register-direct|verify|verify-health|verify-db|verify-redis|verify-proxy|verify-langfuse-trace|verify-isolation|update|stop|all]" ;;
 esac
