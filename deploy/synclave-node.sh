@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Synclave AttestMesh node on the self-hosted on-chain dstack box.
 #
-# Deploys Synclave (console.attestmesh.xyz + tenant apps at *.app.attestmesh.xyz)
+# Deploys Synclave (synclave.net + tenant apps at *.app.attestmesh.xyz)
 # as a full, on-chain-anchored AttestMesh node via the canonical Path-A flow:
 #   deploy (stock DstackApp + sealed env + bridge CreateVm, gateway ON)
 #     -> prime (allowlist compose_hash + app_id on the cluster)
@@ -47,12 +47,12 @@ SANDBOX_DEFAULT_PLAN="${SANDBOX_DEFAULT_PLAN:-std-1-4-128}"
 SANDBOX_DAEMON_TOKEN="${SANDBOX_DAEMON_TOKEN:-$(sed -nE 's/^SANDBOX_DAEMON_TOKEN=//p' "$HOME/.attestmesh/sandboxd.env" 2>/dev/null)}"
 
 # Non-secret config (overridable), sealed alongside the secrets for one measured surface.
-PUBLIC_BASE_URL="${PUBLIC_BASE_URL:-https://console.attestmesh.xyz}"
-CORS_ORIGIN="${CORS_ORIGIN:-https://console.attestmesh.xyz}"
-CONSOLE_HOST="${CONSOLE_HOST:-console.attestmesh.xyz}"
+PUBLIC_BASE_URL="${PUBLIC_BASE_URL:-https://synclave.net}"
+CORS_ORIGIN="${CORS_ORIGIN:-https://synclave.net}"
+CONSOLE_HOST="${CONSOLE_HOST:-synclave.net}"
 APP_DOMAIN="${APP_DOMAIN:-app.s.n}"
 INDEXER_URL="${INDEXER_URL:-http://10.0.100.1:8787}"
-GITHUB_OAUTH_CALLBACK_URL="${GITHUB_OAUTH_CALLBACK_URL:-https://console.attestmesh.xyz/api/v1/auth/github/callback}"
+GITHUB_OAUTH_CALLBACK_URL="${GITHUB_OAUTH_CALLBACK_URL:-https://synclave.net/api/v1/auth/github/callback}"
 # CF app-fronting (non-secret): the attestmesh.xyz zone + the origin the proxied
 # <slug>.app records point at (the box haproxy public IP).
 CLOUDFLARE_ZONE_ID="${CLOUDFLARE_ZONE_ID:-5b276342195bda12c978f20ed38a3757}"
@@ -109,6 +109,14 @@ _require_env() {
            TLS_FULLCHAIN_B64 TLS_KEY_B64; do
     [ -n "${!k:-}" ] || die "secret $k not set in $SECRETS_FILE"
   done
+  [ "$PUBLIC_BASE_URL" = "https://synclave.net" ] \
+    || die "PUBLIC_BASE_URL must be the canonical production origin https://synclave.net"
+  [ "$CORS_ORIGIN" = "https://synclave.net" ] \
+    || die "CORS_ORIGIN must be the canonical production origin https://synclave.net"
+  [ "$CONSOLE_HOST" = "synclave.net" ] \
+    || die "CONSOLE_HOST must be the canonical production host synclave.net"
+  [ "$GITHUB_OAUTH_CALLBACK_URL" = "https://synclave.net/api/v1/auth/github/callback" ] \
+    || die "GITHUB_OAUTH_CALLBACK_URL must use the canonical production origin https://synclave.net"
   [ -n "${SANDBOX_DAEMON_TOKEN:-}" ] || die "SANDBOX_DAEMON_TOKEN empty (expected in \$HOME/.attestmesh/sandboxd.env); required for the Provision button"
   # Synclave's DB defaults to the C3 pg-ha cluster. The compose exposes pg-ha via
   # sidecar-netns forwarders because the app container is not itself in the WG netns.

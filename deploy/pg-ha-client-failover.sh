@@ -83,7 +83,7 @@ prepare_probe_env() {
   export PROBE_LANGFUSE_PUBLIC_KEY="$LANGFUSE_INIT_PROJECT_PUBLIC_KEY"
   export PROBE_LANGFUSE_SECRET_KEY="$LANGFUSE_INIT_PROJECT_SECRET_KEY"
   export PROBE_POCKET_MCP_URL=http://127.0.0.1:28800/sse
-  export PROBE_SYNCLAVE_URL=https://console.attestmesh.xyz
+  export PROBE_SYNCLAVE_URL=https://synclave.net
 }
 
 run_probes() {

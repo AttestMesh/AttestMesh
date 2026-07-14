@@ -1,6 +1,6 @@
 # AttestMesh Synclave node for the self-hosted dstack box.
 #
-# Synclave (console.attestmesh.xyz + tenant apps at *.app.attestmesh.xyz) as a
+# Synclave (synclave.net + tenant apps at *.app.attestmesh.xyz) as a
 # full, on-chain-anchored AttestMesh node. Same Path-A shape as ssh-node.yaml /
 # matrix-node.yaml: the `sidecar` (cluster-mesh-agent) self-registers the CVM's
 # app_id on-chain after deploy/ssh-node.sh primes the cluster and upgrades the
@@ -10,7 +10,7 @@
 #     `docker login` (pre_launch_script wired by synclave-node-box.py from the
 #     sealed DSTACK_DOCKER_* env — see the box helper).
 #   - Public ingress is tlsproxy:443. With the dstack gateway ON, the CVM is also
-#     reachable at <app_id>-443s.gateway.attestmesh.xyz; console.attestmesh.xyz is
+#     reachable at <app_id>-443s.gateway.attestmesh.xyz; synclave.net is
 #     fronted by the box haproxy SNI-passthrough → the CVM's dstack-br0 IP :443
 #     (re-point that backend post-deploy). Unlike matrix-node (tailnet-only), :443
 #     here is *intended* to be reachable from the box — that is not a host-isolation
