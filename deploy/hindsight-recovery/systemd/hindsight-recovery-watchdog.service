@@ -7,7 +7,8 @@ StartLimitIntervalSec=0
 [Service]
 Type=simple
 EnvironmentFile=%h/.config/hindsight-recovery/recovery.env
-ExecStart=%h/agent-session-mcp/server/.venv/bin/python /home/ubuntu/teemesh/deploy/hindsight-recovery/recovery.py watchdog
+ExecStartPre=/usr/bin/test -x %h/.local/share/hindsight-recovery/current/venv/bin/python
+ExecStart=%h/.local/share/hindsight-recovery/current/venv/bin/python %h/.local/share/hindsight-recovery/current/runtime/recovery.py watchdog
 Restart=always
 RestartSec=2s
 CPUQuota=15%

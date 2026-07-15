@@ -27,8 +27,12 @@ source "$HERE/lib.sh"
 : "${RPC_URL:?source deploy/env.sh first}"
 require PRIVATE_KEY RPC_URL CHAIN_ID DEPLOYER_ADDR
 
-NODE="${1:?usage: hindsight-node.sh <node-name> [deploy|verify-sidecar|prime|bind|verify|verify-app|verify-e2e|verify-isolation|update|setup|all]}"
+NODE="${1:?usage: hindsight-node.sh <node-name> [deploy|verify-sidecar|prime|bind|verify|verify-app|verify-e2e|verify-isolation|update|adopt-recovery-control|setup|all]}"
 ACTION="${2:-all}"
+RECOVERY_CONTROL_EXPECTED_NONCE="${3:-}"
+RECOVERY_CONTROL_EXPECTED_ROLL_SHA256="${4:-}"
+RECOVERY_CONTROL_EXPECTED_COMPOSE_HASH="${5:-}"
+RECOVERY_CONTROL_EXPECTED_VM_ID="${6:-}"
 BOX_HOST="${BOX_HOST:-ubuntu@173.231.234.133}"
 BOX_PY="${BOX_PY:-/opt/dstack-mcp/venv/bin/python}"
 BOX_DEPLOYER_KEY="${BOX_DEPLOYER_KEY:-/root/.attestmesh/base-deployer.json}"
@@ -53,6 +57,8 @@ HINDSIGHT_ROUTER_API_KEY_FILE="${HINDSIGHT_ROUTER_API_KEY_FILE:-$HOME/.attestmes
 # exactly one invocation.  Keep unset distinct from explicitly empty.
 _CALLER_RECONCILE_SET="${HINDSIGHT_RECONCILE_AMBIGUOUS_ENABLED+x}"
 _CALLER_RECONCILE_VALUE="${HINDSIGHT_RECONCILE_AMBIGUOUS_ENABLED-}"
+_CALLER_RECONCILE_MANIFEST_SET="${HINDSIGHT_RECONCILE_MANIFEST_SHA256+x}"
+_CALLER_RECONCILE_MANIFEST_VALUE="${HINDSIGHT_RECONCILE_MANIFEST_SHA256-}"
 _CALLER_AUTH_RESET_SET="${HINDSIGHT_RESET_PROVIDER_AUTH_CIRCUIT_ENABLED+x}"
 _CALLER_AUTH_RESET_VALUE="${HINDSIGHT_RESET_PROVIDER_AUTH_CIRCUIT_ENABLED-}"
 _CALLER_AUTH_TOKEN_SET="${HINDSIGHT_PROVIDER_AUTH_RESET_TOKEN+x}"
@@ -67,6 +73,9 @@ fi
 if [ "$_CALLER_RECONCILE_SET" = x ]; then
   HINDSIGHT_RECONCILE_AMBIGUOUS_ENABLED="$_CALLER_RECONCILE_VALUE"
 fi
+if [ "$_CALLER_RECONCILE_MANIFEST_SET" = x ]; then
+  HINDSIGHT_RECONCILE_MANIFEST_SHA256="$_CALLER_RECONCILE_MANIFEST_VALUE"
+fi
 if [ "$_CALLER_AUTH_RESET_SET" = x ]; then
   HINDSIGHT_RESET_PROVIDER_AUTH_CIRCUIT_ENABLED="$_CALLER_AUTH_RESET_VALUE"
 fi
@@ -77,6 +86,7 @@ if [ "$_CALLER_LLM_CONCURRENCY_SET" = x ]; then
   HINDSIGHT_LLM_MAX_CONCURRENT="$_CALLER_LLM_CONCURRENCY_VALUE"
 fi
 unset _CALLER_RECONCILE_SET _CALLER_RECONCILE_VALUE
+unset _CALLER_RECONCILE_MANIFEST_SET _CALLER_RECONCILE_MANIFEST_VALUE
 unset _CALLER_AUTH_RESET_SET _CALLER_AUTH_RESET_VALUE
 unset _CALLER_AUTH_TOKEN_SET _CALLER_AUTH_TOKEN_VALUE
 unset _CALLER_LLM_CONCURRENCY_SET _CALLER_LLM_CONCURRENCY_VALUE
@@ -87,6 +97,7 @@ if [ -z "${HINDSIGHT_ROUTER_API_KEY:-}" ] && [ -s "$HINDSIGHT_ROUTER_API_KEY_FIL
 fi
 HINDSIGHT_PROVIDER_API_KEY="${HINDSIGHT_PROVIDER_API_KEY:-${HINDSIGHT_ROUTER_API_KEY:-}}"
 HINDSIGHT_PROVIDER_EGRESS_ENABLED="${HINDSIGHT_PROVIDER_EGRESS_ENABLED:-false}"
+HINDSIGHT_BUDGET_OBSERVATION_MODE="${HINDSIGHT_BUDGET_OBSERVATION_MODE:-1}"
 HINDSIGHT_PROVIDER_TOTAL_LIMIT_USD="${HINDSIGHT_PROVIDER_TOTAL_LIMIT_USD:-${PROVIDER_TOTAL_LIMIT_USD:-50}}"
 HINDSIGHT_PROVIDER_SAFETY_MARGIN_USD="${HINDSIGHT_PROVIDER_SAFETY_MARGIN_USD:-0.50}"
 HINDSIGHT_BUDGET_PHASE="${HINDSIGHT_BUDGET_PHASE:-backfill}"
@@ -100,8 +111,10 @@ GPT_OSS_120B_OUTPUT_USD_PER_M="${GPT_OSS_120B_OUTPUT_USD_PER_M:-0.60}"
 QWEN_INPUT_USD_PER_M="${QWEN_INPUT_USD_PER_M:-0.01}"
 QWEN_OUTPUT_USD_PER_M="${QWEN_OUTPUT_USD_PER_M:-0}"
 HINDSIGHT_INITIAL_PROVIDER_SPEND_USD="${HINDSIGHT_INITIAL_PROVIDER_SPEND_USD:-0.00002591}"
+HINDSIGHT_PROVIDER_MAX_IN_FLIGHT="${HINDSIGHT_PROVIDER_MAX_IN_FLIGHT:-6}"
 HINDSIGHT_BANK_CLEANUP_ENABLED="${HINDSIGHT_BANK_CLEANUP_ENABLED:-0}"
 HINDSIGHT_RECONCILE_AMBIGUOUS_ENABLED="${HINDSIGHT_RECONCILE_AMBIGUOUS_ENABLED:-0}"
+HINDSIGHT_RECONCILE_MANIFEST_SHA256="${HINDSIGHT_RECONCILE_MANIFEST_SHA256:-}"
 HINDSIGHT_RESET_PROVIDER_AUTH_CIRCUIT_ENABLED="${HINDSIGHT_RESET_PROVIDER_AUTH_CIRCUIT_ENABLED:-0}"
 HINDSIGHT_PROVIDER_AUTH_RESET_TOKEN="${HINDSIGHT_PROVIDER_AUTH_RESET_TOKEN:-}"
 
@@ -129,26 +142,318 @@ STATE="$LOGDIR/hindsight-node-${NODE}.state"
 ZERO32=0x0000000000000000000000000000000000000000000000000000000000000000
 
 _save() {
+  local temporary="${STATE}.tmp.$$"
   umask 077
-  cat > "$STATE" <<EOF
+  cat > "$temporary" <<EOF
 X=${X:-}
 H=${H:-}
 VM_ID=${VM_ID:-}
+UPDATED_AT=${UPDATED_AT:-}
+UPDATE_SEQUENCE=${UPDATE_SEQUENCE:-0}
+RECOVERY_CONTROL_SEQUENCE=${RECOVERY_CONTROL_SEQUENCE:-0}
+RECOVERY_CONTROL_STATE_VERSION=${RECOVERY_CONTROL_STATE_VERSION:-}
+RECOVERY_CONTROL_NONCE=${RECOVERY_CONTROL_NONCE:-}
+RECOVERY_CONTROL_ROLL_SHA256=${RECOVERY_CONTROL_ROLL_SHA256:-}
+RECOVERY_CONTROL_COMPOSE_HASH=${RECOVERY_CONTROL_COMPOSE_HASH:-}
+RECOVERY_CONTROL_VM_ID=${RECOVERY_CONTROL_VM_ID:-}
+RECOVERY_CONTROL_PENDING_NONCE=${RECOVERY_CONTROL_PENDING_NONCE:-}
+RECOVERY_CONTROL_PENDING_ROLL_SHA256=${RECOVERY_CONTROL_PENDING_ROLL_SHA256:-}
+RECOVERY_CONTROL_PENDING_COMPOSE_HASH=${RECOVERY_CONTROL_PENDING_COMPOSE_HASH:-}
+RECOVERY_CONTROL_PENDING_VM_ID=${RECOVERY_CONTROL_PENDING_VM_ID:-}
 CLUSTER=${CLUSTER:-}
 MEMBER_IMPL=${MEMBER_IMPL:-}
 GATEWAY_DOMAIN=${GATEWAY_DOMAIN:-}
 TAK=${TAK:-}
 CPK=${CPK:-}
 BPT=${BPT:-}
+BAT=${BAT:-}
 MESH_IP=${MESH_IP:-}
 DB_MODE=${DB_MODE:-}
 DB_PASSWORD=${DB_PASSWORD:-}
 EOF
+  python3 - "$temporary" "$STATE" <<'PY'
+import os
+import sys
+
+temporary, destination = sys.argv[1:]
+with open(temporary, "rb") as handle:
+    os.fsync(handle.fileno())
+os.replace(temporary, destination)
+os.chmod(destination, 0o600)
+directory = os.path.dirname(destination) or "."
+descriptor = os.open(directory, os.O_RDONLY)
+try:
+    os.fsync(descriptor)
+finally:
+    os.close(descriptor)
+PY
 }
 
-_load() { [ -f "$STATE" ] && source "$STATE" || true; }
+_load() {
+  # These values are deployment state, never caller input.  Clear inherited
+  # variables first so a legacy state file that predates the fields cannot be
+  # made to trust a caller-supplied nonce or fingerprint.
+  UPDATE_SEQUENCE=""
+  RECOVERY_CONTROL_SEQUENCE=""
+  RECOVERY_CONTROL_STATE_VERSION=""
+  RECOVERY_CONTROL_NONCE=""
+  RECOVERY_CONTROL_ROLL_SHA256=""
+  RECOVERY_CONTROL_COMPOSE_HASH=""
+  RECOVERY_CONTROL_VM_ID=""
+  RECOVERY_CONTROL_PENDING_NONCE=""
+  RECOVERY_CONTROL_PENDING_ROLL_SHA256=""
+  RECOVERY_CONTROL_PENDING_COMPOSE_HASH=""
+  RECOVERY_CONTROL_PENDING_VM_ID=""
+  [ -f "$STATE" ] && source "$STATE" || true
+  # The original deployed state predates both counters.  Materialize their
+  # numeric legacy value in the running shell as well as in the next atomic
+  # save; merely writing ${VAR:-0} leaves VAR unbound in this process and can
+  # crash after UpgradeApp succeeds but before the exact deployment is
+  # promoted locally.
+  UPDATE_SEQUENCE="${UPDATE_SEQUENCE:-0}"
+  RECOVERY_CONTROL_SEQUENCE="${RECOVERY_CONTROL_SEQUENCE:-0}"
+}
 ssh_box() { ssh -o BatchMode=yes -o ConnectTimeout=8 "$BOX_HOST" "$@"; }
 ssh_mesh() { ssh -o BatchMode=yes -o ConnectTimeout=15 "$MESH_SSH_HOST" "$@"; }
+
+_validate_recovery_control_inputs() {
+  case "$HINDSIGHT_RECONCILE_AMBIGUOUS_ENABLED" in
+    0|1) ;;
+    *) die "HINDSIGHT_RECONCILE_AMBIGUOUS_ENABLED must be exactly 0 or 1" ;;
+  esac
+  case "$HINDSIGHT_RESET_PROVIDER_AUTH_CIRCUIT_ENABLED" in
+    0|1) ;;
+    *) die "HINDSIGHT_RESET_PROVIDER_AUTH_CIRCUIT_ENABLED must be exactly 0 or 1" ;;
+  esac
+  if [ "$HINDSIGHT_RECONCILE_AMBIGUOUS_ENABLED" = 1 ]; then
+    [[ "$HINDSIGHT_RECONCILE_MANIFEST_SHA256" =~ ^[0-9a-f]{64}$ ]] \
+      || die "enabled ambiguous reconciliation requires an exact lowercase SHA-256 manifest"
+  elif [ -n "$HINDSIGHT_RECONCILE_MANIFEST_SHA256" ]; then
+    die "disabled ambiguous reconciliation requires an empty manifest"
+  fi
+  if [ "$HINDSIGHT_RESET_PROVIDER_AUTH_CIRCUIT_ENABLED" = 1 ]; then
+    [[ "$HINDSIGHT_PROVIDER_AUTH_RESET_TOKEN" =~ ^[0-9a-f]{64}$ ]] \
+      || die "enabled provider-auth reset requires an exact 64-hex token"
+  elif [ -n "$HINDSIGHT_PROVIDER_AUTH_RESET_TOKEN" ]; then
+    die "disabled provider-auth reset requires an empty token"
+  fi
+  if [ "$HINDSIGHT_RECONCILE_AMBIGUOUS_ENABLED" = 1 ] \
+    && [ "$HINDSIGHT_RESET_PROVIDER_AUTH_CIRCUIT_ENABLED" = 1 ]; then
+    die "reconciliation and provider-auth reset cannot be enabled in the same roll"
+  fi
+}
+
+_recovery_control_roll_sha256() {
+  local reset_token_sha256
+  reset_token_sha256=$(printf '%s' "$HINDSIGHT_PROVIDER_AUTH_RESET_TOKEN" | sha256sum | cut -d' ' -f1)
+  printf '%s\n' \
+    'version=1' \
+    "reconcile_enabled=$HINDSIGHT_RECONCILE_AMBIGUOUS_ENABLED" \
+    "reconcile_manifest_sha256=$HINDSIGHT_RECONCILE_MANIFEST_SHA256" \
+    "auth_reset_enabled=$HINDSIGHT_RESET_PROVIDER_AUTH_CIRCUIT_ENABLED" \
+    "auth_reset_token_sha256=$reset_token_sha256" \
+    | sha256sum | cut -d' ' -f1
+}
+
+_validate_recovery_control_state() {
+  local any_recovery_state=""
+  if [ -n "${RECOVERY_CONTROL_NONCE:-}" ] \
+    || [ -n "${RECOVERY_CONTROL_ROLL_SHA256:-}" ] \
+    || [ -n "${RECOVERY_CONTROL_COMPOSE_HASH:-}" ] \
+    || [ -n "${RECOVERY_CONTROL_VM_ID:-}" ] \
+    || [ -n "${RECOVERY_CONTROL_PENDING_NONCE:-}" ] \
+    || [ -n "${RECOVERY_CONTROL_PENDING_ROLL_SHA256:-}" ] \
+    || [ -n "${RECOVERY_CONTROL_PENDING_COMPOSE_HASH:-}" ] \
+    || [ -n "${RECOVERY_CONTROL_PENDING_VM_ID:-}" ]; then
+    any_recovery_state=1
+  fi
+  if [ -n "$any_recovery_state" ]; then
+    [ "${RECOVERY_CONTROL_STATE_VERSION:-}" = 2 ] \
+      || die "legacy recovery-control state lacks exact deployment identity; refusing automatic migration"
+  elif [ -n "${RECOVERY_CONTROL_STATE_VERSION:-}" ] \
+    && [ "${RECOVERY_CONTROL_STATE_VERSION:-}" != 2 ]; then
+    die "unsupported persisted recovery-control state version"
+  fi
+  case "${RECOVERY_CONTROL_SEQUENCE:-0}" in
+    ''|*[!0-9]*) die "invalid persisted RECOVERY_CONTROL_SEQUENCE=${RECOVERY_CONTROL_SEQUENCE:-}" ;;
+  esac
+  case "${UPDATE_SEQUENCE:-0}" in
+    ''|*[!0-9]*) die "invalid persisted UPDATE_SEQUENCE=${UPDATE_SEQUENCE:-}" ;;
+  esac
+  if [ -n "${RECOVERY_CONTROL_NONCE:-}" ] \
+    || [ -n "${RECOVERY_CONTROL_ROLL_SHA256:-}" ] \
+    || [ -n "${RECOVERY_CONTROL_COMPOSE_HASH:-}" ] \
+    || [ -n "${RECOVERY_CONTROL_VM_ID:-}" ]; then
+    [[ "${RECOVERY_CONTROL_NONCE:-}" =~ ^[0-9a-f]{32}$ ]] \
+      || die "persisted deployed recovery-control nonce is invalid"
+    [[ "${RECOVERY_CONTROL_ROLL_SHA256:-}" =~ ^[0-9a-f]{64}$ ]] \
+      || die "persisted deployed recovery-control fingerprint is invalid"
+    [[ "${RECOVERY_CONTROL_COMPOSE_HASH:-}" =~ ^[0-9a-f]{64}$ ]] \
+      || die "persisted deployed recovery-control compose hash is invalid"
+    [[ "${RECOVERY_CONTROL_VM_ID:-}" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]] \
+      || die "persisted deployed recovery-control VM ID is invalid"
+  fi
+  if [ -n "${RECOVERY_CONTROL_PENDING_NONCE:-}" ] \
+    || [ -n "${RECOVERY_CONTROL_PENDING_ROLL_SHA256:-}" ] \
+    || [ -n "${RECOVERY_CONTROL_PENDING_COMPOSE_HASH:-}" ] \
+    || [ -n "${RECOVERY_CONTROL_PENDING_VM_ID:-}" ]; then
+    [[ "${RECOVERY_CONTROL_PENDING_NONCE:-}" =~ ^[0-9a-f]{32}$ ]] \
+      || die "persisted pending recovery-control nonce is invalid"
+    [[ "${RECOVERY_CONTROL_PENDING_ROLL_SHA256:-}" =~ ^[0-9a-f]{64}$ ]] \
+      || die "persisted pending recovery-control fingerprint is invalid"
+    if [ -n "${RECOVERY_CONTROL_PENDING_COMPOSE_HASH:-}" ]; then
+      [[ "$RECOVERY_CONTROL_PENDING_COMPOSE_HASH" =~ ^[0-9a-f]{64}$ ]] \
+        || die "persisted pending recovery-control compose hash is invalid"
+    fi
+    if [ -n "${RECOVERY_CONTROL_PENDING_VM_ID:-}" ]; then
+      [ -n "${RECOVERY_CONTROL_PENDING_COMPOSE_HASH:-}" ] \
+        || die "persisted pending recovery-control VM lacks a compose hash"
+      [[ "$RECOVERY_CONTROL_PENDING_VM_ID" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]] \
+        || die "persisted pending recovery-control VM ID is invalid"
+    fi
+  fi
+}
+
+_prepare_recovery_control_roll() {
+  local requested_sha256
+  _validate_recovery_control_inputs
+  _validate_recovery_control_state
+  requested_sha256=$(_recovery_control_roll_sha256) \
+    || die "could not fingerprint the recovery-control roll"
+  [[ "$requested_sha256" =~ ^[0-9a-f]{64}$ ]] \
+    || die "recovery-control roll fingerprint is invalid"
+
+  if [ -n "${RECOVERY_CONTROL_PENDING_NONCE:-}" ] \
+    || [ -n "${RECOVERY_CONTROL_PENDING_ROLL_SHA256:-}" ]; then
+    [[ "${RECOVERY_CONTROL_PENDING_NONCE:-}" =~ ^[0-9a-f]{32}$ ]] \
+      || die "persisted pending recovery-control nonce is invalid"
+    [[ "${RECOVERY_CONTROL_PENDING_ROLL_SHA256:-}" =~ ^[0-9a-f]{64}$ ]] \
+      || die "persisted pending recovery-control fingerprint is invalid"
+    [ "$requested_sha256" = "$RECOVERY_CONTROL_PENDING_ROLL_SHA256" ] \
+      || die "pending recovery-control roll fingerprint mismatch; refusing a different roll until the pending deployment is reconciled"
+  else
+    RECOVERY_CONTROL_STATE_VERSION=2
+    RECOVERY_CONTROL_PENDING_NONCE=$(openssl rand -hex 16) \
+      || die "could not generate a recovery-control nonce"
+    [[ "$RECOVERY_CONTROL_PENDING_NONCE" =~ ^[0-9a-f]{32}$ ]] \
+      || die "generated recovery-control nonce is invalid"
+    RECOVERY_CONTROL_PENDING_ROLL_SHA256="$requested_sha256"
+    RECOVERY_CONTROL_PENDING_COMPOSE_HASH=""
+    RECOVERY_CONTROL_PENDING_VM_ID=""
+  fi
+  HINDSIGHT_RECOVERY_CONTROL_NONCE="$RECOVERY_CONTROL_PENDING_NONCE"
+  HINDSIGHT_RECOVERY_CONTROL_ROLL_SHA256="$RECOVERY_CONTROL_PENDING_ROLL_SHA256"
+
+  # This save is the crash boundary: the exact nonce and a non-secret binding
+  # of the requested controls are durable before compose hashing, allowlisting,
+  # StopVm, UpgradeApp, or any other deployment mutation can begin.  Raw flags,
+  # reset tokens, and reconciliation manifests are deliberately not persisted.
+  _save || die "could not persist pending recovery-control roll"
+}
+
+_bind_recovery_control_compose() {
+  local expected_compose_hash="${1:?expected recovery-control compose hash required}"
+  [[ "$expected_compose_hash" =~ ^[0-9a-f]{64}$ ]] \
+    || die "expected recovery-control compose hash is invalid"
+  _validate_recovery_control_state
+  [ -n "${RECOVERY_CONTROL_PENDING_NONCE:-}" ] \
+    && [ -n "${RECOVERY_CONTROL_PENDING_ROLL_SHA256:-}" ] \
+    || die "cannot bind compose identity without a pending recovery-control roll"
+  if [ -n "${RECOVERY_CONTROL_PENDING_COMPOSE_HASH:-}" ]; then
+    [ "$RECOVERY_CONTROL_PENDING_COMPOSE_HASH" = "$expected_compose_hash" ] \
+      || die "pending recovery-control compose hash differs from the current reviewed render"
+    return 0
+  fi
+  RECOVERY_CONTROL_PENDING_COMPOSE_HASH="$expected_compose_hash"
+  _save || die "could not persist pending recovery-control compose identity"
+}
+
+_bind_recovery_control_vm() {
+  local expected_vm_id="${1:?expected recovery-control VM ID required}"
+  [[ "$expected_vm_id" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]] \
+    || die "expected recovery-control VM ID is invalid"
+  _validate_recovery_control_state
+  [ -n "${RECOVERY_CONTROL_PENDING_COMPOSE_HASH:-}" ] \
+    || die "cannot bind VM identity before the pending compose hash"
+  if [ -n "${RECOVERY_CONTROL_PENDING_VM_ID:-}" ]; then
+    [ "$RECOVERY_CONTROL_PENDING_VM_ID" = "$expected_vm_id" ] \
+      || die "pending recovery-control VM ID differs from the proven deployment"
+    return 0
+  fi
+  RECOVERY_CONTROL_PENDING_VM_ID="$expected_vm_id"
+  _save || die "could not persist pending recovery-control VM identity"
+}
+
+_promote_recovery_control_roll() {
+  local expected_nonce="${1:?expected recovery-control nonce required}"
+  local increment_update_sequence="${2:-0}"
+  local expected_roll_sha256="${3:?expected recovery-control roll fingerprint required}"
+  local expected_compose_hash="${4:?expected recovery-control compose hash required}"
+  local expected_vm_id="${5:?expected recovery-control VM ID required}"
+  [[ "$expected_nonce" =~ ^[0-9a-f]{32}$ ]] \
+    || die "expected recovery-control nonce is invalid"
+  [[ "$expected_roll_sha256" =~ ^[0-9a-f]{64}$ ]] \
+    || die "expected recovery-control roll fingerprint is invalid"
+  [[ "$expected_compose_hash" =~ ^[0-9a-f]{64}$ ]] \
+    || die "expected recovery-control compose hash is invalid"
+  [[ "$expected_vm_id" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]] \
+    || die "expected recovery-control VM ID is invalid"
+  _validate_recovery_control_state
+
+  # Idempotent adoption lets the controller crash after promotion and safely
+  # retry its phase transition without incrementing either sequence twice.
+  if [ -z "${RECOVERY_CONTROL_PENDING_NONCE:-}" ] \
+    && [ -z "${RECOVERY_CONTROL_PENDING_ROLL_SHA256:-}" ] \
+    && [ -z "${RECOVERY_CONTROL_PENDING_COMPOSE_HASH:-}" ] \
+    && [ -z "${RECOVERY_CONTROL_PENDING_VM_ID:-}" ]; then
+    [ "${RECOVERY_CONTROL_NONCE:-}" = "$expected_nonce" ] \
+      || die "no matching deployed recovery-control nonce to adopt"
+    [ "${RECOVERY_CONTROL_ROLL_SHA256:-}" = "$expected_roll_sha256" ] \
+      || die "deployed recovery-control fingerprint does not match the proven roll"
+    [ "${RECOVERY_CONTROL_COMPOSE_HASH:-}" = "$expected_compose_hash" ] \
+      || die "deployed recovery-control compose hash does not match the proven roll"
+    [ "${RECOVERY_CONTROL_VM_ID:-}" = "$expected_vm_id" ] \
+      || die "deployed recovery-control VM ID does not match the proven roll"
+    [ "${H:-}" = "$expected_compose_hash" ] \
+      || die "node state compose hash does not match the adopted recovery-control roll"
+    [ "${VM_ID:-}" = "$expected_vm_id" ] \
+      || die "node state VM ID does not match the adopted recovery-control roll"
+    return 0
+  fi
+  [ "${RECOVERY_CONTROL_PENDING_NONCE:-}" = "$expected_nonce" ] \
+    || die "pending recovery-control nonce does not match the proven deployment"
+  [ "${RECOVERY_CONTROL_PENDING_ROLL_SHA256:-}" = "$expected_roll_sha256" ] \
+    || die "pending recovery-control fingerprint does not match the proven deployment"
+  [ "${RECOVERY_CONTROL_PENDING_COMPOSE_HASH:-}" = "$expected_compose_hash" ] \
+    || die "pending recovery-control compose hash does not match the proven deployment"
+  [ "${RECOVERY_CONTROL_PENDING_VM_ID:-}" = "$expected_vm_id" ] \
+    || die "pending recovery-control VM ID does not match the proven deployment"
+  case "${RECOVERY_CONTROL_SEQUENCE:-0}" in
+    ''|*[!0-9]*) die "invalid persisted RECOVERY_CONTROL_SEQUENCE=${RECOVERY_CONTROL_SEQUENCE:-}" ;;
+  esac
+  case "${UPDATE_SEQUENCE:-0}" in
+    ''|*[!0-9]*) die "invalid persisted UPDATE_SEQUENCE=${UPDATE_SEQUENCE:-}" ;;
+  esac
+
+  RECOVERY_CONTROL_NONCE="$RECOVERY_CONTROL_PENDING_NONCE"
+  RECOVERY_CONTROL_ROLL_SHA256="$RECOVERY_CONTROL_PENDING_ROLL_SHA256"
+  RECOVERY_CONTROL_COMPOSE_HASH="$RECOVERY_CONTROL_PENDING_COMPOSE_HASH"
+  RECOVERY_CONTROL_VM_ID="$RECOVERY_CONTROL_PENDING_VM_ID"
+  RECOVERY_CONTROL_PENDING_NONCE=""
+  RECOVERY_CONTROL_PENDING_ROLL_SHA256=""
+  RECOVERY_CONTROL_PENDING_COMPOSE_HASH=""
+  RECOVERY_CONTROL_PENDING_VM_ID=""
+  H="$expected_compose_hash"
+  VM_ID="$expected_vm_id"
+  RECOVERY_CONTROL_SEQUENCE=$((RECOVERY_CONTROL_SEQUENCE + 1))
+  if [ "$increment_update_sequence" = 1 ]; then
+    UPDATE_SEQUENCE=$((UPDATE_SEQUENCE + 1))
+  elif [ "$increment_update_sequence" != 0 ]; then
+    die "invalid recovery-control update-sequence mode"
+  fi
+  UPDATED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  _save || die "could not atomically promote the deployed recovery-control nonce"
+}
 
 # Hindsight joins the existing Matrix cluster by default (reuses the already-deployed
 # Path-A ClusterMember impl). Override CLUSTER + MEMBER_IMPL to target a fresh cluster.
@@ -176,9 +481,36 @@ _require_env() {
   TAK="${HINDSIGHT_TENANT_API_KEY:-${TAK:-$(openssl rand -hex 32)}}"
   CPK="${HINDSIGHT_CP_ACCESS_KEY:-${CPK:-$(openssl rand -hex 24)}}"
   BPT="${HINDSIGHT_PROXY_TOKEN:-${BPT:-$(openssl rand -hex 32)}}"
+  BAT="${HINDSIGHT_BUDGET_ADMIN_TOKEN:-${BAT:-$(openssl rand -hex 32)}}"
   HINDSIGHT_PROXY_API_KEY="$BPT"
+  HINDSIGHT_BUDGET_ADMIN_API_KEY="$BAT"
   HINDSIGHT_LLM_API_KEY="$BPT"
+  [ "$HINDSIGHT_PROVIDER_MAX_IN_FLIGHT" = "6" ] \
+    || die "HINDSIGHT_PROVIDER_MAX_IN_FLIGHT must remain exactly 6"
+  [ "$HINDSIGHT_LLM_MAX_CONCURRENT" = "3" ] \
+    || die "HINDSIGHT_LLM_MAX_CONCURRENT must remain exactly 3"
+  case "$HINDSIGHT_BUDGET_OBSERVATION_MODE" in
+    0|1) ;;
+    *) die "HINDSIGHT_BUDGET_OBSERVATION_MODE must be exact 0 or 1" ;;
+  esac
+  python3 - "$HINDSIGHT_BACKFILL_LIMIT_USD" <<'PY' \
+    || die "HINDSIGHT_BACKFILL_LIMIT_USD must remain finite and positive telemetry"
+from decimal import Decimal, InvalidOperation
+import sys
+
+try:
+    value = Decimal(sys.argv[1])
+except InvalidOperation:
+  raise SystemExit(1)
+raise SystemExit(0 if value.is_finite() and value > 0 else 1)
+PY
   _resolve_database_env
+  # Persist every resolved credential before a compose hash is computed or a
+  # VM mutation can begin.  In particular, legacy state files do not have BAT;
+  # losing a newly generated admin token after UpgradeApp accepted the new VM
+  # would make that running budget proxy impossible to audit on retry.  _save
+  # is an atomic replace and retains the already-loaded deployment identity.
+  _save || die "could not persist resolved Hindsight state before deployment mutation"
 }
 
 _urlencode() {
@@ -243,13 +575,17 @@ _box_run() {
     E_HINDSIGHT_API_LLM_MAX_CONCURRENT='$HINDSIGHT_LLM_MAX_CONCURRENT' \
     E_HINDSIGHT_ROUTER_MESH_IP='$HINDSIGHT_ROUTER_MESH_IP' \
     E_HINDSIGHT_PROVIDER_BASE_URL='$HINDSIGHT_PROVIDER_BASE_URL' E_HINDSIGHT_PROVIDER_API_KEY='$HINDSIGHT_PROVIDER_API_KEY' E_HINDSIGHT_PROXY_API_KEY='$HINDSIGHT_PROXY_API_KEY' \
-    E_HINDSIGHT_PROVIDER_EGRESS_ENABLED='$HINDSIGHT_PROVIDER_EGRESS_ENABLED' E_HINDSIGHT_PROVIDER_TOTAL_LIMIT_USD='$HINDSIGHT_PROVIDER_TOTAL_LIMIT_USD' E_HINDSIGHT_PROVIDER_SAFETY_MARGIN_USD='$HINDSIGHT_PROVIDER_SAFETY_MARGIN_USD' \
+    E_HINDSIGHT_BUDGET_ADMIN_API_KEY='$HINDSIGHT_BUDGET_ADMIN_API_KEY' E_HINDSIGHT_PROVIDER_MAX_IN_FLIGHT='$HINDSIGHT_PROVIDER_MAX_IN_FLIGHT' \
+    E_HINDSIGHT_PROVIDER_EGRESS_ENABLED='$HINDSIGHT_PROVIDER_EGRESS_ENABLED' E_HINDSIGHT_BUDGET_OBSERVATION_MODE='$HINDSIGHT_BUDGET_OBSERVATION_MODE' E_HINDSIGHT_PROVIDER_TOTAL_LIMIT_USD='$HINDSIGHT_PROVIDER_TOTAL_LIMIT_USD' E_HINDSIGHT_PROVIDER_SAFETY_MARGIN_USD='$HINDSIGHT_PROVIDER_SAFETY_MARGIN_USD' \
     E_HINDSIGHT_BUDGET_PHASE='$HINDSIGHT_BUDGET_PHASE' E_HINDSIGHT_BACKFILL_LIMIT_USD='$HINDSIGHT_BACKFILL_LIMIT_USD' E_HINDSIGHT_MONTHLY_LIMIT_USD='$HINDSIGHT_MONTHLY_LIMIT_USD' E_QWEN_MONTHLY_LIMIT_USD='$QWEN_MONTHLY_LIMIT_USD' \
     E_HINDSIGHT_PROXY_RPM_LIMIT='$HINDSIGHT_PROXY_RPM_LIMIT' E_HINDSIGHT_PROXY_TPM_LIMIT='$HINDSIGHT_PROXY_TPM_LIMIT' \
     E_GPT_OSS_120B_INPUT_USD_PER_M='$GPT_OSS_120B_INPUT_USD_PER_M' E_GPT_OSS_120B_OUTPUT_USD_PER_M='$GPT_OSS_120B_OUTPUT_USD_PER_M' E_QWEN_INPUT_USD_PER_M='$QWEN_INPUT_USD_PER_M' E_QWEN_OUTPUT_USD_PER_M='$QWEN_OUTPUT_USD_PER_M' \
     E_HINDSIGHT_INITIAL_PROVIDER_SPEND_USD='$HINDSIGHT_INITIAL_PROVIDER_SPEND_USD' \
     E_HINDSIGHT_BANK_CLEANUP_ENABLED='$HINDSIGHT_BANK_CLEANUP_ENABLED' \
+    E_HINDSIGHT_RECOVERY_CONTROL_NONCE='$HINDSIGHT_RECOVERY_CONTROL_NONCE' \
+    E_HINDSIGHT_RECOVERY_CONTROL_ROLL_SHA256='$HINDSIGHT_RECOVERY_CONTROL_ROLL_SHA256' \
     E_HINDSIGHT_RECONCILE_AMBIGUOUS_ENABLED='$HINDSIGHT_RECONCILE_AMBIGUOUS_ENABLED' \
+    E_HINDSIGHT_RECONCILE_MANIFEST_SHA256='$HINDSIGHT_RECONCILE_MANIFEST_SHA256' \
     E_HINDSIGHT_RESET_PROVIDER_AUTH_CIRCUIT_ENABLED='$HINDSIGHT_RESET_PROVIDER_AUTH_CIRCUIT_ENABLED' E_HINDSIGHT_PROVIDER_AUTH_RESET_TOKEN='$HINDSIGHT_PROVIDER_AUTH_RESET_TOKEN' \
     E_HINDSIGHT_API_TENANT_API_KEY='$TAK' E_HINDSIGHT_CP_ACCESS_KEY='$CPK' \
     E_HINDSIGHT_PGHA_ENABLED='$HINDSIGHT_PGHA_ENABLED' E_HINDSIGHT_DB_PASSWORD='$HINDSIGHT_DB_PASSWORD' \
@@ -259,18 +595,51 @@ _box_run() {
     $BOX_PY /tmp/hindsight-node-box.py $mode $app_id $vm_id"
 }
 
+# Read-only measured-deployment queries deliberately receive no sealed values.
+# They can hash the reviewed compose surface or inspect one exact VMM descriptor,
+# but cannot roll, stop, start, or otherwise mutate a VM.
+_box_read_only() {
+  local mode="${1:?read-only box mode required}"
+  local app_id="${2:-}" vm_id="${3:-}" compose_hash="${4:-}"
+  case "$mode" in
+    hash) ;;
+    describe)
+      [[ "$app_id" =~ ^0x[0-9a-fA-F]{40}$ ]] || die "invalid app ID for VMM descriptor proof"
+      [[ "$vm_id" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]] \
+        || die "invalid VM ID for VMM descriptor proof"
+      [[ "$compose_hash" =~ ^[0-9a-f]{64}$ ]] \
+        || die "invalid compose hash for VMM descriptor proof"
+      ;;
+    *) die "unsupported read-only box mode: $mode" ;;
+  esac
+  scp -o BatchMode=yes -q "$COMPOSE" "$BOX_HOST:/tmp/${NODE}.yaml"
+  scp -o BatchMode=yes -q "$HERE/hindsight-node-box.py" "$BOX_HOST:/tmp/hindsight-node-box.py"
+  ssh_box "sudo BOX_NAME='$NODE' BOX_COMPOSE='/tmp/${NODE}.yaml' BOX_GATEWAY_ENABLED='$BOX_GATEWAY_ENABLED' BOX_NET_MODE='$BOX_NET_MODE' \
+    $BOX_PY /tmp/hindsight-node-box.py '$mode' '$app_id' '$vm_id' '$compose_hash'"
+}
+
 deploy_cvm() {
-  _load; _default_cluster_env; _require_env
-  _save
+  _load; _default_cluster_env; _prepare_recovery_control_roll; _require_env
   log "▶ box deploy_app hindsight node=$NODE compose=$COMPOSE cluster=$CLUSTER"
-  local out j
+  local out j nh returned_h returned_vm
+  [ -z "${RECOVERY_CONTROL_PENDING_COMPOSE_HASH:-}" ] \
+    || die "ambiguous initial deployment already has a bound compose hash; reconcile the VMM before retrying CreateVm"
+  nh=$(_box_read_only hash | grep -oE '^[0-9a-f]{64}$' | tail -1)
+  [ -n "$nh" ] || die "could not compute initial compose hash"
+  _bind_recovery_control_compose "$nh"
   out=$(_box_run deploy) || die "box deploy failed"
   j=$(echo "$out" | grep '"app_id"' | tail -1)
   X=$(echo "$j" | jq -r .app_id)
-  H=$(echo "$j" | jq -r .compose_hash)
-  VM_ID=$(echo "$j" | jq -r .vm_id)
+  returned_h=$(echo "$j" | jq -r '.compose_hash // empty')
+  returned_vm=$(echo "$j" | jq -r '.vm_id // empty')
   [ -n "$X" ] && [ "$X" != null ] || die "could not parse app_id from box deploy: $out"
-  _save
+  [ "$returned_h" = "$nh" ] \
+    || die "CreateVm returned a compose hash that differs from the durably bound render"
+  _bind_recovery_control_vm "$returned_vm"
+  _promote_recovery_control_roll \
+    "$HINDSIGHT_RECOVERY_CONTROL_NONCE" 0 \
+    "$HINDSIGHT_RECOVERY_CONTROL_ROLL_SHA256" \
+    "$nh" "$returned_vm"
   log "✔ deployed hindsight node app_id=$X compose_hash=$H vm=$VM_ID"
   log "mesh-only: API/UI reachable ONLY at <mesh-ip>:18888/:18999 by cluster members"
 }
@@ -502,12 +871,20 @@ SCRIPT
 }
 
 update_member() {
-  _load; _default_cluster_env; _require_env
+  _load; _default_cluster_env; _prepare_recovery_control_roll; _require_env
   [ -n "${X:-}" ] && [ -n "${VM_ID:-}" ] && [ -n "${CLUSTER:-}" ] || die "need X/VM_ID/CLUSTER in $STATE"
   log "recovery controls: reconcile_ambiguous=$HINDSIGHT_RECONCILE_AMBIGUOUS_ENABLED provider_auth_reset=$HINDSIGHT_RESET_PROVIDER_AUTH_CIRCUIT_ENABLED llm_max_concurrent=$HINDSIGHT_LLM_MAX_CONCURRENT"
-  local nh allowed out j mode
+  local nh allowed out j mode returned_h returned_vm target_vm
+  case "${BOX_FRESH_DISK:-}" in
+    1|true|TRUE|yes|YES|on|ON)
+      die "recovery-control rolls must preserve the exact existing VM and disk"
+      ;;
+  esac
   nh=$(_box_run hash | grep -oE '^[0-9a-f]{64}$' | tail -1)
   [ -n "$nh" ] || die "could not compute new compose_hash"
+  _bind_recovery_control_compose "$nh"
+  target_vm="$VM_ID"
+  _bind_recovery_control_vm "$target_vm"
   log "new compose_hash=0x$nh"
   allowed=$(cast call "$CLUSTER" 'allowedComposeHashes(bytes32)(bool)' "0x$nh" --rpc-url "$RPC_URL" 2>/dev/null)
   if [ "$allowed" = true ]; then
@@ -515,16 +892,52 @@ update_member() {
   else
     send_seq "hindsight-update-addHash-${NODE}" "$CLUSTER" "addComposeHash(bytes32)" "0x$nh"
   fi
+  wait_box_local_allowlist_propagation \
+    "$BOX_HOST" "$HINDSIGHT_CVM_RPC_URL" "$CLUSTER" "$nh" "$RPC_URL" 300
   out=$(_box_run update "$X" "$VM_ID") || die "in-place update failed"
   echo "$out"
   j=$(echo "$out" | grep '"app_id"' | tail -1)
-  H=$(echo "$j" | jq -r .compose_hash)
-  VM_ID=$(echo "$j" | jq -r '.vm_id // empty'); [ -n "$VM_ID" ] || VM_ID="$(_load; echo "${VM_ID:-}")"
-  [ -n "$H" ] && [ "$H" != null ] || H="$nh"
-  _save
+  returned_h=$(echo "$j" | jq -r '.compose_hash // empty')
+  returned_vm=$(echo "$j" | jq -r '.vm_id // empty')
+  [ "$returned_h" = "$nh" ] \
+    || die "UpgradeApp returned a compose hash that differs from the durably bound render"
+  [ "$returned_vm" = "$target_vm" ] \
+    || die "UpgradeApp returned a VM ID that differs from the durably bound target"
+  _promote_recovery_control_roll \
+    "$HINDSIGHT_RECOVERY_CONTROL_NONCE" 1 \
+    "$HINDSIGHT_RECOVERY_CONTROL_ROLL_SHA256" \
+    "$nh" "$target_vm"
   mode=$(echo "$j" | jq -r '.mode // "upgrade"')
   log "✔ hindsight node update complete mode=$mode vm=$VM_ID"
   # NOTE: service checks (verify / verify-app / verify-e2e) are separate steps.
+}
+
+adopt_recovery_control() {
+  _load
+  [ -n "${X:-}" ] && [ -n "${VM_ID:-}" ] \
+    || die "recovery-control adoption requires an existing deployed Hindsight VM"
+  local rendered descriptor proof
+  rendered=$(_box_read_only hash | grep -oE '^[0-9a-f]{64}$' | tail -1) \
+    || die "could not compute reviewed compose hash during recovery-control adoption"
+  [ "$rendered" = "$RECOVERY_CONTROL_EXPECTED_COMPOSE_HASH" ] \
+    || die "current reviewed compose differs from the pending deployed recovery-control render"
+  descriptor=$(_box_read_only describe "$X" \
+    "$RECOVERY_CONTROL_EXPECTED_VM_ID" \
+    "$RECOVERY_CONTROL_EXPECTED_COMPOSE_HASH") \
+    || die "could not prove the exact VMM descriptor for recovery-control adoption"
+  proof=$(printf '%s\n' "$descriptor" | grep '"identity_match"' | tail -1)
+  [ "$(printf '%s' "$proof" | jq -r '.identity_match // false')" = true ] \
+    || die "VMM descriptor did not prove exact recovery-control deployment identity"
+  [ "$(printf '%s' "$proof" | jq -r '.vm_id // empty')" = "$RECOVERY_CONTROL_EXPECTED_VM_ID" ] \
+    || die "VMM descriptor proof returned the wrong VM ID"
+  [ "$(printf '%s' "$proof" | jq -r '.compose_hash // empty')" = "$RECOVERY_CONTROL_EXPECTED_COMPOSE_HASH" ] \
+    || die "VMM descriptor proof returned the wrong compose hash"
+  _promote_recovery_control_roll \
+    "$RECOVERY_CONTROL_EXPECTED_NONCE" 1 \
+    "$RECOVERY_CONTROL_EXPECTED_ROLL_SHA256" \
+    "$RECOVERY_CONTROL_EXPECTED_COMPOSE_HASH" \
+    "$RECOVERY_CONTROL_EXPECTED_VM_ID"
+  log "✔ adopted proven recovery-control deployment nonce=$RECOVERY_CONTROL_EXPECTED_NONCE"
 }
 
 log "=== Hindsight AttestMesh node: $NODE ==="
@@ -538,7 +951,8 @@ case "$ACTION" in
   verify-e2e) verify_e2e ;;
   verify-isolation) verify_isolation ;;
   update) update_member ;;
+  adopt-recovery-control) adopt_recovery_control ;;
   setup) deploy_cvm; prime_gate; bind_member ;;
   all) deploy_cvm; prime_gate; bind_member; verify; verify_sidecar; verify_app; verify_e2e; verify_isolation ;;
-  *) die "usage: hindsight-node.sh <node-name> [deploy|verify-sidecar|prime|bind|verify|verify-app|verify-e2e|verify-isolation|update|setup|all]" ;;
+  *) die "usage: hindsight-node.sh <node-name> [deploy|verify-sidecar|prime|bind|verify|verify-app|verify-e2e|verify-isolation|update|adopt-recovery-control|setup|all] [expected-recovery-control-nonce] [expected-recovery-control-roll-sha256] [expected-compose-hash] [expected-vm-id]" ;;
 esac

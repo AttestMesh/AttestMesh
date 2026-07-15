@@ -1,0 +1,3 @@
+# Candidate patches target separately versioned application code and are never
+# release inputs for this package.
+candidates/*.patch

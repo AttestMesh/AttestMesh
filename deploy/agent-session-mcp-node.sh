@@ -87,6 +87,7 @@ HINDSIGHT_SYNC_ENABLED="${HINDSIGHT_SYNC_ENABLED:-false}"
 HINDSIGHT_OUTBOX_MAX_IN_FLIGHT="${HINDSIGHT_OUTBOX_MAX_IN_FLIGHT:-2}"
 HINDSIGHT_OUTBOX_TICK_SECONDS="${HINDSIGHT_OUTBOX_TICK_SECONDS:-30}"
 HINDSIGHT_OUTBOX_RUN_LIMIT="${HINDSIGHT_OUTBOX_RUN_LIMIT:-0}"
+HINDSIGHT_OUTBOX_IMAGE_BUILD_ID="${HINDSIGHT_OUTBOX_IMAGE_BUILD_ID:-}"
 RECALL_BACKEND="${RECALL_BACKEND:-postgres}"
 DATABASE_URL="${DATABASE_URL:-postgresql://agent_sessions:${APP_DB_PASSWORD}@sidecar:15431,sidecar:15432,sidecar:15433/agent_sessions?target_session_attrs=read-write&connect_timeout=5}"
 
@@ -136,6 +137,7 @@ _require_env() {
   [ -n "${KMS_ROOT:-}" ] || die "missing KMS_ROOT"
   [ -n "${BUNDLER_URL:-}" ] || die "missing BUNDLER_URL (cluster members need an EIP-4337 bundler/paymaster endpoint)"
   [ -n "${GAS_POLICY_ID:-}" ] || die "missing GAS_POLICY_ID (cluster members need paymaster sponsorship)"
+  [ -n "${HINDSIGHT_OUTBOX_IMAGE_BUILD_ID:-}" ] || die "missing reviewed HINDSIGHT_OUTBOX_IMAGE_BUILD_ID"
   [ "${BUNDLER_URL:-}" != "${RPC_URL:-}" ] || log "BUNDLER_URL equals RPC_URL; continuing because some providers multiplex bundler + node RPC"
   [ -s "$COMPOSE" ] || die "missing compose file: $COMPOSE"
   APP_ENV_B64="${APP_ENV_B64:-}"
@@ -216,6 +218,7 @@ _box_run() {
     printf 'E_HINDSIGHT_OUTBOX_MAX_IN_FLIGHT=%q\n' "${HINDSIGHT_OUTBOX_MAX_IN_FLIGHT:-2}"
     printf 'E_HINDSIGHT_OUTBOX_TICK_SECONDS=%q\n' "${HINDSIGHT_OUTBOX_TICK_SECONDS:-30}"
     printf 'E_HINDSIGHT_OUTBOX_RUN_LIMIT=%q\n' "${HINDSIGHT_OUTBOX_RUN_LIMIT:-0}"
+    printf 'E_HINDSIGHT_OUTBOX_IMAGE_BUILD_ID=%q\n' "${HINDSIGHT_OUTBOX_IMAGE_BUILD_ID:-}"
     printf 'E_RECALL_BACKEND=%q\n' "${RECALL_BACKEND:-postgres}"
     printf 'E_INGEST_TOKEN=%q\n' "${INGEST_TOKEN:-}"
     printf 'E_EMBEDDING_URL=%q\n' "${EMBEDDING_URL:-}"
@@ -228,6 +231,11 @@ _box_run() {
     printf 'E_DSTACK_DOCKER_REGISTRY=%q\n' "ghcr.io"
   } | ssh_box "sudo BOX_NAME='$NODE' BOX_COMPOSE='/tmp/${NODE}.yaml' BOX_VCPU=$BOX_VCPU BOX_MEM=$BOX_MEM BOX_DISK=$BOX_DISK BOX_PORTS='$BOX_PORTS' BOX_GATEWAY_ENABLED='$BOX_GATEWAY_ENABLED' BOX_NET_MODE='$BOX_NET_MODE' \
     bash -c 'set -a; . /dev/stdin; set +a; exec $BOX_PY /tmp/agent-session-mcp-node-box.py $mode $app_id $vm_id'"
+}
+
+wait_box_local_compose_allowlist() {
+  wait_box_local_allowlist_propagation \
+    "$BOX_HOST" "$CVM_RUNTIME_RPC_URL" "$CLUSTER" "$1" "$RPC_URL" 300
 }
 
 _box_stop_vm() {
@@ -445,6 +453,7 @@ update_member() {
   else
     log "compose hash already allowlisted"
   fi
+  wait_box_local_compose_allowlist "$nh"
   out=$(_box_run update "$X" "$VM_ID") || die "in-place update failed"
   echo "$out"
   j=$(echo "$out" | grep '"app_id"' | tail -1)

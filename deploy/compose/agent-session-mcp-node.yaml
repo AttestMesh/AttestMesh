@@ -139,7 +139,7 @@ services:
       - no-new-privileges:true
 
   pg2-proxy:
-    image: alpine/socat:1.8.0.0
+    image: alpine/socat@sha256:a6be4c0262b339c53ddad723cdd178a1a13271e1137c65e27f90a08c16de02b8
     restart: unless-stopped
     network_mode: service:sidecar
     depends_on:
@@ -152,7 +152,7 @@ services:
       - no-new-privileges:true
 
   pg3-proxy:
-    image: alpine/socat:1.8.0.0
+    image: alpine/socat@sha256:a6be4c0262b339c53ddad723cdd178a1a13271e1137c65e27f90a08c16de02b8
     restart: unless-stopped
     network_mode: service:sidecar
     depends_on:
@@ -167,7 +167,7 @@ services:
   # Forwarder to the Hindsight node's mesh API listener (10.18.78.76:18888). The app
   # reaches it at sidecar:18888 (HINDSIGHT_URL) and presents the sealed tenant key.
   hindsight-proxy:
-    image: alpine/socat:1.8.0.0
+    image: alpine/socat@sha256:a6be4c0262b339c53ddad723cdd178a1a13271e1137c65e27f90a08c16de02b8
     restart: unless-stopped
     network_mode: service:sidecar
     depends_on:
@@ -180,7 +180,7 @@ services:
       - no-new-privileges:true
 
   budget-proxy-forwarder:
-    image: alpine/socat:1.8.0.0
+    image: alpine/socat@sha256:a6be4c0262b339c53ddad723cdd178a1a13271e1137c65e27f90a08c16de02b8
     restart: unless-stopped
     network_mode: service:sidecar
     depends_on:
@@ -200,7 +200,7 @@ services:
   # sidecar:1543N. Egress is unlocked here, but migrate only runs DDL — no session text
   # or embeddings flow during migration.
   migrate:
-    image: ghcr.io/attestmesh/agent-session-mcp@sha256:0592224f1cb046bd79da5767703ba702050c9c98b8ca6dfb4b0dc4997e823fce
+    image: ghcr.io/attestmesh/agent-session-mcp@sha256:ae58a0445193178a4c669f923c107216839ffc10e8074e03ae537f099757981c
     restart: on-failure
     network_mode: service:sidecar
     depends_on:
@@ -224,7 +224,7 @@ services:
   # sidecar:1543N and embeds via Redpill. Hard-waits on the
   # migration barrier — ingest does NOT tolerate a missing schema.
   ingest:
-    image: ghcr.io/attestmesh/agent-session-mcp@sha256:0592224f1cb046bd79da5767703ba702050c9c98b8ca6dfb4b0dc4997e823fce
+    image: ghcr.io/attestmesh/agent-session-mcp@sha256:ae58a0445193178a4c669f923c107216839ffc10e8074e03ae537f099757981c
     restart: unless-stopped
     depends_on:
       migrate:
@@ -249,7 +249,7 @@ services:
 
   # MCP server (:8081) over streamable-HTTP. Joins ingest's netns/egress; waits on migrate.
   mcp:
-    image: ghcr.io/attestmesh/agent-session-mcp@sha256:0592224f1cb046bd79da5767703ba702050c9c98b8ca6dfb4b0dc4997e823fce
+    image: ghcr.io/attestmesh/agent-session-mcp@sha256:ae58a0445193178a4c669f923c107216839ffc10e8074e03ae537f099757981c
     restart: unless-stopped
     network_mode: service:ingest
     depends_on:
@@ -281,7 +281,7 @@ services:
   # a two-document concurrency cap, and a 30-second tick.
   # Failed work requires explicit retry.
   hindsight-outbox:
-    image: ghcr.io/attestmesh/agent-session-mcp@sha256:0592224f1cb046bd79da5767703ba702050c9c98b8ca6dfb4b0dc4997e823fce
+    image: ghcr.io/attestmesh/agent-session-mcp@sha256:ae58a0445193178a4c669f923c107216839ffc10e8074e03ae537f099757981c
     restart: unless-stopped
     network_mode: service:ingest
     depends_on:
@@ -298,6 +298,7 @@ services:
       - HINDSIGHT_OUTBOX_MAX_IN_FLIGHT=${HINDSIGHT_OUTBOX_MAX_IN_FLIGHT}
       - HINDSIGHT_OUTBOX_TICK_SECONDS=${HINDSIGHT_OUTBOX_TICK_SECONDS}
       - HINDSIGHT_OUTBOX_RUN_LIMIT=${HINDSIGHT_OUTBOX_RUN_LIMIT}
+      - HINDSIGHT_OUTBOX_IMAGE_BUILD_ID=${HINDSIGHT_OUTBOX_IMAGE_BUILD_ID}
       - INGEST_TOKEN=${INGEST_TOKEN}
       - EMBEDDING_URL=${EMBEDDING_URL}
       - EMBEDDING_API_KEY=${EMBEDDING_API_KEY}
@@ -334,7 +335,7 @@ services:
   # ssh-node, future agents) reach <mesh-ip>:8080/ingest and <mesh-ip>:8081/mcp.
   # Bound only to attestmesh0 inside the sidecar netns.
   mesh-proxy-ingest:
-    image: alpine/socat:1.8.0.0
+    image: alpine/socat@sha256:a6be4c0262b339c53ddad723cdd178a1a13271e1137c65e27f90a08c16de02b8
     restart: unless-stopped
     network_mode: service:sidecar
     depends_on:
@@ -358,7 +359,7 @@ services:
       - no-new-privileges:true
 
   mesh-proxy-mcp:
-    image: alpine/socat:1.8.0.0
+    image: alpine/socat@sha256:a6be4c0262b339c53ddad723cdd178a1a13271e1137c65e27f90a08c16de02b8
     restart: unless-stopped
     network_mode: service:sidecar
     depends_on:

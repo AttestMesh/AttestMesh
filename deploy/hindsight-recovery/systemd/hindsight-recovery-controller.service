@@ -1,0 +1,21 @@
+[Unit]
+Description=Restart-persistent Hindsight incident recovery controller
+After=network-online.target hindsight-recovery-watchdog.service hindsight-recovery-tunnel.service hindsight-recovery-guard.service
+Wants=network-online.target
+Requires=hindsight-recovery-watchdog.service hindsight-recovery-tunnel.service hindsight-recovery-guard.service
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+EnvironmentFile=%h/.config/hindsight-recovery/recovery.env
+ExecStartPre=/usr/bin/test -x %h/.local/share/hindsight-recovery/current/venv/bin/python
+ExecStart=%h/.local/share/hindsight-recovery/current/venv/bin/python %h/.local/share/hindsight-recovery/current/runtime/recovery.py controller
+Restart=always
+RestartSec=2s
+CPUQuota=25%
+MemoryMax=256M
+TasksMax=64
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=default.target

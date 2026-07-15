@@ -4,6 +4,8 @@ set -euo pipefail
 CONFIG=${RECOVERY_CONFIG:-$HOME/.config/hindsight-recovery/recovery.env}
 [ -r "$CONFIG" ] || { echo "missing recovery config: $CONFIG" >&2; exit 2; }
 set -a
+# Operator-owned assignment-only configuration.
+# shellcheck disable=SC1090
 source "$CONFIG"
 set +a
 

@@ -39,6 +39,80 @@ box_local_rpc_url() {
   printf '%s/%s\n' "${base%/}" "$token"
 }
 
+# Wait until the exact compose allowlist state is visible through the
+# box-local KMS RPC before stopping a healthy VM for an upgrade.  The public
+# RPC can confirm the transaction several blocks before local Reth catches up.
+# The eth_call is bound to the same local block number used for the height
+# proof, and two consecutive reads are required.
+wait_box_local_allowlist_propagation() {
+  local box_host="${1:?box host required}"
+  local local_rpc="${2:?box-local RPC required}"
+  local cluster="${3:?cluster required}"
+  local compose_hash="${4:?compose hash required}"
+  local public_rpc="${5:?public RPC required}"
+  local timeout_seconds="${6:-300}"
+  local required_block calldata deadline result local_block allowed consecutive=0
+  required_block=$(cast block-number --rpc-url "$public_rpc") \
+    || die "could not read post-allowlist public block"
+  calldata=$(cast calldata 'allowedComposeHashes(bytes32)' "0x${compose_hash#0x}") \
+    || die "could not encode local allowlist proof call"
+  deadline=$(( $(date +%s) + timeout_seconds ))
+  log "waiting for box-local KMS RPC to prove compose allowlist at block >=$required_block"
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    result=$(
+      {
+        printf 'export LOCAL_RPC=%q\n' "$local_rpc"
+        printf 'export CLUSTER=%q\n' "$cluster"
+        printf 'export CALLDATA=%q\n' "$calldata"
+        cat <<'SCRIPT'
+python3 - <<'PY'
+import json
+import os
+import urllib.request
+
+url = os.environ["LOCAL_RPC"]
+
+def rpc(method, params):
+    request = urllib.request.Request(
+        url,
+        data=json.dumps(
+            {"jsonrpc": "2.0", "id": 1, "method": method, "params": params}
+        ).encode(),
+        headers={"Content-Type": "application/json"},
+    )
+    with urllib.request.urlopen(request, timeout=10) as response:
+        value = json.loads(response.read())
+    if value.get("error"):
+        raise RuntimeError(value["error"])
+    return value["result"]
+
+head_hex = rpc("eth_blockNumber", [])
+head = int(head_hex, 16)
+raw = rpc(
+    "eth_call",
+    [{"to": os.environ["CLUSTER"], "data": os.environ["CALLDATA"]}, head_hex],
+)
+print(json.dumps({"block": head, "allowed": int(raw, 16) == 1}))
+PY
+SCRIPT
+      } | ssh -o BatchMode=yes -o ConnectTimeout=8 "$box_host" "sudo bash -s" 2>/dev/null
+    ) || result=''
+    local_block=$(printf '%s\n' "$result" | jq -r '.block // -1' 2>/dev/null || printf '%s' -1)
+    allowed=$(printf '%s\n' "$result" | jq -r '.allowed // false' 2>/dev/null || printf '%s' false)
+    if [ "$allowed" = true ] && [ "$local_block" -ge "$required_block" ]; then
+      consecutive=$((consecutive + 1))
+      if [ "$consecutive" -ge 2 ]; then
+        log "✔ box-local KMS RPC proves compose allowlist at block=$local_block"
+        return 0
+      fi
+    else
+      consecutive=0
+    fi
+    sleep 5
+  done
+  die "box-local KMS RPC did not converge on the exact compose allowlist; old VM left running"
+}
+
 # run_step <name> <cmd...> : log start, tee output to its own logfile, fail loud with a tail.
 run_step() {
   local name="$1"; shift

@@ -30,6 +30,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import sys
 import time
 
@@ -78,7 +79,10 @@ ENV_KEYS = [
     "HINDSIGHT_PROVIDER_BASE_URL",
     "HINDSIGHT_PROVIDER_API_KEY",
     "HINDSIGHT_PROXY_API_KEY",
+    "HINDSIGHT_BUDGET_ADMIN_API_KEY",
+    "HINDSIGHT_PROVIDER_MAX_IN_FLIGHT",
     "HINDSIGHT_PROVIDER_EGRESS_ENABLED",
+    "HINDSIGHT_BUDGET_OBSERVATION_MODE",
     "HINDSIGHT_PROVIDER_TOTAL_LIMIT_USD",
     "HINDSIGHT_PROVIDER_SAFETY_MARGIN_USD",
     "HINDSIGHT_BUDGET_PHASE",
@@ -93,7 +97,10 @@ ENV_KEYS = [
     "QWEN_OUTPUT_USD_PER_M",
     "HINDSIGHT_INITIAL_PROVIDER_SPEND_USD",
     "HINDSIGHT_BANK_CLEANUP_ENABLED",
+    "HINDSIGHT_RECOVERY_CONTROL_NONCE",
+    "HINDSIGHT_RECOVERY_CONTROL_ROLL_SHA256",
     "HINDSIGHT_RECONCILE_AMBIGUOUS_ENABLED",
+    "HINDSIGHT_RECONCILE_MANIFEST_SHA256",
     "HINDSIGHT_RESET_PROVIDER_AUTH_CIRCUIT_ENABLED",
     "HINDSIGHT_PROVIDER_AUTH_RESET_TOKEN",
     "HINDSIGHT_API_TENANT_API_KEY",
@@ -149,6 +156,67 @@ def kms_urls() -> list[str]:
     return ["https://10.0.2.2:9101"] if NET_MODE == "bridge" else m.KMS_URLS
 
 
+def _normalized_app_id(value: object) -> str:
+    return str(value or "").lower().removeprefix("0x")
+
+
+def describe_exact_deployment(
+    app_id: str, vm_id: str, expected_compose_hash: str
+) -> dict[str, object]:
+    """Return a strict, non-secret VMM identity proof for one deployed VM."""
+    if not re.fullmatch(r"0x[0-9a-fA-F]{40}", app_id):
+        raise SystemExit("describe requires an exact app ID")
+    if not re.fullmatch(
+        r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
+        vm_id,
+    ):
+        raise SystemExit("describe requires an exact lowercase VM UUID")
+    if not re.fullmatch(r"[0-9a-f]{64}", expected_compose_hash):
+        raise SystemExit("describe requires an exact lowercase compose hash")
+
+    response = m.vmm("GetInfo", {"id": vm_id})
+    if not isinstance(response, dict) or response.get("found") is not True:
+        raise SystemExit("VMM GetInfo did not find the exact VM")
+    info = response.get("info")
+    if not isinstance(info, dict):
+        raise SystemExit("VMM GetInfo omitted the VM descriptor")
+    configuration = info.get("configuration")
+    if not isinstance(configuration, dict):
+        raise SystemExit("VMM GetInfo omitted the measured configuration")
+    compose_file = configuration.get("compose_file")
+    if not isinstance(compose_file, str) or not compose_file:
+        raise SystemExit("VMM GetInfo omitted the measured compose file")
+
+    actual_compose_hash = hashlib.sha256(compose_file.encode()).hexdigest()
+    expected_app = _normalized_app_id(app_id)
+    actual_vm_id = str(info.get("id") or "")
+    actual_app = _normalized_app_id(info.get("app_id"))
+    configured_app = _normalized_app_id(configuration.get("app_id"))
+    boot_error = str(info.get("boot_error") or "")
+    status = str(info.get("status") or "").lower()
+    identity_match = (
+        actual_vm_id == vm_id
+        and actual_app == expected_app
+        and configured_app == expected_app
+        and actual_compose_hash == expected_compose_hash
+        and status == "running"
+        and not boot_error
+    )
+    if not identity_match:
+        raise SystemExit("VMM descriptor differs from the exact expected deployment")
+    return {
+        "version": 1,
+        "read_only": True,
+        "found": True,
+        "identity_match": True,
+        "vm_id": actual_vm_id,
+        "app_id": "0x" + actual_app,
+        "compose_hash": actual_compose_hash,
+        "status": status,
+        "boot_error": boot_error,
+    }
+
+
 def main() -> None:
     mode = sys.argv[1] if len(sys.argv) > 1 else "hash"
 
@@ -197,6 +265,18 @@ def main() -> None:
     if mode == "hash":
         _, digest = app_compose_and_hash(ENV_KEYS + ["DSTACK_DOCKER_REGISTRY"])
         print(digest)
+        return
+
+    if mode == "describe":
+        app_id = sys.argv[2] if len(sys.argv) > 2 else ""
+        vm_id = sys.argv[3] if len(sys.argv) > 3 else ""
+        expected_compose_hash = sys.argv[4] if len(sys.argv) > 4 else ""
+        print(
+            json.dumps(
+                describe_exact_deployment(app_id, vm_id, expected_compose_hash),
+                sort_keys=True,
+            )
+        )
         return
 
     if mode == "update":
@@ -309,7 +389,10 @@ def main() -> None:
         )
         return
 
-    raise SystemExit("usage: hindsight-node-box.py [deploy|hash|update <app_id> <vm_id>]")
+    raise SystemExit(
+        "usage: hindsight-node-box.py "
+        "[deploy|hash|describe <app_id> <vm_id> <compose_hash>|update <app_id> <vm_id>]"
+    )
 
 
 if __name__ == "__main__":

@@ -1,0 +1,5 @@
+# Runtime dependency lock. Keep this minimal: recovery uses only psycopg outside
+# the Python standard library. The binary extra avoids undeclared host libpq
+# build dependencies in a fresh install.
+psycopg[binary]==3.3.4
+typing_extensions==4.15.0; python_version < "3.13"

@@ -114,7 +114,7 @@ services:
       - no-new-privileges:true
 
   pg2-proxy:
-    image: alpine/socat:1.8.0.0
+    image: alpine/socat@sha256:a6be4c0262b339c53ddad723cdd178a1a13271e1137c65e27f90a08c16de02b8
     restart: unless-stopped
     network_mode: service:sidecar
     depends_on:
@@ -131,7 +131,7 @@ services:
       - no-new-privileges:true
 
   pg3-proxy:
-    image: alpine/socat:1.8.0.0
+    image: alpine/socat@sha256:a6be4c0262b339c53ddad723cdd178a1a13271e1137c65e27f90a08c16de02b8
     restart: unless-stopped
     network_mode: service:sidecar
     depends_on:
@@ -318,12 +318,13 @@ services:
         [ "$${residual}" = "0" ] || { echo "hindsight-bank-cleanup: residual rows=$${residual}" >&2; exit 1; }
         echo "hindsight-bank-cleanup: complete; target banks and operations absent"
 
-  # --- Local inference budget enforcement --------------------------------------
+  # --- Local inference accounting and concurrency -------------------------------
   # Redpill's key ceiling is total rather than monthly.  This measured proxy
-  # supplies persistent calendar-month Qwen/Hindsight budgets, a one-time
-  # backfill budget, a provider-total safety margin, and crash ambiguity.
+  # supplies persistent spend telemetry and exact crash accounting. Monetary
+  # limits are observation-only during the continuous backfill; concurrency,
+  # payload, pricing, and direct upstream credit-exhaustion controls remain.
   budget-proxy-init:
-    image: ghcr.io/attestmesh/hindsight-budget-proxy@sha256:a7d9820c8a8bcf6d5c73189d240013c349e86309e68805210598bb3180d08b02
+    image: ghcr.io/attestmesh/hindsight-budget-proxy@sha256:096e7d0accd1e9ea8e2308ea8c0dedd7517f5afb23a977f6ddbde0714344d868
     user: "0:0"
     restart: "no"
     entrypoint: ["/bin/sh", "-ec"]
@@ -342,7 +343,7 @@ services:
   # closed. --if-needed keeps a restarted maintenance roll idempotent without
   # clearing provider/auth/budget circuits that have no ambiguous reservation.
   budget-proxy-reconcile:
-    image: ghcr.io/attestmesh/hindsight-budget-proxy@sha256:a7d9820c8a8bcf6d5c73189d240013c349e86309e68805210598bb3180d08b02
+    image: ghcr.io/attestmesh/hindsight-budget-proxy@sha256:096e7d0accd1e9ea8e2308ea8c0dedd7517f5afb23a977f6ddbde0714344d868
     user: "1000:1000"
     restart: "no"
     depends_on:
@@ -351,36 +352,80 @@ services:
     entrypoint: ["/bin/sh", "-ec"]
     command:
       - |
-        if [ "$${HINDSIGHT_RECONCILE_AMBIGUOUS_ENABLED}" != "1" ]; then
-          echo "hindsight-budget-reconcile: disabled"
-          exit 0
-        fi
-        # A hard restart can persist reservations before the proxy has copied
-        # its in-memory open circuit into state.json.  The pinned reconciler
-        # requires that bit, so materialize it only when this measured,
-        # acknowledged one-shot sees actual reservations.  This does not clear
-        # or charge anything; the reconciler below remains the sole mutator.
-        /app/api/.venv/bin/python - <<'PY'
-        import json
-        import os
-        from pathlib import Path
-
-        path = Path("/var/lib/attestmesh-budget/state.json")
-        if path.exists():
-            state = json.loads(path.read_text())
-            if state.get("in_flight") and not state.get("circuit_open"):
-                state["circuit_open"] = True
-                state["reason"] = "operator-authorized stale reservation reconciliation"
-                temporary = path.with_suffix(".json.new")
-                temporary.write_text(json.dumps(state, indent=2, sort_keys=True) + "\n")
-                os.replace(temporary, path)
-        PY
-        exec /app/api/.venv/bin/python /opt/attestmesh/reconcile_ambiguous.py \
-          --ledger /var/lib/attestmesh-budget/ledger.json \
-          --state /var/lib/attestmesh-budget/state.json \
-          --acknowledge-max-spend --if-needed
+        nonce="$${RECOVERY_CONTROL_NONCE}"
+        roll_sha256="$${RECOVERY_CONTROL_ROLL_SHA256}"
+        [ "$${#nonce}" -eq 32 ] || {
+          echo "hindsight-budget-reconcile: invalid recovery-control nonce" >&2
+          exit 2
+        }
+        case "$${nonce}" in
+          *[!0-9a-f]*)
+            echo "hindsight-budget-reconcile: invalid recovery-control nonce" >&2
+            exit 2
+            ;;
+        esac
+        [ "$${#roll_sha256}" -eq 64 ] || {
+          echo "hindsight-budget-reconcile: invalid recovery-control roll fingerprint" >&2
+          exit 2
+        }
+        case "$${roll_sha256}" in
+          *[!0-9a-f]*)
+            echo "hindsight-budget-reconcile: invalid recovery-control roll fingerprint" >&2
+            exit 2
+            ;;
+        esac
+        write_marker() {
+          enabled="$${1}"
+          secret_present="$${2}"
+          /app/api/.venv/bin/python /opt/attestmesh/control_marker.py \
+            --directory /var/lib/attestmesh-budget \
+            --control reconcile --nonce "$${nonce}" \
+            --roll-sha256 "$${roll_sha256}" \
+            --enabled "$${enabled}" --secret-present "$${secret_present}"
+        }
+        case "$${HINDSIGHT_RECONCILE_AMBIGUOUS_ENABLED}" in
+          0)
+            [ -z "$${HINDSIGHT_RECONCILE_MANIFEST_SHA256}" ] || {
+              echo "hindsight-budget-reconcile: disabled control retained a manifest" >&2
+              exit 2
+            }
+            write_marker 0 0
+            echo "hindsight-budget-reconcile: disabled"
+            ;;
+          1)
+            [ -n "$${HINDSIGHT_RECONCILE_MANIFEST_SHA256}" ] || {
+              echo "hindsight-budget-reconcile: missing exact reservation manifest" >&2
+              exit 2
+            }
+            /app/api/.venv/bin/python /opt/attestmesh/reconcile_ambiguous.py \
+              --ledger /var/lib/attestmesh-budget/ledger.json \
+              --state /var/lib/attestmesh-budget/state.json \
+              --expected-manifest-sha256 "$${HINDSIGHT_RECONCILE_MANIFEST_SHA256}" \
+              --provider-max-in-flight "$${PROVIDER_MAX_IN_FLIGHT}" \
+              --acknowledge-max-spend --if-needed
+            write_marker 1 1
+            ;;
+          *)
+            echo "hindsight-budget-reconcile: enable flag must be exact 0 or 1" >&2
+            exit 2
+            ;;
+        esac
     environment:
       - HINDSIGHT_RECONCILE_AMBIGUOUS_ENABLED=${HINDSIGHT_RECONCILE_AMBIGUOUS_ENABLED}
+      - HINDSIGHT_RECONCILE_MANIFEST_SHA256=${HINDSIGHT_RECONCILE_MANIFEST_SHA256}
+      - PROVIDER_MAX_IN_FLIGHT=${HINDSIGHT_PROVIDER_MAX_IN_FLIGHT}
+      - PROVIDER_TOTAL_LIMIT_USD=${HINDSIGHT_PROVIDER_TOTAL_LIMIT_USD}
+      - PROVIDER_SAFETY_MARGIN_USD=${HINDSIGHT_PROVIDER_SAFETY_MARGIN_USD}
+      - HINDSIGHT_BACKFILL_LIMIT_USD=${HINDSIGHT_BACKFILL_LIMIT_USD}
+      - HINDSIGHT_MONTHLY_LIMIT_USD=${HINDSIGHT_MONTHLY_LIMIT_USD}
+      - QWEN_MONTHLY_LIMIT_USD=${QWEN_MONTHLY_LIMIT_USD}
+      - GPT_OSS_120B_INPUT_USD_PER_M=${GPT_OSS_120B_INPUT_USD_PER_M}
+      - GPT_OSS_120B_OUTPUT_USD_PER_M=${GPT_OSS_120B_OUTPUT_USD_PER_M}
+      - QWEN_INPUT_USD_PER_M=${QWEN_INPUT_USD_PER_M}
+      - QWEN_OUTPUT_USD_PER_M=${QWEN_OUTPUT_USD_PER_M}
+      - INITIAL_PROVIDER_SPEND_USD=${HINDSIGHT_INITIAL_PROVIDER_SPEND_USD}
+      - RECOVERY_CONTROL_NONCE=${HINDSIGHT_RECOVERY_CONTROL_NONCE}
+      - RECOVERY_CONTROL_ROLL_SHA256=${HINDSIGHT_RECOVERY_CONTROL_ROLL_SHA256}
     volumes:
       - hindsight-budget:/var/lib/attestmesh-budget
     read_only: true
@@ -393,7 +438,7 @@ services:
   # The operator must validate the credential and exact models out of band,
   # then supply a unique one-shot token. Reusing that token fails closed.
   budget-proxy-auth-reset:
-    image: ghcr.io/attestmesh/hindsight-budget-proxy@sha256:a7d9820c8a8bcf6d5c73189d240013c349e86309e68805210598bb3180d08b02
+    image: ghcr.io/attestmesh/hindsight-budget-proxy@sha256:096e7d0accd1e9ea8e2308ea8c0dedd7517f5afb23a977f6ddbde0714344d868
     user: "1000:1000"
     restart: "no"
     depends_on:
@@ -402,21 +447,80 @@ services:
     entrypoint: ["/bin/sh", "-ec"]
     command:
       - |
-        if [ "$${HINDSIGHT_RESET_PROVIDER_AUTH_CIRCUIT_ENABLED}" != "1" ]; then
-          echo "hindsight-provider-auth-reset: disabled"
-          exit 0
-        fi
-        [ -n "$${HINDSIGHT_PROVIDER_AUTH_RESET_TOKEN}" ] || {
-          echo "hindsight-provider-auth-reset: missing one-shot token" >&2
+        nonce="$${RECOVERY_CONTROL_NONCE}"
+        roll_sha256="$${RECOVERY_CONTROL_ROLL_SHA256}"
+        [ "$${#nonce}" -eq 32 ] || {
+          echo "hindsight-provider-auth-reset: invalid recovery-control nonce" >&2
           exit 2
         }
-        exec /app/api/.venv/bin/python /opt/attestmesh/reset_provider_auth.py \
-          --state /var/lib/attestmesh-budget/state.json \
-          --acknowledge-provider-credential-validated \
-          --reset-token "$${HINDSIGHT_PROVIDER_AUTH_RESET_TOKEN}" --if-needed
+        case "$${nonce}" in
+          *[!0-9a-f]*)
+            echo "hindsight-provider-auth-reset: invalid recovery-control nonce" >&2
+            exit 2
+            ;;
+        esac
+        [ "$${#roll_sha256}" -eq 64 ] || {
+          echo "hindsight-provider-auth-reset: invalid recovery-control roll fingerprint" >&2
+          exit 2
+        }
+        case "$${roll_sha256}" in
+          *[!0-9a-f]*)
+            echo "hindsight-provider-auth-reset: invalid recovery-control roll fingerprint" >&2
+            exit 2
+            ;;
+        esac
+        write_marker() {
+          enabled="$${1}"
+          secret_present="$${2}"
+          /app/api/.venv/bin/python /opt/attestmesh/control_marker.py \
+            --directory /var/lib/attestmesh-budget \
+            --control auth_reset --nonce "$${nonce}" \
+            --roll-sha256 "$${roll_sha256}" \
+            --enabled "$${enabled}" --secret-present "$${secret_present}"
+        }
+        case "$${HINDSIGHT_RESET_PROVIDER_AUTH_CIRCUIT_ENABLED}" in
+          0)
+            [ -z "$${HINDSIGHT_PROVIDER_AUTH_RESET_TOKEN}" ] || {
+              echo "hindsight-provider-auth-reset: disabled control retained a token" >&2
+              exit 2
+            }
+            write_marker 0 0
+            echo "hindsight-provider-auth-reset: disabled"
+            ;;
+          1)
+            [ -n "$${HINDSIGHT_PROVIDER_AUTH_RESET_TOKEN}" ] || {
+              echo "hindsight-provider-auth-reset: missing one-shot token" >&2
+              exit 2
+            }
+            /app/api/.venv/bin/python /opt/attestmesh/reset_provider_auth.py \
+              --state /var/lib/attestmesh-budget/state.json \
+              --ledger /var/lib/attestmesh-budget/ledger.json \
+              --provider-max-in-flight "$${PROVIDER_MAX_IN_FLIGHT}" \
+              --acknowledge-provider-credential-validated \
+              --reset-token "$${HINDSIGHT_PROVIDER_AUTH_RESET_TOKEN}" --if-needed
+            write_marker 1 1
+            ;;
+          *)
+            echo "hindsight-provider-auth-reset: enable flag must be exact 0 or 1" >&2
+            exit 2
+            ;;
+        esac
     environment:
       - HINDSIGHT_RESET_PROVIDER_AUTH_CIRCUIT_ENABLED=${HINDSIGHT_RESET_PROVIDER_AUTH_CIRCUIT_ENABLED}
       - HINDSIGHT_PROVIDER_AUTH_RESET_TOKEN=${HINDSIGHT_PROVIDER_AUTH_RESET_TOKEN}
+      - PROVIDER_MAX_IN_FLIGHT=${HINDSIGHT_PROVIDER_MAX_IN_FLIGHT}
+      - PROVIDER_TOTAL_LIMIT_USD=${HINDSIGHT_PROVIDER_TOTAL_LIMIT_USD}
+      - PROVIDER_SAFETY_MARGIN_USD=${HINDSIGHT_PROVIDER_SAFETY_MARGIN_USD}
+      - HINDSIGHT_BACKFILL_LIMIT_USD=${HINDSIGHT_BACKFILL_LIMIT_USD}
+      - HINDSIGHT_MONTHLY_LIMIT_USD=${HINDSIGHT_MONTHLY_LIMIT_USD}
+      - QWEN_MONTHLY_LIMIT_USD=${QWEN_MONTHLY_LIMIT_USD}
+      - GPT_OSS_120B_INPUT_USD_PER_M=${GPT_OSS_120B_INPUT_USD_PER_M}
+      - GPT_OSS_120B_OUTPUT_USD_PER_M=${GPT_OSS_120B_OUTPUT_USD_PER_M}
+      - QWEN_INPUT_USD_PER_M=${QWEN_INPUT_USD_PER_M}
+      - QWEN_OUTPUT_USD_PER_M=${QWEN_OUTPUT_USD_PER_M}
+      - INITIAL_PROVIDER_SPEND_USD=${HINDSIGHT_INITIAL_PROVIDER_SPEND_USD}
+      - RECOVERY_CONTROL_NONCE=${HINDSIGHT_RECOVERY_CONTROL_NONCE}
+      - RECOVERY_CONTROL_ROLL_SHA256=${HINDSIGHT_RECOVERY_CONTROL_ROLL_SHA256}
     volumes:
       - hindsight-budget:/var/lib/attestmesh-budget
     read_only: true
@@ -428,7 +532,7 @@ services:
   # Mesh-local upstream for both evaluated models. The budget proxy can reach
   # only this listener; the sidecar then carries traffic to the stable Fugu LB.
   fugu-router-proxy:
-    image: alpine/socat:1.8.0.0
+    image: alpine/socat@sha256:a6be4c0262b339c53ddad723cdd178a1a13271e1137c65e27f90a08c16de02b8
     restart: unless-stopped
     network_mode: service:sidecar
     depends_on:
@@ -456,7 +560,7 @@ services:
       retries: 200
 
   budget-proxy:
-    image: ghcr.io/attestmesh/hindsight-budget-proxy@sha256:a7d9820c8a8bcf6d5c73189d240013c349e86309e68805210598bb3180d08b02
+    image: ghcr.io/attestmesh/hindsight-budget-proxy@sha256:096e7d0accd1e9ea8e2308ea8c0dedd7517f5afb23a977f6ddbde0714344d868
     user: "1000:1000"
     restart: unless-stopped
     depends_on:
@@ -475,13 +579,17 @@ services:
       - PROVIDER_BASE_URL=${HINDSIGHT_PROVIDER_BASE_URL}
       - PROVIDER_API_KEY=${HINDSIGHT_PROVIDER_API_KEY}
       - PROXY_API_KEY=${HINDSIGHT_PROXY_API_KEY}
+      - ADMIN_API_KEY=${HINDSIGHT_BUDGET_ADMIN_API_KEY}
       - NO_PROXY=sidecar,127.0.0.1,localhost
       - no_proxy=sidecar,127.0.0.1,localhost
       - PROVIDER_EGRESS_ENABLED=${HINDSIGHT_PROVIDER_EGRESS_ENABLED}
+      - BUDGET_OBSERVATION_MODE=${HINDSIGHT_BUDGET_OBSERVATION_MODE}
       - PROVIDER_TOTAL_LIMIT_USD=${HINDSIGHT_PROVIDER_TOTAL_LIMIT_USD}
       - PROVIDER_SAFETY_MARGIN_USD=${HINDSIGHT_PROVIDER_SAFETY_MARGIN_USD}
       - HINDSIGHT_BUDGET_PHASE=${HINDSIGHT_BUDGET_PHASE}
       - HINDSIGHT_BACKFILL_LIMIT_USD=${HINDSIGHT_BACKFILL_LIMIT_USD}
+      - HINDSIGHT_LLM_MAX_CONCURRENT=${HINDSIGHT_API_LLM_MAX_CONCURRENT}
+      - PROVIDER_MAX_IN_FLIGHT=${HINDSIGHT_PROVIDER_MAX_IN_FLIGHT}
       - HINDSIGHT_MONTHLY_LIMIT_USD=${HINDSIGHT_MONTHLY_LIMIT_USD}
       - QWEN_MONTHLY_LIMIT_USD=${QWEN_MONTHLY_LIMIT_USD}
       - PROXY_RPM_LIMIT=${HINDSIGHT_PROXY_RPM_LIMIT}
@@ -491,6 +599,8 @@ services:
       - QWEN_INPUT_USD_PER_M=${QWEN_INPUT_USD_PER_M}
       - QWEN_OUTPUT_USD_PER_M=${QWEN_OUTPUT_USD_PER_M}
       - INITIAL_PROVIDER_SPEND_USD=${HINDSIGHT_INITIAL_PROVIDER_SPEND_USD}
+      - RECOVERY_CONTROL_NONCE=${HINDSIGHT_RECOVERY_CONTROL_NONCE}
+      - RECOVERY_CONTROL_ROLL_SHA256=${HINDSIGHT_RECOVERY_CONTROL_ROLL_SHA256}
     volumes:
       - hindsight-budget:/var/lib/attestmesh-budget
     expose:
@@ -534,7 +644,7 @@ services:
 
   # --- Mesh-only listeners: bind in the sidecar netns (wg iface) ---------------
   mesh-proxy-api:
-    image: alpine/socat:1.8.0.0
+    image: alpine/socat@sha256:a6be4c0262b339c53ddad723cdd178a1a13271e1137c65e27f90a08c16de02b8
     restart: unless-stopped
     network_mode: service:sidecar
     depends_on:
@@ -547,7 +657,7 @@ services:
       - TCP:hindsight:8888
 
   mesh-proxy-ui:
-    image: alpine/socat:1.8.0.0
+    image: alpine/socat@sha256:a6be4c0262b339c53ddad723cdd178a1a13271e1137c65e27f90a08c16de02b8
     restart: unless-stopped
     network_mode: service:sidecar
     depends_on:
@@ -562,7 +672,7 @@ services:
   # Mesh-only Qwen proxy for the Postgres producers.  They authenticate with
   # HINDSIGHT_PROXY_API_KEY and therefore never receive the provider key.
   mesh-proxy-budget:
-    image: alpine/socat:1.8.0.0
+    image: alpine/socat@sha256:a6be4c0262b339c53ddad723cdd178a1a13271e1137c65e27f90a08c16de02b8
     restart: unless-stopped
     network_mode: service:sidecar
     depends_on:
@@ -590,7 +700,7 @@ services:
 
   # --- Hindsight: API (:8888) + control-plane UI (:9999) + embedded pg0 --------
   hindsight:
-    image: ghcr.io/vectorize-io/hindsight:0.8.4
+    image: ghcr.io/vectorize-io/hindsight@sha256:2c60f233eaba8f51db31adb920a560735aaf6f314e4b63c36c73159742dfa1a7
     restart: unless-stopped
     depends_on:
       pg-provision:
