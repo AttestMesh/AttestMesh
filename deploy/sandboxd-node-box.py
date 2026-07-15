@@ -486,10 +486,11 @@ docker run --rm --privileged \
 # Validate the host mount before compose. sandboxd independently performs xfs_quota state and exact
 # limit read-back checks from inside its trusted container and refuses to start on any mismatch.
 grep -Eqs " $QUOTA_MOUNT xfs .*(prjquota|pquota)" /proc/mounts
-quota_fs_bytes=$(df -B1 --output=size "$QUOTA_MOUNT" | awk 'NR == 2 {print $1}')
-case "$quota_fs_bytes" in
+quota_fs_kib=$(df -Pk "$QUOTA_MOUNT" | awk 'NR == 2 {print $2}')
+case "$quota_fs_kib" in
   ''|*[!0-9]*) echo "invalid XFS capacity readback for $QUOTA_MOUNT" >&2; exit 1 ;;
 esac
+quota_fs_bytes=$((quota_fs_kib * 1024))
 required_fs_bytes=$(((QUOTA_SOLD_MIB + QUOTA_FS_HEADROOM_MIB) * 1024 * 1024))
 [ "$quota_fs_bytes" -ge "$required_fs_bytes" ] || {
   echo "XFS capacity below ${QUOTA_SOLD_MIB} MiB sold + ${QUOTA_FS_HEADROOM_MIB} MiB reserve" >&2
