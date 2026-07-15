@@ -12,10 +12,12 @@
 # updates IndexerRegistry with the candidate/pool signing key
 # and calls `commit`, which changes both HAProxy backends, closes old streams, and
 # re-enables the frontends. Sidecars reconnect through the stable endpoint.
+# The Sidecar and registration-helper OCI index below was published by CI from
+# source commit 1cbb85cc5bb71d12102417d18e2cc6c352e6021c.
 
 services:
   sidecar:
-    image: ghcr.io/attestmesh/cluster-mesh-agent@sha256:e3d53442aa6e52d47227fb3528c1141302ad4fc63c4b3fb6dc38df7ce907d486
+    image: ghcr.io/attestmesh/cluster-mesh-agent@sha256:87d7ee2b1a85e903d80791551e813001cfdd7b2cecf131c8d7e407d2c7d7ecfb
     restart: unless-stopped
     environment:
       - CHAIN_ID=${CHAIN_ID}
@@ -47,7 +49,7 @@ services:
       - /dev/net/tun
 
   registration-calldata:
-    image: ghcr.io/attestmesh/cluster-mesh-agent@sha256:e3d53442aa6e52d47227fb3528c1141302ad4fc63c4b3fb6dc38df7ce907d486
+    image: ghcr.io/attestmesh/cluster-mesh-agent@sha256:87d7ee2b1a85e903d80791551e813001cfdd7b2cecf131c8d7e407d2c7d7ecfb
     restart: "no"
     depends_on:
       - sidecar
