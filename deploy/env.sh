@@ -44,6 +44,9 @@ export GAS_POLICY_ID="$(_read "$TEESQL/alchemy-policy.id")"
 export PRIVATE_KEY="$(_read "$TEESQL/global-deployer.key")"
 export DEPLOYER_ADDR="$(_read "$TEESQL/global-deployer.address")"
 export ORG_SAFE="${ORG_SAFE:-$DEPLOYER_ADDR}"       # deployer-owned during bring-up; transfer to the hub Safe later
+# Reviewed Base Stage-A signer-cluster owner. onchain.sh independently pins and
+# validates the exact Safe proxy, singleton, threshold, and owner set.
+export INDEXER_CLUSTER_OWNER="${INDEXER_CLUSTER_OWNER:-0xD97b5e3Fc685e29825d76b4F90B7B3ACAE7D66f0}"
 
 # dstack KMS (Phala dstack-base-prod5): the real, validated root signer
 # (= the corrected 0x52d3CF51… from dstackgres's monitor-kms-fix-root-signer Safe bundle)

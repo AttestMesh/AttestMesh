@@ -4,6 +4,7 @@ pragma solidity 0.8.24;
 import { Test } from "forge-std/Test.sol";
 
 import { IERC2535DiamondCut } from "@solidstate/contracts/interfaces/IERC2535DiamondCut.sol";
+import { IERC2535DiamondLoupe } from "@solidstate/contracts/interfaces/IERC2535DiamondLoupe.sol";
 import {
     IERC2535DiamondCutInternal
 } from "@solidstate/contracts/interfaces/IERC2535DiamondCutInternal.sol";
@@ -20,10 +21,43 @@ import { DiamondInit } from "../../src/DiamondInit.sol";
 import { ClusterMember } from "../../src/members/ClusterMember.sol";
 import { ClusterMemberFactory } from "../../src/members/ClusterMemberFactory.sol";
 import { ClusterDiamondFactory } from "../../src/factory/ClusterDiamondFactory.sol";
+import { ClusterDiamond } from "../../src/ClusterDiamond.sol";
+import { ClusterCut } from "../../src/libraries/ClusterCut.sol";
+
+contract TestablePrepareDstackFacetPathASafe is PrepareDstackFacetPathASafe {
+    function _validateApprovedSafe(address expectedSafe) internal view override {
+        _validateSafeBoundary(expectedSafe);
+    }
+
+    function _validateCanonicalCluster(address) internal view override { }
+}
+
+contract FactoryCheckingPrepareDstackFacetPathASafe is PrepareDstackFacetPathASafe {
+    function _validateApprovedSafe(address expectedSafe) internal view override {
+        _validateSafeBoundary(expectedSafe);
+    }
+}
+
+contract BoundaryCheckingPrepareDstackFacetPathASafe is PrepareDstackFacetPathASafe {
+    function validateSafeExecutionSurface(
+        address safe,
+        address expectedHandler,
+        bytes32 expectedHandlerCodehash
+    ) external view {
+        _validateSafeExecutionSurface(safe, expectedHandler, expectedHandlerCodehash);
+    }
+
+    function validateExactTopology(address cluster, address dstackFacet) external view {
+        _validateExactClusterTopology(cluster, dstackFacet);
+    }
+}
 
 contract MockPathASafe {
     uint256 internal immutable _threshold;
     address[] internal _owners;
+    address[] internal _modules;
+    address internal _guard;
+    address internal _fallbackHandler;
 
     constructor(uint256 threshold_, address[] memory owners_) {
         _threshold = threshold_;
@@ -36,6 +70,39 @@ contract MockPathASafe {
 
     function getOwners() external view returns (address[] memory) {
         return _owners;
+    }
+
+    function setModule(address module) external {
+        delete _modules;
+        if (module != address(0)) _modules.push(module);
+    }
+
+    function setGuard(address guard_) external {
+        _guard = guard_;
+    }
+
+    function setFallbackHandler(address handler_) external {
+        _fallbackHandler = handler_;
+    }
+
+    function getModulesPaginated(address, uint256)
+        external
+        view
+        returns (address[] memory modules, address next)
+    {
+        return (_modules, address(1));
+    }
+
+    function getStorageAt(uint256 offset, uint256) external view returns (bytes memory) {
+        bytes32 guardSlot = 0x4a204f620c8c5ccdca3fd54d003badd85ba500436a431f0cbda4f558c93c34c8;
+        bytes32 fallbackSlot = 0x6c9a6c4a39284e37ed1cf53d337577d14212a4870fb976a4366c693b939918d5;
+        if (bytes32(offset) == guardSlot) {
+            return abi.encode(bytes32(uint256(uint160(_guard))));
+        }
+        if (bytes32(offset) == fallbackSlot) {
+            return abi.encode(bytes32(uint256(uint160(_fallbackHandler))));
+        }
+        return abi.encode(bytes32(0));
     }
 
     function execute(address target, bytes calldata data) external returns (bytes memory result) {
@@ -73,7 +140,8 @@ contract MockPathAClusterTopology {
 }
 
 contract PrepareDstackFacetPathASafeTest is Test {
-    PrepareDstackFacetPathASafe internal preparer;
+    TestablePrepareDstackFacetPathASafe internal preparer;
+    PrepareDstackFacetPathASafe internal strictPreparer;
     MockPathASafe internal safe;
     ClusterDiamondFactory internal clusterFactory;
 
@@ -81,8 +149,16 @@ contract PrepareDstackFacetPathASafeTest is Test {
     address internal initialDstackFacet;
 
     function setUp() public {
-        preparer = new PrepareDstackFacetPathASafe();
+        vm.chainId(8453);
+        preparer = new TestablePrepareDstackFacetPathASafe();
+        strictPreparer = new PrepareDstackFacetPathASafe();
         safe = _newSafe(1);
+
+        // Canonical deterministic deployment proxy, pinned by production codehash.
+        vm.etch(
+            preparer.CREATE2_DEPLOYER(),
+            hex"7fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffe03601600081602082378035828234f58015156039578182fd5b8082525050506014600cf3"
+        );
 
         address memberImplementation = address(new ClusterMember());
         ClusterMemberFactory memberFactory =
@@ -127,7 +203,30 @@ contract PrepareDstackFacetPathASafeTest is Test {
         assertEq(cut[0].target, replacement);
         assertEq(uint256(cut[0].action), uint256(IERC2535DiamondCutInternal.FacetCutAction.REPLACE));
         assertEq(cut[0].selectors.length, 19);
-        assertEq(cut[0].selectors[14], bytes4(0x537d491c));
+        bytes4[19] memory expectedSelectors = [
+            bytes4(0xdfc77223),
+            bytes4(0x67b3f22c),
+            bytes4(0x2a819728),
+            bytes4(0x1d266200),
+            bytes4(0x7c4beeb8),
+            bytes4(0x6e4c7422),
+            bytes4(0x2f6622e5),
+            bytes4(0xbf8b211b),
+            bytes4(0x3440a16a),
+            bytes4(0x0aa58c83),
+            bytes4(0x54fd4d50),
+            bytes4(0x2514ce2d),
+            bytes4(0x7e02756a),
+            bytes4(0x12c604da),
+            bytes4(0x537d491c),
+            bytes4(0x1e079198),
+            bytes4(0x64e985f8),
+            bytes4(0x4bc7cbb7),
+            bytes4(0x875f31fb)
+        ];
+        for (uint256 i; i < expectedSelectors.length; ++i) {
+            assertEq(cut[0].selectors[i], expectedSelectors[i], "reviewed selector/order drift");
+        }
 
         for (uint256 i; i < cut[0].selectors.length; ++i) {
             for (uint256 j = i + 1; j < cut[0].selectors.length; ++j) {
@@ -156,7 +255,14 @@ contract PrepareDstackFacetPathASafeTest is Test {
         assertEq(preparer.validateCluster(cluster, address(safe)), replacement);
     }
 
-    function test_runWritesExactBundleWithoutMutatingCluster() public {
+    function test_runRecoversPartialDeploymentWritesExactBundleAndIsIdempotent() public {
+        bytes memory initCode = type(DstackFacet).creationCode;
+        (bool deployedPartial,) = preparer.CREATE2_DEPLOYER()
+            .call(abi.encodePacked(preparer.DSTACK_FACET_SALT(), initCode));
+        assertTrue(deployedPartial);
+        assertGt(preparer.DETERMINISTIC_DSTACK_FACET().code.length, 0);
+        assertEq(preparer.DETERMINISTIC_MEMBER_IMPLEMENTATION().code.length, 0);
+
         uint256 broadcasterKey = 0xB0B;
         address broadcaster = vm.addr(broadcasterKey);
         vm.deal(broadcaster, 10 ether);
@@ -179,15 +285,183 @@ contract PrepareDstackFacetPathASafeTest is Test {
         assertEq(vm.parseJsonUint(json, ".chainId"), block.chainid);
         assertEq(vm.parseJsonAddress(json, ".broadcaster"), broadcaster);
         assertEq(vm.parseJsonAddress(json, ".safeOwner"), address(safe));
+        assertEq(vm.parseJsonUint(json, ".safeModuleCount"), 0);
+        assertEq(vm.parseJsonAddress(json, ".safeModulesNext"), address(1));
+        assertEq(vm.parseJsonAddress(json, ".safeGuard"), address(0));
+        assertEq(
+            vm.parseJsonAddress(json, ".safeFallbackHandler"),
+            preparer.APPROVED_SAFE_FALLBACK_HANDLER()
+        );
+        assertEq(
+            vm.parseJsonBytes32(json, ".safeFallbackHandlerCodeHash"),
+            preparer.APPROVED_SAFE_FALLBACK_HANDLER_CODEHASH()
+        );
+        assertEq(vm.parseJsonAddress(json, ".create2Deployer"), preparer.CREATE2_DEPLOYER());
         assertEq(vm.parseJsonAddress(json, ".cluster"), cluster);
         assertEq(vm.parseJsonAddress(json, ".target"), cluster);
+        assertEq(vm.parseJsonUint(json, ".clusterFacetCount"), 5);
+        assertEq(vm.parseJsonUint(json, ".clusterSelectorCount"), 54);
+        assertEq(vm.parseJsonUint(json, ".memberCount"), 0);
+        assertEq(vm.parseJsonBytes32(json, ".cskCommitment"), bytes32(0));
         assertEq(vm.parseJsonAddress(json, ".currentDstackFacet"), initialDstackFacet);
         assertEq(vm.parseJsonAddress(json, ".dstackFacet"), replacement);
+        assertEq(replacement, preparer.DETERMINISTIC_DSTACK_FACET());
+        assertEq(
+            vm.parseJsonBytes32(json, ".dstackFacetRuntimeCodeHash"),
+            preparer.DSTACK_FACET_RUNTIME_CODEHASH()
+        );
         assertEq(vm.parseJsonAddress(json, ".clusterMemberImplementation"), memberImplementation);
+        assertEq(memberImplementation, preparer.DETERMINISTIC_MEMBER_IMPLEMENTATION());
+        assertEq(
+            vm.parseJsonBytes32(json, ".clusterMemberImplementationRuntimeCodeHash"),
+            preparer.MEMBER_IMPLEMENTATION_RUNTIME_CODEHASH()
+        );
         assertEq(vm.parseJsonUint(json, ".value"), 0);
         assertEq(vm.parseJsonBytes(json, ".data"), safeCalldata);
         assertEq(vm.parseJsonBytes32(json, ".calldataHash"), keccak256(safeCalldata));
+
+        bytes32 facetHash = replacement.codehash;
+        bytes32 memberHash = memberImplementation.codehash;
+        (address secondFacet, address secondMember,) = preparer.run();
+        assertEq(secondFacet, replacement);
+        assertEq(secondMember, memberImplementation);
+        assertEq(secondFacet.codehash, facetHash);
+        assertEq(secondMember.codehash, memberHash);
         vm.removeFile(bundleFile);
+    }
+
+    function test_safeExecutionSurfaceRejectsModulesGuardHandlerAndCodeDrift() public {
+        BoundaryCheckingPrepareDstackFacetPathASafe checker =
+            new BoundaryCheckingPrepareDstackFacetPathASafe();
+        address handler = address(new DstackFacet());
+        safe.setFallbackHandler(handler);
+        checker.validateSafeExecutionSurface(address(safe), handler, handler.codehash);
+
+        safe.setModule(address(0xBEEF));
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                PrepareDstackFacetPathASafe.UnexpectedSafeModules.selector, uint256(1), address(1)
+            )
+        );
+        checker.validateSafeExecutionSurface(address(safe), handler, handler.codehash);
+        safe.setModule(address(0));
+
+        safe.setGuard(address(0xCAFE));
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                PrepareDstackFacetPathASafe.UnexpectedSafeGuard.selector, address(0xCAFE)
+            )
+        );
+        checker.validateSafeExecutionSurface(address(safe), handler, handler.codehash);
+        safe.setGuard(address(0));
+
+        safe.setFallbackHandler(address(0xDEAD));
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                PrepareDstackFacetPathASafe.UnexpectedSafeFallbackHandler.selector,
+                handler,
+                address(0xDEAD)
+            )
+        );
+        checker.validateSafeExecutionSurface(address(safe), handler, handler.codehash);
+        safe.setFallbackHandler(handler);
+
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                PrepareDstackFacetPathASafe.UnexpectedCodeHash.selector,
+                handler,
+                bytes32(uint256(1)),
+                handler.codehash
+            )
+        );
+        checker.validateSafeExecutionSurface(address(safe), handler, bytes32(uint256(1)));
+    }
+
+    function test_exactFactoryTopologyRejectsExtraFacet() public {
+        BoundaryCheckingPrepareDstackFacetPathASafe checker =
+            new BoundaryCheckingPrepareDstackFacetPathASafe();
+        address oldDstackFacet = checker.FACTORY_DSTACK_FACET();
+        vm.etch(checker.ATTEST_FACET(), hex"00");
+        vm.etch(checker.MESSAGE_FACET(), hex"00");
+        vm.etch(checker.FACTORY_NETWORK_FACET(), hex"00");
+        vm.etch(oldDstackFacet, hex"00");
+
+        IERC2535DiamondCutInternal.FacetCut[] memory cut = ClusterCut.buildFacetCuts(
+            checker.ATTEST_FACET(),
+            checker.MESSAGE_FACET(),
+            checker.FACTORY_NETWORK_FACET(),
+            oldDstackFacet
+        );
+        bytes4[] memory oldNetworkSelectors = new bytes4[](3);
+        for (uint256 i; i < oldNetworkSelectors.length; ++i) {
+            oldNetworkSelectors[i] = cut[2].selectors[i];
+        }
+        cut[2].selectors = oldNetworkSelectors;
+        ClusterDiamond topology = new ClusterDiamond(cut, address(0), bytes(""));
+        checker.validateExactTopology(address(topology), oldDstackFacet);
+        assertEq(IPathADiamondLoupe(address(topology)).facetAddress(0xcedc29c2), address(0));
+        assertEq(IPathADiamondLoupe(address(topology)).facetAddress(0x14342a70), address(0));
+
+        IERC2535DiamondCutInternal.FacetCut[] memory extra =
+            new IERC2535DiamondCutInternal.FacetCut[](1);
+        bytes4[] memory extraSelector = new bytes4[](1);
+        extraSelector[0] = 0xdeadbeef;
+        extra[0] = IERC2535DiamondCutInternal.FacetCut({
+            target: checker.FACTORY_NETWORK_FACET(),
+            action: IERC2535DiamondCutInternal.FacetCutAction.ADD,
+            selectors: extraSelector
+        });
+        IERC2535DiamondCut(address(topology)).diamondCut(extra, address(0), bytes(""));
+        assertEq(
+            IERC2535DiamondLoupe(address(topology))
+            .facetFunctionSelectors(checker.FACTORY_NETWORK_FACET())
+            .length,
+            4
+        );
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                PrepareDstackFacetPathASafe.UnexpectedClusterFacetSet.selector,
+                checker.FACTORY_NETWORK_FACET()
+            )
+        );
+        checker.validateExactTopology(address(topology), oldDstackFacet);
+    }
+
+    function test_strictValidationRejectsSafeCompatibleImpostor() public {
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                PrepareDstackFacetPathASafe.UnexpectedApprovedSafe.selector,
+                strictPreparer.APPROVED_SAFE(),
+                address(safe)
+            )
+        );
+        strictPreparer.validateCluster(cluster, address(safe));
+    }
+
+    function test_strictValidationRejectsUnreviewedFactoryCode() public {
+        FactoryCheckingPrepareDstackFacetPathASafe factoryChecking =
+            new FactoryCheckingPrepareDstackFacetPathASafe();
+        vm.etch(factoryChecking.CANONICAL_CLUSTER_FACTORY(), hex"60006000");
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                PrepareDstackFacetPathASafe.UnexpectedCodeHash.selector,
+                factoryChecking.CANONICAL_CLUSTER_FACTORY(),
+                factoryChecking.CANONICAL_CLUSTER_FACTORY_CODEHASH(),
+                factoryChecking.CANONICAL_CLUSTER_FACTORY().codehash
+            )
+        );
+        factoryChecking.validateCluster(cluster, address(safe));
+    }
+
+    function test_strictValidationRejectsWrongChain() public {
+        address approvedSafe = strictPreparer.APPROVED_SAFE();
+        vm.chainId(1);
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                PrepareDstackFacetPathASafe.UnexpectedChain.selector, uint256(8453), uint256(1)
+            )
+        );
+        strictPreparer.validateCluster(cluster, approvedSafe);
     }
 
     function test_rejectsEoaAsExpectedSafe() public {
