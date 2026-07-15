@@ -77,6 +77,51 @@ RUNSC_URL="https://storage.googleapis.com/gvisor/releases/release/20260420.0/x86
 RUNSC_SHA512="9efeefada7b9a7bcc21dc3a1ad3531d11dfac267808cced45d047aab742f15ecb91b2bb635dea78a4ae36817f76e5ed223b7ad80f3165f15dd24de9b0c95726f"
 INSTALL_DIR="/dstack/persistent/bin"
 RUNSC_BIN="$INSTALL_DIR/runsc"
+QUOTA_ZVOL="dstack/sandboxd-data"
+QUOTA_DEVICE="/dev/zvol/dstack/sandboxd-data"
+QUOTA_MOUNT="/var/lib/sandboxd-data"
+QUOTA_TOOLS_IMAGE="ghcr.io/dmvt/confidential-sandboxes@sha256:c286648112f2dbe7ff061d11410b63825d6f6c62d398d5cc2f1e6b54b2bd5091"
+
+if [ -n "${DSTACK_DOCKER_PASSWORD:-}" ]; then
+  echo "$DSTACK_DOCKER_PASSWORD" | docker login "${DSTACK_DOCKER_REGISTRY:-ghcr.io}" -u "$DSTACK_DOCKER_USERNAME" --password-stdin
+fi
+
+# Persistent sandbox storage is a separate XFS filesystem with project-quota enforcement. A sparse
+# 48 GiB ZFS zvol lives in the encrypted CVM data pool; HOST_DISK_MB sells only 40 GiB, leaving
+# filesystem headroom. Never start the app on an unquotaed fallback directory.
+for tool in docker grep mount zfs; do
+  command -v "$tool" >/dev/null 2>&1 || {
+    echo "missing required disk-quota host tool: $tool" >&2
+    exit 1
+  }
+done
+if ! zfs list -H -o name "$QUOTA_ZVOL" >/dev/null 2>&1; then
+  zfs create -s -V 48G -o volblocksize=16K "$QUOTA_ZVOL"
+  zfs set sandboxd:managed=1 "$QUOTA_ZVOL"
+fi
+[ "$(zfs get -H -o value sandboxd:managed "$QUOTA_ZVOL")" = "1" ] || {
+  echo "refusing unmanaged quota zvol $QUOTA_ZVOL" >&2
+  exit 1
+}
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+  [ -b "$QUOTA_DEVICE" ] && break
+  sleep 1
+done
+[ -b "$QUOTA_DEVICE" ] || { echo "quota zvol device missing: $QUOTA_DEVICE" >&2; exit 1; }
+if [ "$(zfs get -H -o value sandboxd:format "$QUOTA_ZVOL")" != "xfs-v1" ]; then
+  # The minimal dstack host has no xfsprogs. Format only our marked, managed zvol with the exact
+  # pinned sandboxd image; the image is needed for the app anyway and is digest-pinned.
+  docker run --rm --privileged -v /dev:/dev \
+    --entrypoint mkfs.xfs "$QUOTA_TOOLS_IMAGE" -f -K "$QUOTA_DEVICE"
+  zfs set sandboxd:format=xfs-v1 "$QUOTA_ZVOL"
+fi
+mkdir -p "$QUOTA_MOUNT"
+grep -qs " $QUOTA_MOUNT " /proc/mounts || \
+  mount -t xfs -o prjquota,nosuid,nodev "$QUOTA_DEVICE" "$QUOTA_MOUNT"
+# Validate the host mount before compose. sandboxd independently performs xfs_quota state and exact
+# limit read-back checks from inside its trusted container and refuses to start on any mismatch.
+grep -Eqs " $QUOTA_MOUNT xfs .*(prjquota|pquota)" /proc/mounts
+chmod 0711 "$QUOTA_MOUNT"
 
 sha512_file() {
   if command -v sha512sum >/dev/null 2>&1; then
@@ -133,9 +178,7 @@ fi
 docker info 2>/dev/null | grep -iE "runtime" || true
 docker info 2>/dev/null | grep -qi "runsc"
 
-if [ -n "${DSTACK_DOCKER_PASSWORD:-}" ]; then
-  echo "$DSTACK_DOCKER_PASSWORD" | docker login "${DSTACK_DOCKER_REGISTRY:-ghcr.io}" -u "$DSTACK_DOCKER_USERNAME" --password-stdin
-fi'''
+'''
     rendered = json.dumps(app_compose, indent=4, ensure_ascii=False)
     return rendered, hashlib.sha256(rendered.encode()).hexdigest()
 

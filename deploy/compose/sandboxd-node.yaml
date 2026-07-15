@@ -28,7 +28,7 @@ services:
       - /dev/net/tun
 
   sandboxd:
-    image: ghcr.io/dmvt/confidential-sandboxes@sha256:5850401851fc30a91299ed1e097f7e4d60f6f5648a581bae9ecd02fbb978ded7
+    image: ghcr.io/dmvt/confidential-sandboxes@sha256:c286648112f2dbe7ff061d11410b63825d6f6c62d398d5cc2f1e6b54b2bd5091
     restart: unless-stopped
     environment:
       SANDBOX_DAEMON_TOKEN: ${SANDBOX_DAEMON_TOKEN:?set in the CVM env; gateway-exposed control API}
@@ -54,7 +54,10 @@ services:
       HOST_CPU_MILLIS: "3500"
       HOST_MEMORY_MB: "6144"
       HOST_DISK_MB: "40960"
-      HOST_MAX_SANDBOXES: "20"     # documented ceiling (not yet enforced by the core; forward-compat)
+      HOST_MAX_SANDBOXES: "20"     # hard concurrent-sandbox ceiling
+      SANDBOXD_REQUIRE_CAPACITY: "1"  # fail closed if any production ceiling is invalid/missing
+      SANDBOX_DISK_ROOT: /var/lib/sandboxd-data
+      SANDBOXD_REQUIRE_DISK_QUOTA: "1"  # fail closed unless XFS project quotas enforce /data
       # Registry creds (CVM-sealed) so the daemon can pull PRIVATE images for runsc workloads.
       DSTACK_DOCKER_USERNAME: ${DSTACK_DOCKER_USERNAME}
       DSTACK_DOCKER_PASSWORD: ${DSTACK_DOCKER_PASSWORD}
@@ -66,6 +69,11 @@ services:
       - /var/run/docker.sock:/var/run/docker.sock
       # Durable daemon state — survives restart (H4). Metadata + manifests, no tenant secrets.
       - sandboxd-state:/var/lib/sandboxd
+      # xfs_quota must resolve the XFS backing device. Only this trusted daemon receives /dev.
+      - /dev:/dev
+      # Host pre-launch provisions this as dedicated XFS+prjquota. Same absolute path is required
+      # because tenant bind mounts are resolved by the host Docker daemon.
+      - /var/lib/sandboxd-data:/var/lib/sandboxd-data
     cap_add:
       - SYS_ADMIN
     security_opt:
@@ -78,7 +86,7 @@ services:
   # named volume, using the already-pinned sandboxd image. Metadata only (no tenant secrets). Per-
   # sandbox tenant data volumes are NOT backed up in MVP (roadmap). See deploy/README.md.
   sandboxd-backup:
-    image: ghcr.io/dmvt/confidential-sandboxes@sha256:5850401851fc30a91299ed1e097f7e4d60f6f5648a581bae9ecd02fbb978ded7
+    image: ghcr.io/dmvt/confidential-sandboxes@sha256:c286648112f2dbe7ff061d11410b63825d6f6c62d398d5cc2f1e6b54b2bd5091
     restart: unless-stopped
     environment:
       STATE_DB: /var/lib/sandboxd/state.sqlite3
