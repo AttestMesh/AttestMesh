@@ -3,6 +3,24 @@ services:
   sidecar:
     image: ghcr.io/attestmesh/cluster-mesh-agent@sha256:b9e0ae107d9db015c22059c9fecdc28f2b35e09b257eabb4739bd4e46d96f641
     restart: unless-stopped
+    init: true
+    stop_grace_period: 30s
+    cpus: "0.50"
+    mem_limit: 512m
+    pids_limit: 256
+    read_only: true
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,noexec,size=32m
+      - /run:rw,nosuid,nodev,noexec,size=16m
+    logging:
+      driver: local
+      options:
+        max-size: "10m"
+        max-file: "3"
+    ulimits:
+      nofile:
+        soft: 8192
+        hard: 8192
     environment:
       - CHAIN_ID=${CHAIN_ID}
       - RPC_URL=${RPC_URL}
@@ -17,44 +35,125 @@ services:
       - LOG_FORMAT=pretty
       - LOG_LEVEL=info,cluster_mesh_agent=debug
     volumes:
-      - /var/run/dstack.sock:/var/run/dstack.sock
+      - /var/run/dstack.sock:/var/run/dstack.sock:ro
       - sidecar-state:/var/lib/attestmesh
     ports:
       - "9090:9090"
       - "51900:51900"
+    cap_drop:
+      - ALL
     cap_add:
       - NET_ADMIN
+    security_opt:
+      - no-new-privileges:true
     devices:
       - /dev/net/tun
 
   sandboxd:
-    image: ghcr.io/dmvt/confidential-sandboxes@sha256:c286648112f2dbe7ff061d11410b63825d6f6c62d398d5cc2f1e6b54b2bd5091
+    image: ghcr.io/dmvt/confidential-sandboxes@sha256:743d2815561fd0a89557313098ef74923a2e5bb243891a18085259736fae1a33
     restart: unless-stopped
+    init: true
+    stop_grace_period: 90s
+    cpus: "1.0"
+    mem_limit: 1536m
+    pids_limit: 1024
+    sysctls:
+      net.ipv4.ip_forward: "0"
+      net.ipv6.conf.all.forwarding: "0"
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
+    read_only: true
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,noexec,size=128m
+      - /run:rw,nosuid,nodev,noexec,size=32m
+    logging:
+      driver: local
+      options:
+        max-size: "20m"
+        max-file: "5"
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          curl -fsS --max-time 3 http://10.191.255.250:8088/healthz |
+          grep -Eq '"ok":[[:space:]]*true.*"dstack_socket_present":[[:space:]]*true' &&
+          docker info --format '{{.ServerVersion}}' >/dev/null &&
+          xfs_quota -x -c 'state -p' "$${SANDBOX_DISK_ROOT}" |
+          grep -q 'Enforcement: ON'
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 45s
     environment:
       SANDBOX_DAEMON_TOKEN: ${SANDBOX_DAEMON_TOKEN:?set in the CVM env; gateway-exposed control API}
       PUBLIC_BASE_URL: ${PUBLIC_BASE_URL}
       ONCHAIN_CLUSTER_DIAMOND: ${ONCHAIN_CLUSTER_DIAMOND}
       DSTACK_SOCKET: /var/run/dstack.sock
-      # Durable state on the named sandboxd-state volume: sandbox store + org/handle/uid ledger share
-      # one sqlite file; SANDBOX_STATE_DB points at the same path so whichever the core reads resolves
-      # to the durable volume. No private key material (identity keys are re-derived from KMS).
+      SANDBOXD_REQUIRE_DSTACK: "1"
+      SANDBOXD_MAX_CONCURRENT_IMAGE_PULLS: "1"
+      SANDBOXD_IMAGE_CACHE_GC: "1"
+      SANDBOXD_MAX_IMAGE_BYTES: "4294967296"
+      SANDBOXD_IMAGE_CACHE_BUDGET_BYTES: "17179869184"
+      SANDBOXD_DOCKER_DATA_LIMIT_BYTES: "30064771072"
+      SANDBOXD_DOCKER_DATA_RESERVE_BYTES: "6442450944"
+      SANDBOXD_MAX_CONCURRENT_EXECS: "16"
+      # Arbitrary command execution is intentionally unavailable on the first production release.
+      # It can be enabled only by a new measured compose and an explicit operator decision.
+      SANDBOXD_ENABLE_EXEC: "0"
+      SANDBOXD_MAX_CONCURRENT_QUOTES: "2"
+      SANDBOXD_QUOTES_PER_ID_PER_MINUTE: "10"
+      SANDBOXD_QUOTES_GLOBAL_PER_MINUTE: "60"
+      SANDBOXD_MAX_PROXY_CONNECTIONS: "32"
+      SANDBOXD_MAX_PROXY_CONNECTIONS_PER_SANDBOX: "4"
+      SANDBOXD_PROXY_TOTAL_TIMEOUT_SECONDS: "300"
+      SANDBOXD_PROXY_READ_TIMEOUT_SECONDS: "60"
+      # Initial production guardrail for the permanent handle ledger and append-only RTMR3 history.
+      # Raising this is an explicit measured deployment change after quote-size monitoring.
+      SANDBOXD_MAX_LIFETIME_ALLOCATIONS: "1000"
+      SANDBOXD_ALLOWED_IMAGE_REPOSITORIES: "ghcr.io/dmvt/cs-sandbox-base"
+      DOCKER_CONFIG: /run/sandboxd-docker
+      SANDBOXD_HOST: 10.191.255.250
+      SANDBOXD_PORT: "8088"
+      # Durable state on a pre-provisioned, separately reserved ZFS filesystem: sandbox store +
+      # org/handle/uid ledger share one sqlite file. No private key material is persisted.
       SANDBOX_ALLOCATION_DB: /var/lib/sandboxd/state.sqlite3
       SANDBOX_STATE_DB: /var/lib/sandboxd/state.sqlite3
-      # Shared bridge the daemon + every tenant join → Docker DNS resolves http://cs_<id16>:<port>/…
+      # Fixed control-only bridge; each tenant instead receives its own labeled `csn_*` bridge.
       SANDBOX_INGRESS_NETWORK: cs-ingress
+      SANDBOX_NETWORK_POOL: 10.192.0.0/10
+      SANDBOX_NETWORK_PREFIXLEN: "29"
+      SANDBOXD_REQUIRE_NETWORK_FIREWALL: "1"
+      SANDBOXD_FIREWALL_HELPER_IMAGE: ghcr.io/dmvt/confidential-sandboxes@sha256:743d2815561fd0a89557313098ef74923a2e5bb243891a18085259736fae1a33
+      SANDBOXD_FIREWALL_WATCHDOG_INTERVAL_SECONDS: "15"
       # Preview URLs (/app/{id}/…) are capability URLs reachable without the daemon bearer; /_api/*
       # stays bearer-gated.
       SANDBOX_APP_PUBLIC: "1"
+      # Production app traffic is host-only. Every sandbox receives a high-entropy sibling hostname;
+      # the shared /app/{id} route is disabled so tenants cannot share a browser origin.
+      SANDBOXD_REQUIRE_UNIQUE_APP_ORIGINS: "1"
+      SANDBOX_APPS_DOMAIN: ${APP_DOMAIN:?set to the dedicated sandbox wildcard domain}
       # One-shot image to chown a fresh per-sandbox /data volume to the tenant uid (65534) so the
       # attested durable writable area is writable under read-only rootfs + non-root user.
-      SANDBOX_VOLUME_INIT_IMAGE: busybox:stable
-      # Host capacity ceilings so admission can't oversell the CVM (BOX_VCPU=4 / BOX_MEM=8192 /
-      # BOX_DISK=80 in sandboxd-node-box.py). Headroom left for daemon/OS/backups; overcommit stays at
-      # the code default 1.0. NOTE: the core reads HOST_CPU_MILLIS (not HOST_VCPU_MILLIS).
-      HOST_CPU_MILLIS: "3500"
-      HOST_MEMORY_MB: "6144"
-      HOST_DISK_MB: "40960"
-      HOST_MAX_SANDBOXES: "20"     # hard concurrent-sandbox ceiling
+      SANDBOX_VOLUME_INIT_IMAGE: busybox@sha256:73aaf090f3d85aa34ee199857f03fa3a95c8ede2ffd4cc2cdb5b94e566b11662
+      SANDBOXD_ALLOWED_RUNTIMES: runsc
+      SANDBOXD_RUNSC_DIGEST: sha512:9efeefada7b9a7bcc21dc3a1ad3531d11dfac267808cced45d047aab742f15ecb91b2bb635dea78a4ae36817f76e5ed223b7ad80f3165f15dd24de9b0c95726f
+      SANDBOXD_MIN_RUNSC_CPU_MILLIS: "100"
+      SANDBOXD_MIN_RUNSC_MEMORY_MB: "128"
+      SANDBOXD_MIN_RUNSC_PIDS: "128"
+      SANDBOXD_MIN_RUNSC_DISK_MB: "16"
+      # Fixed admission budgets for BOX_VCPU=8 / BOX_MEM=16384 / BOX_DISK=300. Tenant plus trusted
+      # service maxima total 7 vCPU / 12.5 GiB, leaving host dockerd/OS/ZFS headroom. Tenant PIDs
+      # are hard-capped at 16,384. The 250 GiB XFS zvol sells 232 GiB and leaves 18 GiB internally.
+      HOST_VCPU_MILLIS: "5000"
+      HOST_MEMORY_MB: "10240"
+      HOST_DISK_MB: "237568"
+      HOST_PIDS: "16384"
+      HOST_MAX_SANDBOXES: "50"
+      HOST_CPU_OVERCOMMIT: "1.0"
+      HOST_MEMORY_OVERCOMMIT: "1.0"
+      HOST_DISK_OVERCOMMIT: "1.0"
       SANDBOXD_REQUIRE_CAPACITY: "1"  # fail closed if any production ceiling is invalid/missing
       SANDBOX_DISK_ROOT: /var/lib/sandboxd-data
       SANDBOXD_REQUIRE_DISK_QUOTA: "1"  # fail closed unless XFS project quotas enforce /data
@@ -63,12 +162,21 @@ services:
       DSTACK_DOCKER_PASSWORD: ${DSTACK_DOCKER_PASSWORD}
       DSTACK_DOCKER_REGISTRY: ${DSTACK_DOCKER_REGISTRY}
     networks:
-      - cs-ingress
+      cs-ingress:
+        ipv4_address: 10.191.255.250
+        aliases:
+          # The pinned Caddy image's measured upstream name is frontproxy:8088.
+          - frontproxy
     volumes:
       - /var/run/dstack.sock:/var/run/dstack.sock:ro
       - /var/run/docker.sock:/var/run/docker.sock
-      # Durable daemon state — survives restart (H4). Metadata + manifests, no tenant secrets.
-      - sandboxd-state:/var/lib/sandboxd
+      # Pre-launch creates this as dstack/sandboxd-state with exact 2 GiB quota, refquota, and
+      # refreservation. It remains writable even if the separate Docker data-root reaches its cap.
+      - type: bind
+        source: /var/lib/sandboxd-state
+        target: /var/lib/sandboxd
+        bind:
+          create_host_path: false
       # xfs_quota must resolve the XFS backing device. Only this trusted daemon receives /dev.
       - /dev:/dev
       # Host pre-launch provisions this as dedicated XFS+prjquota. Same absolute path is required
@@ -79,61 +187,126 @@ services:
     security_opt:
       - seccomp=unconfined
       - apparmor=unconfined
+      - no-new-privileges:true
     ports:
-      - "8080:8080"
+      # Preserve the existing dstack gateway/control URL while moving the in-container listener to
+      # the Caddy image's fixed upstream port.
+      - "8080:8088"
 
-  # State backup sidecar — hourly online-backup snapshot of the sandboxd-state sqlite to a SEPARATE
-  # named volume, using the already-pinned sandboxd image. Metadata only (no tenant secrets). Per-
-  # sandbox tenant data volumes are NOT backed up in MVP (roadmap). See deploy/README.md.
-  sandboxd-backup:
-    image: ghcr.io/dmvt/confidential-sandboxes@sha256:c286648112f2dbe7ff061d11410b63825d6f6c62d398d5cc2f1e6b54b2bd5091
+  # Unique-origin TLS ingress. The image is the exact digest currently used by the production
+  # webhost; wildcard certificates are obtained through a sealed, zone-scoped Cloudflare token.
+  tlsproxy:
+    image: ghcr.io/dmvt/webhost-tlsproxy@sha256:8fc8545f084f63977a635845d594a2574efafc4b0f2bd514c9704c6f509bf83b
     restart: unless-stopped
+    init: true
+    stop_grace_period: 30s
+    cpus: "0.25"
+    mem_limit: 256m
+    pids_limit: 128
+    read_only: true
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,noexec,size=32m
+      - /run:rw,nosuid,nodev,noexec,size=16m
+    logging:
+      driver: local
+      options:
+        max-size: "10m"
+        max-file: "3"
+    ulimits:
+      nofile:
+        soft: 8192
+        hard: 8192
     environment:
-      STATE_DB: /var/lib/sandboxd/state.sqlite3
-      BACKUP_DIR: /backups
-      BACKUP_INTERVAL_SECONDS: "3600"
-      BACKUP_KEEP: "48"
-    entrypoint:
-      - python
-      - -c
+      CLOUDFLARE_API_TOKEN: ${CLOUDFLARE_API_TOKEN:?sealed Cloudflare DNS token required}
+      SANDBOX_APPS_DOMAIN: ${APP_DOMAIN:?set to sandbox.synclave.net}
+    # Override the webhost image's broader default config with one measured, minimal wildcard. The
+    # doubled dollar survives Compose interpolation for Caddy's own environment substitution.
+    entrypoint: ["/bin/sh", "-ceu"]
+    command:
       - |
-        import sqlite3, time, os, glob, datetime
-        src = os.environ.get("STATE_DB", "/var/lib/sandboxd/state.sqlite3")
-        dst_dir = os.environ.get("BACKUP_DIR", "/backups")
-        keep = int(os.environ.get("BACKUP_KEEP", "48") or "0")
-        interval = int(os.environ.get("BACKUP_INTERVAL_SECONDS", "3600") or "3600")
-        os.makedirs(dst_dir, exist_ok=True)
-        print(f"[backup] snapshotting {src} -> {dst_dir} every {interval}s (keep {keep})", flush=True)
-        while True:
-            if os.path.exists(src):
-                ts = datetime.datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
-                out = os.path.join(dst_dir, f"state-{ts}.sqlite3")
-                try:
-                    s = sqlite3.connect(src)
-                    d = sqlite3.connect(out)
-                    with d:
-                        s.backup(d)
-                    d.close(); s.close()
-                    print(f"[backup] ok {out}", flush=True)
-                except Exception as e:  # noqa: BLE001 — best-effort loop, never crash the sidecar
-                    print(f"[backup] FAILED {e}", flush=True)
-                if keep > 0:
-                    snaps = sorted(glob.glob(os.path.join(dst_dir, "state-*.sqlite3")))
-                    for old in snaps[:-keep]:
-                        try:
-                            os.remove(old)
-                        except OSError:
-                            pass
-            else:
-                print(f"[backup] source {src} not present yet; waiting", flush=True)
-            time.sleep(interval)
+        cat > /tmp/Caddyfile <<'CADDYFILE'
+        {
+          admin off
+          acme_dns cloudflare {env.CLOUDFLARE_API_TOKEN}
+          servers {
+            max_header_size 32KB
+            timeouts {
+              read_body 30s
+              read_header 10s
+              write 5m
+              idle 30s
+            }
+          }
+        }
+        *.{$$SANDBOX_APPS_DOMAIN} {
+          log {
+            output stdout
+            format json
+          }
+          @sandbox_host header_regexp Host ^sbx-[0-9a-f]{52}\.sandbox\.synclave\.net$
+          handle @sandbox_host {
+            reverse_proxy frontproxy:8088 {
+              header_up Accept-Encoding identity
+              header_up -Forwarded
+              header_up -X-Forwarded-*
+              header_up -X-Real-IP
+              header_up Host {http.request.host}
+              header_up X-Forwarded-For {http.request.remote.host}
+              header_up X-Forwarded-Host {http.request.host}
+              header_up X-Forwarded-Proto https
+              transport http {
+                dial_timeout 5s
+                response_header_timeout 30s
+                keepalive_idle_conns_per_host 16
+              }
+            }
+          }
+          handle {
+            abort
+          }
+        }
+        CADDYFILE
+        exec caddy run --config /tmp/Caddyfile --adapter caddyfile
+    ports:
+      - "443:443"
     volumes:
-      - sandboxd-state:/var/lib/sandboxd
-      - sandboxd-backups:/backups
+      - sandboxd-caddy-data:/data
+      - sandboxd-caddy-config:/config
+    depends_on:
+      sandboxd:
+        condition: service_healthy
+    networks:
+      - cs-ingress
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
 
   registration-calldata:
     image: ghcr.io/dmvt/attestmesh-indexer@sha256:d99b1d207e0df8bfdf6fbac5b001142307475ac9a5b1b88b730b7edabd4283e5
     restart: "no"
+    init: true
+    stop_grace_period: 15s
+    cpus: "0.25"
+    mem_limit: 256m
+    pids_limit: 128
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,noexec,size=16m
+      - /run:rw,nosuid,nodev,noexec,size=8m
+    logging:
+      driver: local
+      options:
+        max-size: "10m"
+        max-file: "3"
+    ulimits:
+      nofile:
+        soft: 1024
+        hard: 1024
     depends_on:
       - sidecar
     entrypoint: ["/usr/local/bin/attestmesh-registration-calldata"]
@@ -144,16 +317,17 @@ services:
     ports:
       - "9092:9092"
     volumes:
-      - /var/run/dstack.sock:/var/run/dstack.sock
+      - /var/run/dstack.sock:/var/run/dstack.sock:ro
 
 networks:
-  # Fixed literal name so tenant containers launched by the daemon with `--network cs-ingress` join
-  # the SAME network sandboxd is on. Plain bridge (egress enforcement is CUT for MVP; the attested
-  # manifest declares the network open/unconfined). The entrypoint also creates it belt-and-suspenders.
+  # Fixed control plane. Tenant `csn_*` bridges are separate and come from 10.192.0.0/10.
   cs-ingress:
     name: cs-ingress
+    ipam:
+      config:
+        - subnet: 10.191.255.248/29
 
 volumes:
   sidecar-state:
-  sandboxd-state:
-  sandboxd-backups:
+  sandboxd-caddy-data:
+  sandboxd-caddy-config:
