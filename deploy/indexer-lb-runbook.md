@@ -37,14 +37,16 @@ An Indexer backend has an attestation-derived signing key and its own cursor dat
 
 The implemented cutover is:
 
-1. `prepare`: probe the candidate or every pool member and verify its identity/readiness; pause new LB frontend accepts while existing streams continue.
-2. Update `IndexerRegistry` to the stable LB endpoint plus candidate code ID/pubkey.
-3. `commit`: re-probe, switch both HAProxy backends to the selected worker(s), close old LB streams, and reopen the frontends.
+1. `prepare`: create a durable operation ID, probe the candidate or every pool member, verify its identity/readiness, and pause new LB frontend accepts while existing streams continue.
+2. Persist registry-mutation intent in the controller journal, then update `IndexerRegistry` to the stable LB endpoint plus candidate code ID/pubkey.
+3. `commit`: present the same operation ID, re-probe, switch both HAProxy backends to the selected worker(s), close old LB streams, and reopen the frontends.
 4. Sidecars reconnect, re-read the registry, and send their last handled block. The candidate replays that block, so same-block duplicates are possible but gaps are not.
 
 The sidecar persists the last signed checkpoint in `SIDECAR_STATE_DIR/indexer-cursor.v1`. Every production sidecar must run the protocol-v3 exact-cursor implementation and mount `SIDECAR_STATE_DIR` on durable storage before a shared pool is activated. An ephemeral or missing state directory can lose the exact resume cursor on restart.
 
-If the registry transaction fails, the driver aborts the prepare and keeps the old backend. If commit fails after the transaction, it restores both the previous registry record and the previous HAProxy pool. Registry rollback happens first so the old data plane is never deliberately reopened against the new identity.
+The driver stores its crash-durable transaction journal in `deploy/logs/indexer-lb-transaction-<lb-name>.json`. If it exits or loses an SSH/HTTP response, run `deploy/indexer-lb-node.sh <lb-name> recover`; recovery queries the operation ID instead of assuming a timed-out commit failed. If the registry transaction fails, the driver keeps the old backend. If commit definitively fails after the transaction, it restores the previous endpoint/code ID/pubkey tuple with a fresh on-chain `updatedAt`, then restores the previous HAProxy pool. Registry rollback happens first so the old data plane is never deliberately reopened against the new identity.
+
+Registry writes currently require the configured `DEPLOYER_ADDR` to equal `IndexerRegistry.owner()`. The driver fails before prepare if ownership differs; it does not yet emit an org Safe transaction flow.
 
 ## Stage A shared-identity worker pool
 
@@ -56,11 +58,15 @@ Stage A makes the Indexer workers redundant while retaining the existing stable 
 - a distinct, nonzero `servingMemberId`
 - an RPC-reachable, caught-up read model
 
-The `indexerCluster` must be a dedicated Dstack-only Indexer cluster. It must not be the main C3 cluster that contains the LB or general workloads. Named worker state is used as the expected cluster and compose hash; the driver rejects a status response that differs from it and requires every replica to have the same hash. Shared named workers must be reachable over the same host's private bridge because the main-C3 LB has no mesh route into the dedicated cluster. Alternatively, pass explicitly private routable IPs together with `INDEXER_BACKEND_CODE_ID` and `INDEXER_HA_CLUSTER`.
+The `indexerCluster` must be a dedicated Dstack-only Indexer cluster. It must not be the main C3 cluster that contains the LB or general workloads. Named worker state is used as the expected cluster and compose hash; the driver reads only the fixed `VM_ID`, `X`, `CLUSTER`, and `H` keys as untrusted data, validates their exact shapes, and never sources the state file as shell code. It rejects a status response that differs from that state and requires every replica to have the same hash. Shared named workers must be reachable over the same host's private bridge because the main-C3 LB has no mesh route into the dedicated cluster. Alternatively, pass explicitly private routable IPs together with `INDEXER_BACKEND_CODE_ID` and `INDEXER_HA_CLUSTER`.
 
 Every shared-pool operation also requires `INDEXER_BACKEND_PUBKEY` as a nonzero, independently obtained pin. Obtain and verify this key from trusted enclave serial output or attestation evidence out of band; never copy it from the unauthenticated bridge `/status` response used by the switch. The driver requires every worker's reported key to match the pin before it can prepare the registry transaction.
 
 Shared activation is additionally fail-closed behind `INDEXER_PROTOCOL_V3_FLEET_CONFIRMED=1`. Set this operator confirmation only after fleet inventory proves that all production sidecars have both durable `SIDECAR_STATE_DIR` storage and protocol-v3 exact-cursor support. The driver and the sealed LB controller both require the exact value `1`; update an existing LB once to seal the confirmation before its first pool switch. Without it, every multi-backend switch and shared initial pool is rejected, while legacy single-backend blue/green switching remains available.
+
+### Dedicated worker bootstrap placeholder
+
+The exact production bootstrap sequence for the dedicated Indexer cluster and its shared worker identity is intentionally pending the reviewed worker deployment slice. It must pin the approved artifact/compose hash and document the owner or Safe-mediated cluster-acceptance flow before operators use it. Until that procedure lands, do not infer ad-hoc cluster or Safe commands from this LB runbook; use the existing deployment helpers only in their documented modes and do not activate an unreviewed production pool.
 
 Select a prepared shared pool with one comma-separated argument:
 
@@ -78,9 +84,9 @@ deploy/indexer-lb-node.sh attestmesh-indexer-lb verify-lb
 
 Pool preparation intentionally does not require `grpcAccepting=true`: a worker may keep gRPC closed while the registry still names the old identity. Preparation does require every worker's exact shared identity, code ID, dedicated cluster, distinct member ID, RPC reachability, chain-head lag below ten blocks, and a populated read model. After the unchanged v1 registry record is written, commit waits up to 90 seconds for every prepared worker to report `grpcAccepting=true` and healthy before exposing any of them.
 
-HAProxy round-robins new TCP connections over healthy workers. Existing streams remain pinned to their selected worker until a cutover closes them. `active` reports the exact persisted backend list and identity metadata; `verify-lb` probes every active shared worker, not only the public endpoint.
+HAProxy round-robins new TCP connections over healthy workers. The gRPC slots forward to `:50052` but use each worker's `:9090/healthz` response as their native health check, so an RPC-dead or lagging worker is removed and its sessions are closed even if the controller is unavailable. The controller watches the HAProxy socket generation; an isolated HAProxy restart automatically reloads and revalidates the crash-durable active pool before reopening. A prepared operation remains paused for explicit recovery. Existing streams otherwise remain pinned to their selected worker until a cutover closes them. `active` reports the exact persisted backend list and identity metadata; `verify-lb` probes every active shared worker, not only the public endpoint.
 
-Stage A removes a single Indexer worker as a serving-path dependency, but the stable LB remains a front-door SPOF. Planned worker maintenance should use a newly prepared pool that omits the drained worker. If compromise of the shared cluster key is suspected, routing eviction is not key rotation: build a fresh dedicated cluster and shared identity, then use the same two-phase switch to rotate the registry and entire pool.
+Stage A removes a single Indexer worker as a serving-path dependency, but the stable LB remains a front-door SPOF. Planned worker maintenance must first switch to a pool that omits the worker, then run `assert-drained` before stopping it. That authenticated assertion requires the current active operation token, no prepared operation, an exact active-pool/runtime match, and the worker's address to be absent. If compromise of the shared cluster key is suspected, routing eviction is not key rotation: build a fresh dedicated cluster and shared identity, then use the same two-phase switch to rotate the registry and entire pool.
 
 ## One-time migration from a direct endpoint
 
@@ -132,18 +138,29 @@ deploy/indexer-lb-node.sh attestmesh-indexer-lb setup
 # Show active/prepared state and HAProxy runtime state.
 deploy/indexer-lb-node.sh attestmesh-indexer-lb active
 
-# Recover an operator-abandoned prepare (reopens the old frontends).
-deploy/indexer-lb-node.sh attestmesh-indexer-lb abort
+# Recover an interrupted/uncertain switch from its durable local journal.
+deploy/indexer-lb-node.sh attestmesh-indexer-lb recover
+
+# Prove a worker is absent from the tokenized active generation and live slots
+# before stopping it. Optionally pin the expected generation in the environment.
+INDEXER_LB_ACTIVE_OPERATION_ID=<64-hex-operation-id> \
+  deploy/indexer-lb-node.sh attestmesh-indexer-lb assert-drained indexer-ha-r1
+
+# Abort only a pre-registry-intent prepare, using its operation ID (or journal).
+deploy/indexer-lb-node.sh attestmesh-indexer-lb abort <operation-id>
 
 # Roll the LB compose itself; its active-backend volume survives the update.
 deploy/indexer-lb-node.sh attestmesh-indexer-lb update
 ```
 
-The control key lives in `~/.attestmesh/indexer-lb.env`. The control listener binds only to `attestmesh0:50053`; it is not a public gateway API.
+The control key lives in `~/.attestmesh/indexer-lb.env`. The control listener binds only to `attestmesh0:50053`; all state and operation endpoints, including `active`, require that bearer key and are not public gateway APIs.
 
 ## Expected delivery semantics
 
 - Backend changes intentionally close gRPC streams; sidecars reconnect with backoff.
-- The last checkpoint block is replayed on a backend with no server cursor. Duplicate events from that block are expected and preserve at-least-once delivery.
+- Protocol v3 resumes strictly after the exact durable `(blockNumber, logIndex)` cursor. A checkpoint cursor denotes the next block to process; it does not replay the preceding checkpoint block.
+- A crash can still duplicate an application effect if a handler performs that effect before durably advancing its cursor. Such effects must therefore be idempotent at the application boundary.
+- A missing or corrupt durable cursor fails closed instead of silently resetting or starting over.
+- The transport cursor is resume metadata, not a durable application inbox. Consumers that need durable work ownership must persist their own inbox/queue before acknowledging handling.
 - Candidate and old Indexers can index concurrently; they are read-only apart from their independent cursor volumes.
 - Do not stop the old backend until the stable public `/status` pubkey matches `IndexerRegistry.current()` and fleet diagnostics have caught up.

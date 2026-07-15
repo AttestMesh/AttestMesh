@@ -105,9 +105,13 @@ services:
         backend indexer_grpc_active
           mode tcp
           balance roundrobin
-          option tcp-check
+          # Forward gRPC to :50052, but use the Indexer's readiness endpoint on
+          # :9090 as the native health signal. This keeps an RPC-dead or lagging
+          # worker out of the gRPC pool even if its TCP listener is still open.
+          option httpchk GET /healthz
+          http-check expect status 200
           default-server inter 3s fall 2 rise 2 on-marked-down shutdown-sessions
-          server-template worker 1-8 127.0.0.1:1 check disabled
+          server-template worker 1-8 127.0.0.1:1 check port 9090 disabled
 
         frontend indexer_http
           mode http
@@ -145,18 +149,22 @@ services:
         . /tmp/indexer-lb.env
         set +a
         cat >/tmp/indexer_lb_controller.py <<'PY'
+        import csv
         import fcntl
         import hmac
         import ipaddress
+        import io
         import json
         import os
         import re
         import socket
         import struct
+        import threading
         import time
         import urllib.request
         from concurrent.futures import ThreadPoolExecutor
         from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+        from urllib.parse import parse_qs, urlparse
 
         ADMIN_KEY = os.environ.get("INDEXER_LB_ADMIN_KEY", "")
         INITIAL_BACKENDS = os.environ.get("INDEXER_LB_INITIAL_BACKEND", "")
@@ -173,14 +181,20 @@ services:
         ACTIVE_CODE_ID_PATH = "/indexer-lb-state/active_code_id"
         ACTIVE_CLUSTER_PATH = "/indexer-lb-state/active_cluster"
         ACTIVE_MEMBERS_PATH = "/indexer-lb-state/active_members"
+        ACTIVE_OPERATION_PATH = "/indexer-lb-state/active_operation"
+        ACTIVE_STATE_PATH = "/indexer-lb-state/active.json"
         PREPARED_PATH = "/indexer-lb-state/prepared.json"
         HEX32_RE = re.compile(r"^0x[0-9a-fA-F]{64}$")
         ADDRESS_RE = re.compile(r"^0x[0-9a-fA-F]{40}$")
+        OPERATION_RE = re.compile(r"^[0-9a-f]{64}$")
         ZERO32 = "0x" + ("0" * 64)
         ZERO_ADDRESS = "0x" + ("0" * 40)
         MAX_BACKENDS = 8
         MAX_HEAD_LAG_BLOCKS = 10
         SERVING_WAIT_SECONDS = 90
+        REQUEST_TIMEOUT_SECONDS = 15
+        MAX_CONTROL_THREADS = 16
+        MUTATION_LOCK = threading.RLock()
 
         if not ADMIN_KEY:
             raise SystemExit("INDEXER_LB_ADMIN_KEY is required")
@@ -207,47 +221,94 @@ services:
             except FileNotFoundError:
                 return ""
 
+        def fsync_parent(path: str) -> None:
+            directory = os.path.dirname(path) or "."
+            fd = os.open(directory, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+            try:
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+
         def write_text(path: str, value: str) -> None:
             tmp = path + ".tmp"
             with open(tmp, "w", encoding="utf-8") as fh:
                 fh.write(value + "\n")
+                fh.flush()
+                os.fsync(fh.fileno())
             os.replace(tmp, path)
+            fsync_parent(path)
+
+        def write_json_atomic(path: str, value: dict) -> None:
+            tmp = path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as fh:
+                json.dump(value, fh, sort_keys=True)
+                fh.write("\n")
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.replace(tmp, path)
+            fsync_parent(path)
+
+        def read_active_json() -> dict:
+            try:
+                with open(ACTIVE_STATE_PATH, "r", encoding="utf-8") as fh:
+                    value = json.load(fh)
+                if not isinstance(value, dict):
+                    raise RuntimeError("active.json must contain a JSON object")
+                return value
+            except FileNotFoundError:
+                return {}
+            except ValueError as exc:
+                raise RuntimeError("active.json is corrupt") from exc
 
         def read_prepared() -> dict:
             try:
                 with open(PREPARED_PATH, "r", encoding="utf-8") as fh:
                     value = json.load(fh)
-                    return value if isinstance(value, dict) else {}
-            except (FileNotFoundError, ValueError):
+                    if not isinstance(value, dict):
+                        raise RuntimeError("prepared journal must be a JSON object")
+                    return value
+            except FileNotFoundError:
                 return {}
+            except ValueError as exc:
+                raise RuntimeError("prepared journal is corrupt") from exc
 
         def write_prepared(value: dict) -> None:
-            tmp = PREPARED_PATH + ".tmp"
-            with open(tmp, "w", encoding="utf-8") as fh:
-                json.dump(value, fh, sort_keys=True)
-            os.replace(tmp, PREPARED_PATH)
+            write_json_atomic(PREPARED_PATH, value)
 
         def clear_prepared() -> None:
             try:
                 os.unlink(PREPARED_PATH)
+                fsync_parent(PREPARED_PATH)
             except FileNotFoundError:
                 pass
 
         def haproxy_cmd(command: str) -> str:
             sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-            sock.settimeout(10)
-            sock.connect(SOCKET_PATH)
-            sock.sendall((command.rstrip() + "\n").encode("utf-8"))
-            sock.shutdown(socket.SHUT_WR)
-            chunks = []
-            while True:
-                chunk = sock.recv(4096)
-                if not chunk:
-                    break
-                chunks.append(chunk)
-            sock.close()
+            try:
+                sock.settimeout(10)
+                sock.connect(SOCKET_PATH)
+                sock.sendall((command.rstrip() + "\n").encode("utf-8"))
+                sock.shutdown(socket.SHUT_WR)
+                chunks = []
+                while True:
+                    chunk = sock.recv(4096)
+                    if not chunk:
+                        break
+                    chunks.append(chunk)
+            finally:
+                sock.close()
             output = b"".join(chunks).decode("utf-8", errors="replace")
-            if output.lstrip().startswith("Unknown command"):
+            lowered = output.strip().lower()
+            failure_markers = (
+                "unknown command",
+                "no such ",
+                "invalid ",
+                "can't ",
+                "cannot ",
+                "permission denied",
+                "error:",
+            )
+            if any(marker in lowered for marker in failure_markers):
                 raise RuntimeError(output.strip())
             return output
 
@@ -293,7 +354,23 @@ services:
                 raise ValueError(f"{field} must be a nonzero 20-byte 0x address")
             return value
 
+        def normalize_operation_id(value: str) -> str:
+            value = value.strip().lower()
+            if not OPERATION_RE.fullmatch(value):
+                raise ValueError("operation_id must be 32 bytes of lowercase hex")
+            return value
+
+        def require_operation(prepared: dict, supplied: str) -> str:
+            operation_id = normalize_operation_id(supplied)
+            expected = str(prepared.get("operation_id", ""))
+            if not expected or not hmac.compare_digest(operation_id, expected):
+                raise ValueError("operation_id does not match the prepared generation")
+            return operation_id
+
         def read_active_backends() -> list[str]:
+            state = read_active_json()
+            if state:
+                return validate_backends(state.get("backends", []), allow_empty=True)
             return validate_backends(read_text(ACTIVE_BACKEND_PATH), allow_empty=True)
 
         def probe_backend(
@@ -510,8 +587,58 @@ services:
                 else:
                     haproxy_cmd(f"disable server indexer_grpc_active/{name}")
                     haproxy_cmd(f"disable server indexer_http_active/{name}")
+                    haproxy_cmd(
+                        f"set server indexer_grpc_active/{name} addr 127.0.0.1 port 1"
+                    )
+                    haproxy_cmd(
+                        f"set server indexer_http_active/{name} addr 127.0.0.1 port 1"
+                    )
                     outputs["slots"].append({"slot": name, "enabled": False})
+            verify_runtime_pool(backends)
             return outputs
+
+        def verify_runtime_pool(backends: list[str]) -> None:
+            raw = haproxy_cmd("show stat")
+            if not raw.startswith("# "):
+                raise RuntimeError("HAProxy show stat returned no CSV header")
+            rows = list(csv.DictReader(io.StringIO(raw[2:])))
+            by_key = {
+                (row.get("pxname", ""), row.get("svname", "")): row
+                for row in rows
+            }
+            for index in range(1, MAX_BACKENDS + 1):
+                name = f"worker{index}"
+                for backend_name, port in (
+                    ("indexer_grpc_active", 50052),
+                    ("indexer_http_active", 9090),
+                ):
+                    row = by_key.get((backend_name, name))
+                    if not row:
+                        raise RuntimeError(
+                            f"HAProxy runtime slot is missing: {backend_name}/{name}"
+                        )
+                    status = row.get("status", "")
+                    if index <= len(backends):
+                        expected_addr = f"{backends[index - 1]}:{port}"
+                        if row.get("addr") != expected_addr:
+                            raise RuntimeError(
+                                f"HAProxy runtime address mismatch for {backend_name}/{name}: "
+                                f"expected {expected_addr}, got {row.get('addr')}"
+                            )
+                        if status.startswith("MAINT"):
+                            raise RuntimeError(
+                                f"HAProxy runtime slot remained disabled: {backend_name}/{name}"
+                            )
+                    else:
+                        if not status.startswith("MAINT"):
+                            raise RuntimeError(
+                                f"unused HAProxy runtime slot remained enabled: {backend_name}/{name}"
+                            )
+                        if row.get("addr") != "127.0.0.1:1":
+                            raise RuntimeError(
+                                f"unused HAProxy runtime slot retained an address: "
+                                f"{backend_name}/{name}={row.get('addr')}"
+                            )
 
         def close_sessions() -> dict:
             outputs = {}
@@ -534,14 +661,39 @@ services:
             code_id: str = "",
             cluster: str = "",
             members: list[str] | None = None,
+            operation_id: str = "",
         ) -> None:
+            state = {
+                "backends": list(backends),
+                "pubkey": pubkey,
+                "code_id": code_id,
+                "cluster": cluster,
+                "members": list(members or []),
+                "operation_id": operation_id,
+            }
+            # active.json is the sole crash-consistent authority. The individual
+            # files remain as a migration/debug compatibility view only.
+            write_json_atomic(ACTIVE_STATE_PATH, state)
             write_text(ACTIVE_BACKEND_PATH, ",".join(backends))
             write_text(ACTIVE_PUBKEY_PATH, pubkey)
             write_text(ACTIVE_CODE_ID_PATH, code_id)
             write_text(ACTIVE_CLUSTER_PATH, cluster)
             write_text(ACTIVE_MEMBERS_PATH, ",".join(members or []))
+            write_text(ACTIVE_OPERATION_PATH, operation_id)
 
         def active_state() -> dict:
+            state = read_active_json()
+            if state:
+                state["backends"] = validate_backends(
+                    state.get("backends", []), allow_empty=True
+                )
+                if not isinstance(state.get("members", []), list):
+                    raise RuntimeError("active.json members must be an array")
+                state["members"] = list(state.get("members", []))
+                operation_id = str(state.get("operation_id", ""))
+                if operation_id:
+                    state["operation_id"] = normalize_operation_id(operation_id)
+                return state
             return {
                 "backends": read_active_backends(),
                 "pubkey": read_text(ACTIVE_PUBKEY_PATH),
@@ -552,6 +704,7 @@ services:
                     for member in read_text(ACTIVE_MEMBERS_PATH).split(",")
                     if member
                 ],
+                "operation_id": read_text(ACTIVE_OPERATION_PATH),
             }
 
         def restore_state(state: dict, *, close_existing: bool) -> dict:
@@ -564,11 +717,131 @@ services:
                 code_id=str(state.get("code_id", "")),
                 cluster=str(state.get("cluster", "")),
                 members=list(state.get("members", [])),
+                operation_id=str(state.get("operation_id", "")),
             )
             return {"haproxy": changed, "closed_sessions": sessions}
 
+        def validate_active_before_reopen(state: dict) -> None:
+            backends = validate_backends(state.get("backends", []), allow_empty=True)
+            if not backends:
+                return
+            pubkey_raw = str(state.get("pubkey", ""))
+            if len(backends) == 1:
+                # Old direct/blue-green state predates active.json and may not have
+                # a persisted key. HAProxy's native /healthz check remains the
+                # fail-closed serving gate for that migration-only case.
+                if pubkey_raw:
+                    probe_pool(
+                        backends,
+                        normalize_pubkey(pubkey_raw),
+                        shared_ha=False,
+                        require_serving=True,
+                    )
+                return
+
+            pubkey = normalize_pubkey(pubkey_raw)
+            code_id = normalize_hex32(
+                str(state.get("code_id", "")), "active.code_id", nonzero=True
+            )
+            cluster = normalize_address(
+                str(state.get("cluster", "")), "active.cluster"
+            )
+            if cluster == LB_CLUSTER:
+                raise RuntimeError("persisted shared pool uses the LB/C3 cluster")
+            members = state.get("members", [])
+            if not isinstance(members, list) or len(members) != len(backends):
+                raise RuntimeError("persisted shared pool has invalid member IDs")
+            normalized_members = [
+                normalize_hex32(str(member), "active.members[]", nonzero=True)
+                for member in members
+            ]
+            if len(set(normalized_members)) != len(normalized_members):
+                raise RuntimeError("persisted shared pool repeats a member ID")
+            probe_pool(
+                backends,
+                pubkey,
+                shared_ha=True,
+                code_id=code_id,
+                cluster=cluster,
+                expected_members=normalized_members,
+                require_serving=True,
+            )
+
+        def reconcile_haproxy(reason: str) -> dict:
+            with MUTATION_LOCK:
+                frontends(False)
+                prepared = read_prepared()
+                if prepared:
+                    if prepared.get("commit_complete") is True:
+                        state = active_state()
+                        if state.get("operation_id") == prepared.get("operation_id"):
+                            validate_active_before_reopen(state)
+                            changed = set_pool(state.get("backends", []))
+                            clear_prepared()
+                            frontends(True)
+                            return {
+                                "reason": reason,
+                                "paused": False,
+                                "completed_commit": True,
+                                "haproxy": changed,
+                            }
+                        # A marker write may have reached disk just before the
+                        # data-plane try block rolled back. Treat an active-state
+                        # mismatch as incomplete and recover journal.previous.
+                        prepared["commit_complete"] = False
+                        prepared.pop("commit_completed_at", None)
+                        write_prepared(prepared)
+                    previous = prepared.get("previous")
+                    if isinstance(previous, dict):
+                        restored = restore_state(
+                            previous,
+                            close_existing=(
+                                prepared.get("commit_started") is True
+                                or prepared.get("registry_intent") is True
+                            ),
+                        )
+                    else:
+                        state = active_state()
+                        restored = restore_state(state, close_existing=False)
+                    # A prepared generation is never reopened automatically. The
+                    # durable driver journal must explicitly commit or abort it.
+                    return {"reason": reason, "paused": True, **restored}
+
+                state = active_state()
+                validate_active_before_reopen(state)
+                changed = set_pool(state.get("backends", []))
+                frontends(True)
+                return {"reason": reason, "paused": False, "haproxy": changed}
+
+        def socket_generation():
+            try:
+                stat = os.stat(SOCKET_PATH)
+                return (stat.st_dev, stat.st_ino, stat.st_mtime_ns)
+            except FileNotFoundError:
+                return None
+
+        def watch_haproxy(initial_generation) -> None:
+            generation = initial_generation
+            while True:
+                current = socket_generation()
+                if current is None:
+                    generation = None
+                elif current != generation:
+                    try:
+                        reconcile_haproxy("socket-generation-change")
+                    except Exception as exc:
+                        print(
+                            "indexer-lb-controller: HAProxy reconciliation failed: "
+                            f"{type(exc).__name__}: {exc}",
+                            flush=True,
+                        )
+                    else:
+                        generation = current
+                time.sleep(1)
+
         def prepare_from_body(body: dict) -> tuple[dict, list[dict]]:
             pubkey = normalize_pubkey(str(body.get("expected_pubkey", "")))
+            operation_id = normalize_operation_id(str(body.get("operation_id", "")))
             if "backends" not in body:
                 # Backward-compatible single-backend blue/green request.
                 backends = [validate_backend(str(body.get("backend", "")).strip())]
@@ -590,6 +863,7 @@ services:
                         "backends": backends,
                         "pubkey": pubkey,
                         "code_id": code_id,
+                        "operation_id": operation_id,
                         "shared_ha": False,
                         "prepared_at": int(time.time()),
                     },
@@ -633,11 +907,53 @@ services:
                     "code_id": code_id,
                     "cluster": cluster,
                     "members": members,
+                    "operation_id": operation_id,
                     "shared_ha": True,
                     "prepared_at": int(time.time()),
                 },
                 probes,
             )
+
+        def prepare_body_matches(prepared: dict, body: dict) -> bool:
+            """Allow an idempotent retry only for the exact bound generation."""
+            try:
+                if prepared.get("shared_ha") is True:
+                    if body.get("protocol_v3_fleet_confirmed") is not True:
+                        return False
+                    return (
+                        validate_backends(body.get("backends"))
+                        == prepared.get("backends")
+                        and normalize_pubkey(str(body.get("expected_pubkey", "")))
+                        == prepared.get("pubkey")
+                        and normalize_hex32(
+                            str(body.get("expected_code_id", "")),
+                            "expected_code_id",
+                            nonzero=True,
+                        )
+                        == prepared.get("code_id")
+                        and normalize_address(
+                            str(body.get("expected_cluster", "")),
+                            "expected_cluster",
+                        )
+                        == prepared.get("cluster")
+                    )
+                if "backends" in body:
+                    return False
+                raw_code_id = str(body.get("expected_code_id", "")).strip()
+                code_id = (
+                    normalize_hex32(raw_code_id, "expected_code_id")
+                    if raw_code_id
+                    else ""
+                )
+                return (
+                    validate_backend(str(body.get("backend", "")).strip())
+                    == prepared.get("backend")
+                    and normalize_pubkey(str(body.get("expected_pubkey", "")))
+                    == prepared.get("pubkey")
+                    and code_id == prepared.get("code_id", "")
+                )
+            except (TypeError, ValueError):
+                return False
 
         def restore_from_body(body: dict) -> dict:
             backends = validate_backends(body.get("backends", []), allow_empty=True)
@@ -660,22 +976,53 @@ services:
             ]
             if normalized_members and len(normalized_members) != len(backends):
                 raise ValueError("active_members length must match backends")
+            active_operation_id = str(body.get("active_operation_id", "")).strip()
+            if active_operation_id:
+                active_operation_id = normalize_operation_id(active_operation_id)
             frontends(False)
-            restored = restore_state(
-                {
-                    "backends": backends,
-                    "pubkey": pubkey,
-                    "code_id": code_id,
-                    "cluster": cluster,
-                    "members": normalized_members,
-                },
-                close_existing=True,
-            )
+            restored_state = {
+                "backends": backends,
+                "pubkey": pubkey,
+                "code_id": code_id,
+                "cluster": cluster,
+                "members": normalized_members,
+                "operation_id": active_operation_id,
+            }
+            validate_active_before_reopen(restored_state)
+            restored = restore_state(restored_state, close_existing=True)
             clear_prepared()
             frontends(True)
             return {"restored": True, **restored}
 
+        class BoundedThreadingHTTPServer(ThreadingHTTPServer):
+            daemon_threads = True
+            request_queue_size = MAX_CONTROL_THREADS
+
+            def __init__(self, *args, **kwargs):
+                self._request_slots = threading.BoundedSemaphore(MAX_CONTROL_THREADS)
+                super().__init__(*args, **kwargs)
+
+            def process_request(self, request, client_address):
+                if not self._request_slots.acquire(blocking=False):
+                    self.shutdown_request(request)
+                    return
+                try:
+                    super().process_request(request, client_address)
+                except Exception:
+                    self._request_slots.release()
+                    raise
+
+            def process_request_thread(self, request, client_address):
+                try:
+                    super().process_request_thread(request, client_address)
+                finally:
+                    self._request_slots.release()
+
         class Handler(BaseHTTPRequestHandler):
+            def setup(self) -> None:
+                super().setup()
+                self.connection.settimeout(REQUEST_TIMEOUT_SECONDS)
+
             def _json(self, status: int, payload: dict) -> None:
                 data = json.dumps(payload, sort_keys=True).encode("utf-8")
                 self.send_response(status)
@@ -689,36 +1036,85 @@ services:
                 return hmac.compare_digest(supplied, f"Bearer {ADMIN_KEY}")
 
             def _body(self) -> dict:
-                length = min(int(self.headers.get("content-length", "0") or 0), 16384)
-                value = json.loads(self.rfile.read(length).decode("utf-8") or "{}")
+                if self.headers.get("transfer-encoding"):
+                    raise ValueError("Transfer-Encoding is not supported")
+                lengths = self.headers.get_all("content-length", [])
+                if len(lengths) > 1:
+                    raise ValueError("exactly one Content-Length is allowed")
+                raw_length = (lengths[0] if lengths else "0") or "0"
+                try:
+                    length = int(raw_length, 10)
+                except ValueError as exc:
+                    raise ValueError("Content-Length must be an integer") from exc
+                if length < 0 or length > 16384:
+                    raise ValueError("Content-Length must be between 0 and 16384")
+                raw = self.rfile.read(length)
+                if len(raw) != length:
+                    raise ValueError("request body ended before Content-Length")
+                value = json.loads(raw.decode("utf-8") or "{}")
                 if not isinstance(value, dict):
                     raise ValueError("request body must be a JSON object")
                 return value
 
             def do_GET(self) -> None:
-                if self.path not in ("/healthz", "/active"):
+                parsed = urlparse(self.path)
+                if parsed.path not in ("/healthz", "/active", "/operation"):
                     self._json(404, {"error": "not found"})
                     return
+                if parsed.path != "/healthz" and not self._authorized():
+                    self._json(401, {"error": "unauthorized"})
+                    return
                 socket_ok = os.path.exists(SOCKET_PATH)
+                if parsed.path == "/healthz":
+                    self._json(200 if socket_ok else 503, {"haproxy_socket": socket_ok})
+                    return
+                if parsed.path == "/operation":
+                    values = parse_qs(parsed.query)
+                    try:
+                        operation_id = normalize_operation_id(
+                            (values.get("operation_id") or [""])[0]
+                        )
+                    except ValueError as exc:
+                        self._json(400, {"error": str(exc)})
+                        return
+                    with MUTATION_LOCK:
+                        prepared = read_prepared()
+                        active = active_state()
+                    if prepared.get("operation_id") == operation_id:
+                        if (
+                            prepared.get("commit_complete") is True
+                            and active.get("operation_id") == operation_id
+                        ):
+                            status = "committed"
+                        elif prepared.get("commit_started") is True:
+                            status = "commit-started"
+                        elif prepared.get("registry_intent") is True:
+                            status = "registry-intent"
+                        else:
+                            status = "prepared"
+                    elif active.get("operation_id") == operation_id:
+                        status = "committed"
+                    else:
+                        status = "unknown"
+                    self._json(200, {"operation_id": operation_id, "status": status})
+                    return
                 state = ""
                 if socket_ok:
                     try:
                         state = haproxy_cmd("show servers state")[:8000]
                     except Exception as exc:
                         state = f"error: {type(exc).__name__}: {exc}"
+                active = active_state()
                 self._json(
                     200,
                     {
-                        "active_backend": read_text(ACTIVE_BACKEND_PATH),
-                        "active_backends": read_active_backends(),
-                        "active_pubkey": read_text(ACTIVE_PUBKEY_PATH),
-                        "active_code_id": read_text(ACTIVE_CODE_ID_PATH),
-                        "active_cluster": read_text(ACTIVE_CLUSTER_PATH),
-                        "active_members": [
-                            member
-                            for member in read_text(ACTIVE_MEMBERS_PATH).split(",")
-                            if member
-                        ],
+                        "active_backend": ",".join(active.get("backends", [])),
+                        "active_backends": active.get("backends", []),
+                        "active_pubkey": active.get("pubkey", ""),
+                        "active_code_id": active.get("code_id", ""),
+                        "active_cluster": active.get("cluster", ""),
+                        "active_members": active.get("members", []),
+                        "active_operation_id": active.get("operation_id", ""),
                         "prepared": read_prepared(),
                         "haproxy_socket": socket_ok,
                         "haproxy_state": state,
@@ -726,19 +1122,104 @@ services:
                 )
 
             def do_POST(self) -> None:
-                if self.path not in ("/prepare", "/commit", "/abort", "/restore"):
+                if self.path not in (
+                    "/prepare",
+                    "/intent",
+                    "/commit",
+                    "/abort",
+                    "/restore",
+                    "/assert-drained",
+                ):
                     self._json(404, {"error": "not found"})
                     return
                 if not self._authorized():
                     self._json(401, {"error": "unauthorized"})
                     return
                 try:
+                    body = self._body()
+                    with MUTATION_LOCK:
+                        self._do_POST_locked(body)
+                except Exception as exc:
+                    self._json(400, {"error": f"{type(exc).__name__}: {exc}"})
+
+            def _do_POST_locked(self, body: dict) -> None:
+                    if self.path == "/assert-drained":
+                        operation_id = normalize_operation_id(
+                            str(body.get("operation_id", ""))
+                        )
+                        backend = validate_backend(str(body.get("backend", "")).strip())
+                        if read_prepared():
+                            self._json(
+                                409,
+                                {"error": "cannot assert drain while an operation is prepared"},
+                            )
+                            return
+                        active = active_state()
+                        active_operation = str(active.get("operation_id", ""))
+                        if not active_operation or not hmac.compare_digest(
+                            operation_id, active_operation
+                        ):
+                            self._json(
+                                409,
+                                {"error": "operation_id is not the active generation"},
+                            )
+                            return
+                        backends = validate_backends(
+                            active.get("backends", []), allow_empty=True
+                        )
+                        if backend in backends:
+                            self._json(
+                                409,
+                                {"error": "backend is still present in the active pool"},
+                            )
+                            return
+                        # Prove persisted state and the live runtime slots agree;
+                        # this makes the assertion safe for a worker-stop gate.
+                        verify_runtime_pool(backends)
+                        self._json(
+                            200,
+                            {
+                                "drained": True,
+                                "backend": backend,
+                                "operation_id": operation_id,
+                                "active_backends": backends,
+                            },
+                        )
+                        return
+
                     if self.path == "/prepare":
-                        prepared, probes = prepare_from_body(self._body())
+                        operation_id = normalize_operation_id(
+                            str(body.get("operation_id", ""))
+                        )
+                        existing = read_prepared()
+                        if existing:
+                            if (
+                                existing.get("operation_id") == operation_id
+                                and prepare_body_matches(existing, body)
+                            ):
+                                self._json(
+                                    200,
+                                    {
+                                        "prepared": existing,
+                                        "operation_id": operation_id,
+                                        "idempotent": True,
+                                    },
+                                )
+                            else:
+                                self._json(
+                                    409,
+                                    {
+                                        "error": "operation_id is already bound to another prepared generation"
+                                    },
+                                )
+                            return
+                        prepared, probes = prepare_from_body(body)
                         # This is the rollback journal for an interrupted commit.
                         # It is cleared only after the new pool is fully persisted.
                         prepared["previous"] = active_state()
                         prepared["commit_started"] = False
+                        prepared["commit_complete"] = False
+                        prepared["registry_intent"] = False
                         write_prepared(prepared)
                         try:
                             frontends(False)
@@ -746,16 +1227,104 @@ services:
                             clear_prepared()
                             frontends(True)
                             raise
-                        self._json(200, {"prepared": prepared, "probes": probes})
+                        self._json(
+                            200,
+                            {
+                                "prepared": prepared,
+                                "probes": probes,
+                                "operation_id": operation_id,
+                            },
+                        )
+                        return
+
+                    prepared = read_prepared()
+                    if self.path == "/commit" and not prepared:
+                        operation_id = normalize_operation_id(
+                            str(body.get("operation_id", ""))
+                        )
+                        if active_state().get("operation_id") == operation_id:
+                            self._json(
+                                200,
+                                {
+                                    "operation_id": operation_id,
+                                    "already_committed": True,
+                                },
+                            )
+                        else:
+                            self._json(409, {"error": "no matching prepared generation"})
+                        return
+                    if not prepared:
+                        if self.path == "/restore":
+                            operation_id = normalize_operation_id(
+                                str(body.get("operation_id", ""))
+                            )
+                            if active_state().get("operation_id") != operation_id:
+                                self._json(
+                                    409,
+                                    {"error": "no matching active generation to restore"},
+                                )
+                                return
+                            restored = restore_from_body(body)
+                            self._json(
+                                200,
+                                {
+                                    **restored,
+                                    "operation_id": operation_id,
+                                    "active_backend": ",".join(read_active_backends()),
+                                    "active_backends": read_active_backends(),
+                                },
+                            )
+                            return
+                        self._json(409, {"error": "no prepared backend or pool"})
+                        return
+                    operation_id = require_operation(
+                        prepared, str(body.get("operation_id", ""))
+                    )
+
+                    if self.path == "/commit" and prepared.get("commit_complete") is True:
+                        if active_state().get("operation_id") != operation_id:
+                            raise RuntimeError(
+                                "completed commit journal does not match active generation"
+                            )
+                        clear_prepared()
+                        self._json(
+                            200,
+                            {
+                                "operation_id": operation_id,
+                                "already_committed": True,
+                            },
+                        )
+                        return
+
+                    if self.path == "/intent":
+                        prepared["registry_intent"] = True
+                        prepared["registry_intent_at"] = int(time.time())
+                        write_prepared(prepared)
+                        frontends(False)
+                        self._json(
+                            200,
+                            {"operation_id": operation_id, "registry_intent": True},
+                        )
                         return
 
                     if self.path == "/abort":
-                        prepared = read_prepared()
+                        if prepared.get("registry_intent") is True:
+                            self._json(
+                                409,
+                                {
+                                    "error": "registry intent is durable; roll back the registry and use restore"
+                                },
+                            )
+                            return
                         previous = prepared.get("previous") if prepared else None
                         if isinstance(previous, dict):
+                            validate_active_before_reopen(previous)
                             restore_state(
                                 previous,
-                                close_existing=prepared.get("commit_started") is True,
+                                close_existing=(
+                                    prepared.get("commit_started") is True
+                                    or prepared.get("registry_intent") is True
+                                ),
                             )
                         else:
                             set_pool(read_active_backends())
@@ -763,25 +1332,29 @@ services:
                         frontends(True)
                         self._json(
                             200,
-                            {"aborted": True, "active_backend": read_text(ACTIVE_BACKEND_PATH)},
+                            {
+                                "aborted": True,
+                                "operation_id": operation_id,
+                                "active_backend": ",".join(read_active_backends()),
+                            },
                         )
                         return
 
                     if self.path == "/restore":
-                        restored = restore_from_body(self._body())
+                        restored = restore_from_body(body)
                         self._json(
                             200,
                             {
                                 **restored,
-                                "active_backend": read_text(ACTIVE_BACKEND_PATH),
+                                "operation_id": operation_id,
+                                "active_backend": ",".join(read_active_backends()),
                                 "active_backends": read_active_backends(),
                             },
                         )
                         return
 
-                    prepared = read_prepared()
-                    if not prepared:
-                        self._json(409, {"error": "no prepared backend or pool"})
+                    if prepared.get("registry_intent") is not True:
+                        self._json(409, {"error": "registry intent was not recorded"})
                         return
                     backends = validate_backends(prepared.get("backends", []))
                     pubkey = normalize_pubkey(str(prepared.get("pubkey", "")))
@@ -789,6 +1362,7 @@ services:
                     if not isinstance(previous, dict):
                         previous = active_state()
                     prepared["commit_started"] = True
+                    prepared["commit_complete"] = False
                     write_prepared(prepared)
                     # Re-probe after the on-chain registry transaction, immediately
                     # before changing the data plane. Shared candidates may have been
@@ -804,21 +1378,37 @@ services:
                             code_id=prepared.get("code_id", ""),
                             cluster=prepared.get("cluster", ""),
                             members=prepared.get("members", []),
+                            operation_id=operation_id,
                         )
-                        clear_prepared()
                         frontends(True)
+                        prepared["commit_complete"] = True
+                        prepared["commit_completed_at"] = int(time.time())
+                        write_prepared(prepared)
                     except Exception:
-                        # A partially applied runtime-slot update must not leak a
-                        # candidate connection after we reopen the old pool.
-                        restore_state(previous, close_existing=True)
-                        frontends(True)
+                        # A partially applied runtime-slot update must not leave a
+                        # candidate connection alive while rollback is pending.
+                        prepared["commit_complete"] = False
+                        prepared.pop("commit_completed_at", None)
+                        try:
+                            frontends(False)
+                        finally:
+                            restore_state(previous, close_existing=True)
+                        write_prepared(prepared)
+                        # Registry intent may already have reached chain. Leave the
+                        # old pool paused until the driver rolls the tuple back and
+                        # calls the token-bound restore endpoint.
                         raise
+                    # If unlink/fsync reports an uncertain outcome, both the
+                    # active state and commit-complete marker still identify this
+                    # generation, so operation status remains safely queryable.
+                    clear_prepared()
                     self._json(
                         200,
                         {
                             "active_backend": ",".join(backends),
                             "active_backends": backends,
                             "active_pubkey": pubkey,
+                            "operation_id": operation_id,
                             "previous_backend": ",".join(previous.get("backends", [])),
                             "previous_backends": previous.get("backends", []),
                             "probes": probes,
@@ -826,8 +1416,6 @@ services:
                             "closed_sessions": sessions,
                         },
                     )
-                except Exception as exc:
-                    self._json(400, {"error": f"{type(exc).__name__}: {exc}"})
 
             def log_message(self, fmt: str, *args) -> None:
                 print(
@@ -841,8 +1429,9 @@ services:
             time.sleep(1)
         if not os.path.exists(SOCKET_PATH):
             raise SystemExit("HAProxy runtime socket did not appear")
-        # HAProxy starts with disabled runtime slots. Restore the persisted pool
-        # (or the one-time initial backend) before reopening an abandoned prepare.
+        # HAProxy starts with disabled runtime slots. Restore and validate the
+        # persisted pool (or one-time initial backend); a prepared generation
+        # remains paused for explicit journal recovery.
         active_backends = read_active_backends()
         if not active_backends and INITIAL_BACKENDS.strip():
             active_backends = validate_backends(INITIAL_BACKENDS)
@@ -869,26 +1458,36 @@ services:
                     ],
                 ),
             )
-        abandoned = read_prepared()
-        previous = abandoned.get("previous") if abandoned else None
-        if (
-            abandoned.get("commit_started") is True
-            and isinstance(previous, dict)
-        ):
-            # The prepared journal is the commit boundary. If the controller died
-            # after changing any runtime slot but before clearing it, restore the
-            # complete old pool and evict sessions from every candidate slot.
-            restore_state(previous, close_existing=True)
-        else:
-            set_pool(active_backends)
-        # A controller restart must never leave frontends paused from an abandoned
-        # prepare or interrupted commit.
-        if abandoned:
-            clear_prepared()
-        frontends(True)
+        elif active_backends and not os.path.exists(ACTIVE_STATE_PATH):
+            # One-time migration from the original split state files.
+            persist_active(
+                active_backends,
+                read_text(ACTIVE_PUBKEY_PATH),
+                code_id=read_text(ACTIVE_CODE_ID_PATH),
+                cluster=read_text(ACTIVE_CLUSTER_PATH),
+                members=[
+                    member
+                    for member in read_text(ACTIVE_MEMBERS_PATH).split(",")
+                    if member
+                ],
+                operation_id=read_text(ACTIVE_OPERATION_PATH),
+            )
+        try:
+            reconcile_haproxy("controller-start")
+        except Exception as exc:
+            # Reconciliation begins by pausing both frontends. Never start the
+            # control plane on an unvalidated or partially restored pool.
+            raise SystemExit(f"initial HAProxy reconciliation failed: {exc}") from exc
+        generation = socket_generation()
+        threading.Thread(
+            target=watch_haproxy,
+            args=(generation,),
+            name="haproxy-generation-watch",
+            daemon=True,
+        ).start()
         ip = mesh_ip()
         print(f"indexer-lb-controller: listening on {ip}:50053", flush=True)
-        ThreadingHTTPServer((ip, 50053), Handler).serve_forever()
+        BoundedThreadingHTTPServer((ip, 50053), Handler).serve_forever()
         PY
         exec python3 /tmp/indexer_lb_controller.py
 

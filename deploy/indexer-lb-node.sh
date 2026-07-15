@@ -21,13 +21,14 @@ source "$HERE/lib.sh"
 : "${RPC_URL:?source deploy/env.sh first}"
 require PRIVATE_KEY RPC_URL CHAIN_ID DEPLOYER_ADDR
 
-NODE="${1:?usage: indexer-lb-node.sh <node-name> [setup|preflight|deploy|prime|bind|start|register-direct|verify|verify-health|verify-lb|active|abort|switch|update|stop|all] [indexer-node-or-ip[,..]]}"
+NODE="${1:?usage: indexer-lb-node.sh <node-name> [setup|preflight|deploy|prime|bind|start|register-direct|verify|verify-health|verify-lb|active|assert-drained|abort|recover|switch|update|stop|all] [target-or-operation-id]}"
 ACTION="${2:-all}"
 TARGET="${3:-}"
 COMPOSE="${COMPOSE:-$ROOT/deploy/compose/indexer-lb-node.yaml}"
 MATRIX_STATE="${MATRIX_STATE:-$LOGDIR/matrix-node-matrix-node.state}"
 GENERIC_STATE="$LOGDIR/generic-node-${NODE}.state"
 LB_STATE="$LOGDIR/indexer-lb-node-${NODE}.state"
+TXN_STATE="$LOGDIR/indexer-lb-transaction-${NODE}.json"
 SECRETS_FILE="${SECRETS_FILE:-$HOME/.attestmesh/indexer-lb.env}"
 GATEWAY_DOMAIN="${GATEWAY_DOMAIN:-gateway.attestmesh.xyz}"
 MESH_SSH_HOST="${MESH_SSH_HOST:-attestmesh-mesh-node}"
@@ -51,14 +52,32 @@ _state_value() {
 }
 
 _load_generic() {
+  local state_cluster
   [ -f "$GENERIC_STATE" ] || die "missing LB node state: $GENERIC_STATE"
-  # shellcheck disable=SC1090
-  source "$GENERIC_STATE"
-  [ -n "${X:-}" ] && [ -n "${H:-}" ] && [ -n "${VM_ID:-}" ] \
-    || die "LB state is missing X/H/VM_ID: $GENERIC_STATE"
+  # State is written from remote MCP responses. Read only fixed keys and treat
+  # every value as untrusted data; never execute the file as shell syntax.
+  X="$(_validate_address "$(_state_value "$GENERIC_STATE" X)" "LB X")"
+  _validate_bytes32 "$(_state_value "$GENERIC_STATE" H)" "LB H" >/dev/null
+  VM_ID="$(_validate_vm_id "$(_state_value "$GENERIC_STATE" VM_ID)" "LB VM_ID")"
+  state_cluster="$(_state_value "$GENERIC_STATE" CLUSTER)"
+  if [ -n "$state_cluster" ]; then
+    CLUSTER="$(_validate_address "$state_cluster" "LB CLUSTER")"
+  fi
 }
 
-_load_lb() { [ -f "$LB_STATE" ] && source "$LB_STATE" || true; }
+_load_lb() {
+  [ -f "$LB_STATE" ] || return 0
+  MESH_IP="$(_state_value "$LB_STATE" MESH_IP)"
+  ACTIVE_BACKEND="$(_state_value "$LB_STATE" ACTIVE_BACKEND)"
+  ACTIVE_BACKEND_NODE="$(_state_value "$LB_STATE" ACTIVE_BACKEND_NODE)"
+  ACTIVE_BACKENDS="$(_state_value "$LB_STATE" ACTIVE_BACKENDS)"
+  ACTIVE_BACKEND_NODES="$(_state_value "$LB_STATE" ACTIVE_BACKEND_NODES)"
+  ACTIVE_PUBKEY="$(_state_value "$LB_STATE" ACTIVE_PUBKEY)"
+  ACTIVE_CODE_ID="$(_state_value "$LB_STATE" ACTIVE_CODE_ID)"
+  ACTIVE_INDEXER_CLUSTER="$(_state_value "$LB_STATE" ACTIVE_INDEXER_CLUSTER)"
+  ACTIVE_MEMBER_IDS="$(_state_value "$LB_STATE" ACTIVE_MEMBER_IDS)"
+  STABLE_ENDPOINT="$(_state_value "$LB_STATE" STABLE_ENDPOINT)"
+}
 
 _save_lb() {
   umask 077
@@ -198,7 +217,47 @@ SCRIPT
 
 _backend_state() {
   local target="$1"
+  [[ "$target" =~ ^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$ ]] \
+    || die "backend node name must be a safe token of at most 128 characters"
   printf '%s\n' "$LOGDIR/generic-node-${target}.state"
+}
+
+_validate_vm_id() {
+  local value="$1" field="${2:-VM_ID}"
+  [[ "$value" =~ ^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$ ]] \
+    || die "$field must be a safe token of at most 128 characters"
+  printf '%s\n' "$value"
+}
+
+_validate_address() {
+  local value="$1" field="$2"
+  [[ "$value" =~ ^0x[0-9a-fA-F]{40}$ ]] \
+    || die "$field must be a 20-byte 0x address"
+  [ "${value,,}" != "$ZERO_ADDRESS" ] || die "$field must be nonzero"
+  printf '%s\n' "${value,,}"
+}
+
+_validate_bytes32() {
+  local value="$1" field="$2"
+  value="0x${value#0x}"
+  [[ "$value" =~ ^0x[0-9a-fA-F]{64}$ ]] \
+    || die "$field must be a 32-byte 0x hex value"
+  [ "${value,,}" != "$ZERO32" ] || die "$field must be nonzero"
+  printf '%s\n' "${value,,}"
+}
+
+_validate_private_ipv4() {
+  local value="$1"
+  python3 - "$value" <<'PY'
+import ipaddress, sys
+try:
+    ip = ipaddress.IPv4Address(sys.argv[1])
+except ipaddress.AddressValueError as exc:
+    raise SystemExit(f"invalid backend IPv4 address: {exc}")
+if not ip.is_private:
+    raise SystemExit("backend must be a private bridge or mesh IPv4 address")
+print(ip)
+PY
 }
 
 _trim() {
@@ -211,7 +270,7 @@ _trim() {
 _backend_ip() {
   local target="$1" require_bridge="${2:-0}" state vm app cluster ip
   if [[ "$target" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
-    printf '%s\n' "$target"
+    _validate_private_ipv4 "$target"
     return 0
   fi
   state="$(_backend_state "$target")"
@@ -219,25 +278,27 @@ _backend_ip() {
   if [ "$require_bridge" = 1 ]; then
     [ "${INDEXER_LB_BACKEND_MODE:-bridge}" = bridge ] \
       || die "shared named workers require same-host bridge routing; mesh mode is only valid for legacy single-C3 candidates"
-    vm="$(_state_value "$state" VM_ID)"
-    [ -n "$vm" ] || die "shared worker state has no VM_ID: $state"
+    vm="$(_validate_vm_id "$(_state_value "$state" VM_ID)" "backend VM_ID")"
     ip="$(_bridge_ip_for_vm "$vm" 2>/dev/null || true)"
     [ -n "$ip" ] \
       || die "shared worker $target has no same-host bridge address; pass an explicitly private routable IP instead"
+    ip="$(_validate_private_ipv4 "$ip")"
     printf '%s\n' "$ip"
     return 0
   fi
   if [ "${INDEXER_LB_BACKEND_MODE:-bridge}" = bridge ]; then
-    vm="$(_state_value "$state" VM_ID)"
+    vm="$(_validate_vm_id "$(_state_value "$state" VM_ID)" "backend VM_ID")"
     ip="$(_bridge_ip_for_vm "$vm" 2>/dev/null || true)"
     if [ -n "$ip" ]; then
+      ip="$(_validate_private_ipv4 "$ip")"
       printf '%s\n' "$ip"
       return 0
     fi
   fi
-  app="$(_state_value "$state" X)"
+  app="$(_validate_address "$(_state_value "$state" X)" "backend X")"
   cluster="$(_state_value "$state" CLUSTER)"
   cluster="${cluster:-${CLUSTER:-}}"
+  cluster="$(_validate_address "$cluster" "backend CLUSTER")"
   _member_mesh_ip "$app" "$cluster"
 }
 
@@ -310,10 +371,8 @@ _backend_metadata() {
         || die "literal shared backend IP requires INDEXER_HA_CLUSTER"
     else
       state="$(_backend_state "$target")"
-      expected_code="$(_state_value "$state" H)"
-      expected_cluster="$(_state_value "$state" CLUSTER)"
-      [ -n "$expected_cluster" ] \
-        || die "shared candidate state has no dedicated CLUSTER: $state"
+      expected_code="$(_validate_bytes32 "$(_state_value "$state" H)" "backend H")"
+      expected_cluster="$(_validate_address "$(_state_value "$state" CLUSTER)" "backend CLUSTER")"
     fi
     expected_code="0x${expected_code#0x}"
     expected_code="${expected_code,,}"
@@ -350,7 +409,7 @@ _backend_metadata() {
     fi
   else
     state="$(_backend_state "$target")"
-    BACKEND_CODE_ID="$(_state_value "$state" H)"
+    BACKEND_CODE_ID="$(_validate_bytes32 "$(_state_value "$state" H)" "backend H")"
   fi
   BACKEND_CODE_ID="0x${BACKEND_CODE_ID#0x}"
   BACKEND_CODE_ID="${BACKEND_CODE_ID,,}"
@@ -443,8 +502,13 @@ _resolve_switch_pool() {
 
 _control_get() {
   local path="$1"
+  _ensure_secrets
   _discover_mesh_ip || die "LB is not registered with a mesh IP"
-  ssh_mesh "curl -fsS --max-time 12 'http://$MESH_IP:50053$path'"
+  ssh_mesh "INDEXER_LB_ADMIN_KEY=$(printf '%q' "$INDEXER_LB_ADMIN_KEY") INDEXER_LB_URL=$(printf '%q' "http://$MESH_IP:50053$path") bash -s" <<'SCRIPT'
+curl -fsS --max-time 15 \
+  -H "Authorization: Bearer $INDEXER_LB_ADMIN_KEY" \
+  "$INDEXER_LB_URL"
+SCRIPT
 }
 
 _control_post() {
@@ -465,11 +529,72 @@ send_seq() {
   send_with_nonce_retry "$label" "$@"
 }
 
+_registry_owner_preflight() {
+  local owner
+  owner=$(cast call "$REGISTRY" 'owner()(address)' --rpc-url "$RPC_URL" 2>/dev/null | tr 'A-F' 'a-f') \
+    || die "could not read IndexerRegistry.owner()"
+  [ "$owner" = "${DEPLOYER_ADDR,,}" ] \
+    || die "IndexerRegistry owner=$owner but configured deployer=${DEPLOYER_ADDR,,}; this driver does not yet emit Safe transactions"
+}
+
 _set_registry() {
   local label="$1" endpoint="$2" code_id="$3" pubkey="$4" updated_at="$5"
+  _registry_owner_preflight
   send_seq "$label" "$REGISTRY" \
     "setIndexer((string,bytes32,bytes32,uint64))" \
     "($endpoint,$code_id,$pubkey,$updated_at)"
+}
+
+_atomic_json_write() {
+  local path="$1" value="$2"
+  python3 - "$path" "$value" <<'PY'
+import json, os, sys
+path, raw = sys.argv[1], sys.argv[2]
+value = json.loads(raw)
+tmp = path + ".tmp"
+os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+with open(tmp, "w", encoding="utf-8") as fh:
+    json.dump(value, fh, sort_keys=True)
+    fh.write("\n")
+    fh.flush()
+    os.fsync(fh.fileno())
+os.chmod(tmp, 0o600)
+os.replace(tmp, path)
+fd = os.open(os.path.dirname(path) or ".", os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+try:
+    os.fsync(fd)
+finally:
+    os.close(fd)
+PY
+}
+
+_txn_update_phase() {
+  local phase="$1" value
+  [ -s "$TXN_STATE" ] || die "missing transaction journal: $TXN_STATE"
+  value=$(jq -c --arg phase "$phase" --argjson at "$(date +%s)" \
+    '.phase=$phase | .phase_updated_at=$at' "$TXN_STATE")
+  _atomic_json_write "$TXN_STATE" "$value"
+}
+
+_txn_clear() {
+  python3 - "$TXN_STATE" <<'PY'
+import os, sys
+path = sys.argv[1]
+try:
+    os.unlink(path)
+except FileNotFoundError:
+    raise SystemExit(0)
+fd = os.open(os.path.dirname(path) or ".", os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+try:
+    os.fsync(fd)
+finally:
+    os.close(fd)
+PY
+}
+
+_operation_status() {
+  local operation_id="$1"
+  _control_get "/operation?operation_id=$operation_id" | jq -er '.status'
 }
 
 _registry_snapshot() {
@@ -482,18 +607,21 @@ _registry_snapshot() {
 
 _stable_endpoint() {
   _load_generic
-  printf 'https://%s-50052.%s\n' "$(printf '%s' "${X#0x}" | tr 'A-Z' 'a-z')" "$GATEWAY_DOMAIN"
+  printf 'https://%s-50052.%s\n' "${X#0x}" "$GATEWAY_DOMAIN"
 }
 
 switch_backend() {
   local requested="${1:-${TARGET:-}}" stable before old_endpoint old_code old_pub old_updated
-  local control_before old_pool_json old_members_json old_active_pub old_active_code old_active_cluster
-  local restore_pub restore_code prepare_payload prepare_out commit_out abort_out restore_payload restore_out
-  local pool_json shared_label
+  local control_before old_pool_json old_members_json old_active_pub old_active_code old_active_cluster old_active_operation
+  local restore_pub restore_code prepare_payload prepare_out commit_out restore_payload restore_out
+  local pool_json targets_json members_json shared_label operation_id operation_status journal
   [ -n "$requested" ] || die "usage: $0 $NODE switch <indexer-node-or-ip[,indexer-node-or-ip...]>"
+  [ ! -s "$TXN_STATE" ] \
+    || die "unfinished Indexer LB transaction journal exists; run '$0 $NODE recover' first: $TXN_STATE"
   _load_generic
   _default_cluster_env
   _ensure_secrets
+  _registry_owner_preflight
   _discover_mesh_ip || die "LB mesh IP unavailable"
   _resolve_switch_pool "$requested"
   stable="$(_stable_endpoint)"
@@ -516,6 +644,7 @@ switch_backend() {
   old_active_pub=$(echo "$control_before" | jq -r '.active_pubkey // empty' | tr 'A-F' 'a-f')
   old_active_code=$(echo "$control_before" | jq -r '.active_code_id // empty' | tr 'A-F' 'a-f')
   old_active_cluster=$(echo "$control_before" | jq -r '.active_cluster // empty' | tr 'A-F' 'a-f')
+  old_active_operation=$(echo "$control_before" | jq -r '.active_operation_id // empty' | tr 'A-F' 'a-f')
   restore_pub="$old_active_pub"
   restore_code="$old_active_code"
   if [ "$(echo "$old_pool_json" | jq 'length')" -gt 0 ]; then
@@ -523,56 +652,111 @@ switch_backend() {
     [ -n "$restore_code" ] || restore_code="$old_code"
   fi
 
+  operation_id=$(openssl rand -hex 32)
+  pool_json=$(printf '%s\n' "${POOL_BACKENDS[@]}" | jq -Rsc 'split("\n") | map(select(length > 0))')
+  targets_json=$(printf '%s\n' "${POOL_TARGETS[@]}" | jq -Rsc 'split("\n") | map(select(length > 0))')
+  members_json=$(printf '%s\n' "${POOL_MEMBER_IDS[@]}" | jq -Rsc 'split("\n") | map(select(length > 0))')
+
   if [ "$POOL_SHARED_HA" = 1 ]; then
-    pool_json=$(printf '%s\n' "${POOL_BACKENDS[@]}" | jq -Rsc 'split("\n") | map(select(length > 0))')
     prepare_payload=$(jq -nc \
       --argjson backends "$pool_json" \
       --arg pubkey "$POOL_PUBKEY" \
       --arg code "$POOL_CODE_ID" \
       --arg cluster "$POOL_CLUSTER" \
-      '{backends:$backends, expected_pubkey:$pubkey, expected_code_id:$code, expected_cluster:$cluster, protocol_v3_fleet_confirmed:true}')
+      --arg operation "$operation_id" \
+      '{backends:$backends, expected_pubkey:$pubkey, expected_code_id:$code, expected_cluster:$cluster, protocol_v3_fleet_confirmed:true, operation_id:$operation}')
     shared_label="shared pool nodes=$POOL_TARGETS_CSV backends=$POOL_BACKENDS_CSV cluster=$POOL_CLUSTER members=$POOL_MEMBER_IDS_CSV"
   else
     prepare_payload=$(jq -nc \
       --arg backend "${POOL_BACKENDS[0]}" \
       --arg pubkey "$POOL_PUBKEY" \
       --arg code "$POOL_CODE_ID" \
-      '{backend:$backend, expected_pubkey:$pubkey, expected_code_id:$code}')
+      --arg operation "$operation_id" \
+      '{backend:$backend, expected_pubkey:$pubkey, expected_code_id:$code, operation_id:$operation}')
     shared_label="candidate=${POOL_TARGETS[0]} backend=${POOL_BACKENDS[0]}"
   fi
+
+  restore_payload=$(jq -nc \
+    --arg operation "$operation_id" \
+    --argjson backends "$old_pool_json" \
+    --arg pubkey "$restore_pub" \
+    --arg code "$restore_code" \
+    --arg cluster "$old_active_cluster" \
+    --arg active_operation "$old_active_operation" \
+    --argjson members "$old_members_json" \
+    '{operation_id:$operation, backends:$backends, active_pubkey:$pubkey, active_code_id:$code, active_cluster:$cluster, active_members:$members, active_operation_id:$active_operation}')
+  journal=$(jq -nc \
+    --arg operation "$operation_id" \
+    --arg requested "$requested" \
+    --arg stable "$stable" \
+    --arg old_endpoint "$old_endpoint" \
+    --arg old_code "$old_code" \
+    --arg old_pub "$old_pub" \
+    --arg old_updated "$old_updated" \
+    --arg new_code "$POOL_CODE_ID" \
+    --arg new_pub "$POOL_PUBKEY" \
+    --arg cluster "$POOL_CLUSTER" \
+    --argjson targets "$targets_json" \
+    --argjson backends "$pool_json" \
+    --argjson members "$members_json" \
+    --argjson prepare "$prepare_payload" \
+    --argjson restore "$restore_payload" \
+    --argjson created "$(date +%s)" \
+    --arg shared "$POOL_SHARED_HA" \
+    '{operation_id:$operation, phase:"created", created_at:$created, requested:$requested, stable_endpoint:$stable, old_registry:{endpoint:$old_endpoint,code_id:$old_code,pubkey:$old_pub,updated_at:$old_updated}, new_registry:{endpoint:$stable,code_id:$new_code,pubkey:$new_pub}, pool:{targets:$targets,backends:$backends,members:$members,pubkey:$new_pub,code_id:$new_code,cluster:$cluster,shared:($shared == "1")}, prepare_payload:$prepare, restore_payload:$restore}')
+  _atomic_json_write "$TXN_STATE" "$journal"
   log "▶ preparing Indexer LB $NODE $shared_label pubkey=$POOL_PUBKEY"
   if ! prepare_out="$(_control_post /prepare "$prepare_payload" 2>&1)"; then
-    _control_post /abort '{}' >/dev/null 2>&1 || true
-    die "LB prepare failed: $prepare_out"
+    operation_status="$(_operation_status "$operation_id" 2>/dev/null || true)"
+    if [ "$operation_status" = prepared ]; then
+      if _control_post /abort "$(jq -nc --arg operation "$operation_id" '{operation_id:$operation}')" >/dev/null 2>&1; then
+        _txn_clear
+      fi
+    elif [ "$operation_status" = unknown ]; then
+      _txn_clear
+    fi
+    die "LB prepare failed or response was uncertain (journal retained unless safely aborted): $prepare_out"
   fi
+  [ "$(echo "$prepare_out" | jq -r '.operation_id // empty')" = "$operation_id" ] \
+    || die "LB prepare returned the wrong operation_id; recover using $TXN_STATE"
+  _txn_update_phase prepared
   echo "$prepare_out" | tee "$LOGDIR/indexer-lb-prepare-${NODE}.$(ts).log"
 
+  _txn_update_phase registry-intent
+  if ! _control_post /intent "$(jq -nc --arg operation "$operation_id" '{operation_id:$operation}')" >/dev/null; then
+    die "could not durably mark registry intent; LB remains paused and recovery journal is $TXN_STATE"
+  fi
   log "▶ updating IndexerRegistry at unchanged stable endpoint=$stable codeId=$POOL_CODE_ID"
   if ! _set_registry "indexer-lb-registry-${NODE}" "$stable" "$POOL_CODE_ID" "$POOL_PUBKEY" "$(date +%s)"; then
-    if ! abort_out="$(_control_post /abort '{}' 2>&1)"; then
-      die "registry update failed and LB abort failed; frontends may remain paused: $abort_out"
+    if ! restore_out="$(_control_post /restore "$restore_payload" 2>&1)"; then
+      die "registry update failed and old pool restore failed; frontends remain paused and journal is $TXN_STATE: $restore_out"
     fi
+    _txn_clear
     die "registry update failed; previous LB pool restored and frontends reopened"
   fi
+  _txn_update_phase registry-updated
 
   log "▶ committing Indexer LB data-plane pool and reconnecting subscribers"
-  if ! commit_out="$(_control_post /commit '{}' 2>&1)"; then
-    log "commit failed; rolling the registry back before restoring the previous data-plane pool"
-    if ! _set_registry "indexer-lb-registry-rollback-${NODE}" "$old_endpoint" "$old_code" "$old_pub" "$old_updated"; then
-      die "LB commit failed AND registry rollback failed; data-plane state was not changed by the driver: $commit_out"
+  if ! commit_out="$(_control_post /commit "$(jq -nc --arg operation "$operation_id" '{operation_id:$operation}')" 2>&1)"; then
+    operation_status="$(_operation_status "$operation_id" 2>/dev/null || true)"
+    if [ "$operation_status" = committed ]; then
+      commit_out=$(jq -nc --arg operation "$operation_id" \
+        '{operation_id:$operation, committed_after_uncertain_response:true}')
+    elif [ -n "$operation_status" ] && [ "$operation_status" != unknown ]; then
+      log "commit failed; rolling the registry tuple back before restoring the previous data-plane pool"
+      if ! _set_registry "indexer-lb-registry-rollback-${NODE}" "$old_endpoint" "$old_code" "$old_pub" "$(date +%s)"; then
+        die "LB commit failed AND registry rollback failed; frontends remain paused and journal is $TXN_STATE: $commit_out"
+      fi
+      if ! restore_out="$(_control_post /restore "$restore_payload" 2>&1)"; then
+        die "LB commit failed; previous registry tuple was restored with a fresh timestamp but pool restore failed: $restore_out"
+      fi
+      _txn_clear
+      die "LB commit failed; previous registry tuple and LB pool were restored: $commit_out"
+    else
+      die "LB commit outcome is uncertain; no rollback was attempted. Run '$0 $NODE recover' using $TXN_STATE: $commit_out"
     fi
-    restore_payload=$(jq -nc \
-      --argjson backends "$old_pool_json" \
-      --arg pubkey "$restore_pub" \
-      --arg code "$restore_code" \
-      --arg cluster "$old_active_cluster" \
-      --argjson members "$old_members_json" \
-      '{backends:$backends, active_pubkey:$pubkey, active_code_id:$code, active_cluster:$cluster, active_members:$members}')
-    if ! restore_out="$(_control_post /restore "$restore_payload" 2>&1)"; then
-      die "LB commit failed; previous registry record was restored but previous LB pool restore failed: $restore_out"
-    fi
-    die "LB commit failed; previous registry record and LB pool were restored: $commit_out"
   fi
+  _txn_update_phase committed
   echo "$commit_out" | tee "$LOGDIR/indexer-lb-commit-${NODE}.$(ts).log"
 
   ACTIVE_BACKEND="${POOL_BACKENDS[0]}"
@@ -586,7 +770,107 @@ switch_backend() {
   STABLE_ENDPOINT="$stable"
   _save_lb
   verify_lb
+  _txn_clear
   log "✔ Indexer LB active $shared_label; keep the old worker(s) running until subscriber diagnostics reconnect"
+}
+
+_finalize_recovered_transaction() {
+  local first_backend first_target
+  first_backend=$(jq -r '.pool.backends[0]' "$TXN_STATE")
+  first_target=$(jq -r '.pool.targets[0]' "$TXN_STATE")
+  ACTIVE_BACKEND="$first_backend"
+  ACTIVE_BACKEND_NODE="$first_target"
+  ACTIVE_BACKENDS=$(jq -r '.pool.backends | join(",")' "$TXN_STATE")
+  ACTIVE_BACKEND_NODES=$(jq -r '.pool.targets | join(",")' "$TXN_STATE")
+  ACTIVE_PUBKEY=$(jq -r '.pool.pubkey' "$TXN_STATE")
+  ACTIVE_CODE_ID=$(jq -r '.pool.code_id' "$TXN_STATE")
+  ACTIVE_INDEXER_CLUSTER=$(jq -r '.pool.cluster' "$TXN_STATE")
+  ACTIVE_MEMBER_IDS=$(jq -r '.pool.members | join(",")' "$TXN_STATE")
+  STABLE_ENDPOINT=$(jq -r '.stable_endpoint' "$TXN_STATE")
+  _save_lb
+  verify_lb
+  _txn_clear
+  log "✔ recovered and finalized committed Indexer LB transaction"
+}
+
+recover_transaction() {
+  local operation_id status registry current_endpoint current_code current_pub
+  local new_endpoint new_code new_pub old_endpoint old_code old_pub restore_payload commit_out
+  [ -s "$TXN_STATE" ] || die "no unfinished Indexer LB transaction journal: $TXN_STATE"
+  _load_generic
+  _default_cluster_env
+  _ensure_secrets
+  _discover_mesh_ip || die "LB mesh IP unavailable"
+  _registry_owner_preflight
+  operation_id=$(jq -er '.operation_id' "$TXN_STATE") \
+    || die "transaction journal has no operation_id: $TXN_STATE"
+  status="$(_operation_status "$operation_id")" \
+    || die "could not determine controller operation status; leaving journal untouched"
+  registry="$(_registry_snapshot)" || die "could not read IndexerRegistry.current()"
+  current_endpoint=$(echo "$registry" | jq -r '.[0]')
+  current_code=$(echo "$registry" | jq -r '.[1]' | tr 'A-F' 'a-f')
+  current_pub=$(echo "$registry" | jq -r '.[2]' | tr 'A-F' 'a-f')
+  new_endpoint=$(jq -r '.new_registry.endpoint' "$TXN_STATE")
+  new_code=$(jq -r '.new_registry.code_id' "$TXN_STATE" | tr 'A-F' 'a-f')
+  new_pub=$(jq -r '.new_registry.pubkey' "$TXN_STATE" | tr 'A-F' 'a-f')
+  old_endpoint=$(jq -r '.old_registry.endpoint' "$TXN_STATE")
+  old_code=$(jq -r '.old_registry.code_id' "$TXN_STATE" | tr 'A-F' 'a-f')
+  old_pub=$(jq -r '.old_registry.pubkey' "$TXN_STATE" | tr 'A-F' 'a-f')
+  restore_payload=$(jq -c '.restore_payload' "$TXN_STATE")
+
+  if [ "$status" = committed ] \
+    && [ "$current_endpoint" = "$new_endpoint" ] \
+    && [ "$current_code" = "$new_code" ] \
+    && [ "$current_pub" = "$new_pub" ]; then
+    _finalize_recovered_transaction
+    return 0
+  fi
+
+  if [ "$status" = unknown ] \
+    && [ "$current_endpoint" = "$old_endpoint" ] \
+    && [ "$current_code" = "$old_code" ] \
+    && [ "$current_pub" = "$old_pub" ]; then
+    _txn_clear
+    log "✔ cleared a transaction that never reached the controller or registry"
+    return 0
+  fi
+
+  if [ "$current_endpoint" = "$old_endpoint" ] \
+    && [ "$current_code" = "$old_code" ] \
+    && [ "$current_pub" = "$old_pub" ]; then
+    if [ "$status" = prepared ]; then
+      _control_post /abort "$(jq -nc --arg operation "$operation_id" '{operation_id:$operation}')" >/dev/null \
+        || die "controller abort failed; journal retained"
+    else
+      _control_post /restore "$restore_payload" >/dev/null \
+        || die "controller old-pool restore failed; journal retained"
+    fi
+    _txn_clear
+    log "✔ recovered the previous registry tuple and LB pool"
+    return 0
+  fi
+
+  if [ "$current_endpoint" = "$new_endpoint" ] \
+    && [ "$current_code" = "$new_code" ] \
+    && [ "$current_pub" = "$new_pub" ] \
+    && [ "$status" != unknown ]; then
+    if commit_out="$(_control_post /commit "$(jq -nc --arg operation "$operation_id" '{operation_id:$operation}')" 2>&1)" \
+      || [ "$(_operation_status "$operation_id" 2>/dev/null || true)" = committed ]; then
+      _txn_update_phase committed
+      _finalize_recovered_transaction
+      return 0
+    fi
+    log "forward recovery failed; restoring the previous registry tuple with a fresh timestamp"
+    _set_registry "indexer-lb-registry-recover-rollback-${NODE}" \
+      "$old_endpoint" "$old_code" "$old_pub" "$(date +%s)" \
+      || die "recovery registry rollback failed; journal retained: $commit_out"
+    _control_post /restore "$restore_payload" >/dev/null \
+      || die "registry rolled back but LB pool restore failed; journal retained"
+    _txn_clear
+    die "forward recovery failed; previous registry tuple and LB pool were restored"
+  fi
+
+  die "registry/controller state does not match either journal generation; no mutation performed"
 }
 
 verify_sidecar_health() {
@@ -697,7 +981,51 @@ verify_lb() {
 }
 
 active() { _control_get /active | jq; }
-abort_prepare() { _control_post /abort '{}' | jq; }
+
+assert_drained() {
+  local target="${1:-}" backend control operation_id pinned_operation payload
+  [ -n "$target" ] \
+    || die "usage: $0 $NODE assert-drained <indexer-worker-node-or-private-ip>"
+  [[ "$target" != *,* ]] || die "assert-drained accepts exactly one worker"
+  backend="$(_backend_ip "$target" 1)" \
+    || die "could not resolve worker to assert drained: $target"
+  control="$(_control_get /active)" || die "could not read active LB generation"
+  operation_id=$(echo "$control" | jq -er '.active_operation_id | select(type == "string" and test("^[0-9a-f]{64}$"))') \
+    || die "LB has no tokenized active generation; perform a successful switch before stopping workers"
+  pinned_operation="${INDEXER_LB_ACTIVE_OPERATION_ID:-}"
+  if [ -n "$pinned_operation" ]; then
+    pinned_operation="${pinned_operation,,}"
+    [[ "$pinned_operation" =~ ^[0-9a-f]{64}$ ]] \
+      || die "INDEXER_LB_ACTIVE_OPERATION_ID must be 32 bytes of lowercase hex"
+    [ "$pinned_operation" = "$operation_id" ] \
+      || die "active LB operation changed: expected $pinned_operation, got $operation_id"
+  fi
+  payload=$(jq -nc \
+    --arg operation "$operation_id" \
+    --arg backend "$backend" \
+    '{operation_id:$operation,backend:$backend}')
+  _control_post /assert-drained "$payload" | jq
+}
+
+abort_prepare() {
+  local operation_id="${1:-}" journal_operation=""
+  if [ -s "$TXN_STATE" ]; then
+    journal_operation=$(jq -er '.operation_id | select(type == "string" and test("^[0-9a-f]{64}$"))' "$TXN_STATE") \
+      || die "transaction journal contains an invalid operation_id: $TXN_STATE"
+  fi
+  if [ -z "$operation_id" ]; then
+    operation_id="$journal_operation"
+  elif [ -n "$journal_operation" ] && [ "${operation_id,,}" != "$journal_operation" ]; then
+    die "refusing to abort operation $operation_id while local journal tracks $journal_operation"
+  fi
+  operation_id="${operation_id,,}"
+  [ -n "$operation_id" ] \
+    || die "abort requires an operation_id or local transaction journal"
+  [[ "$operation_id" =~ ^[0-9a-f]{64}$ ]] \
+    || die "abort operation_id must be 32 bytes of lowercase hex"
+  _control_post /abort "$(jq -nc --arg operation "$operation_id" '{operation_id:$operation}')" | jq
+  [ ! -s "$TXN_STATE" ] || _txn_clear
+}
 
 log "=== AttestMesh Indexer LB node: $NODE ==="
 case "$ACTION" in
@@ -706,7 +1034,9 @@ case "$ACTION" in
   verify-health) verify_sidecar_health ;;
   verify-lb) verify_lb ;;
   active) active ;;
-  abort) abort_prepare ;;
+  assert-drained) assert_drained "$TARGET" ;;
+  abort) abort_prepare "$TARGET" ;;
+  recover) recover_transaction ;;
   switch) switch_backend "$TARGET" ;;
   update) generic update; verify_sidecar_health; verify_lb ;;
   stop) generic stop ;;
@@ -717,5 +1047,5 @@ case "$ACTION" in
     _discover_mesh_ip || die "LB failed to acquire a mesh IP"
     switch_backend "${TARGET:-${INDEXER_LB_INITIAL_INDEXER:-attestmesh-indexer-c3-green}}"
     ;;
-  *) die "usage: $0 <node-name> [setup|preflight|deploy|prime|bind|start|register-direct|verify|verify-health|verify-lb|active|abort|switch|update|stop|all] [indexer-node-or-ip[,..]]" ;;
+  *) die "usage: $0 <node-name> [setup|preflight|deploy|prime|bind|start|register-direct|verify|verify-health|verify-lb|active|assert-drained|abort|recover|switch|update|stop|all] [target-or-operation-id]" ;;
 esac
