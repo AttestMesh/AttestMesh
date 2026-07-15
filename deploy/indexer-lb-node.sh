@@ -1216,12 +1216,10 @@ _ingest_legacy_candidate_state() {
   destination="$LB_PRIVATE_STATE_DIR/legacy-candidate-${target}.state"
   expected_hash="${INDEXER_EXPECTED_BACKEND_STATE_SHA256:-}"
   expected_app="${INDEXER_EXPECTED_BACKEND_APP_ID:-}"
-  [ -n "$expected_hash" ] || [ -n "$expected_app" ] \
-    || die "legacy LOGDIR candidate ingestion requires independent INDEXER_EXPECTED_BACKEND_STATE_SHA256 or INDEXER_EXPECTED_BACKEND_APP_ID"
-  if [ -n "$expected_hash" ]; then
-    [[ "$expected_hash" =~ ^[0-9a-f]{64}$ ]] \
-      || die "INDEXER_EXPECTED_BACKEND_STATE_SHA256 must be 64 lowercase hex characters"
-  fi
+  [ -n "$expected_hash" ] \
+    || die "legacy LOGDIR candidate ingestion requires independent INDEXER_EXPECTED_BACKEND_STATE_SHA256; an app ID alone does not bind VM_ID and H"
+  [[ "$expected_hash" =~ ^[0-9a-f]{64}$ ]] \
+    || die "INDEXER_EXPECTED_BACKEND_STATE_SHA256 must be 64 lowercase hex characters"
   if [ -n "$expected_app" ]; then
     expected_app="$(_validate_address "$expected_app" "INDEXER_EXPECTED_BACKEND_APP_ID")"
   fi

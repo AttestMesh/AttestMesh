@@ -929,7 +929,7 @@ class DriverTransactionTests(unittest.TestCase):
         self.assertEqual(swapped.returncode, 83, swapped.stderr)
         self.assertIn("independently pinned LB app", swapped.stderr)
 
-    def test_legacy_candidate_ingestion_requires_independent_digest(self) -> None:
+    def test_legacy_candidate_ingestion_requires_digest_and_optionally_binds_app(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             logs = root / "logs"
@@ -969,6 +969,13 @@ class DriverTransactionTests(unittest.TestCase):
             unpinned = run_bash(harness, str(logs), str(private))
             self.assertEqual(unpinned.returncode, 84, unpinned.stderr)
             self.assertIn("requires independent", unpinned.stderr)
+            app_only = run_bash(
+                "INDEXER_EXPECTED_BACKEND_APP_ID=0x" + ("1" * 40) + "\n" + harness,
+                str(logs),
+                str(private),
+            )
+            self.assertEqual(app_only.returncode, 84, app_only.stderr)
+            self.assertIn("app ID alone does not bind VM_ID and H", app_only.stderr)
             mismatched = run_bash(
                 "INDEXER_EXPECTED_BACKEND_STATE_SHA256=" + ("0" * 64) + "\n" + harness,
                 str(logs),
@@ -985,6 +992,17 @@ class DriverTransactionTests(unittest.TestCase):
             snapshot = private / "legacy-candidate-blue.state"
             self.assertTrue(snapshot.is_file())
             self.assertEqual(snapshot.stat().st_mode & 0o777, 0o600)
+            digest_and_app = run_bash(
+                "INDEXER_EXPECTED_BACKEND_STATE_SHA256="
+                + digest
+                + "\nINDEXER_EXPECTED_BACKEND_APP_ID=0x"
+                + ("1" * 40)
+                + "\n"
+                + harness,
+                str(logs),
+                str(private),
+            )
+            self.assertEqual(digest_and_app.returncode, 0, digest_and_app.stderr)
 
     def test_legacy_lb_routing_migration_requires_authenticated_active_match(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
