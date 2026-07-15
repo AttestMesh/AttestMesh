@@ -185,9 +185,10 @@ services:
     # v21 = user-visible orchestrator failure details in enclave deploys;
     # v20 = CLUSTER_NETWORKS-only live mesh config + structured orchestrator errors;
     # v19 = Apps → Sandboxes rename (labels only, wire stays app).
-    # v47 = fleet-control main f3f916b — full-width deployment/activity details,
-    #       complete hosted-app failure diagnostics, and the public app directory.
-    image: ghcr.io/attestmesh/synclave-app:sha-f3f916b5eba2c84214b3574ee38938b1b42906fd@sha256:fc3fa44569fadfa789918bf317e1b0a228cdab2f53ea3b18a483495a700d35f7
+    # v48 = fleet-control main ccabea7 — full-width deployment/activity details,
+    #       complete hosted-app failure diagnostics, public app directory, and no
+    #       global rollout containment check. Custom domains remain excluded.
+    image: ghcr.io/attestmesh/synclave-app:sha-ccabea75072c128902796b67889a026fe1383617@sha256:3e47d0e8df4f2907f31e835771aa07c88915669495b579616d0d55461fe61885
     environment:
       API_HOST: 0.0.0.0
       API_PORT: 80
