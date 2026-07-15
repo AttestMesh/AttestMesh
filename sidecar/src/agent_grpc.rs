@@ -149,14 +149,19 @@ impl Agent for AgentService {
         _: Request<Empty>,
     ) -> Result<Response<Self::SubscribeMessagesStream>, Status> {
         let rx = self.shared.incoming_tx.subscribe();
-        let stream = BroadcastStream::new(rx).filter_map(|item| {
-            item.ok().map(|m| {
-                Ok(IncomingMessage {
-                    sender_member_id: m.sender_member_id.to_vec(),
-                    payload: m.payload,
-                    block_number: m.block_number,
-                })
-            })
+        let stream = BroadcastStream::new(rx).filter_map(|item| match item {
+            Ok(m) => Some(Ok(IncomingMessage {
+                sender_member_id: m.sender_member_id.to_vec(),
+                payload: m.payload,
+                block_number: m.block_number,
+            })),
+            Err(error) => {
+                tracing::warn!(
+                    ?error,
+                    "SubscribeMessages receiver lagged; messages were dropped"
+                );
+                None
+            }
         });
         Ok(Response::new(Box::pin(stream)))
     }
@@ -168,8 +173,8 @@ impl Agent for AgentService {
         _: Request<Empty>,
     ) -> Result<Response<Self::SubscribePeerEventsStream>, Status> {
         let rx = self.shared.peer_event_tx.subscribe();
-        let stream = BroadcastStream::new(rx).filter_map(|item| {
-            item.ok().map(|ev| {
+        let stream = BroadcastStream::new(rx).filter_map(|item| match item {
+            Ok(ev) => {
                 let kind = match ev {
                     AppPeerEvent::Joined { member_id, mesh_ip } => {
                         peer_event::Kind::Joined(PeerJoined {
@@ -184,8 +189,15 @@ impl Agent for AgentService {
                         })
                     }
                 };
-                Ok(PeerEvent { kind: Some(kind) })
-            })
+                Some(Ok(PeerEvent { kind: Some(kind) }))
+            }
+            Err(error) => {
+                tracing::warn!(
+                    ?error,
+                    "SubscribePeerEvents receiver lagged; events were dropped"
+                );
+                None
+            }
         });
         Ok(Response::new(Box::pin(stream)))
     }

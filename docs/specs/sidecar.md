@@ -1,10 +1,10 @@
 # AttestMesh Sidecar — Component Spec
 
-**Status**: Implemented v1 + protocol-v2 Indexer delivery — Base canary rollout pending; see §1.1 and [`docs/deployment.md`](../deployment.md)
+**Status**: Implemented v1 + protocol-v3 exact-cursor Indexer delivery; shared-worker production rollout pending
 **Parent spec**: [`attestmesh-coordination-layer.md`](./attestmesh-coordination-layer.md) (especially §7, §8)
 **Component**: `sidecar/`
 **Binary**: `cluster-mesh-agent`
-**Last updated**: 2026-07-11
+**Last updated**: 2026-07-14
 
 ---
 
@@ -14,7 +14,7 @@ The sidecar is the per-node process that turns "a CVM running in dstack" into "a
 
 ### 1.1 Implementation status (v1)
 
-The original two-node bring-up is live-proven on Base mainnet (8453); see [`docs/deployment.md`](../deployment.md). `state::run()` drives key derivation, proof construction, sponsored registration, wireguard-over-gateway setup, heartbeats, CSK lifecycle, and the app/peer gRPC façades. Protocol v2 replaces the former sidecar `MessageSent` log poll with signed Indexer envelope dispatch while direct RPC remains limited to current-state views. The v2 path has unit and fake-Indexer transport coverage (including ACK ordering and checkpoints) and awaits the documented Indexer-first canary rollout.
+The original two-node bring-up is live-proven on Base mainnet (8453); see [`docs/deployment.md`](../deployment.md). `state::run()` drives key derivation, proof construction, sponsored registration, wireguard-over-gateway setup, heartbeats, CSK lifecycle, and the app/peer gRPC façades. Protocol v2 replaced the former sidecar `MessageSent` log poll with signed Indexer envelope dispatch while direct RPC remains limited to current-state views. Protocol v3 adds a durable exact `(blockNumber, logIndex)` resume cursor so a reconnect can safely select any Stage-A worker. Unit and fake-Indexer transport tests cover handling-before-persistence-before-Ack ordering, checkpoints, corrupt-state rejection, and cross-worker replay.
 
 ---
 
@@ -131,7 +131,7 @@ All configuration is via environment variables (no config files). The sidecar fa
 | `WG_TCP_PORT` | no | `51900` | TCP port of the wg-over-TCP ingress, exposed through the gateway (§10) |
 | `WG_LISTEN_PORT` | no | `51821` | wireguard outer listen port. Distinct from the in-mesh heartbeat port `51820` (§11.1) because kernel wg owns its UDP socket — the two must not collide |
 | `DSTACK_SOCKET` | no | `/var/run/dstack.sock` | path to dstack guest-agent socket |
-| `SIDECAR_STATE_DIR` | no | — | sidecar-only durable directory for the KMS-wrapped CSK, public peer-key cache, and last signed Indexer checkpoint. Production mounts `/var/lib/attestmesh` from the `sidecar-state` named volume; unset preserves memory-only restart behavior. |
+| `SIDECAR_STATE_DIR` | no | — | sidecar-only durable directory for the KMS-wrapped CSK, public peer-key cache, and exact handled Indexer cursor. It is required before a protocol-v3 Indexer connection is opened. Production mounts `/var/lib/attestmesh` from the `sidecar-state` named volume; unset preserves memory-only behavior only for deployments that do not enable Indexer delivery. |
 | `AGENT_GRPC_SOCKET` | no | `/var/run/attestmesh/agent.sock` | path the app facade listens on |
 | `HEALTH_HTTP_ADDR` | no | `127.0.0.1:9090` | HTTP /healthz endpoint (for docker-compose healthcheck) |
 | `LOG_FORMAT` | no | `json` | `json` or `pretty` |
@@ -302,8 +302,14 @@ message Hello {
   bytes32 cluster_addr = 1;
   bytes32 member_id = 2;
   bytes attestation = 3;    // reserved for milestone B re-verification; v1 indexer ignores (indexer.md §8.3)
-  uint64 from_block = 4;    // 0 on first boot; last handled block on reconnect/backend change
-  uint32 protocol_version = 5; // 2 = signed checkpoints + initialize missing cursor at indexed head
+  uint64 from_block = 4;    // boundary-block fallback for older Indexers
+  uint32 protocol_version = 5; // 2 = checkpoints/head init; 3 = exact resume_cursor semantics
+  DeliveryCursor resume_cursor = 6; // v3 exact highest durably handled position; presence matters
+}
+
+message DeliveryCursor {
+  uint64 block_number = 1;
+  uint64 log_index = 2;
 }
 
 message Ack {
@@ -328,13 +334,13 @@ The proto file itself is canonical for codegen; both this spec and indexer.md mu
 ### 9.2 Client behavior
 
 - Read `IndexerRegistry.current()` at boot. Cache `indexerPubKey` and `endpoint`.
-- Open a single bidi stream and send protocol-v2 `Hello`. A first boot sends `from_block = 0`; reconnects send the last handled block, loaded from `SIDECAR_STATE_DIR/indexer-cursor.v1` when available. This lets a newly selected Indexer with no server cursor replay the boundary block instead of skipping to head. Verify every `indexer_signature` against the registry's `pubKey`; the signed `rpc_repro` remains diagnostic material and is not executed by default.
+- Open a single bidi stream and send protocol-v3 `Hello`. A genuinely fresh sidecar omits `resume_cursor` and sends `from_block = 0`. A reconnect loads the exact highest durably handled `(blockNumber, logIndex)` from `SIDECAR_STATE_DIR/indexer-cursor.v1`, sends it as `resume_cursor`, and also sends its block in `from_block` as an older-Indexer fallback. The valid exact cursor `(0, 0)` uses `from_block = 1` for that fallback so an older server cannot mistake it for a fresh subscription and initialize at head; a v3 server still follows the explicit `(0, 0)` cursor. An existing unreadable, malformed, or wrong-member cursor fails closed rather than being treated as fresh. Verify every `indexer_signature` against the registry's `pubKey`; the signed `rpc_repro` remains diagnostic material and is not executed by default.
 - On every event push: validate the cluster/RLP shape, decode and dispatch (`MessageSent` → decrypt/demux; membership/key/CSK events → wake the current-view reconciler). Cross-cluster or malformed signed data tears down the stream; undecryptable addressed messages are handled drops.
-- Send `Ack(blockNumber, logIndex)` only after the handler completes. A signed empty checkpoint uses `(indexedThroughBlock, uint64::MAX)`, advances the server cursor across blocks with no relevant events, and is atomically persisted as the sidecar's cross-backend replay floor.
-- On stream drop: mark the Indexer diagnostic disconnected, re-read `IndexerRegistry.current()`, and retry an established stream after 1 second. Failures before Subscribe opens back off `1s → 2s → 4s … 30s`. The server's exact cursor wins when present; a different backend replays from the sidecar-supplied block, including that whole boundary block. Registry read failures retry after 60 seconds, and an empty registry after 300 seconds.
-- Preserve the signed `rpc_repro` for diagnostics/future sampling; protocol v2 does not execute it.
+- Send `Ack(blockNumber, logIndex)` only after the handler completes and the same exact cursor is atomically written and fsynced. Never Ack without an active `SubscribeMessages` consumer. A signed empty checkpoint uses `(indexedThroughBlock, uint64::MAX)` and resumes at the following block. A durability failure closes the stream without Ack.
+- On stream drop: mark the Indexer diagnostic disconnected, re-read `IndexerRegistry.current()`, and retry an established stream after 1 second. Failures before Subscribe opens back off `1s → 2s → 4s … 30s`. On a v3 Indexer, the subscriber cursor is authoritative and replay starts strictly after it, including later logs in the same block. On an older server, `from_block` replays the whole boundary block and may duplicate it. Registry read failures retry after 60 seconds, and an empty registry after 300 seconds.
+- Preserve the signed `rpc_repro` for diagnostics/future sampling; protocol v2/v3 does not execute it.
 
-As wired in protocol v2, the Indexer is the sidecar's sole event source: there is no `eth_getLogs` boot scan or outage fallback. Direct RPC remains for current contract views (`listMembers`, member/key/CSK reads, and IndexerRegistry discovery). A missing/down Indexer pauses event delivery while reconnect runs; `MeshStatus` and `/healthz` report `indexer_connected`, `indexer_caught_up`, and the cursor block, but those diagnostics do not participate in the convergence+CSK health result. One gateway quirk remains: the tonic client must set `ClientTlsConfig::assume_http2(true)` for the dstack gateway.
+As wired in protocol v2/v3, the Indexer is the sidecar's sole event source: there is no `eth_getLogs` boot scan or outage fallback. Direct RPC remains for current contract views (`listMembers`, member/key/CSK reads, and IndexerRegistry discovery). A missing/down Indexer pauses event delivery while reconnect runs; `MeshStatus` and `/healthz` report `indexer_connected`, `indexer_caught_up`, and the cursor block, but those diagnostics do not participate in the convergence+CSK health result. One gateway quirk remains: the tonic client must set `ClientTlsConfig::assume_http2(true)` for the dstack gateway.
 
 ---
 
@@ -491,7 +497,7 @@ message ClusterSharedKey { bytes key = 1; }   // 32 bytes
 ### 12.3 Semantics
 
 - `SendMessage`: sidecar encrypts payload with sealed-box to `recipient_member_id`'s `xPubKey` (read from local cache → fallback `AttestFacet.xPubKeyOf` via RPC), submits `MessageFacet.send(recipient, envelope_id, ciphertext)`. Returns when the tx is mined (Base ≈ 2s blocks; a few seconds typical). On revert (`DuplicateEnvelope`, `RecipientNotMember`), returns `FailedPrecondition` with a descriptive message.
-- `SubscribeMessages`: stream every successfully-decrypted indexed message whose recipient is self and whose kind is *not* sidecar-internal. A plaintext `PeerEndpoint` carrying the reserved `peer-endpoint.v1` kind is consumed internally; **every other decrypted payload is forwarded verbatim** as `AppIncoming{sender_member_id, payload, block_number}`. Failed decryptions are handled drops and Ack'd so poison messages cannot wedge replay. Delivery is at-least-once; applications must dedup (the matrix-admin-agent keeps a `request_id` ledger), and the in-memory app queue remains non-durable across sidecar process restarts.
+- `SubscribeMessages`: stream every successfully-decrypted indexed message whose recipient is self and whose kind is *not* sidecar-internal. A plaintext `PeerEndpoint` carrying the reserved `peer-endpoint.v1` kind is consumed internally; **every other decrypted payload is forwarded verbatim** as `AppIncoming{sender_member_id, payload, block_number}`. Failed decryptions are handled drops and Ack'd so poison messages cannot wedge replay. The exact cursor gives at-least-once Indexer-to-sidecar handling, not durable application delivery: this server stream has no app Ack, and the sidecar advances after enqueueing to an active in-memory receiver. An app disconnect, process crash, or lag overflow can therefore lose a message after the cursor advances. Applications should still deduplicate what they receive, but workloads requiring durable delivery need a future inbox/acknowledgment protocol or independent state reconciliation.
 - `SubscribePeerEvents`: stream `PeerJoined` (on MemberRegistered + endpoint) and `PeerLiveness` (on heartbeat status changes).
 - `GetClusterSharedKey`: returns the 32-byte CSK. Returns `Unavailable` before acquisition.
 - `GetSelf` / `GetMeshStatus` / `ListPeers`: trivial reads of in-memory state.
@@ -586,7 +592,8 @@ Phases reported (`MeshStatus.phase`):
 
 ### 16.2 Integration
 
-`tests/integration/` runs a fake dstack socket + a fake Indexer + a foundry-anvil RPC, brings up three sidecar instances, asserts:
+`tests/integration.rs` is an ignored placeholder for a future fake-dstack +
+fake-Indexer + Anvil three-sidecar harness. The planned harness will assert:
 
 1. All three reach `healthy`.
 2. Originator derives CSK; onboardees pull it; all three `GetClusterSharedKey` return identical bytes.
@@ -595,10 +602,16 @@ Phases reported (`MeshStatus.phase`):
 5. `SendMessage` from A to B is observed in B's `SubscribeMessages` stream as a decrypted payload; not observed in C's stream.
 6. Killing the originator and bringing up a fourth onboardee still succeeds (the fourth pulls from one of the remaining two).
 7. Killing the Indexer mid-flight only flips the diagnostic connection fields: existing health remains unchanged, event delivery pauses, and neither an existing nor a fresh sidecar starts an RPC log scan.
-8. The focused fake-Indexer transport test delivers a signed `MessageSent`, proves its Ack happens only after handler completion, and verifies checkpoint Ack/diagnostics.
+8. The implemented focused fake-Indexer transport test delivers a signed
+   `MessageSent`, proves no Ack precedes dispatch completion, proves the exact
+   cursor is durable before Ack, checks checkpoint/diagnostic behavior, and
+   reconnects with the saved exact cursor without redispatching an older event.
+   Corrupt-cursor fail-closed behavior is covered by a separate unit test; an
+   app-consumer acknowledgment does not exist in the current API.
 9. A rejecting JSON-RPC fixture allows current-view reconciliation but rejects every `eth_getLogs`; boot reconciliation succeeds with zero log calls.
 
-No fuzz tests for v1. No mainnet-fork tests. No actual dstack hardware tests; those are milestone B.
+No fuzz tests for v1. No mainnet-fork tests. No automated dstack hardware tests;
+live hardware behavior is recorded in `docs/deployment.md`.
 
 ---
 

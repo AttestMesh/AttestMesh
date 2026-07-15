@@ -6,6 +6,8 @@ on:
   push:
     paths:
       - "sidecar/**"
+      - "deploy/compose/indexer-ha-replica-node.yaml"
+      - "docs/specs/sidecar.md"
       - ".github/workflows/build-sidecar.yml"
   workflow_dispatch: {}
 
