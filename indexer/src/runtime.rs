@@ -132,7 +132,7 @@ impl Runtime {
                 let logs = watcher::poll_cluster_logs(&self.provider, &clusters, from, to).await?;
                 self.ingest_for_cache(&logs).await;
                 batches += 1;
-                if batches % 100 == 0 {
+                if batches.is_multiple_of(100) {
                     tracing::info!(from, head, "boot catch-up progress");
                 }
             }

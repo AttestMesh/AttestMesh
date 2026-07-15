@@ -3,7 +3,7 @@
 # PUT/GET plaintext; only ciphertext (content + filenames) ever reaches R2. See
 # docs/specs/r2-host-node.md. Built/pushed by .github/workflows/build-r2host-s3gw.yml (and buildable
 # on the box: docker build -t ghcr.io/attestmesh/r2host-s3gw:latest . && docker push …).
-FROM rclone/rclone:1.74.2
+FROM rclone/rclone:1.74.2@sha256:9ce0d49b611d3781233e25334e9e23d7af01e5546da7087f90d55f034ef13637
 
 ARG GRPCURL_VERSION=v1.9.3
 RUN set -eux; \

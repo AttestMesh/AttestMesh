@@ -2,7 +2,7 @@
 name = "cluster-mesh-agent"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.78"
+rust-version = "1.92"
 description = "AttestMesh node sidecar — registration, mesh bring-up, heartbeats, CSK"
 
 [lib]

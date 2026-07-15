@@ -9,6 +9,8 @@ target/
 
 # Rust
 **/Cargo.lock
+!sidecar/Cargo.lock
+!indexer/Cargo.lock
 **/*.rs.bk
 
 # Node / Cloudflare Worker

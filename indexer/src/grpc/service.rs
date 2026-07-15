@@ -93,7 +93,7 @@ fn replay_start(reg_floor: u64, requested: u64, persisted: Option<Cursor>) -> u6
 }
 
 fn is_after_cursor(block_number: u64, log_index: u64, cursor: Option<Cursor>) -> bool {
-    cursor.map_or(true, |c| Cursor::new(block_number, log_index) > c)
+    cursor.is_none_or(|c| Cursor::new(block_number, log_index) > c)
 }
 
 fn initialize_at_head(protocol_version: u32, requested: u64, persisted: Option<Cursor>) -> bool {

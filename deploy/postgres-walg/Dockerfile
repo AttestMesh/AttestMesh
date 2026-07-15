@@ -2,7 +2,7 @@
 # the cluster shared key from the sidecar over the agent UDS to derive the encryption key). A drop-in for
 # the Matrix node's `postgres` service; backups are off unless BACKUP_ENABLED=true. Built/pushed by
 # .github/workflows/build-postgres-walg.yml (and buildable on the box: docker build -t … && push).
-FROM postgres:16-bookworm
+FROM postgres:16-bookworm@sha256:92620daddcd947f8d5ab5ba66e848702fe443d87fed30c4cea8e389fd78dfc55
 
 ARG WALG_VERSION=v3.0.8
 ARG GRPCURL_VERSION=v1.9.3

@@ -137,9 +137,8 @@ async fn resend_due(ctx: &Ctx, member_id: &[u8; 32], peer_key_known: bool, now: 
 
 async fn reply_due(ctx: &Ctx, member_id: &[u8; 32], now: u64) -> bool {
     let sent = ctx.last_sent.lock().await;
-    sent.get(member_id).map_or(true, |state| {
-        now.saturating_sub(state.at_ms) > ENVELOPE_RESEND.as_millis() as u64
-    })
+    sent.get(member_id)
+        .is_none_or(|state| now.saturating_sub(state.at_ms) > ENVELOPE_RESEND.as_millis() as u64)
 }
 
 /// Record either a successful or failed sponsored send and return the prior attempt

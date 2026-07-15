@@ -2,7 +2,7 @@
 name = "attestmesh-indexer"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.78"
+rust-version = "1.92"
 description = "AttestMesh Indexer — attested off-chain event distribution for ClusterDiamonds"
 
 # A lib target exposes every module to the unit/integration tests; the bin is a thin

@@ -298,7 +298,7 @@ pub async fn connect_and_run(
             })),
         };
         tx.send(ack).await.context("send indexer Ack")?;
-        if last_handled.map_or(true, |last| position > last) {
+        if last_handled.is_none_or(|last| position > last) {
             last_handled = Some(position);
         }
         shared
