@@ -83,7 +83,7 @@ services:
   # API is gateway-exposed, so TEE_DAEMON_TOKEN is REQUIRED (the image refuses
   # to boot without it). RUNYARD_HUB_TOKEN stays sealed in this cluster.
   tee-daemon:
-    image: ghcr.io/dmvt/webhost-control:hostname-directory-9738ed2@sha256:7043db73b5d715db3efb63b398b5aa923178816ba6f3dc677d7361fea1fa62d9
+    image: ghcr.io/dmvt/webhost-control:full-domain-3401a6b@sha256:4b3d0ca63ba15974af8f512315683f448970003210f8a3a4cb12ac697b9ac51a
     environment:
       TEE_DAEMON_TOKEN: ${TEE_DAEMON_TOKEN}
       WEBHOST_MCP_TOKEN: ${WEBHOST_MCP_TOKEN}
@@ -197,7 +197,7 @@ services:
       - tee-daemon
 
   tlsproxy:
-    image: ghcr.io/dmvt/webhost-tlsproxy:directory-e4fb640@sha256:afc0bca11b4624bf180c5eb4c962ea2b8f06ce8aed05c004e2756e3a8d2a32c0
+    image: ghcr.io/dmvt/webhost-tlsproxy:full-domain-8c89acb@sha256:bef2cf0d126b6e61f3965cae4d3abef2b49d687e494bc70b3fb9989fd5bca578
     environment:
       CLOUDFLARE_API_TOKEN: ${CLOUDFLARE_API_TOKEN}
       CLOUDFLARE_SYNCLAVE_API_TOKEN: ${CLOUDFLARE_SYNCLAVE_API_TOKEN}

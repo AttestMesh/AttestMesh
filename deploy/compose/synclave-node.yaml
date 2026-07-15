@@ -193,9 +193,9 @@ services:
     # v21 = user-visible orchestrator failure details in enclave deploys;
     # v20 = CLUSTER_NETWORKS-only live mesh config + structured orchestrator errors;
     # v19 = Apps → Sandboxes rename (labels only, wire stays app).
-    # v44 = fleet-control main 1cb4ebb — sandbox-first Stripe billing foundation;
-    #       production stays keyless/inert until separately approved credentials and switches arrive.
-    image: ghcr.io/attestmesh/synclave-app:sha-c4494d6e69d6c59d0cd8d70dc4b0f34487ae2355@sha256:bf90e172bd5f821631a0d3dd50afda7b2efc0bd6133d7c3b12acd297223e9540
+    # v46 = fleet-control main 3536566 — full app.synclave.net hosted-app domain;
+    #       includes the v45 test-catalog controls and v44 sandbox-first billing foundation.
+    image: ghcr.io/dmvt/synclave-app:full-domain-3536566@sha256:466758dbb249703c805048a6b9ba43fe0fd2bfa1d0a00a97efaac3a95aef04a4
     environment:
       API_HOST: 0.0.0.0
       API_PORT: 80

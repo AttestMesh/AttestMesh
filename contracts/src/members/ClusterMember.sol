@@ -26,6 +26,7 @@ import { ClusterMemberStorage } from "../storage/ClusterMemberStorage.sol";
 import {
     OnlyEntryPoint,
     OnlyCluster,
+    AlreadyBound,
     OwnerAlreadySet,
     InvalidBootstrapCall,
     NotClusterOwner
@@ -72,7 +73,9 @@ contract ClusterMember is
     ///         mint an app_id it provisioned (dstack base KMS), so the member contract must
     ///         BE that app_id rather than a factory-predicted address.
     function reinitializeFromDstackApp(address cluster_) external reinitializer(2) {
-        ClusterMemberStorage.layout().cluster = cluster_;
+        ClusterMemberStorage.Layout storage l = ClusterMemberStorage.layout();
+        if (l.cluster != address(0)) revert AlreadyBound();
+        l.cluster = cluster_;
     }
 
     function cluster() external view returns (address) {

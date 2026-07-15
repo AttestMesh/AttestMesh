@@ -6,13 +6,19 @@ import { Test } from "forge-std/Test.sol";
 import {
     PackedUserOperation
 } from "@account-abstraction/contracts/interfaces/PackedUserOperation.sol";
+import { ERC1967Proxy } from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
+import {
+    UUPSUpgradeable
+} from "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
 
 import { ClusterMember } from "../../src/members/ClusterMember.sol";
 import { ClusterMemberFactory } from "../../src/members/ClusterMemberFactory.sol";
 import { IAppAuth } from "../../src/interfaces/IAppAuth.sol";
+import { MockStockApp } from "../helpers/MockStockApp.sol";
 import {
     OnlyEntryPoint,
     OnlyCluster,
+    AlreadyBound,
     OwnerAlreadySet,
     InvalidBootstrapCall,
     NotClusterOwner
@@ -114,6 +120,35 @@ contract ClusterMemberAuthTest is Test {
         factory = new ClusterMemberFactory(impl, address(0xA11CE));
         member = ClusterMember(payable(factory.deployMember(address(clusterMock), keccak256("m"))));
         entryPoint = member.ENTRY_POINT();
+    }
+
+    // ── initialization paths ────────────────────────────────────────────────────────
+
+    function test_reinitializeFromDstackAppRejectsFactoryMember() public {
+        vm.expectRevert(AlreadyBound.selector);
+        member.reinitializeFromDstackApp(address(0xBEEF));
+
+        assertEq(member.cluster(), address(clusterMock));
+    }
+
+    function test_reinitializeFromDstackAppAllowsUnboundStockProxy() public {
+        address stockImpl = address(new MockStockApp());
+        MockStockApp proxy = MockStockApp(
+            address(
+                new ERC1967Proxy(
+                    stockImpl, abi.encodeCall(MockStockApp.initialize, (address(this)))
+                )
+            )
+        );
+        address memberImpl = address(new ClusterMember());
+
+        UUPSUpgradeable(address(proxy))
+            .upgradeToAndCall(
+                memberImpl,
+                abi.encodeCall(ClusterMember.reinitializeFromDstackApp, (address(clusterMock)))
+            );
+
+        assertEq(ClusterMember(payable(address(proxy))).cluster(), address(clusterMock));
     }
 
     // ── execute ───────────────────────────────────────────────────────────────
