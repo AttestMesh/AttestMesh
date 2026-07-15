@@ -536,6 +536,26 @@ verify_candidate() {
   die "shared candidate failed exact identity/readiness validation: ${status:-no status}"
 }
 
+_assert_lb_drained() {
+  local operation="${INDEXER_LB_ACTIVE_OPERATION_ID:-}" proof
+  [ -n "${INDEXER_LB_NODE:-}" ] \
+    || die "registered worker stop requires explicit INDEXER_LB_NODE"
+  [[ "$INDEXER_LB_NODE" =~ ^[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}$ ]] \
+    || die "INDEXER_LB_NODE must be a safe node name of at most 128 characters"
+  [[ "$operation" =~ ^[0-9a-f]{64}$ ]] \
+    || die "registered worker stop requires INDEXER_LB_ACTIVE_OPERATION_ID as exactly 64 lowercase hex characters"
+  proof=$(INDEXER_LB_ACTIVE_OPERATION_ID="$operation" \
+    "$HERE/indexer-lb-node.sh" "$INDEXER_LB_NODE" assert-drained "$NODE") \
+    || die "authenticated Indexer LB drain proof failed; refusing to stop registered worker $NODE"
+  echo "$proof" | jq -e --arg operation "$operation" '
+    .drained == true
+    and .operation_id == $operation
+    and (.active_backends | type == "array")
+  ' >/dev/null \
+    || die "Indexer LB returned an invalid or mismatched drain proof; refusing to stop registered worker $NODE"
+  log "authenticated LB drain proof accepted for worker=$NODE active_operation_id=$operation"
+}
+
 stop_replica() {
   _load_cluster_state
   _load_replica_state allow-config-drift
@@ -545,8 +565,7 @@ stop_replica() {
   [[ "$member_id" =~ ^0x[0-9a-fA-F]{64}$ ]] \
     || die "worker membership query returned a malformed member id"
   if [ "${member_id,,}" != "$ZERO32" ]; then
-    [ "${INDEXER_LB_DRAIN_CONFIRMED:-0}" = 1 ] \
-      || die "refusing to stop a registered worker until INDEXER_LB_DRAIN_CONFIRMED=1"
+    _assert_lb_drained
   else
     log "worker never registered and cannot have opened shared gRPC; LB drain confirmation is not required"
   fi

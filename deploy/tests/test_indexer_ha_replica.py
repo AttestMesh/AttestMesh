@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 import runpy
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -231,9 +232,15 @@ def wrapper_env(tmp: Path, node: str, *, create_state: bool = True) -> dict[str,
     return env
 
 
-def run_wrapper(node: str, action: str, env: dict[str, str]) -> subprocess.CompletedProcess:
+def run_wrapper(
+    node: str,
+    action: str,
+    env: dict[str, str],
+    *,
+    script: Path = WRAPPER,
+) -> subprocess.CompletedProcess:
     return subprocess.run(
-        [str(WRAPPER), node, action],
+        [str(script), node, action],
         cwd=ROOT,
         env=env,
         text=True,
@@ -255,6 +262,51 @@ def run_generic(node: str, action: str, env: dict[str, str]) -> subprocess.Compl
 
 def read_state(path: Path) -> dict[str, str]:
     return dict(line.split("=", 1) for line in path.read_text(encoding="utf-8").splitlines())
+
+
+def isolated_wrapper_with_fake_drivers(tmp: Path) -> Path:
+    deploy_dir = tmp / "isolated-deploy"
+    deploy_dir.mkdir()
+    wrapper = deploy_dir / WRAPPER.name
+    shutil.copy2(WRAPPER, wrapper)
+    shutil.copy2(ROOT / "deploy" / "lib.sh", deploy_dir / "lib.sh")
+    write_executable(
+        deploy_dir / "indexer-lb-node.sh",
+        textwrap.dedent(
+            """\
+            #!/usr/bin/env bash
+            set -eu
+            printf 'lb|%s|%s|%s|%s\n' "$1" "$2" "$3" \
+              "$INDEXER_LB_ACTIVE_OPERATION_ID" >> "$EVENT_LOG"
+            case "${LB_PROOF_MODE:-success}" in
+              fail) exit 42 ;;
+              false)
+                printf '{"drained":false,"operation_id":"%s","active_backends":[]}\n' \
+                  "$INDEXER_LB_ACTIVE_OPERATION_ID"
+                ;;
+              mismatch)
+                printf '{"drained":true,"operation_id":"%064d","active_backends":[]}\n' 9
+                ;;
+              success)
+                printf '{"drained":true,"operation_id":"%s","active_backends":["10.0.0.2"]}\n' \
+                  "$INDEXER_LB_ACTIVE_OPERATION_ID"
+                ;;
+              *) exit 43 ;;
+            esac
+            """
+        ),
+    )
+    write_executable(
+        deploy_dir / "generic-node.sh",
+        textwrap.dedent(
+            """\
+            #!/usr/bin/env bash
+            set -eu
+            printf 'generic|%s|%s\n' "$1" "$2" >> "$EVENT_LOG"
+            """
+        ),
+    )
+    return wrapper
 
 
 class IndexerHaReplicaTests(unittest.TestCase):
@@ -594,15 +646,110 @@ class IndexerHaReplicaTests(unittest.TestCase):
         self.assertIn("does not match signer-cluster hash", result.stderr)
         self.assertFalse(Path(env["INDEXER_HA_CLUSTER_STATE"]).exists())
 
-    def test_stop_requires_explicit_lb_drain_confirmation(self) -> None:
+    def test_registered_stop_requires_explicit_valid_lb_proof_inputs(self) -> None:
         node = "indexer-ha-r1"
+        operation = "a" * 64
+        cases = [
+            ({}, "explicit INDEXER_LB_NODE"),
+            (
+                {"INDEXER_LB_NODE": "attestmesh-indexer-lb"},
+                "exactly 64 lowercase hex characters",
+            ),
+            (
+                {
+                    "INDEXER_LB_NODE": "../indexer-lb",
+                    "INDEXER_LB_ACTIVE_OPERATION_ID": operation,
+                },
+                "safe node name",
+            ),
+            (
+                {
+                    "INDEXER_LB_NODE": "attestmesh-indexer-lb",
+                    "INDEXER_LB_ACTIVE_OPERATION_ID": "A" * 64,
+                },
+                "exactly 64 lowercase hex characters",
+            ),
+            (
+                {
+                    "INDEXER_LB_NODE": "attestmesh-indexer-lb",
+                    "INDEXER_LB_ACTIVE_OPERATION_ID": "0x" + operation,
+                },
+                "exactly 64 lowercase hex characters",
+            ),
+        ]
+        for updates, expected_error in cases:
+            with self.subTest(expected_error=expected_error), tempfile.TemporaryDirectory() as raw_tmp:
+                tmp = Path(raw_tmp)
+                env = wrapper_env(tmp, node)
+                env.update(updates)
+                result = run_wrapper(node, "stop", env)
+                state = read_state(
+                    Path(env["LOGDIR"]) / f"generic-node-{node}.state"
+                )
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn(expected_error, result.stderr)
+            self.assertEqual(state["STATE_PHASE"], "deployed-stopped")
+
+    def test_registered_stop_passes_pinned_generation_before_stop(self) -> None:
+        node = "indexer-ha-r1"
+        operation = "a" * 64
         with tempfile.TemporaryDirectory() as raw_tmp:
             tmp = Path(raw_tmp)
             env = wrapper_env(tmp, node)
-            result = run_wrapper(node, "stop", env)
+            wrapper = isolated_wrapper_with_fake_drivers(tmp)
+            events = tmp / "events.log"
+            env.update(
+                {
+                    "EVENT_LOG": str(events),
+                    "INDEXER_LB_NODE": "attestmesh-indexer-lb",
+                    "INDEXER_LB_ACTIVE_OPERATION_ID": operation,
+                }
+            )
+            result = run_wrapper(node, "stop", env, script=wrapper)
+            recorded = events.read_text(encoding="utf-8").splitlines()
 
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn("INDEXER_LB_DRAIN_CONFIRMED=1", result.stderr)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            recorded,
+            [
+                f"lb|attestmesh-indexer-lb|assert-drained|{node}|{operation}",
+                f"generic|{node}|stop",
+            ],
+        )
+        self.assertIn("authenticated LB drain proof accepted", result.stderr)
+
+    def test_registered_stop_fails_closed_when_lb_proof_fails(self) -> None:
+        node = "indexer-ha-r1"
+        operation = "a" * 64
+        cases = [
+            ("fail", "authenticated Indexer LB drain proof failed"),
+            ("false", "invalid or mismatched drain proof"),
+            ("mismatch", "invalid or mismatched drain proof"),
+        ]
+        for mode, expected_error in cases:
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as raw_tmp:
+                tmp = Path(raw_tmp)
+                env = wrapper_env(tmp, node)
+                wrapper = isolated_wrapper_with_fake_drivers(tmp)
+                events = tmp / "events.log"
+                env.update(
+                    {
+                        "EVENT_LOG": str(events),
+                        "LB_PROOF_MODE": mode,
+                        "INDEXER_LB_NODE": "attestmesh-indexer-lb",
+                        "INDEXER_LB_ACTIVE_OPERATION_ID": operation,
+                    }
+                )
+                result = run_wrapper(node, "stop", env, script=wrapper)
+                recorded = events.read_text(encoding="utf-8").splitlines()
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn(expected_error, result.stderr)
+            self.assertEqual(
+                recorded,
+                [f"lb|attestmesh-indexer-lb|assert-drained|{node}|{operation}"],
+            )
 
     def test_never_registered_candidate_can_be_cleaned_without_lb_drain(self) -> None:
         node = "indexer-ha-r1"
@@ -793,7 +940,12 @@ class IndexerHaReplicaTests(unittest.TestCase):
     def test_wrapper_has_no_registry_write_and_preflights_bundler(self) -> None:
         wrapper = WRAPPER.read_text(encoding="utf-8")
         self.assertNotIn("setIndexer", wrapper)
+        self.assertNotIn("INDEXER_LB_DRAIN_CONFIRMED", wrapper)
         self.assertIn("addAllowedAppId(address)", wrapper)
+        self.assertIn(
+            '"$HERE/indexer-lb-node.sh" "$INDEXER_LB_NODE" assert-drained "$NODE"',
+            wrapper,
+        )
         self.assertIn("eth_supportedEntryPoints", wrapper)
 
 
