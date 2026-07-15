@@ -100,7 +100,7 @@ QUOTA_ZVOL_BYTES=$((251 * 1024 * 1024 * 1024))
 QUOTA_SOLD_MIB=237568
 QUOTA_FS_HEADROOM_MIB=18432
 QUOTA_POOL_HEADROOM_MIB=28672
-QUOTA_TOOLS_IMAGE="ghcr.io/dmvt/confidential-sandboxes@sha256:0ee022e38f5a66ced205428c60450e9ab054e4d31fff292821b2e5760dc4ac75"
+QUOTA_TOOLS_IMAGE="ghcr.io/dmvt/confidential-sandboxes@sha256:360248c7139bea2cee716d33acbd66e7aa3252f7750f8420a819c2d37ef4e938"
 MIN_HOST_VCPUS=8
 # The VMM resource readback must still be exactly 16,384 MiB. Inside this TDX image that allocation
 # exposes about 15,034 MiB after confidential-guest firmware/kernel reservations, so retain a
