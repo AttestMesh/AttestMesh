@@ -39,6 +39,7 @@ GATEWAY_DOMAIN="${GATEWAY_DOMAIN:-gateway.attestmesh.xyz}"
 #   GITHUB_CLIENT_ID GITHUB_CLIENT_SECRET CLOUDFLARE_API_TOKEN ADMIN_API_KEY
 #   TLS_FULLCHAIN_B64 TLS_KEY_B64   (optional: DATABASE_URL)
 SECRETS_FILE="${SECRETS_FILE:-$HOME/.attestmesh/synclave.env}"
+SYNCLAVE_CF_SECRETS_FILE="${SYNCLAVE_CF_SECRETS_FILE:-$HOME/.attestmesh/cloudflare-synclave-net.toml}"
 
 # confidential-sandboxes (sandboxd) wiring for the "Provision sandbox" button. URL/image/plan are
 # non-secret config; the token is the sandboxd daemon secret (reused from its own secrets file).
@@ -100,13 +101,17 @@ _require_env() {
   INDEXER_REGISTRY_ADDR="${INDEXER_REGISTRY_ADDR:-$indexer}"
   [ -n "${BUNDLER_URL:-}" ] || BUNDLER_URL="$RPC_URL"
   [ -n "$INDEXER_REGISTRY_ADDR" ] && [ "$INDEXER_REGISTRY_ADDR" != null ] || die "missing INDEXER_REGISTRY_ADDR"
+  # Use the authenticated box-local Base node for the long-running sidecar.
+  # Public endpoints rate-limit its bounded startup reads and can strand pg-ha.
+  SYNCLAVE_CVM_RPC_URL="${SYNCLAVE_CVM_RPC_URL:-$(box_local_rpc_url "$BOX_HOST" synclave)}"
 
   [ -f "$SECRETS_FILE" ] || die "missing secrets file: $SECRETS_FILE"
   # shellcheck disable=SC1090
   source "$SECRETS_FILE"
+  SYNCLAVE_CLOUDFLARE_API_TOKEN="${SYNCLAVE_CLOUDFLARE_API_TOKEN:-$(sed -nE 's/^[[:space:]]*api_token[[:space:]]*=[[:space:]]*"?([^"#[:space:]]+)"?.*/\1/p' "$SYNCLAVE_CF_SECRETS_FILE" 2>/dev/null)}"
   local k
   for k in POSTGRES_PASSWORD TEE_DAEMON_TOKEN SESSION_SECRET PRIVY_APP_ID PRIVY_APP_SECRET \
-           GITHUB_CLIENT_ID GITHUB_CLIENT_SECRET CLOUDFLARE_API_TOKEN ADMIN_API_KEY \
+           GITHUB_CLIENT_ID GITHUB_CLIENT_SECRET CLOUDFLARE_API_TOKEN SYNCLAVE_CLOUDFLARE_API_TOKEN ADMIN_API_KEY \
            TLS_FULLCHAIN_B64 TLS_KEY_B64; do
     [ -n "${!k:-}" ] || die "secret $k not set in $SECRETS_FILE"
   done
@@ -135,7 +140,7 @@ _box_run() {
   scp -o BatchMode=yes -q "$HERE/synclave-node-box.py" "$BOX_HOST:/tmp/synclave-node-box.py"
   {
     printf 'E_CHAIN_ID=%q\n'                 "$CHAIN_ID"
-    printf 'E_RPC_URL=%q\n'                  "${CVM_RPC_URL:-$RPC_URL}"
+    printf 'E_RPC_URL=%q\n'                  "$SYNCLAVE_CVM_RPC_URL"
     printf 'E_BUNDLER_URL=%q\n'              "${CVM_BUNDLER_URL:-${BUNDLER_URL:-$RPC_URL}}"
     printf 'E_GAS_POLICY_ID=%q\n'            "${GAS_POLICY_ID:-}"
     printf 'E_INDEXER_REGISTRY_ADDR=%q\n'    "$INDEXER_REGISTRY_ADDR"
@@ -171,6 +176,7 @@ _box_run() {
     printf 'E_BILLING_WORKER_INTERVAL_SEC=%q\n' "${BILLING_WORKER_INTERVAL_SEC:-10}"
     printf 'E_BILLING_CATALOG_RECONCILE_INTERVAL_SEC=%q\n' "${BILLING_CATALOG_RECONCILE_INTERVAL_SEC:-3600}"
     printf 'E_CLOUDFLARE_API_TOKEN=%q\n'     "$CLOUDFLARE_API_TOKEN"
+    printf 'E_SYNCLAVE_CLOUDFLARE_API_TOKEN=%q\n' "$SYNCLAVE_CLOUDFLARE_API_TOKEN"
     printf 'E_CLOUDFLARE_ZONE_ID=%q\n'       "$CLOUDFLARE_ZONE_ID"
     printf 'E_CLOUDFLARE_ORIGIN_IP=%q\n'     "$CLOUDFLARE_ORIGIN_IP"
     printf 'E_ADMIN_API_KEY=%q\n'            "$ADMIN_API_KEY"
@@ -321,6 +327,8 @@ update_member() {
     allowed=$(cast call "$CLUSTER" 'allowedComposeHashes(bytes32)(bool)' "0x$nh" --rpc-url "$RPC_URL" 2>/dev/null)
     [ "$allowed" = true ] || die "compose hash still not allowlisted after send — aborting before UpgradeApp"
   fi
+  wait_box_local_allowlist_propagation \
+    "$BOX_HOST" "$SYNCLAVE_CVM_RPC_URL" "$CLUSTER" "$nh" "$RPC_URL" 300
   out=$(_box_run update "$X" "$VM_ID") || die "in-place update failed"
   echo "$out"
   j=$(echo "$out" | grep '"app_id"' | tail -1)

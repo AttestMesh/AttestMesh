@@ -185,9 +185,9 @@ services:
     # v21 = user-visible orchestrator failure details in enclave deploys;
     # v20 = CLUSTER_NETWORKS-only live mesh config + structured orchestrator errors;
     # v19 = Apps → Sandboxes rename (labels only, wire stays app).
-    # v46 = fleet-control main 3536566 — full app.synclave.net hosted-app domain;
-    #       includes the v45 test-catalog controls and v44 sandbox-first billing foundation.
-    image: ghcr.io/dmvt/synclave-app:full-domain-3536566@sha256:466758dbb249703c805048a6b9ba43fe0fd2bfa1d0a00a97efaac3a95aef04a4
+    # v47 = fleet-control main f3f916b — full-width deployment/activity details,
+    #       complete hosted-app failure diagnostics, and the public app directory.
+    image: ghcr.io/attestmesh/synclave-app:sha-f3f916b5eba2c84214b3574ee38938b1b42906fd@sha256:fc3fa44569fadfa789918bf317e1b0a228cdab2f53ea3b18a483495a700d35f7
     environment:
       API_HOST: 0.0.0.0
       API_PORT: 80
@@ -244,13 +244,32 @@ services:
       - "80"
     depends_on:
       pg-provision:
-        condition: service_completed_successfully
+        condition: service_started
       pg-primary-router:
         condition: service_started
       pg2-proxy:
         condition: service_started
       pg3-proxy:
         condition: service_started
+    restart: unless-stopped
+
+  # Public apps directory. Kept separate from the database-backed control-plane API
+  # so apps.synclave.net stays available during console/database maintenance.
+  directory:
+    image: ghcr.io/dmvt/synclave-directory:back-to-synclave-20260715-v4@sha256:0aa8f69031ec5229c9f84166b39a2081e77528e0c9588308aae5df4f56e2c7dc
+    environment:
+      # Cloudflare-proxied, token-gated route to the isolated Webhost CVM.
+      # The Webhost origin address is not published by this service hostname.
+      DAEMON_URL: https://daemon.synclave.net
+      TEE_DAEMON_TOKEN: ${TEE_DAEMON_TOKEN}
+      PORT: "8080"
+    expose:
+      - "8080"
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
     restart: unless-stopped
 
   # Control-plane only: fronts the console host → the app (UI + API). Tenant-app and concierge
@@ -272,9 +291,9 @@ services:
     restart: unless-stopped
 
   tlsproxy:
-    image: ghcr.io/dmvt/synclave-tlsproxy:v4@sha256:2f9686cd836e15aba287e6412a1612145c1658616a581e4b817f65a20042be09
+    image: ghcr.io/dmvt/synclave-tlsproxy:apps-directory-20260715-v3@sha256:0167220c836004c5435cfb3dde70d70d0219ea5e2c1b2666d9437aecd5ac952b
     environment:
-      CLOUDFLARE_API_TOKEN: ${CLOUDFLARE_API_TOKEN}
+      SYNCLAVE_CLOUDFLARE_API_TOKEN: ${SYNCLAVE_CLOUDFLARE_API_TOKEN}
       TLS_FULLCHAIN_B64: ${TLS_FULLCHAIN_B64}
       TLS_KEY_B64: ${TLS_KEY_B64}
     ports:
@@ -284,6 +303,7 @@ services:
       - caddy_config:/config
     depends_on:
       - frontproxy
+      - directory
     restart: unless-stopped
 
 volumes:

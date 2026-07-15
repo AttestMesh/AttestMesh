@@ -100,6 +100,7 @@ ENV_KEYS = [
     "BILLING_WORKER_INTERVAL_SEC",
     "BILLING_CATALOG_RECONCILE_INTERVAL_SEC",
     "CLOUDFLARE_API_TOKEN",
+    "SYNCLAVE_CLOUDFLARE_API_TOKEN",
     # CF app-fronting: zone for the proxied <slug>.app records + the origin IP
     # (box haproxy) they point at. Non-secret, still sealed (one measured surface).
     "CLOUDFLARE_ZONE_ID",
