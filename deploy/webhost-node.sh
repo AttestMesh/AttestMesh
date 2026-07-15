@@ -37,7 +37,7 @@ REDPILL_KEY_FILE="${REDPILL_KEY_FILE:-$HOME/.attestmesh/redpill-key}"
 CLOUDFLARE_TOML="${CLOUDFLARE_TOML:-$HOME/.attestmesh/cloudflare-attestmesh-xyz.toml}"
 CLOUDFLARE_SYNCLAVE_TOML="${CLOUDFLARE_SYNCLAVE_TOML:-$HOME/.attestmesh/cloudflare-synclave-net.toml}"
 
-APP_DOMAIN="${APP_DOMAIN:-app.s.n}"
+APP_DOMAIN="${APP_DOMAIN:-app.synclave.net}"
 DIRECTORY_HOST="${DIRECTORY_HOST:-apps.synclave.net}"
 CONSOLE_HOST="${CONSOLE_HOST:-$DIRECTORY_HOST}"
 NEXTAUTH_URL="${NEXTAUTH_URL:-https://${CONSOLE_HOST}}"
