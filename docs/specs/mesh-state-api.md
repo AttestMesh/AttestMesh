@@ -194,7 +194,11 @@ Bounded, cached event scan from `DEPLOY_BLOCK` → head. v1 events: `MemberRegis
 
 ### 5.5 `GET /healthz`
 
-`200 {"ok": true, "rpcReachable": true, "atBlock": 48079256, "cacheAgeMs": 4200}` — for the container/host probe. `503` if the RPC is unreachable and no cache is warm.
+The probe reports the same indexed state used by the background refresher, including
+`atBlock`, the last observed `headBlock`, `blockLag`, `indexedAt`, `ageSeconds`, and
+the derived `fresh` boolean. `rpcReachable=false` and `stale=true` retain the
+last-good index after a failed refresh; `rpcReachable=null` means the service has
+only loaded the persisted index and has not completed an RPC refresh in this process.
 
 ### 5.6 Errors
 

@@ -2,7 +2,7 @@
 
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { loadConfig, type Config } from "./config.ts";
-import { TtlCache } from "./cache.ts";
+import { TtlCache, type Cached } from "./cache.ts";
 import { withImagePinning } from "./pinning.ts";
 import {
   deploymentsFromIndex,
@@ -10,11 +10,13 @@ import {
   fetchSnapshot,
   fetchTimeline,
   makeClient,
+  meshIndexProgress,
   readMeshIndex,
   snapshotsFromIndex,
   timelinesFromIndex,
   updateMeshIndex,
   type ClusterDeployment,
+  type MeshIndexState,
   type Snapshot,
   type Timeline,
 } from "./chain.ts";
@@ -123,9 +125,46 @@ function aggregateTimelines(timelines: Timeline[], deployments: ClusterDeploymen
   };
 }
 
-export function createApp(cfg: Config) {
-  const client = makeClient(cfg);
-  const indexCache = new TtlCache(cfg.cacheTtlMs, () => updateMeshIndex(client, cfg));
+type MeshClient = ReturnType<typeof makeClient>;
+
+interface AppRuntime {
+  client?: MeshClient;
+  indexCache?: TtlCache<MeshIndexState>;
+}
+
+export function createIndexCache(cfg: Config, client: MeshClient): TtlCache<MeshIndexState> {
+  return new TtlCache(cfg.cacheTtlMs, () => updateMeshIndex(client, cfg));
+}
+
+export function buildIndexedHealth(
+  cached: Cached<MeshIndexState>,
+  cfg: Pick<Config, "cacheTtlMs" | "indexRefreshMs">,
+  now = Date.now(),
+) {
+  const deployments = deploymentsFromIndex(cached.value);
+  const progress = meshIndexProgress(cached.value);
+  const parsedIndexedAt = cached.value.updatedAt ? Date.parse(cached.value.updatedAt) : Number.NaN;
+  const indexedAtMs = Number.isFinite(parsedIndexedAt) ? parsedIndexedAt : cached.fetchedAt;
+  const indexAgeMs = Math.max(0, now - indexedAtMs);
+  const freshnessWindowMs = Math.max(60_000, cfg.cacheTtlMs, cfg.indexRefreshMs * 2);
+  return {
+    ok: true,
+    rpcReachable: !cached.stale,
+    clusterCount: deployments.length,
+    clusters: deployments,
+    ...progress,
+    indexedAt: new Date(indexedAtMs).toISOString(),
+    ageSeconds: Math.floor(indexAgeMs / 1000),
+    cacheAgeMs: Math.max(0, now - cached.fetchedAt),
+    indexed: true,
+    fresh: !cached.stale && progress.blockLag === 0 && indexAgeMs <= freshnessWindowMs,
+    stale: cached.stale || undefined,
+  };
+}
+
+export function createApp(cfg: Config, runtime: AppRuntime = {}) {
+  const client = runtime.client ?? makeClient(cfg);
+  const indexCache = runtime.indexCache ?? createIndexCache(cfg, client);
   const discoveryCache = new TtlCache<ClusterDeployment[]>(cfg.discoveryCacheTtlMs, () =>
     fetchClusterDeployments(client, cfg),
   );
@@ -335,31 +374,18 @@ export function createApp(cfg: Config) {
         case "/healthz": {
           const indexPeek = cfg.indexedReads ? indexCache.peek() : null;
           if (indexPeek) {
-            const deployments = deploymentsFromIndex(indexPeek.value);
-            json(res, 200, {
-              ok: true,
-              rpcReachable: !indexPeek.stale,
-              clusterCount: deployments.length,
-              clusters: deployments,
-              cacheAgeMs: Date.now() - indexPeek.fetchedAt,
-              indexed: true,
-              stale: indexPeek.stale || undefined,
-            });
+            json(res, 200, buildIndexedHealth(indexPeek, cfg));
             return;
           }
           if (cfg.indexedReads) {
             const diskIndex = await readMeshIndex(cfg);
             if (diskIndex.clusters.length > 0) {
-              const deployments = deploymentsFromIndex(diskIndex);
-              json(res, 200, {
-                ok: true,
-                rpcReachable: null,
-                clusterCount: deployments.length,
-                clusters: deployments,
-                cacheAgeMs: null,
-                indexed: true,
-                stale: true,
-              });
+              const indexedAtMs = diskIndex.updatedAt ? Date.parse(diskIndex.updatedAt) : Date.now();
+              const health = buildIndexedHealth(
+                { value: diskIndex, fetchedAt: indexedAtMs, stale: true },
+                cfg,
+              );
+              json(res, 200, { ...health, rpcReachable: null, cacheAgeMs: null });
               return;
             }
           }
@@ -385,12 +411,15 @@ export function createApp(cfg: Config) {
   };
 }
 
-function startIndexer(cfg: Config): void {
+export function startIndexer(cfg: Config, indexCache: TtlCache<MeshIndexState>): void {
   if (!cfg.indexedReads || cfg.indexRefreshMs <= 0) return;
-  const client = makeClient(cfg);
   let inflight: Promise<unknown> | null = null;
   const refresh = () => {
-    inflight ??= updateMeshIndex(client, cfg)
+    inflight ??= indexCache
+      .refresh()
+      .then((result) => {
+        if (result.stale) throw new Error("index refresh failed; serving last-good state");
+      })
       .catch((err) => {
         // eslint-disable-next-line no-console
         console.error(JSON.stringify({ msg: "mesh-state-api index refresh failed", error: String(err) }));
@@ -407,7 +436,9 @@ function startIndexer(cfg: Config): void {
 const isMain = import.meta.url === `file://${process.argv[1]}`;
 if (isMain) {
   const cfg = loadConfig();
-  const handle = createApp(cfg);
+  const client = makeClient(cfg);
+  const indexCache = createIndexCache(cfg, client);
+  const handle = createApp(cfg, { client, indexCache });
   const server = createServer((req, res) => {
     handle(req, res).catch((err) => {
       json(res, 500, { error: "internal", message: err instanceof Error ? err.message : String(err) });
@@ -425,6 +456,6 @@ if (isMain) {
         gatewayDomain: cfg.gatewayDomain,
       }),
     );
-    startIndexer(cfg);
+    startIndexer(cfg, indexCache);
   });
 }

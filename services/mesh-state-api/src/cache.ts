@@ -22,8 +22,13 @@ export class TtlCache<T> {
   /** Return a fresh value, a cached value within TTL, or (on loader failure) the last-good value flagged stale. */
   async get(): Promise<Cached<T>> {
     const e = this.entry;
-    if (e && this.now() - e.fetchedAt < this.ttlMs) return e;
+    if (e && !e.stale && this.now() - e.fetchedAt < this.ttlMs) return e;
 
+    return this.refresh();
+  }
+
+  /** Force a refresh while sharing the same in-flight loader with request-driven reads. */
+  async refresh(): Promise<Cached<T>> {
     // Collapse concurrent refreshes.
     this.inflight ??= this.loader();
     try {
@@ -33,7 +38,8 @@ export class TtlCache<T> {
     } catch (err) {
       if (this.entry) {
         // Serve last-good, flagged stale — don't overwrite fetchedAt so it keeps retrying.
-        return { ...this.entry, stale: true };
+        this.entry = { ...this.entry, stale: true };
+        return this.entry;
       }
       throw err;
     } finally {
