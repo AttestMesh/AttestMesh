@@ -86,9 +86,10 @@ ENV_KEYS = [
     "CONSOLE_HOST",
     # platform superadmins — view-as-user impersonation gate (value sealed, key measured)
     "PLATFORM_ADMIN_EMAILS",
-    # waitlist → Telegram bot (turned-away sign-ups); both optional (unset ⇒ no telegram send)
+    # waitlist + concierge feedback → Telegram bot; all optional (unset ⇒ no telegram send)
     "TELEGRAM_BOT_TOKEN",
     "TELEGRAM_WAITLIST_CHAT_ID",
+    "TELEGRAM_FEEDBACK_CHAT_ID",
     # billing (Stripe) — keys are optional; every money-moving switch defaults off.
     "STRIPE_SECRET_KEY",
     "STRIPE_WEBHOOK_SECRET",
@@ -100,10 +101,19 @@ ENV_KEYS = [
     "BILLING_WORKER_INTERVAL_SEC",
     "BILLING_CATALOG_RECONCILE_INTERVAL_SEC",
     "CLOUDFLARE_API_TOKEN",
+    "SYNCLAVE_CLOUDFLARE_API_TOKEN",
     # CF app-fronting: zone for the proxied <slug>.app records + the origin IP
     # (box haproxy) they point at. Non-secret, still sealed (one measured surface).
     "CLOUDFLARE_ZONE_ID",
     "CLOUDFLARE_ORIGIN_IP",
+    # Custom-domain provider + routing projection. Optional while rollout is dark.
+    "CLOUDFLARE_SAAS_API_TOKEN",
+    "CLOUDFLARE_SAAS_ZONE_ID",
+    "CUSTOM_DOMAIN_CNAME_ZONE",
+    "CLOUDFLARE_KV_API_TOKEN",
+    "CLOUDFLARE_ACCOUNT_ID",
+    "CLOUDFLARE_CUSTOM_DOMAIN_KV_NAMESPACE_ID",
+    "CUSTOM_DOMAIN_KV_PROPAGATION_SEC",
     "ADMIN_API_KEY",
     "LABELS_WRITE_TOKENS",
     "TLS_FULLCHAIN_B64",
@@ -136,11 +146,11 @@ def app_compose_and_hash(env_keys: list[str]) -> tuple[str, str]:
         "gateway_enabled": GATEWAY_ENABLED,
         "local_key_provider_enabled": False,
         "key_provider_id": "",
-        "public_logs": True,
-        "public_sysinfo": True,
+        "public_logs": False,
+        "public_sysinfo": False,
         "allowed_envs": sorted(set(env_keys) | {"APP_ID"}),
         "no_instance_id": False,  # stable per-instance disk (app_id||instance_id)
-        "secure_time": False,
+        "secure_time": True,
     }
     # Log in to the private registry inside the guest so ghcr.io/dmvt/* +
     # ghcr.io/attestmesh/* images pull. Creds arrive sealed as DSTACK_DOCKER_*.
