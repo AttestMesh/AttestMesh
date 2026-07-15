@@ -197,7 +197,7 @@ services:
       - tee-daemon
 
   tlsproxy:
-    image: ghcr.io/dmvt/webhost-tlsproxy:full-domain-689120d@sha256:fb8dff54d9487491a1b1ca32905702f4ebb037a7b565373232cda122f2d054dd
+    image: ghcr.io/dmvt/webhost-tlsproxy:full-domain-8c89acb@sha256:bef2cf0d126b6e61f3965cae4d3abef2b49d687e494bc70b3fb9989fd5bca578
     environment:
       CLOUDFLARE_API_TOKEN: ${CLOUDFLARE_API_TOKEN}
       CLOUDFLARE_SYNCLAVE_API_TOKEN: ${CLOUDFLARE_SYNCLAVE_API_TOKEN}
