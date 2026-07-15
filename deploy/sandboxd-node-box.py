@@ -95,8 +95,8 @@ STATE_RESERVE_MIB=2048
 QUOTA_ZVOL="dstack/sandboxd-data"
 QUOTA_DEVICE="/dev/zvol/dstack/sandboxd-data"
 QUOTA_MOUNT="/var/lib/sandboxd-data"
-QUOTA_ZVOL_SIZE="250G"
-QUOTA_ZVOL_BYTES=$((250 * 1024 * 1024 * 1024))
+QUOTA_ZVOL_SIZE="251G"
+QUOTA_ZVOL_BYTES=$((251 * 1024 * 1024 * 1024))
 QUOTA_SOLD_MIB=237568
 QUOTA_FS_HEADROOM_MIB=18432
 QUOTA_POOL_HEADROOM_MIB=28672
@@ -415,8 +415,9 @@ docker run --rm --privileged --network host \
   '
 
 # Persistent sandbox storage is a separate XFS filesystem with project-quota enforcement. A sparse
-# 250 GiB ZFS zvol lives in the encrypted CVM data pool; HOST_DISK_MB sells 232 GiB. Never start the
-# app on an unquotaed or undersized fallback directory.
+# A 251 GiB ZFS zvol lives in the encrypted CVM data pool; HOST_DISK_MB sells 232 GiB. The extra GiB
+# absorbs XFS log/metadata while preserving 18 GiB of usable filesystem reserve. Never start the app
+# on an unquotaed or undersized fallback directory.
 if ! zfs list -H -o name "$QUOTA_ZVOL" >/dev/null 2>&1; then
   zfs create -s -V "$QUOTA_ZVOL_SIZE" -o volblocksize=16K "$QUOTA_ZVOL"
   zfs set sandboxd:managed=1 "$QUOTA_ZVOL"

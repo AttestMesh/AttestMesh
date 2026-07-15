@@ -145,7 +145,8 @@ services:
       SANDBOXD_MIN_RUNSC_DISK_MB: "16"
       # Fixed admission budgets for BOX_VCPU=8 / BOX_MEM=16384 / BOX_DISK=300. Tenant plus trusted
       # service maxima total 7 vCPU / 12.5 GiB, leaving host dockerd/OS/ZFS headroom. Tenant PIDs
-      # are hard-capped at 16,384. The 250 GiB XFS zvol sells 232 GiB and leaves 18 GiB internally.
+      # are hard-capped at 16,384. The 251 GiB XFS zvol sells 232 GiB, preserves 18 GiB of usable
+      # reserve, and absorbs its own filesystem metadata in the remaining space.
       HOST_VCPU_MILLIS: "5000"
       HOST_MEMORY_MB: "10240"
       HOST_DISK_MB: "237568"
