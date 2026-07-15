@@ -59,7 +59,13 @@ compose hash via `allowed_envs`.
 
 | Env var | Required | Default | Meaning |
 |---|---|---|---|
-| `R2_ENDPOINT` | yes | — | R2 S3 endpoint `https://<account>.r2.cloudflarestorage.com`. Also the egress-fw allow target. |
+| `BACKEND_PROVIDER` | no | `Cloudflare` | rclone S3 provider (`Cloudflare`, `AWS`, or another supported S3 implementation). |
+| `BACKEND_ENDPOINT` | yes | — | R2 or S3 endpoint. Also the egress-fw allow target. |
+| `BACKEND_BUCKET` | yes | — | Ciphertext bucket (optionally with a prefix). |
+| `BACKEND_REGION` | no | `auto` | Backend region (`auto` for R2; an AWS region for S3). |
+| `BACKEND_ACCESS_KEY_ID` / `BACKEND_SECRET_ACCESS_KEY` | yes | — | Bucket-scoped backend credentials. |
+| `BACKEND_FORCE_PATH_STYLE` | no | `true` | Use path-style requests; set `false` if the S3 provider requires virtual-host style. |
+| `R2_*` | compatibility | — | Existing R2 names remain accepted as fallbacks for deployed environments. |
 | `R2_BUCKET` | yes | — | Dedicated ciphertext bucket (e.g. `attestmesh-r2-host`). |
 | `R2_REGION` | no | `auto` | R2 region. |
 | `R2_ACCESS_KEY_ID` / `R2_SECRET_ACCESS_KEY` | yes | — | R2 token scoped to that bucket. |
@@ -237,3 +243,4 @@ write-back drains — symptom: hung PUTs.
 | Date | Author | Changes |
 |---|---|---|
 | 2026-07-02 | AttestMesh | Initial spec (rclone serve s3 + crypt over R2, CSK-derived key, mesh-only, join C3). |
+| 2026-07-15 | AttestMesh | Added provider-neutral R2/S3 backend settings and a resumable Smithers KMS-root recovery workflow (`deploy/workflows/r2-host-recovery.tsx`). The workflow captures the in-CVM proof, independently recovers and pins the expected KMS signer, allowlists it, simulates registration, submits idempotently, clean-rolls away the helper, and verifies the node. |

@@ -82,6 +82,14 @@ ENV_KEYS = [
     "R2_REGION",
     "R2_ACCESS_KEY_ID",
     "R2_SECRET_ACCESS_KEY",
+    # --- provider-neutral S3 backend (AWS, Cloudflare, or another rclone S3 provider) ---
+    "BACKEND_PROVIDER",
+    "BACKEND_ENDPOINT",
+    "BACKEND_BUCKET",
+    "BACKEND_REGION",
+    "BACKEND_ACCESS_KEY_ID",
+    "BACKEND_SECRET_ACCESS_KEY",
+    "BACKEND_FORCE_PATH_STYLE",
     # --- mesh-client S3 credentials (rclone serve s3 --auth-key) ---
     "S3GW_ACCESS_KEY_ID",
     "S3GW_SECRET_ACCESS_KEY",
@@ -96,6 +104,9 @@ def build_env() -> dict[str, str]:
     env = {key: os.environ.get("E_" + key, "") for key in ENV_KEYS}
     env["DSTACK_DOCKER_REGISTRY"] = env.get("DSTACK_DOCKER_REGISTRY") or "ghcr.io"
     env["R2_REGION"] = env.get("R2_REGION") or "auto"
+    env["BACKEND_PROVIDER"] = env.get("BACKEND_PROVIDER") or "Cloudflare"
+    env["BACKEND_REGION"] = env.get("BACKEND_REGION") or env["R2_REGION"]
+    env["BACKEND_FORCE_PATH_STYLE"] = env.get("BACKEND_FORCE_PATH_STYLE") or "true"
     return env
 
 
