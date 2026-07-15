@@ -21,7 +21,9 @@ INDEXER_GRPC_GATEWAY_PORT="${INDEXER_GRPC_GATEWAY_PORT:-50052}"
 BOX_HOST="${BOX_HOST:-ubuntu@173.231.234.133}"
 BOX_PY="${BOX_PY:-/opt/dstack-mcp/venv/bin/python}"
 REGISTRY=$(jq -r .indexerRegistry "$ROOT/contracts/script/deployments/${CHAIN_ID}.json")
-STATE="$LOGDIR/generic-node-${NODE}.state"
+STATE_DIR="${GENERIC_STATE_DIR:-$LOGDIR}"
+STATE="$STATE_DIR/generic-node-${NODE}.state"
+STATE_CONTENT=""
 REGISTER_SIGNATURE='dstack_register((bytes32,bytes32,bytes,bytes,bytes,bytes,bytes,string),address,bytes32,bytes32)'
 
 export COMPOSE GATEWAY_DOMAIN
@@ -40,10 +42,45 @@ _default_cluster_env() {
 _load_state() {
   local mode owner value state_cluster state_impl state_gateway
   [ -f "$STATE" ] || die "missing state $STATE; run deploy/all first"
-  mode=$(stat -c '%a' "$STATE") || die "cannot stat state $STATE"
-  owner=$(stat -c '%u' "$STATE") || die "cannot read state owner $STATE"
-  [ "$owner" = "$(id -u)" ] || die "state is not owned by the current operator: $STATE"
-  [ $((8#$mode & 077)) -eq 0 ] || die "state must not be group/world accessible: $STATE"
+  if [ "${REQUIRE_PRIVATE_GENERIC_STATE:-0}" = 1 ]; then
+    STATE_CONTENT=$(python3 - "$STATE" "${EXPECTED_GENERIC_STATE_SHA256:-}" <<'PY'
+import hashlib
+import os
+import stat
+import sys
+
+path = os.path.abspath(sys.argv[1])
+expected = sys.argv[2]
+parent, name = os.path.dirname(path), os.path.basename(path)
+directory_fd = os.open(parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+try:
+    fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=directory_fd)
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
+            raise SystemExit("state is not a regular file")
+        if info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) != 0o600:
+            raise SystemExit("state must be current-user-owned mode 0600")
+        raw = os.read(fd, 65537)
+        if not raw or len(raw) > 65536:
+            raise SystemExit("state size is invalid")
+        digest = hashlib.sha256(raw).hexdigest()
+        if expected and digest != expected:
+            raise SystemExit("state snapshot changed before direct registration")
+        sys.stdout.buffer.write(raw)
+    finally:
+        os.close(fd)
+finally:
+    os.close(directory_fd)
+PY
+    ) || die "could not safely read state $STATE"
+  else
+    STATE_CONTENT=$(cat "$STATE") || die "could not read state $STATE"
+    mode=$(stat -c '%a' "$STATE") || die "cannot stat state $STATE"
+    owner=$(stat -c '%u' "$STATE") || die "cannot read state owner $STATE"
+    [ "$owner" = "$(id -u)" ] || die "state is not owned by the current operator: $STATE"
+    [ $((8#$mode & 077)) -eq 0 ] || die "state must not be group/world accessible: $STATE"
+  fi
 
   value=$(_state_field X) || die "state must contain exactly one X field"
   [[ "$value" =~ ^0x[0-9a-fA-F]{40}$ ]] || die "state X is not an address"
@@ -83,7 +120,7 @@ _state_field() {
       if (count != 1) exit 1
       print value
     }
-  ' "$STATE"
+  ' < <(printf '%s\n' "$STATE_CONTENT")
 }
 
 _app_host_prefix() {

@@ -10,6 +10,7 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+import time
 import types
 import unittest
 from pathlib import Path
@@ -32,11 +33,15 @@ COMPOSE_HASH = "0x" + ("1" * 64)
 MEMBER_ID = "0x" + ("2" * 64)
 PUBKEY = "0x" + ("3" * 64)
 MEASURED_NAME = "attestmesh-indexer-ha-replica"
+CLUSTER_NAME = "attestmesh-indexer-ha"
+DEVICE_ID = "0x" + ("ab" * 32)
+LB_BACKEND = "10.0.0.2"
+LB_ACTIVE_BACKEND = "10.0.0.3"
+RESERVATION_ID = "b" * 64
+RELEASE_TOKEN = "c" * 64
 ENTRY_POINT_V07 = "0x0000000071727De22E5E9d8BAf0edAc6f37da032"
 OLD_INDEXER_DIGEST = "14e9e3f6869ada585642c14e4e2e43bee197978ffc68d146dd6d3cddbc49d2bb"
 STAGE_A_INDEXER_DIGEST = "0d7cbbdb049e1c7606d169ea69f890cf05d3384bc1777c5dac3e1237ebaaa68c"
-DSTACK_FACET_CODEHASH = "0x91c3c31fabe7d7c55924bd46873bcb46960c1e5db5fb1e322fc8fb2f1ad76563"
-MEMBER_IMPL_CODEHASH = "0xadc979a69cd23526776858fefe6ed0c9e143e7ffbe2f81d715b2ea84468f0f22"
 INDEXER_REGISTRY = "0xbC003686943fB957100E517D3CEf66c52B5CDdBf"
 GHCR_USER = "test-user"
 GHCR_TOKEN = "test-token"
@@ -69,6 +74,8 @@ def write_cluster_state(path: Path) -> None:
             UPDATED_AT=20260714T000000Z
             CHAIN_ID={CHAIN_ID}
             CLUSTER={CLUSTER}
+            CLUSTER_NAME={CLUSTER_NAME}
+            INDEXER_DEVICE_IDS_JSON=["{DEVICE_ID}"]
             DSTACK_FACET={DSTACK_FACET}
             MEMBER_IMPL={MEMBER_IMPL}
             INDEXER_COMPOSE_HASH={COMPOSE_HASH}
@@ -79,6 +86,7 @@ def write_cluster_state(path: Path) -> None:
         ),
         encoding="utf-8",
     )
+    path.chmod(0o600)
 
 
 def guest_config_fingerprint(env: dict[str, str]) -> str:
@@ -108,9 +116,10 @@ def guest_config_fingerprint(env: dict[str, str]) -> str:
 
 
 def write_replica_state(
-    logdir: Path, node: str, fingerprint: str, *, phase: str = "deployed-stopped"
+    state_dir: Path, node: str, fingerprint: str, *, phase: str = "deployed-stopped"
 ) -> None:
-    (logdir / f"generic-node-{node}.state").write_text(
+    path = state_dir / f"generic-node-{node}.state"
+    path.write_text(
         textwrap.dedent(
             f"""\
             STATE_SCHEMA=2
@@ -128,16 +137,15 @@ def write_replica_state(
         ),
         encoding="utf-8",
     )
+    path.chmod(0o600)
 
 
 def cast_stub(
     *,
-    solidstate_owner: str = SAFE,
     guest_chain_id: str = CHAIN_ID,
-    dstack_facet: str = DSTACK_FACET,
-    dstack_codehash: str = DSTACK_FACET_CODEHASH,
-    member_codehash: str = MEMBER_IMPL_CODEHASH,
     member_id: str = MEMBER_ID,
+    member_count: str = "0",
+    csk_commitment: str = "0x" + ("0" * 64),
 ) -> str:
     return textwrap.dedent(
         f"""\
@@ -150,13 +158,6 @@ def cast_stub(
             esac
             ;;
           code) echo 0x60006000 ;;
-          codehash)
-            case "$2" in
-              {DSTACK_FACET}) echo {dstack_codehash} ;;
-              {MEMBER_IMPL}) echo {member_codehash} ;;
-              *) echo "unexpected codehash target: $2" >&2; exit 90 ;;
-            esac
-            ;;
           calldata)
             case "$2" in
               'addAllowedAppId(address)')
@@ -170,8 +171,8 @@ def cast_stub(
           call)
             case "$3" in
               'clusterOwner()(address)') echo {SAFE} ;;
-              'owner()(address)') echo {solidstate_owner} ;;
-              'facetAddress(bytes4)(address)') echo {dstack_facet} ;;
+              'owner()(address)') echo {SAFE} ;;
+              'facetAddress(bytes4)(address)') echo {DSTACK_FACET} ;;
               'getThreshold()(uint256)') echo 2 ;;
               'allowAnyDevice()(bool)') echo false ;;
               'requireTcbUpToDate()(bool)') echo true ;;
@@ -179,7 +180,8 @@ def cast_stub(
               'allowedKmsRoots(address)(bool)') echo true ;;
               'allowedAppIds(address)(bool)') echo true ;;
               'memberIdOf(address)(bytes32)') echo {member_id} ;;
-              'memberCount()(uint256)') echo 1 ;;
+              'memberCount()(uint256)') echo {member_count} ;;
+              'cskCommitment()(bytes32)') echo {csk_commitment} ;;
               'cluster()(address)') echo {CLUSTER} ;;
               *) echo "unexpected cast call: $*" >&2; exit 93 ;;
             esac
@@ -190,10 +192,52 @@ def cast_stub(
     )
 
 
+def install_fake_stage_a_verifier(deploy_dir: Path) -> None:
+    write_executable(
+        deploy_dir / "onchain.sh",
+        textwrap.dedent(
+            """\
+            #!/usr/bin/env bash
+            set -euo pipefail
+            [ "$1" = indexer-stage-a-verify ]
+            [ "$2" = "$CLUSTER" ]
+            [ "$3" = "$CLUSTER_NAME" ]
+            : "${RPC_URL:?}" "${CHAIN_ID:?}" "${KMS_ROOT:?}"
+            : "${INDEXER_CLUSTER_OWNER:?}" "${INDEXER_COMPOSE_HASH:?}"
+            : "${DSTACK_FACET:?}" "${MEMBER_IMPL:?}" "${INDEXER_DEVICE_IDS_JSON:?}"
+            if [ -n "${ONCHAIN_VERIFY_LOG:-}" ]; then
+              printf '%s|%s|%s|%s\n' "$1" "$2" "$3" \
+                "$INDEXER_DEVICE_IDS_JSON" >> "$ONCHAIN_VERIFY_LOG"
+            fi
+            if [ "${ONCHAIN_VERIFY_MODE:-success}" = fail ]; then
+              echo "simulated complete Stage-A verification failure" >&2
+              exit 77
+            fi
+            echo "verified complete Stage-A runtime boundary" >&2
+            """
+        ),
+    )
+
+
+def isolated_worker_wrapper(tmp: Path) -> Path:
+    deploy_dir = tmp / "worker-deploy"
+    deploy_dir.mkdir()
+    for source in (WRAPPER, ROOT / "deploy" / "lib.sh"):
+        shutil.copy2(source, deploy_dir / source.name)
+    write_executable(
+        deploy_dir / "generic-node.sh",
+        f'#!/usr/bin/env bash\nexec "{GENERIC}" "$@"\n',
+    )
+    install_fake_stage_a_verifier(deploy_dir)
+    write_executable(deploy_dir / "indexer-lb-node.sh", "#!/bin/sh\nexit 97\n")
+    return deploy_dir / WRAPPER.name
+
+
 def wrapper_env(tmp: Path, node: str, *, create_state: bool = True) -> dict[str, str]:
     logdir = tmp / "logs"
     bindir = tmp / "bin"
     logdir.mkdir()
+    logdir.chmod(0o700)
     bindir.mkdir()
     credentials = tmp / ".teesql"
     credentials.mkdir()
@@ -201,7 +245,9 @@ def wrapper_env(tmp: Path, node: str, *, create_state: bool = True) -> dict[str,
         f'username = "{GHCR_USER}"\ntoken = "{GHCR_TOKEN}"\n',
         encoding="utf-8",
     )
-    cluster_state = tmp / "indexer-ha-cluster.state"
+    private = tmp / "private"
+    private.mkdir(mode=0o700)
+    cluster_state = private / "indexer-ha-cluster.state"
     compose = tmp / "indexer-ha-replica-node.yaml"
     compose.write_text(COMPOSE.read_text(encoding="utf-8"), encoding="utf-8")
     write_executable(bindir / "cast", cast_stub())
@@ -223,12 +269,21 @@ def wrapper_env(tmp: Path, node: str, *, create_state: bool = True) -> dict[str,
         "INDEXER_REGISTRY_ADDR": INDEXER_REGISTRY,
         "CHAIN_ID": CHAIN_ID,
         "CLUSTER": CLUSTER,
+        "CLUSTER_NAME": CLUSTER_NAME,
+        "INDEXER_DEVICE_IDS_JSON": json.dumps([DEVICE_ID]),
         "MEMBER_IMPL": MEMBER_IMPL,
         "KMS_ROOT": KMS_ROOT,
+        "INDEXER_HA_REPLICA_STATE_DIR": str(private),
+        "INDEXER_HA_DRAIN_STATE": str(logdir / f"indexer-ha-drain-{node}.json"),
+        "INDEXER_HA_SAFE_PAYLOAD": str(
+            logdir / f"indexer-ha-safe-admission-{node}.json"
+        ),
+        "LB_REMOTE_STATE": str(tmp / "lb-remote-reservation.json"),
+        "TEST_WRAPPER": str(isolated_worker_wrapper(tmp)),
     }
     if create_state:
         write_cluster_state(cluster_state)
-        write_replica_state(logdir, node, guest_config_fingerprint(env))
+        write_replica_state(private, node, guest_config_fingerprint(env))
     return env
 
 
@@ -237,10 +292,11 @@ def run_wrapper(
     action: str,
     env: dict[str, str],
     *,
-    script: Path = WRAPPER,
+    script: Path | None = None,
 ) -> subprocess.CompletedProcess:
+    selected_script = script or Path(env.get("TEST_WRAPPER", WRAPPER))
     return subprocess.run(
-        [str(script), node, action],
+        [str(selected_script), node, action],
         cwd=ROOT,
         env=env,
         text=True,
@@ -250,10 +306,13 @@ def run_wrapper(
 
 
 def run_generic(node: str, action: str, env: dict[str, str]) -> subprocess.CompletedProcess:
+    generic_env = dict(env)
+    generic_env["GENERIC_STATE_DIR"] = env["INDEXER_HA_REPLICA_STATE_DIR"]
+    generic_env["REQUIRE_PRIVATE_GENERIC_STATE"] = "1"
     return subprocess.run(
         [str(GENERIC), node, action],
         cwd=ROOT,
-        env=env,
+        env=generic_env,
         text=True,
         capture_output=True,
         check=False,
@@ -264,34 +323,89 @@ def read_state(path: Path) -> dict[str, str]:
     return dict(line.split("=", 1) for line in path.read_text(encoding="utf-8").splitlines())
 
 
+def replica_state_path(env: dict[str, str], node: str) -> Path:
+    return Path(env["INDEXER_HA_REPLICA_STATE_DIR"]) / f"generic-node-{node}.state"
+
+
 def isolated_wrapper_with_fake_drivers(tmp: Path) -> Path:
     deploy_dir = tmp / "isolated-deploy"
     deploy_dir.mkdir()
     wrapper = deploy_dir / WRAPPER.name
     shutil.copy2(WRAPPER, wrapper)
     shutil.copy2(ROOT / "deploy" / "lib.sh", deploy_dir / "lib.sh")
+    install_fake_stage_a_verifier(deploy_dir)
     write_executable(
         deploy_dir / "indexer-lb-node.sh",
         textwrap.dedent(
-            """\
+            f"""\
             #!/usr/bin/env bash
             set -eu
-            printf 'lb|%s|%s|%s|%s\n' "$1" "$2" "$3" \
-              "$INDEXER_LB_ACTIVE_OPERATION_ID" >> "$EVENT_LOG"
-            case "${LB_PROOF_MODE:-success}" in
-              fail) exit 42 ;;
-              false)
-                printf '{"drained":false,"operation_id":"%s","active_backends":[]}\n' \
-                  "$INDEXER_LB_ACTIVE_OPERATION_ID"
+            action="$2"
+            target="${{3:-}}"
+            printf 'lb|%s|%s|%s|%s\n' "$1" "$action" "$target" \
+              "${{INDEXER_LB_ACTIVE_OPERATION_ID:-}}" >> "$EVENT_LOG"
+            case "$action" in
+              assert-drained)
+                case "${{LB_PROOF_MODE:-success}}" in
+                  fail) exit 42 ;;
+                  false)
+                    printf '{{"drained":false,"operation_id":"%s","active_backends":[]}}\n' \
+                      "$INDEXER_LB_ACTIVE_OPERATION_ID"
+                    exit 0
+                    ;;
+                  mismatch)
+                    printf '{{"drained":true,"operation_id":"%064d","active_backends":[]}}\n' 9
+                    exit 0
+                    ;;
+                  different) reservation="{'d' * 64}" ;;
+                  success) reservation="{RESERVATION_ID}" ;;
+                  *) exit 43 ;;
+                esac
+                if [ -s "$LB_REMOTE_STATE" ]; then
+                  reservation=$(jq -r .reservation_id "$LB_REMOTE_STATE")
+                  token=$(jq -r .release_token "$LB_REMOTE_STATE")
+                  created=$(jq -r .created_at "$LB_REMOTE_STATE")
+                  idempotent=true
+                else
+                  token="{RELEASE_TOKEN}"
+                  created=1721000000
+                  idempotent=false
+                  printf '{{"backend":"{LB_BACKEND}","reserved_at_operation_id":"%s","reservation_id":"%s","release_token":"%s","created_at":%s}}\n' \
+                    "$INDEXER_LB_ACTIVE_OPERATION_ID" "$reservation" "$token" "$created" \
+                    > "$LB_REMOTE_STATE"
+                fi
+                printf '{{"drained":true,"backend":"{LB_BACKEND}","reserved_at_operation_id":"%s","reservation_id":"%s","release_token":"%s","created_at":%s,"operation_id":"%s","active_backends":["{LB_ACTIVE_BACKEND}"],"idempotent":%s}}\n' \
+                  "$INDEXER_LB_ACTIVE_OPERATION_ID" "$reservation" "$token" "$created" \
+                  "$INDEXER_LB_ACTIVE_OPERATION_ID" "$idempotent"
                 ;;
-              mismatch)
-                printf '{"drained":true,"operation_id":"%064d","active_backends":[]}\n' 9
+              release-drain)
+                [ "$target" = "{LB_BACKEND}" ]
+                [ "${{4:-}}" = "{RESERVATION_ID}" ]
+                [ "${{5:-}}" = "{RELEASE_TOKEN}" ]
+                case "${{LB_RELEASE_MODE:-success}}" in
+                  success)
+                    rm -f "$LB_REMOTE_STATE"
+                    printf '{{"released":true,"backend":"{LB_BACKEND}","reservation_id":"{RESERVATION_ID}","operation_id":"%064d"}}\n' 8
+                    ;;
+                  lost-after-apply) rm -f "$LB_REMOTE_STATE"; exit 44 ;;
+                  fail-retained) exit 45 ;;
+                  *) exit 46 ;;
+                esac
                 ;;
-              success)
-                printf '{"drained":true,"operation_id":"%s","active_backends":["10.0.0.2"]}\n' \
-                  "$INDEXER_LB_ACTIVE_OPERATION_ID"
+              drain-reservations)
+                if [ "${{LB_LIST_MODE:-valid}}" = object ]; then
+                  printf '{{"reservations":{{}}}}\n'
+                elif [ "${{LB_LIST_MODE:-valid}}" = null-entry ]; then
+                  printf '{{"reservations":[null]}}\n'
+                elif [ -s "$LB_REMOTE_STATE" ]; then
+                  printf '{{"reservations":['
+                  cat "$LB_REMOTE_STATE"
+                  printf ']}}\n'
+                else
+                  printf '{{"reservations":[]}}\n'
+                fi
                 ;;
-              *) exit 43 ;;
+              *) exit 47 ;;
             esac
             """
         ),
@@ -303,6 +417,15 @@ def isolated_wrapper_with_fake_drivers(tmp: Path) -> Path:
             #!/usr/bin/env bash
             set -eu
             printf 'generic|%s|%s\n' "$1" "$2" >> "$EVENT_LOG"
+            if [ "$2" = stop ]; then
+              [ -f "$INDEXER_HA_DRAIN_STATE" ]
+              [ "$(stat -c '%a' "$INDEXER_HA_DRAIN_STATE")" = 600 ]
+              if [ -n "${GENERIC_STOP_BLOCK_DIR:-}" ]; then
+                : > "$GENERIC_STOP_BLOCK_DIR/ready"
+                while [ ! -f "$GENERIC_STOP_BLOCK_DIR/release" ]; do sleep 0.02; done
+              fi
+              [ "${GENERIC_STOP_MODE:-success}" = success ] || exit 48
+            fi
             """
         ),
     )
@@ -428,32 +551,17 @@ class IndexerHaReplicaTests(unittest.TestCase):
             ],
         )
 
-    def test_solidstate_ownership_must_be_accepted_by_the_safe(self) -> None:
+    def test_complete_stage_a_verifier_failure_is_fatal(self) -> None:
         node = "indexer-ha-r1"
         with tempfile.TemporaryDirectory() as raw_tmp:
             tmp = Path(raw_tmp)
-            env = wrapper_env(tmp, node, create_state=False)
-            env.update(
-                {
-                    "CHAIN_ID": CHAIN_ID,
-                    "CLUSTER": CLUSTER,
-                    "DSTACK_FACET": DSTACK_FACET,
-                    "MEMBER_IMPL": MEMBER_IMPL,
-                    "INDEXER_COMPOSE_HASH": COMPOSE_HASH,
-                    "INDEXER_CLUSTER_OWNER": SAFE,
-                    "KMS_ROOT": KMS_ROOT,
-                }
-            )
-            write_executable(
-                tmp / "bin" / "cast",
-                cast_stub(solidstate_owner="0x" + ("6" * 40)),
-            )
-            result = run_wrapper(node, "save-cluster-state", env)
+            env = wrapper_env(tmp, node)
+            env["ONCHAIN_VERIFY_MODE"] = "fail"
+            result = run_wrapper(node, "verify-cluster", env)
 
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("Safe must execute acceptOwnership()", result.stderr)
-        self.assertIn(f"SAFE_TARGET={CLUSTER}", result.stderr)
-        self.assertIn(f"SAFE_CALLDATA={ACCEPT_OWNERSHIP_CALLDATA}", result.stderr)
+        self.assertIn("simulated complete Stage-A verification failure", result.stderr)
+        self.assertIn("failed the complete read-only Stage-A verification", result.stderr)
 
     def test_dedicated_state_never_falls_back_to_matrix_state(self) -> None:
         node = "indexer-ha-r1"
@@ -466,43 +574,177 @@ class IndexerHaReplicaTests(unittest.TestCase):
             result = run_wrapper(node, "safe-admission", env)
 
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("missing dedicated state", result.stderr)
+        self.assertIn("missing or unsafe dedicated state", result.stderr)
 
-    def test_cluster_must_have_the_persisted_path_a_facet_installed(self) -> None:
+    def test_worker_passes_persisted_identity_to_read_only_verifier(self) -> None:
         node = "indexer-ha-r1"
         with tempfile.TemporaryDirectory() as raw_tmp:
             tmp = Path(raw_tmp)
             env = wrapper_env(tmp, node)
-            old_facet = "0x" + ("6" * 40)
+            verify_log = tmp / "onchain-verify.log"
+            env["ONCHAIN_VERIFY_LOG"] = str(verify_log)
+            result = run_wrapper(node, "verify-cluster", env)
+            calls = verify_log.read_text(encoding="utf-8").splitlines()
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            calls,
+            [
+                f'indexer-stage-a-verify|{CLUSTER}|{CLUSTER_NAME}|["{DEVICE_ID}"]'
+            ],
+        )
+
+    def test_save_cluster_state_persists_canonical_factory_identity(self) -> None:
+        node = "indexer-ha-r1"
+        second_device = "0x" + ("cd" * 32)
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            tmp = Path(raw_tmp)
+            env = wrapper_env(tmp, node, create_state=False)
+            env.update(
+                {
+                    "DSTACK_FACET": DSTACK_FACET,
+                    "INDEXER_COMPOSE_HASH": COMPOSE_HASH,
+                    "INDEXER_CLUSTER_OWNER": SAFE,
+                    "INDEXER_DEVICE_IDS_JSON": json.dumps(
+                        [second_device.upper().replace("0X", "0x"), DEVICE_ID.upper().replace("0X", "0x")]
+                    ),
+                }
+            )
+            write_executable(tmp / "bin" / "scp", "#!/bin/sh\nexit 0\n")
             write_executable(
-                tmp / "bin" / "cast", cast_stub(dstack_facet=old_facet)
+                tmp / "bin" / "ssh",
+                "#!/bin/sh\ncat >/dev/null\necho " + COMPOSE_HASH[2:] + "\n",
+            )
+            result = run_wrapper(node, "save-cluster-state", env)
+            verified = run_wrapper(node, "verify-cluster", env)
+            state_path = Path(env["INDEXER_HA_CLUSTER_STATE"])
+            state = read_state(state_path)
+            mode = oct(state_path.stat().st_mode & 0o777)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(verified.returncode, 0, verified.stderr)
+        self.assertEqual(state["CLUSTER_NAME"], CLUSTER_NAME)
+        self.assertEqual(
+            state["INDEXER_DEVICE_IDS_JSON"],
+            json.dumps([DEVICE_ID, second_device], separators=(",", ":")),
+        )
+        self.assertEqual(mode, "0o600")
+
+    def test_save_cluster_state_requires_a_fresh_generation(self) -> None:
+        node = "indexer-ha-r1"
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            tmp = Path(raw_tmp)
+            env = wrapper_env(tmp, node, create_state=False)
+            env.update(
+                {
+                    "DSTACK_FACET": DSTACK_FACET,
+                    "INDEXER_COMPOSE_HASH": COMPOSE_HASH,
+                    "INDEXER_CLUSTER_OWNER": SAFE,
+                }
+            )
+            write_executable(tmp / "bin" / "cast", cast_stub(member_count="1"))
+            result = run_wrapper(node, "save-cluster-state", env)
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("before the first member registers", result.stderr)
+
+    def test_cluster_state_requires_canonical_device_ids(self) -> None:
+        node = "indexer-ha-r1"
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            tmp = Path(raw_tmp)
+            env = wrapper_env(tmp, node)
+            state = Path(env["INDEXER_HA_CLUSTER_STATE"])
+            state.write_text(
+                state.read_text(encoding="utf-8").replace(
+                    DEVICE_ID, DEVICE_ID.upper().replace("0X", "0x")
+                ),
+                encoding="utf-8",
             )
             result = run_wrapper(node, "verify-cluster", env)
 
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("does not match prepared Path-A DSTACK_FACET", result.stderr)
+        self.assertIn("is not canonical lowercase/sorted/minified JSON", result.stderr)
 
-    def test_stage_a_implementations_must_have_reviewed_runtime_codehashes(self) -> None:
-        cases = [
-            (
-                {"dstack_codehash": "0x" + ("6" * 64)},
-                "DSTACK_FACET runtime code hash",
-            ),
-            (
-                {"member_codehash": "0x" + ("7" * 64)},
-                "MEMBER_IMPL runtime code hash",
-            ),
-        ]
-        for overrides, expected_error in cases:
-            with self.subTest(expected_error=expected_error), tempfile.TemporaryDirectory() as raw_tmp:
+    def test_cluster_state_requires_private_file_and_parent_modes(self) -> None:
+        node = "indexer-ha-r1"
+        for target, expected in (
+            ("file", "private state must have exact mode 0600"),
+            ("parent", "private state parent must have exact mode 0700"),
+        ):
+            with self.subTest(target=target), tempfile.TemporaryDirectory() as raw_tmp:
                 tmp = Path(raw_tmp)
-                env = wrapper_env(tmp, "indexer-ha-r1")
-                write_executable(tmp / "bin" / "cast", cast_stub(**overrides))
-                result = run_wrapper("indexer-ha-r1", "verify-cluster", env)
+                env = wrapper_env(tmp, node)
+                state = Path(env["INDEXER_HA_CLUSTER_STATE"])
+                if target == "file":
+                    state.chmod(0o666)
+                else:
+                    state.parent.chmod(0o755)
+                result = run_wrapper(node, "verify-cluster", env)
 
             self.assertNotEqual(result.returncode, 0)
-            self.assertIn(expected_error, result.stderr)
-            self.assertIn("not the reviewed Stage-A build", result.stderr)
+            self.assertIn(expected, result.stderr)
+
+    def test_cluster_state_reader_refuses_a_symlink(self) -> None:
+        node = "indexer-ha-r1"
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            tmp = Path(raw_tmp)
+            env = wrapper_env(tmp, node)
+            state = Path(env["INDEXER_HA_CLUSTER_STATE"])
+            victim = tmp / "victim.state"
+            victim.write_text(state.read_text(encoding="utf-8"), encoding="utf-8")
+            victim.chmod(0o600)
+            state.unlink()
+            state.symlink_to(victim)
+            result = run_wrapper(node, "verify-cluster", env)
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("missing or unsafe dedicated state", result.stderr)
+
+    def test_replica_state_requires_private_regular_file(self) -> None:
+        node = "indexer-ha-r1"
+        for target, expected in (
+            ("mode", "private state must have exact mode 0600"),
+            ("symlink", "missing or unsafe replica state"),
+        ):
+            with self.subTest(target=target), tempfile.TemporaryDirectory() as raw_tmp:
+                tmp = Path(raw_tmp)
+                env = wrapper_env(tmp, node)
+                state = replica_state_path(env, node)
+                if target == "mode":
+                    state.chmod(0o644)
+                else:
+                    victim = tmp / "replica-victim.state"
+                    victim.write_bytes(state.read_bytes())
+                    victim.chmod(0o600)
+                    state.unlink()
+                    state.symlink_to(victim)
+                result = run_wrapper(node, "safe-admission", env)
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn(expected, result.stderr)
+
+    def test_real_direct_register_chain_enforces_exact_replica_snapshot(self) -> None:
+        node = "indexer-ha-r1"
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            tmp = Path(raw_tmp)
+            env = wrapper_env(tmp, node)
+            state = replica_state_path(env, node)
+            expected = hashlib.sha256(state.read_bytes()).hexdigest()
+            env["EXPECTED_GENERIC_STATE_SHA256"] = expected
+
+            accepted = run_generic(node, "register-direct", env)
+            state.write_text(
+                state.read_text(encoding="utf-8").replace(
+                    "VM_ID=test-vm-id", "VM_ID=replaced-vm-id"
+                ),
+                encoding="utf-8",
+            )
+            state.chmod(0o600)
+            rejected = run_generic(node, "register-direct", env)
+
+        self.assertEqual(accepted.returncode, 0, accepted.stderr)
+        self.assertNotEqual(rejected.returncode, 0)
+        self.assertIn("state snapshot changed before direct registration", rejected.stderr)
 
     def test_bundler_must_not_equal_node_rpc(self) -> None:
         node = "indexer-ha-r1"
@@ -551,7 +793,9 @@ class IndexerHaReplicaTests(unittest.TestCase):
             env["SEAL_CAPTURE"] = str(tmp / "sealed-env.txt")
             env["CURL_LOG"] = str(tmp / "curl-urls.txt")
             write_replica_state(
-                Path(env["LOGDIR"]), node, guest_config_fingerprint(env)
+                Path(env["INDEXER_HA_REPLICA_STATE_DIR"]),
+                node,
+                guest_config_fingerprint(env),
             )
             write_executable(tmp / "bin" / "scp", "#!/bin/sh\nexit 0\n")
             write_executable(
@@ -683,9 +927,7 @@ class IndexerHaReplicaTests(unittest.TestCase):
                 env = wrapper_env(tmp, node)
                 env.update(updates)
                 result = run_wrapper(node, "stop", env)
-                state = read_state(
-                    Path(env["LOGDIR"]) / f"generic-node-{node}.state"
-                )
+                state = read_state(replica_state_path(env, node))
 
             self.assertNotEqual(result.returncode, 0)
             self.assertIn(expected_error, result.stderr)
@@ -708,6 +950,9 @@ class IndexerHaReplicaTests(unittest.TestCase):
             )
             result = run_wrapper(node, "stop", env, script=wrapper)
             recorded = events.read_text(encoding="utf-8").splitlines()
+            drain_path = Path(env["INDEXER_HA_DRAIN_STATE"])
+            drain = json.loads(drain_path.read_text(encoding="utf-8"))
+            drain_mode = oct(drain_path.stat().st_mode & 0o777)
 
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(
@@ -717,15 +962,20 @@ class IndexerHaReplicaTests(unittest.TestCase):
                 f"generic|{node}|stop",
             ],
         )
-        self.assertIn("authenticated LB drain proof accepted", result.stderr)
+        self.assertEqual(drain_mode, "0o600")
+        self.assertEqual(drain["backend"], LB_BACKEND)
+        self.assertEqual(drain["operation_id"], operation)
+        self.assertEqual(drain["reservation_id"], RESERVATION_ID)
+        self.assertEqual(drain["release_token"], RELEASE_TOKEN)
+        self.assertIn("durable LB drain reservation accepted", result.stderr)
 
     def test_registered_stop_fails_closed_when_lb_proof_fails(self) -> None:
         node = "indexer-ha-r1"
         operation = "a" * 64
         cases = [
-            ("fail", "authenticated Indexer LB drain proof failed"),
-            ("false", "invalid or mismatched drain proof"),
-            ("mismatch", "invalid or mismatched drain proof"),
+            ("fail", "authenticated Indexer LB drain reservation failed"),
+            ("false", "invalid or mismatched drain reservation"),
+            ("mismatch", "invalid or mismatched drain reservation"),
         ]
         for mode, expected_error in cases:
             with self.subTest(mode=mode), tempfile.TemporaryDirectory() as raw_tmp:
@@ -751,6 +1001,245 @@ class IndexerHaReplicaTests(unittest.TestCase):
                 [f"lb|attestmesh-indexer-lb|assert-drained|{node}|{operation}"],
             )
 
+    def test_stop_retry_reuses_exact_durable_reservation(self) -> None:
+        node = "indexer-ha-r1"
+        operation = "a" * 64
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            tmp = Path(raw_tmp)
+            env = wrapper_env(tmp, node)
+            wrapper = isolated_wrapper_with_fake_drivers(tmp)
+            events = tmp / "events.log"
+            env.update(
+                {
+                    "EVENT_LOG": str(events),
+                    "INDEXER_LB_NODE": "attestmesh-indexer-lb",
+                    "INDEXER_LB_ACTIVE_OPERATION_ID": operation,
+                }
+            )
+            first = run_wrapper(node, "stop", env, script=wrapper)
+            drain_path = Path(env["INDEXER_HA_DRAIN_STATE"])
+            first_proof = drain_path.read_bytes()
+            env.pop("INDEXER_LB_NODE")
+            env.pop("INDEXER_LB_ACTIVE_OPERATION_ID")
+            second = run_wrapper(node, "stop", env, script=wrapper)
+            second_proof = drain_path.read_bytes()
+            recorded = events.read_text(encoding="utf-8").splitlines()
+
+        self.assertEqual(first.returncode, 0, first.stderr)
+        self.assertEqual(second.returncode, 0, second.stderr)
+        self.assertEqual(first_proof, second_proof)
+        self.assertEqual(
+            recorded,
+            [
+                f"lb|attestmesh-indexer-lb|assert-drained|{node}|{operation}",
+                f"generic|{node}|stop",
+                f"lb|attestmesh-indexer-lb|assert-drained|{LB_BACKEND}|{operation}",
+                f"generic|{node}|stop",
+            ],
+        )
+
+    def test_stop_retains_reservation_when_vm_stop_fails(self) -> None:
+        node = "indexer-ha-r1"
+        operation = "a" * 64
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            tmp = Path(raw_tmp)
+            env = wrapper_env(tmp, node)
+            wrapper = isolated_wrapper_with_fake_drivers(tmp)
+            events = tmp / "events.log"
+            env.update(
+                {
+                    "EVENT_LOG": str(events),
+                    "GENERIC_STOP_MODE": "fail",
+                    "INDEXER_LB_NODE": "attestmesh-indexer-lb",
+                    "INDEXER_LB_ACTIVE_OPERATION_ID": operation,
+                }
+            )
+            result = run_wrapper(node, "stop", env, script=wrapper)
+            local_exists = Path(env["INDEXER_HA_DRAIN_STATE"]).is_file()
+            remote_exists = Path(env["LB_REMOTE_STATE"]).is_file()
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertTrue(local_exists)
+        self.assertTrue(remote_exists)
+
+    def test_release_cannot_race_worker_stop(self) -> None:
+        node = "indexer-ha-r1"
+        operation = "a" * 64
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            tmp = Path(raw_tmp)
+            env = wrapper_env(tmp, node)
+            wrapper = isolated_wrapper_with_fake_drivers(tmp)
+            events = tmp / "events.log"
+            block = tmp / "stop-block"
+            block.mkdir()
+            env.update(
+                {
+                    "EVENT_LOG": str(events),
+                    "GENERIC_STOP_BLOCK_DIR": str(block),
+                    "INDEXER_LB_NODE": "attestmesh-indexer-lb",
+                    "INDEXER_LB_ACTIVE_OPERATION_ID": operation,
+                }
+            )
+            first = subprocess.Popen(
+                [str(wrapper), node, "stop"],
+                cwd=ROOT,
+                env=env,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            for _ in range(100):
+                if (block / "ready").exists():
+                    break
+                time.sleep(0.02)
+            else:
+                first.kill()
+                self.fail("first stop did not reach the serialized VM-stop boundary")
+            raced = run_wrapper(node, "release-drain", env, script=wrapper)
+            (block / "release").touch()
+            _stdout, first_stderr = first.communicate(timeout=5)
+
+        self.assertEqual(first.returncode, 0, first_stderr)
+        self.assertNotEqual(raced.returncode, 0)
+        self.assertIn("another worker stop/release operation is already running", raced.stderr)
+
+    def test_stop_fails_if_remote_reservation_differs_from_local_proof(self) -> None:
+        node = "indexer-ha-r1"
+        operation = "a" * 64
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            tmp = Path(raw_tmp)
+            env = wrapper_env(tmp, node)
+            wrapper = isolated_wrapper_with_fake_drivers(tmp)
+            events = tmp / "events.log"
+            env.update(
+                {
+                    "EVENT_LOG": str(events),
+                    "INDEXER_LB_NODE": "attestmesh-indexer-lb",
+                    "INDEXER_LB_ACTIVE_OPERATION_ID": operation,
+                }
+            )
+            first = run_wrapper(node, "stop", env, script=wrapper)
+            remote = Path(env["LB_REMOTE_STATE"])
+            value = json.loads(remote.read_text(encoding="utf-8"))
+            value["reservation_id"] = "d" * 64
+            remote.write_text(json.dumps(value), encoding="utf-8")
+            second = run_wrapper(node, "stop", env, script=wrapper)
+            recorded = events.read_text(encoding="utf-8").splitlines()
+
+        self.assertEqual(first.returncode, 0, first.stderr)
+        self.assertNotEqual(second.returncode, 0)
+        self.assertIn("differs from durable worker proof", second.stderr)
+        self.assertEqual(recorded[-1], f"lb|attestmesh-indexer-lb|assert-drained|{LB_BACKEND}|{operation}")
+
+    def test_release_drain_reconciles_success_and_lost_response(self) -> None:
+        node = "indexer-ha-r1"
+        operation = "a" * 64
+        for mode in ("success", "lost-after-apply"):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as raw_tmp:
+                tmp = Path(raw_tmp)
+                env = wrapper_env(tmp, node)
+                wrapper = isolated_wrapper_with_fake_drivers(tmp)
+                events = tmp / "events.log"
+                env.update(
+                    {
+                        "EVENT_LOG": str(events),
+                        "INDEXER_LB_NODE": "attestmesh-indexer-lb",
+                        "INDEXER_LB_ACTIVE_OPERATION_ID": operation,
+                    }
+                )
+                stopped = run_wrapper(node, "stop", env, script=wrapper)
+                env["LB_RELEASE_MODE"] = mode
+                released = run_wrapper(node, "release-drain", env, script=wrapper)
+                local_exists = Path(env["INDEXER_HA_DRAIN_STATE"]).exists()
+                remote_exists = Path(env["LB_REMOTE_STATE"]).exists()
+
+            self.assertEqual(stopped.returncode, 0, stopped.stderr)
+            self.assertEqual(released.returncode, 0, released.stderr)
+            self.assertFalse(local_exists)
+            self.assertFalse(remote_exists)
+
+    def test_release_drain_retains_proof_while_remote_reservation_exists(self) -> None:
+        node = "indexer-ha-r1"
+        operation = "a" * 64
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            tmp = Path(raw_tmp)
+            env = wrapper_env(tmp, node)
+            wrapper = isolated_wrapper_with_fake_drivers(tmp)
+            events = tmp / "events.log"
+            env.update(
+                {
+                    "EVENT_LOG": str(events),
+                    "INDEXER_LB_NODE": "attestmesh-indexer-lb",
+                    "INDEXER_LB_ACTIVE_OPERATION_ID": operation,
+                }
+            )
+            stopped = run_wrapper(node, "stop", env, script=wrapper)
+            env["LB_RELEASE_MODE"] = "fail-retained"
+            released = run_wrapper(node, "release-drain", env, script=wrapper)
+            local_exists = Path(env["INDEXER_HA_DRAIN_STATE"]).is_file()
+            remote_exists = Path(env["LB_REMOTE_STATE"]).is_file()
+
+        self.assertEqual(stopped.returncode, 0, stopped.stderr)
+        self.assertNotEqual(released.returncode, 0)
+        self.assertIn("reservation remains active", released.stderr)
+        self.assertTrue(local_exists)
+        self.assertTrue(remote_exists)
+
+    def test_release_drain_rejects_malformed_reservation_lists(self) -> None:
+        node = "indexer-ha-r1"
+        operation = "a" * 64
+        for list_mode in ("object", "null-entry"):
+            with self.subTest(list_mode=list_mode), tempfile.TemporaryDirectory() as raw_tmp:
+                tmp = Path(raw_tmp)
+                env = wrapper_env(tmp, node)
+                wrapper = isolated_wrapper_with_fake_drivers(tmp)
+                events = tmp / "events.log"
+                env.update(
+                    {
+                        "EVENT_LOG": str(events),
+                        "INDEXER_LB_NODE": "attestmesh-indexer-lb",
+                        "INDEXER_LB_ACTIVE_OPERATION_ID": operation,
+                    }
+                )
+                stopped = run_wrapper(node, "stop", env, script=wrapper)
+                env.update(
+                    {
+                        "LB_RELEASE_MODE": "lost-after-apply",
+                        "LB_LIST_MODE": list_mode,
+                    }
+                )
+                released = run_wrapper(node, "release-drain", env, script=wrapper)
+                local_exists = Path(env["INDEXER_HA_DRAIN_STATE"]).is_file()
+
+            self.assertEqual(stopped.returncode, 0, stopped.stderr)
+            self.assertNotEqual(released.returncode, 0)
+            self.assertIn("malformed drain reservation list", released.stderr)
+            self.assertTrue(local_exists)
+
+    def test_release_drain_rejects_nonprivate_local_proof(self) -> None:
+        node = "indexer-ha-r1"
+        operation = "a" * 64
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            tmp = Path(raw_tmp)
+            env = wrapper_env(tmp, node)
+            wrapper = isolated_wrapper_with_fake_drivers(tmp)
+            events = tmp / "events.log"
+            env.update(
+                {
+                    "EVENT_LOG": str(events),
+                    "INDEXER_LB_NODE": "attestmesh-indexer-lb",
+                    "INDEXER_LB_ACTIVE_OPERATION_ID": operation,
+                }
+            )
+            stopped = run_wrapper(node, "stop", env, script=wrapper)
+            proof = Path(env["INDEXER_HA_DRAIN_STATE"])
+            proof.chmod(0o644)
+            released = run_wrapper(node, "release-drain", env, script=wrapper)
+
+        self.assertEqual(stopped.returncode, 0, stopped.stderr)
+        self.assertNotEqual(released.returncode, 0)
+        self.assertIn("private state must have exact mode 0600", released.stderr)
+
     def test_never_registered_candidate_can_be_cleaned_without_lb_drain(self) -> None:
         node = "indexer-ha-r1"
         with tempfile.TemporaryDirectory() as raw_tmp:
@@ -766,7 +1255,7 @@ class IndexerHaReplicaTests(unittest.TestCase):
                 '#!/bin/sh\necho \'{"vm_id":"test-vm-id","found":true,"stopped":true,"status":"stopped"}\'\n',
             )
             result = run_wrapper(node, "stop", env)
-            state_path = Path(env["LOGDIR"]) / f"generic-node-{node}.state"
+            state_path = replica_state_path(env, node)
             state = read_state(state_path)
 
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -790,9 +1279,7 @@ class IndexerHaReplicaTests(unittest.TestCase):
                 '#!/bin/sh\necho \'{"vm_id":"test-vm-id","found":true,"stopped":false,"status":"stopping"}\'\n',
             )
             result = run_wrapper(node, "stop", env)
-            state = read_state(
-                Path(env["LOGDIR"]) / f"generic-node-{node}.state"
-            )
+            state = read_state(replica_state_path(env, node))
 
         self.assertNotEqual(result.returncode, 0)
         self.assertIn(
@@ -805,7 +1292,7 @@ class IndexerHaReplicaTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as raw_tmp:
             tmp = Path(raw_tmp)
             env = wrapper_env(tmp, node)
-            state_path = Path(env["LOGDIR"]) / f"generic-node-{node}.state"
+            state_path = replica_state_path(env, node)
             marker = tmp / "state-was-evaluated"
             state_path.write_text(
                 state_path.read_text(encoding="utf-8").replace(
@@ -829,7 +1316,7 @@ class IndexerHaReplicaTests(unittest.TestCase):
             with self.subTest(expected_error=expected_error), tempfile.TemporaryDirectory() as raw_tmp:
                 tmp = Path(raw_tmp)
                 env = wrapper_env(tmp, node)
-                state_path = Path(env["LOGDIR"]) / f"generic-node-{node}.state"
+                state_path = replica_state_path(env, node)
                 with state_path.open("a", encoding="utf-8") as state:
                     state.write(suffix)
                 result = run_wrapper(node, "safe-admission", env)
@@ -875,9 +1362,7 @@ class IndexerHaReplicaTests(unittest.TestCase):
                     f"#!/bin/sh\ncat >/dev/null\nprintf '%s\\n' '{payload}'\n",
                 )
                 result = run_generic(node, "deploy", env)
-                state = read_state(
-                    Path(env["LOGDIR"]) / f"generic-node-{node}.state"
-                )
+                state = read_state(replica_state_path(env, node))
 
             self.assertNotEqual(result.returncode, 0)
             self.assertIn(expected_error, result.stderr)
@@ -902,7 +1387,7 @@ class IndexerHaReplicaTests(unittest.TestCase):
         self.assertIn(".clusterMemberImplementation", result.stdout)
         self.assertIn("save-cluster-state", result.stdout)
         self.assertIn(
-            "CHAIN_ID, CLUSTER, DSTACK_FACET, MEMBER_IMPL", result.stdout
+            "CHAIN_ID, CLUSTER, CLUSTER_NAME", result.stdout
         )
 
     def test_warmed_candidate_may_keep_grpc_closed_before_registry_rotation(self) -> None:
@@ -942,10 +1427,9 @@ class IndexerHaReplicaTests(unittest.TestCase):
         self.assertNotIn("setIndexer", wrapper)
         self.assertNotIn("INDEXER_LB_DRAIN_CONFIRMED", wrapper)
         self.assertIn("addAllowedAppId(address)", wrapper)
-        self.assertIn(
-            '"$HERE/indexer-lb-node.sh" "$INDEXER_LB_NODE" assert-drained "$NODE"',
-            wrapper,
-        )
+        self.assertIn("assert-drained", wrapper)
+        self.assertIn("release-drain", wrapper)
+        self.assertIn("_durable_write_drain_state", wrapper)
         self.assertIn("eth_supportedEntryPoints", wrapper)
 
 

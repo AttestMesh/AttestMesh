@@ -20,7 +20,8 @@ GATEWAY_DOMAIN="${GATEWAY_DOMAIN:-gateway.attestmesh.xyz}"
 export BOX_VCPU="${BOX_VCPU:-2}" BOX_MEM="${BOX_MEM:-4096}" BOX_DISK="${BOX_DISK:-40}"
 export BOX_PORTS="${BOX_PORTS:-[]}" BOX_GATEWAY_ENABLED="${BOX_GATEWAY_ENABLED:-true}" BOX_NET_MODE="${BOX_NET_MODE:-bridge}"
 
-STATE="$LOGDIR/generic-node-${NODE}.state"
+STATE_DIR="${GENERIC_STATE_DIR:-$LOGDIR}"
+STATE="$STATE_DIR/generic-node-${NODE}.state"
 ZERO32=0x0000000000000000000000000000000000000000000000000000000000000000
 ZERO_ADDRESS=0x0000000000000000000000000000000000000000
 REQUESTED_CLUSTER="${CLUSTER:-}"
@@ -87,13 +88,75 @@ _validate_state_values() {
   fi
 }
 
+_ensure_state_dir() {
+  umask 077
+  mkdir -p "$STATE_DIR"
+  if [ "${REQUIRE_PRIVATE_GENERIC_STATE:-0}" = 1 ]; then
+    [ ! -L "$STATE_DIR" ] || die "refusing symlinked generic state directory: $STATE_DIR"
+    [ -d "$STATE_DIR" ] || die "generic state directory is not a directory: $STATE_DIR"
+    [ "$(stat -c '%u' "$STATE_DIR")" = "$(id -u)" ] \
+      || die "generic state directory is not owned by the current user"
+    [ "$(stat -c '%a' "$STATE_DIR")" = 700 ] \
+      || die "generic state directory must have exact mode 0700"
+  fi
+}
+
+_read_state_once() {
+  local expected="${EXPECTED_GENERIC_STATE_SHA256:-}"
+  if [ "${REQUIRE_PRIVATE_GENERIC_STATE:-0}" != 1 ]; then
+    cat "$STATE"
+    return
+  fi
+  python3 - "$STATE" "$expected" <<'PY'
+import hashlib
+import os
+import stat
+import sys
+
+path = os.path.abspath(sys.argv[1])
+expected = sys.argv[2]
+parent, name = os.path.dirname(path), os.path.basename(path)
+directory_fd = os.open(parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+try:
+    fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=directory_fd)
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
+            raise SystemExit("generic state is not a regular file")
+        if info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) != 0o600:
+            raise SystemExit("generic state must be current-user-owned mode 0600")
+        if info.st_size < 1 or info.st_size > 65536:
+            raise SystemExit("generic state size is invalid")
+        raw = b""
+        while len(raw) <= 65536:
+            chunk = os.read(fd, 65537 - len(raw))
+            if not chunk:
+                break
+            raw += chunk
+        if len(raw) > 65536:
+            raise SystemExit("generic state exceeds 65536 bytes")
+        digest = hashlib.sha256(raw).hexdigest()
+        if expected and digest != expected:
+            raise SystemExit(
+                f"generic state snapshot changed ({digest} != expected {expected})"
+            )
+        sys.stdout.buffer.write(raw)
+    finally:
+        os.close(fd)
+finally:
+    os.close(directory_fd)
+PY
+}
+
 _save() {
   local tmp
   umask 077
+  _ensure_state_dir
   STATE_SCHEMA=2
   UPDATED_AT=$(ts)
   _validate_state_values
-  tmp="${STATE}.tmp.$$"
+  tmp=$(mktemp "$STATE_DIR/.generic-node-state.XXXXXX") \
+    || die "could not create generic state temporary file"
   if ! {
     printf 'STATE_SCHEMA=2\n'
     printf 'UPDATED_AT=%s\n' "$UPDATED_AT"
@@ -117,8 +180,15 @@ _save() {
 }
 
 _load() {
+  local content
   _clear_state
-  [ -f "$STATE" ] || return 0
+  if [ ! -e "$STATE" ] && [ ! -L "$STATE" ]; then
+    return 0
+  fi
+  _ensure_state_dir
+  content=$( { _read_state_once; rc=$?; printf '\034'; exit "$rc"; } ) \
+    || die "could not safely read generic state: $STATE"
+  content="${content%$'\034'}"
   local line key value required
   declare -A seen=()
   while IFS= read -r line || [ -n "$line" ]; do
@@ -133,7 +203,7 @@ _load() {
     [ -z "${seen[$key]+present}" ] || die "duplicate generic state field '$key' in $STATE"
     seen[$key]=1
     printf -v "$key" '%s' "$value"
-  done <"$STATE"
+  done < <(printf '%s' "$content")
   for required in UPDATED_AT STATE_PHASE X H VM_ID CLUSTER MEMBER_IMPL KMS_ROOT GATEWAY_DOMAIN; do
     [ -n "${seen[$required]+present}" ] || die "generic state is missing $required: $STATE"
   done
@@ -164,7 +234,7 @@ ssh_box() { ssh -o BatchMode=yes -o ConnectTimeout=8 "$BOX_HOST" "$@"; }
 
 _require_tools() {
   local tool
-  for tool in jq cast ssh scp sha256sum sync; do
+  for tool in jq cast mktemp python3 scp sha256sum ssh stat sync; do
     command -v "$tool" >/dev/null 2>&1 || die "missing required tool: $tool"
   done
 }

@@ -2,7 +2,7 @@
 # same dedicated signer cluster and must be rendered with the constant measured
 # compose name selected by deploy/indexer-ha-replica-node.sh.
 #
-# Both multi-architecture OCI indexes were published by CI from source commit
+# Both OCI indexes were published by CI from source commit
 # 9641e99c1450cde84383932ff4cb982e97c4477b.
 services:
   sidecar:
@@ -16,6 +16,10 @@ services:
       - GAS_POLICY_ID=${GAS_POLICY_ID}
       - INDEXER_REGISTRY_ADDR=${INDEXER_REGISTRY_ADDR}
       - GATEWAY_DOMAIN=${GATEWAY_DOMAIN}
+      # The immutable factory installs its reviewed pre-Ed25519 NetworkFacet on a
+      # fresh cluster. Keep the sealed PeerEndpoint exchange enabled until a
+      # separate Safe-approved NetworkFacet cut moves this cluster to on-chain keys.
+      - PEER_ENVELOPE_FALLBACK=true
       - DSTACK_SOCKET=/var/run/dstack.sock
       - SIDECAR_STATE_DIR=/var/lib/attestmesh
       - AGENT_GRPC_SOCKET=/var/run/attestmesh/agent.sock
