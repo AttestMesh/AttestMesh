@@ -58,7 +58,7 @@ required runtime config; cluster addresses are never configured directly.
 | `GET /mesh/topology` | aggregate per-cluster nodes + all-pairs edges (full mesh; edge `state: "unknown"` on this tier) |
 | `GET /mesh/health` | aggregate on-chain summaries (member count, CSK committed, originator) |
 | `GET /mesh/timeline` | aggregate indexed membership-event histories from each discovered cluster deploy block |
-| `GET /healthz` | liveness probe (`ok`, `rpcReachable`, `clusterCount`, `cacheAgeMs`) |
+| `GET /healthz` | liveness + index freshness (`rpcReachable`, `atBlock`, `headBlock`, `blockLag`, `indexedAt`, `ageSeconds`, `fresh`) |
 
 Hex casing: `bytes32` lowercase; `address` EIP-55 checksummed; `appId` = `memberContract`
 lowercased, no `0x` (the operator join key, since **app_id == ClusterMember address**).
