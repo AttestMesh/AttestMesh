@@ -143,18 +143,18 @@ contract PrepareDstackFacetPathASafe is Script {
     bytes32 public constant MEMBER_IMPLEMENTATION_SALT =
         0xac3d0f1737eb55ea6a051b5a5d36d8a37dd42e0408cd9c8d415905623c7f9074;
     bytes32 public constant DSTACK_FACET_INIT_CODEHASH =
-        0x61e193b29e486425995a684eaa54c35c9f8d6daddc162fed76ae6788719f3f21;
+        0x4b022b0b0542765fd75e895713a3aa621e5730c4ddd0172598177235adf65662;
     bytes32 public constant MEMBER_IMPLEMENTATION_INIT_CODEHASH =
-        0x3908e3b1dada03a44e17e2e5b21ce3ea721f7cdb99ee1fdb38ebe1e3ace2c2a9;
+        0x667dae361d485f9cb65c74af1548c9e5054c89eb2669156dbbd3da7f24fd0ef1;
     bytes32 public constant DSTACK_FACET_RUNTIME_CODEHASH =
-        0x91c3c31fabe7d7c55924bd46873bcb46960c1e5db5fb1e322fc8fb2f1ad76563;
+        0xf19b470a052d0b3ab62e80ce94dd828aae33d554e507c01dab6ef7e779f77c79;
     // ClusterMember inherits UUPSUpgradeable's immutable __self. This is the runtime
     // hash at DETERMINISTIC_MEMBER_IMPLEMENTATION, not forge inspect's zero-address template.
     bytes32 public constant MEMBER_IMPLEMENTATION_RUNTIME_CODEHASH =
-        0xff7bc4fce11b058048beea8374ef775a81fc48c1133e3d28197212a12b1fee5f;
-    address public constant DETERMINISTIC_DSTACK_FACET = 0x15ABc7087941AfD4640A8974F1D56aD4A4860d28;
+        0xf5820491e5bb675a2e410b583652f4e651b98a070c5900ed1d93ac3a87d263ff;
+    address public constant DETERMINISTIC_DSTACK_FACET = 0xE0c2140dD2a163198b3DDdB78D959b115Cd43ff1;
     address public constant DETERMINISTIC_MEMBER_IMPLEMENTATION =
-        0x6f66d930923d18cc6469954E2b90452e60266d64;
+        0x3354510A01fAb92359dBD4204CcEc91dA9BC1E06;
 
     error UnexpectedChain(uint256 expected, uint256 actual);
     error UnexpectedApprovedSafe(address expected, address actual);
