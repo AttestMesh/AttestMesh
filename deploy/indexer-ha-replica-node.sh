@@ -26,6 +26,8 @@ ENTRY_POINT_V07=0x0000000071727De22E5E9d8BAf0edAc6f37da032
 DSTACK_REGISTER_SELECTOR=0x537d491c
 STAGE_A_SIDECAR_DIGEST=cc8aaa13ae356de28f2e02df777adc56754a9b52e7b81e718e755969e8804943
 STAGE_A_INDEXER_DIGEST=0d7cbbdb049e1c7606d169ea69f890cf05d3384bc1777c5dac3e1237ebaaa68c
+STAGE_A_DSTACK_FACET_CODEHASH=0x91c3c31fabe7d7c55924bd46873bcb46960c1e5db5fb1e322fc8fb2f1ad76563
+STAGE_A_MEMBER_IMPL_CODEHASH=0xadc979a69cd23526776858fefe6ed0c9e143e7ffbe2f81d715b2ea84468f0f22
 
 export COMPOSE GATEWAY_DOMAIN
 export BOX_COMPOSE_NAME="$MEASURED_COMPOSE_NAME"
@@ -101,6 +103,7 @@ _verify_safe_owner() {
 
 _verify_cluster_policy() {
   local actual_owner solidstate_owner actual_dstack_facet main_cluster chain accept_calldata
+  local dstack_codehash member_codehash
   _validate_cluster_values
   chain=$(cast chain-id --rpc-url "$RPC_URL") || die "RPC_URL is unavailable"
   [ "$chain" = "$CHAIN_ID" ] || die "RPC chain $chain does not match CHAIN_ID=$CHAIN_ID"
@@ -110,6 +113,14 @@ _verify_cluster_policy() {
     || die "DSTACK_FACET has no code"
   cast code "$MEMBER_IMPL" --rpc-url "$RPC_URL" | grep -Eq '^0x[0-9a-fA-F]{4,}$' \
     || die "MEMBER_IMPL has no code"
+  dstack_codehash=$(cast codehash "$DSTACK_FACET" --rpc-url "$RPC_URL") \
+    || die "cannot read DSTACK_FACET runtime code hash"
+  [ "${dstack_codehash,,}" = "$STAGE_A_DSTACK_FACET_CODEHASH" ] \
+    || die "DSTACK_FACET runtime code hash $dstack_codehash is not the reviewed Stage-A build"
+  member_codehash=$(cast codehash "$MEMBER_IMPL" --rpc-url "$RPC_URL") \
+    || die "cannot read MEMBER_IMPL runtime code hash"
+  [ "${member_codehash,,}" = "$STAGE_A_MEMBER_IMPL_CODEHASH" ] \
+    || die "MEMBER_IMPL runtime code hash $member_codehash is not the reviewed Stage-A build"
   actual_dstack_facet=$(cast call "$CLUSTER" 'facetAddress(bytes4)(address)' \
     "$DSTACK_REGISTER_SELECTOR" --rpc-url "$RPC_URL") \
     || die "CLUSTER does not expose ERC-2535 facetAddress(bytes4)"
@@ -150,6 +161,7 @@ save_cluster_state() {
   _tools
   _require_reviewed_images
   _verify_cluster_policy
+  verify_rendered_hash
   if [ -e "$CLUSTER_STATE" ] && [ "${FORCE:-0}" != 1 ]; then
     die "$CLUSTER_STATE already exists; set FORCE=1 only for an intentional replacement"
   fi
@@ -174,9 +186,36 @@ EOF
 _load_cluster_state() {
   [ -f "$CLUSTER_STATE" ] \
     || die "missing dedicated state $CLUSTER_STATE; run save-cluster-state with explicit values"
-  # This file is written only by save_cluster_state after strict fixed-width validation.
-  # shellcheck disable=SC1090
-  source "$CLUSTER_STATE"
+  local line key value required
+  declare -A state=() seen=()
+  while IFS= read -r line || [ -n "$line" ]; do
+    [ -n "$line" ] || die "blank line in dedicated cluster state: $CLUSTER_STATE"
+    [[ "$line" == *=* ]] || die "malformed line in dedicated cluster state: $CLUSTER_STATE"
+    key="${line%%=*}"
+    value="${line#*=}"
+    case "$key" in
+      UPDATED_AT|CHAIN_ID|CLUSTER|DSTACK_FACET|MEMBER_IMPL|INDEXER_COMPOSE_HASH|INDEXER_CLUSTER_OWNER|KMS_ROOT|MEASURED_COMPOSE_NAME) ;;
+      *) die "unknown dedicated cluster state field '$key' in $CLUSTER_STATE" ;;
+    esac
+    [ -z "${seen[$key]+present}" ] \
+      || die "duplicate dedicated cluster state field '$key' in $CLUSTER_STATE"
+    seen[$key]=1
+    state[$key]="$value"
+  done <"$CLUSTER_STATE"
+  for required in UPDATED_AT CHAIN_ID CLUSTER DSTACK_FACET MEMBER_IMPL INDEXER_COMPOSE_HASH INDEXER_CLUSTER_OWNER KMS_ROOT MEASURED_COMPOSE_NAME; do
+    [ -n "${seen[$required]+present}" ] \
+      || die "dedicated cluster state is missing $required: $CLUSTER_STATE"
+  done
+  [[ "${state[UPDATED_AT]}" =~ ^[0-9]{8}T[0-9]{6}Z$ ]] \
+    || die "dedicated cluster state UPDATED_AT is malformed"
+  CHAIN_ID="${state[CHAIN_ID]}"
+  CLUSTER="${state[CLUSTER]}"
+  DSTACK_FACET="${state[DSTACK_FACET]}"
+  MEMBER_IMPL="${state[MEMBER_IMPL]}"
+  INDEXER_COMPOSE_HASH="${state[INDEXER_COMPOSE_HASH]}"
+  INDEXER_CLUSTER_OWNER="${state[INDEXER_CLUSTER_OWNER]}"
+  KMS_ROOT="${state[KMS_ROOT]}"
+  MEASURED_COMPOSE_NAME="${state[MEASURED_COMPOSE_NAME]}"
   [ "${MEASURED_COMPOSE_NAME:-}" = "$BOX_COMPOSE_NAME" ] \
     || die "cluster state compose name differs from INDEXER_HA_COMPOSE_NAME=$BOX_COMPOSE_NAME"
   _validate_cluster_values
@@ -190,28 +229,31 @@ _load_cluster_state() {
 }
 
 _runtime_env() {
-  require PRIVATE_KEY DEPLOYER_ADDR RPC_URL BUNDLER_URL GAS_POLICY_ID
+  require PRIVATE_KEY DEPLOYER_ADDR RPC_URL GAS_POLICY_ID
   [ -n "${GAS_POLICY_ID//[[:space:]]/}" ] || die "GAS_POLICY_ID must not be blank"
-  local bundler="${BUNDLER_URL%/}" rpc="${RPC_URL%/}" cvm_rpc="${CVM_RPC_URL:-}"
-  cvm_rpc="${cvm_rpc%/}"
-  [ "$bundler" != "$rpc" ] || die "BUNDLER_URL must not equal RPC_URL"
-  if [ -n "$cvm_rpc" ]; then
-    [ "$bundler" != "$cvm_rpc" ] || die "BUNDLER_URL must not equal CVM_RPC_URL"
-  fi
+  local rpc="${RPC_URL%/}" guest_rpc="${CVM_RPC_URL:-$RPC_URL}" bundler_compare
+  GUEST_BUNDLER_URL="${CVM_BUNDLER_URL:-${BUNDLER_URL:-$RPC_URL}}"
+  bundler_compare="${GUEST_BUNDLER_URL%/}"
+  guest_rpc="${guest_rpc%/}"
+  [ -n "$GUEST_BUNDLER_URL" ] || die "CVM_BUNDLER_URL/BUNDLER_URL must not be blank"
+  [ "$bundler_compare" != "$rpc" ] || die "sealed guest BUNDLER_URL must not equal RPC_URL"
+  [ "$bundler_compare" != "$guest_rpc" ] \
+    || die "sealed guest BUNDLER_URL must not equal CVM_RPC_URL"
+  export GUEST_BUNDLER_URL
 }
 
 _bundler_rpc() {
   local method="$1"
   curl -fsS --max-time 15 -H 'content-type: application/json' \
     --data "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"$method\",\"params\":[]}" \
-    "$BUNDLER_URL"
+    "$GUEST_BUNDLER_URL"
 }
 
 preflight_bundler() {
   local entries chain expected
   _runtime_env
   entries="$(_bundler_rpc eth_supportedEntryPoints)" \
-    || die "BUNDLER_URL did not answer eth_supportedEntryPoints"
+    || die "sealed guest BUNDLER_URL did not answer eth_supportedEntryPoints"
   echo "$entries" | jq -e --arg entry "${ENTRY_POINT_V07,,}" \
     '.result
      | type == "array"
@@ -219,13 +261,13 @@ preflight_bundler() {
        and all(.[]; test("^0x[0-9a-fA-F]{40}$"))
        and (map(ascii_downcase) | index($entry) != null)' \
     >/dev/null \
-    || die "BUNDLER_URL does not support the sidecar's canonical v0.7 EntryPoint $ENTRY_POINT_V07"
-  chain="$(_bundler_rpc eth_chainId)" || die "BUNDLER_URL did not answer eth_chainId"
+    || die "sealed guest BUNDLER_URL does not support the sidecar's canonical v0.7 EntryPoint $ENTRY_POINT_V07"
+  chain="$(_bundler_rpc eth_chainId)" || die "sealed guest BUNDLER_URL did not answer eth_chainId"
   chain=$(echo "$chain" | jq -er '.result | select(type == "string")') \
-    || die "BUNDLER_URL returned an invalid chain id"
+    || die "sealed guest BUNDLER_URL returned an invalid chain id"
   expected=$(printf '0x%x' "$CHAIN_ID")
   [ "${chain,,}" = "$expected" ] \
-    || die "BUNDLER_URL chain id $chain does not match CHAIN_ID=$CHAIN_ID"
+    || die "sealed guest BUNDLER_URL chain id $chain does not match CHAIN_ID=$CHAIN_ID"
   log "ERC-4337 bundler preflight passed (canonical v0.7 entry point + chain id; gas policy present)"
 }
 
@@ -239,8 +281,13 @@ preflight_guest_rpc() {
 }
 
 _generic() {
-  local action="$1"
+  local action="$1" allow_gateway_drift=0
+  case "$action" in
+    cleanup|stop) allow_gateway_drift=1 ;;
+  esac
   COMPOSE="$COMPOSE" BOX_COMPOSE_NAME="$BOX_COMPOSE_NAME" \
+    ALLOW_GENERIC_GATEWAY_DRIFT="$allow_gateway_drift" \
+    REQUIRE_GUEST_CONFIG_FINGERPRINT=1 STRICT_GENERIC_STATE_BINDINGS=1 \
     "$HERE/generic-node.sh" "$NODE" "$action"
 }
 
@@ -273,22 +320,66 @@ preflight() {
 }
 
 _load_replica_state() {
+  local drift_mode="${1:-enforce-config}"
   local expected_cluster="$CLUSTER" expected_impl="$MEMBER_IMPL"
-  local expected_hash="${INDEXER_COMPOSE_HASH,,}" actual_hash
+  local expected_kms="$KMS_ROOT" expected_hash="${INDEXER_COMPOSE_HASH,,}"
+  local actual_hash current_guest_hash line key value required
+  declare -A state=() seen=()
   [ -f "$REPLICA_STATE" ] || die "missing replica state $REPLICA_STATE; run deploy first"
-  # shellcheck disable=SC1090
-  source "$REPLICA_STATE"
-  require X H VM_ID
+  while IFS= read -r line || [ -n "$line" ]; do
+    [ -n "$line" ] || die "blank line in replica state: $REPLICA_STATE"
+    [[ "$line" == *=* ]] || die "malformed line in replica state: $REPLICA_STATE"
+    key="${line%%=*}"
+    value="${line#*=}"
+    case "$key" in
+      STATE_SCHEMA|UPDATED_AT|STATE_PHASE|X|H|VM_ID|CLUSTER|MEMBER_IMPL|KMS_ROOT|GATEWAY_DOMAIN|GUEST_CONFIG_SHA256) ;;
+      *) die "unknown replica state field '$key' in $REPLICA_STATE" ;;
+    esac
+    [ -z "${seen[$key]+present}" ] || die "duplicate replica state field '$key' in $REPLICA_STATE"
+    seen[$key]=1
+    state[$key]="$value"
+  done <"$REPLICA_STATE"
+  for required in STATE_SCHEMA UPDATED_AT STATE_PHASE X H VM_ID CLUSTER MEMBER_IMPL KMS_ROOT GATEWAY_DOMAIN GUEST_CONFIG_SHA256; do
+    [ -n "${seen[$required]+present}" ] || die "replica state is missing $required: $REPLICA_STATE"
+  done
+  [ "${state[STATE_SCHEMA]}" = 2 ] || die "replica state must use schema 2"
+  [[ "${state[UPDATED_AT]}" =~ ^[0-9]{8}T[0-9]{6}Z$ ]] \
+    || die "replica state UPDATED_AT is malformed"
+  case "${state[STATE_PHASE]}" in
+    preflighted|deployed-stopped|primed|bound|started|registered|cleaned) ;;
+    *) die "replica state STATE_PHASE is invalid: ${state[STATE_PHASE]}" ;;
+  esac
+  X="${state[X]}"
+  H="${state[H]}"
+  VM_ID="${state[VM_ID]}"
   _address X "$X"
   _bytes32 H "0x${H#0x}"
-  [ "${CLUSTER,,}" = "${expected_cluster,,}" ] \
-    || die "replica state belongs to cluster $CLUSTER, expected $expected_cluster"
-  [ "${MEMBER_IMPL,,}" = "${expected_impl,,}" ] \
+  [[ "$VM_ID" =~ ^[a-zA-Z0-9][a-zA-Z0-9._:-]{0,127}$ ]] \
+    || die "replica state VM_ID contains unsupported characters"
+  [[ "${state[GATEWAY_DOMAIN]}" =~ ^[a-zA-Z0-9._:-]+$ ]] \
+    || die "replica state GATEWAY_DOMAIN contains unsupported characters"
+  [ "${state[CLUSTER],,}" = "${expected_cluster,,}" ] \
+    || die "replica state belongs to cluster ${state[CLUSTER]}, expected $expected_cluster"
+  [ "${state[MEMBER_IMPL],,}" = "${expected_impl,,}" ] \
     || die "replica state MEMBER_IMPL differs from dedicated cluster state"
+  [ "${state[KMS_ROOT],,}" = "${expected_kms,,}" ] \
+    || die "replica state KMS_ROOT differs from dedicated cluster state"
+  if [ "$drift_mode" != allow-config-drift ]; then
+    [ "${state[GATEWAY_DOMAIN]}" = "$GATEWAY_DOMAIN" ] \
+      || die "replica state GATEWAY_DOMAIN differs from the requested gateway"
+  fi
   actual_hash="0x${H#0x}"
   actual_hash="${actual_hash,,}"
   [ "$actual_hash" = "$expected_hash" ] \
     || die "replica compose hash $actual_hash differs from dedicated cluster state"
+  [[ "${state[GUEST_CONFIG_SHA256]}" =~ ^[0-9a-fA-F]{64}$ ]] \
+    || die "replica state GUEST_CONFIG_SHA256 is malformed"
+  if [ "$drift_mode" != allow-config-drift ]; then
+    current_guest_hash=$(_generic guest-config-sha256 | grep -oE '^[0-9a-fA-F]{64}$' | tail -1)
+    [ -n "$current_guest_hash" ] || die "could not fingerprint the current sealed guest configuration"
+    [ "${state[GUEST_CONFIG_SHA256],,}" = "${current_guest_hash,,}" ] \
+      || die "sealed guest configuration drifted since replica deployment; redeploy instead of continuing"
+  fi
   H="${H#0x}"
   INDEXER_COMPOSE_HASH="$expected_hash"
 }
@@ -447,17 +538,22 @@ verify_candidate() {
 
 stop_replica() {
   _load_cluster_state
-  _load_replica_state
-  [ "${INDEXER_LB_DRAIN_CONFIRMED:-0}" = 1 ] \
-    || die "refusing to stop a worker until INDEXER_LB_DRAIN_CONFIRMED=1"
+  _load_replica_state allow-config-drift
   local member_id
   member_id=$(cast call "$CLUSTER" 'memberIdOf(address)(bytes32)' "$X" \
     --rpc-url "$RPC_URL") || die "cannot verify worker membership before stop"
-  _bytes32 servingMemberId "$member_id"
+  [[ "$member_id" =~ ^0x[0-9a-fA-F]{64}$ ]] \
+    || die "worker membership query returned a malformed member id"
+  if [ "${member_id,,}" != "$ZERO32" ]; then
+    [ "${INDEXER_LB_DRAIN_CONFIRMED:-0}" = 1 ] \
+      || die "refusing to stop a registered worker until INDEXER_LB_DRAIN_CONFIRMED=1"
+  else
+    log "worker never registered and cannot have opened shared gRPC; LB drain confirmation is not required"
+  fi
   # The dedicated cluster is Safe-owned. Generic cleanup is used only for its
   # idempotent VM stop and is forbidden from attempting an EOA allowlist write.
   FORCE_CLEANUP=1 SKIP_APP_ALLOWLIST_CLEANUP=1 _generic stop
-  log "worker VM stopped after explicit LB drain confirmation; Safe app admission remains unchanged"
+  log "worker VM is proven stopped or gone; Safe app admission remains unchanged"
 }
 
 bootstrap_help() {
@@ -466,8 +562,12 @@ Dedicated cluster handoff (state path: $CLUSTER_STATE):
   1. Compute INDEXER_COMPOSE_HASH with: $0 $NODE hash
   2. Run deploy/onchain.sh indexer-cluster and capture its "Cluster deployed:" address.
   3. Have INDEXER_CLUSTER_OWNER execute acceptOwnership() on that cluster.
-  4. Complete the Safe-controlled Path-A upgrade and capture both the new
-     DstackFacet and ClusterMember implementation addresses.
+  4. Prepare the exact Safe-owned Path-A cut (this only deploys implementations):
+       deploy/onchain.sh patha-safe-prepare "\$CLUSTER" "\$INDEXER_CLUSTER_OWNER"
+     Review and execute the bundle's target/value/calldata through the Safe, then extract:
+       PATHA_BUNDLE="contracts/script/deployments/\${CHAIN_ID}-patha-safe-\${CLUSTER,,}.json"
+       DSTACK_FACET=\$(jq -r .dstackFacet "\$PATHA_BUNDLE")
+       MEMBER_IMPL=\$(jq -r .clusterMemberImplementation "\$PATHA_BUNDLE")
   5. Persist the exact handoff with:
      CLUSTER=<Cluster-deployed-address> DSTACK_FACET=<new-DstackFacet> \\
      MEMBER_IMPL=<new-ClusterMember-impl> \\

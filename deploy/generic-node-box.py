@@ -101,16 +101,68 @@ def kms_urls() -> list[str]:
 def stop_vm(vm_id: str) -> dict[str, object]:
     if not vm_id:
         raise SystemExit("usage: generic-node-box.py stop <vm_id>")
+    if len(vm_id) > 128 or not all(ch.isalnum() or ch in "._:-" for ch in vm_id):
+        raise SystemExit("vm_id contains unsupported characters")
     before = m.vmm("GetInfo", {"id": vm_id})
-    found = bool(before.get("found", True))
-    if found:
+    initial_found = before.get("found")
+    if initial_found is False:
+        return {"vm_id": vm_id, "found": False, "stopped": True, "status": "gone"}
+    if initial_found is not True:
+        raise RuntimeError(f"GetInfo returned an ambiguous found value for VM {vm_id}")
+
+    stop_error = ""
+    try:
+        m.vmm("StopVm", {"id": vm_id})
+    except Exception as exc:
+        # Some VMM builds return an error for an already-stopping VM. Do not
+        # declare success from that error: only a subsequent GetInfo terminal
+        # state proves that cleanup is complete.
+        stop_error = str(exc)
+
+    attempts = int(os.environ.get("BOX_STOP_ATTEMPTS", "40"))
+    poll_seconds = float(os.environ.get("BOX_STOP_POLL_SECONDS", "1"))
+    if attempts <= 0 or poll_seconds < 0:
+        raise RuntimeError("BOX_STOP_ATTEMPTS and BOX_STOP_POLL_SECONDS are invalid")
+
+    last_status = "unknown"
+    last_poll_error = ""
+    for attempt in range(attempts):
         try:
-            m.vmm("StopVm", {"id": vm_id})
+            current = m.vmm("GetInfo", {"id": vm_id})
+            current_found = current.get("found")
+            if current_found is False:
+                return {
+                    "vm_id": vm_id,
+                    "found": False,
+                    "stopped": True,
+                    "status": "gone",
+                }
+            if current_found is not True:
+                last_status = "ambiguous-found"
+                last_poll_error = "GetInfo found must be a JSON boolean"
+            else:
+                last_status = str((current.get("info") or {}).get("status") or "unknown")
+                normalized = last_status.lower()
+                if normalized in {"stopped", "exited", "dead"}:
+                    return {
+                        "vm_id": vm_id,
+                        "found": True,
+                        "stopped": True,
+                        "status": last_status,
+                    }
+                last_poll_error = ""
         except Exception as exc:
-            # StopVm is not idempotent on every dstack build. Treat already-gone
-            # or already-stopped VMs as cleanup success, but keep the error text.
-            return {"vm_id": vm_id, "found": found, "stopped": False, "error": str(exc)}
-    return {"vm_id": vm_id, "found": found, "stopped": found}
+            # An unreadable VMM is ambiguous, not evidence that the VM vanished.
+            last_poll_error = str(exc)
+        if attempt + 1 < attempts:
+            time.sleep(poll_seconds)
+
+    detail = f"last status={last_status}"
+    if stop_error:
+        detail += f", StopVm error={stop_error}"
+    if last_poll_error:
+        detail += f", GetInfo error={last_poll_error}"
+    raise RuntimeError(f"could not prove VM {vm_id} stopped or disappeared ({detail})")
 
 
 def main() -> None:
@@ -178,25 +230,7 @@ def main() -> None:
         compose_file, compose_hash = app_compose_and_hash(list(env.keys()))
         sealed = dict(env)
         sealed["APP_ID"] = app_id
-        try:
-            m.vmm("StopVm", {"id": vm_id})
-        except Exception:
-            pass
-        stopped = False
-        for _ in range(40):
-            try:
-                gi = m.vmm("GetInfo", {"id": vm_id})
-                if not gi.get("found", True):
-                    stopped = True
-                    break
-                status = str((gi.get("info") or {}).get("status") or "").lower()
-                if status.startswith("stop") or status.startswith("exit"):
-                    stopped = True
-                    break
-            except Exception:
-                stopped = True
-                break
-            time.sleep(2)
+        stop_result = stop_vm(vm_id)
 
         upgrade = m.vmm(
             "UpgradeApp",
@@ -220,7 +254,8 @@ def main() -> None:
                     "compose_hash": compose_hash,
                     "vm_id": vm_id,
                     "mode": "upgrade",
-                    "stopped": stopped,
+                    "stopped": True,
+                    "stop": stop_result,
                     "upgrade": upgrade,
                     "start": start,
                 }
