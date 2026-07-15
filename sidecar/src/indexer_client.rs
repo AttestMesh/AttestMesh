@@ -24,6 +24,14 @@ pub const CHECKPOINT_LOG_INDEX: u64 = u64::MAX;
 const CURSOR_FILE: &str = "indexer-cursor.v1";
 const CURSOR_BYTES: u64 = 69;
 
+/// Keep the boundary-block fallback useful for pre-v3 Indexers. An exact `(0, 0)`
+/// is a real v3 cursor, but legacy servers interpret `from_block = 0` as a fresh
+/// subscription and initialize at head. Block 1 is therefore the safe legacy
+/// sentinel; the server will still clamp it to the member's registration block.
+fn legacy_from_block(resume: Option<(u64, u64)>) -> u64 {
+    resume.map_or(0, |(block, _)| block.max(1))
+}
+
 /// Load the last durably handled cursor. A missing file is a genuinely fresh
 /// subscription. Existing but unreadable, malformed, or mis-bound state fails
 /// closed: treating it as fresh could skip events by initializing at chain head.
@@ -231,7 +239,7 @@ pub async fn connect_and_run(
     // The exact sidecar cursor is authoritative across independent Indexer replicas.
     // Keep `from_block` populated as a boundary-block fallback for a pre-v3 server.
     let resume = shared.indexer_resume_cursor().await;
-    let from_block = resume.map_or(0, |cursor| cursor.0);
+    let from_block = legacy_from_block(resume);
     let hello = SubscribeMessage {
         inner: Some(subscribe_message::Inner::Hello(Hello {
             cluster_addr: shared.cluster.as_slice().to_vec(),
@@ -534,5 +542,12 @@ mod tests {
         assert!(load_cursor(Some(temp.path()), cluster, &member)
             .await
             .is_err());
+    }
+
+    #[test]
+    fn exact_zero_cursor_does_not_look_fresh_to_a_legacy_indexer() {
+        assert_eq!(legacy_from_block(None), 0);
+        assert_eq!(legacy_from_block(Some((0, 0))), 1);
+        assert_eq!(legacy_from_block(Some((42, 7))), 42);
     }
 }
