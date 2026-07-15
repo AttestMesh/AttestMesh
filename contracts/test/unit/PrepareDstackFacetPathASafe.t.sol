@@ -214,6 +214,24 @@ contract PrepareDstackFacetPathASafeTest is Test {
         preparer.validateCluster(address(topology), address(invalidSafe));
     }
 
+    function test_rejectsDuplicateSafeBoundaryOwners() public {
+        address[] memory owners = new address[](2);
+        owners[0] = address(this);
+        owners[1] = address(this);
+        MockPathASafe invalidSafe = new MockPathASafe(1, owners);
+        MockPathAClusterTopology topology = new MockPathAClusterTopology(address(invalidSafe));
+
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                PrepareDstackFacetPathASafe.InvalidSafeConfiguration.selector,
+                address(invalidSafe),
+                1,
+                2
+            )
+        );
+        preparer.validateCluster(address(topology), address(invalidSafe));
+    }
+
     function test_rejectsSafeThatHasNotAcceptedSolidstateOwnership() public {
         MockPathASafe otherSafe = _newSafe(1);
         vm.expectRevert(

@@ -195,6 +195,11 @@ contract PrepareDstackFacetPathASafe is Script {
                     if (owners[i] == address(0)) {
                         revert InvalidSafeConfiguration(expectedSafe, threshold, owners.length);
                     }
+                    for (uint256 j = i + 1; j < owners.length; ++j) {
+                        if (owners[i] == owners[j]) {
+                            revert InvalidSafeConfiguration(expectedSafe, threshold, owners.length);
+                        }
+                    }
                 }
             } catch {
                 revert InvalidSafeBoundary(expectedSafe);

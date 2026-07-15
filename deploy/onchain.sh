@@ -58,6 +58,8 @@ JSON
 #   INDEXER_CLUSTER_OWNER     org Safe that owns both cluster policy surfaces
 indexer_cluster() {
   local name="${1:-attestmesh-indexer-ha}"
+  local actual_chain cluster_factory_code member_factory_code safe_code safe_threshold
+  local safe_owners_json safe_owner_count
   require INDEXER_COMPOSE_HASH INDEXER_DEVICE_IDS_JSON INDEXER_CLUSTER_OWNER
   echo "$name" | grep -Eq '^[a-zA-Z0-9._-]+$' \
     || die "indexer cluster name may contain only letters, digits, dot, underscore, and dash"
@@ -83,9 +85,54 @@ indexer_cluster() {
   [ "${KMS_ROOT,,}" != "0x$(printf '0%.0s' {1..40})" ] \
     || die "KMS_ROOT must be nonzero"
 
+  actual_chain=$(cast chain-id --rpc-url "$RPC_URL") \
+    || die "could not read RPC chain id"
+  [ "$actual_chain" = "$CHAIN_ID" ] \
+    || die "RPC chain mismatch ($actual_chain != configured $CHAIN_ID)"
+  [ -f "$RECEIPT" ] || die "infrastructure receipt not found: $RECEIPT"
+
   export CLUSTER_FACTORY MEMBER_FACTORY CLUSTER_CONFIG
-  CLUSTER_FACTORY=$(jq -r .clusterDiamondFactory "$RECEIPT")
-  MEMBER_FACTORY=$(jq -r .clusterMemberFactory "$RECEIPT")
+  CLUSTER_FACTORY=$(jq -er '.clusterDiamondFactory | select(test("^0x[0-9a-fA-F]{40}$"))' \
+    "$RECEIPT") || die "receipt has no valid clusterDiamondFactory"
+  MEMBER_FACTORY=$(jq -er '.clusterMemberFactory | select(test("^0x[0-9a-fA-F]{40}$"))' \
+    "$RECEIPT") || die "receipt has no valid clusterMemberFactory"
+  cluster_factory_code=$(cast code "$CLUSTER_FACTORY" --rpc-url "$RPC_URL") \
+    || die "could not read ClusterDiamondFactory code: $CLUSTER_FACTORY"
+  [ "$cluster_factory_code" != "0x" ] \
+    || die "ClusterDiamondFactory has no code: $CLUSTER_FACTORY"
+  member_factory_code=$(cast code "$MEMBER_FACTORY" --rpc-url "$RPC_URL") \
+    || die "could not read ClusterMemberFactory code: $MEMBER_FACTORY"
+  [ "$member_factory_code" != "0x" ] \
+    || die "ClusterMemberFactory has no code: $MEMBER_FACTORY"
+  safe_code=$(cast code "$INDEXER_CLUSTER_OWNER" --rpc-url "$RPC_URL") \
+    || die "could not read Indexer cluster Safe code: $INDEXER_CLUSTER_OWNER"
+  [ "$safe_code" != "0x" ] \
+    || die "INDEXER_CLUSTER_OWNER must be a deployed Safe contract"
+  safe_threshold=$(cast call "$INDEXER_CLUSTER_OWNER" 'getThreshold()(uint256)' \
+    --rpc-url "$RPC_URL") || die "INDEXER_CLUSTER_OWNER does not expose getThreshold()"
+  safe_threshold=$(cast to-dec "$safe_threshold") \
+    || die "INDEXER_CLUSTER_OWNER returned an invalid threshold"
+  [[ "$safe_threshold" =~ ^[0-9]+$ ]] && [ "$safe_threshold" -gt 0 ] \
+    || die "INDEXER_CLUSTER_OWNER Safe threshold must be positive"
+  safe_owners_json=$(cast call "$INDEXER_CLUSTER_OWNER" 'getOwners()(address[])' \
+    --rpc-url "$RPC_URL" --json) || die "INDEXER_CLUSTER_OWNER does not expose getOwners()"
+  safe_owner_count=$(printf '%s\n' "$safe_owners_json" | jq -er '
+      if type == "array"
+         and length == 1
+         and (.[0] | type) == "array"
+         and (.[0] | length) > 0
+         and (.[0] | all(.[];
+           type == "string"
+           and test("^0x[0-9a-fA-F]{40}$")
+           and ascii_downcase != ("0x" + ("0" * 40))))
+         and ((.[0] | map(ascii_downcase) | unique | length) == (.[0] | length))
+      then (.[0] | length)
+      else empty
+      end
+    ') || die "INDEXER_CLUSTER_OWNER Safe owners must be non-empty, unique, nonzero addresses"
+  [ "$safe_threshold" -le "$safe_owner_count" ] \
+    || die "INDEXER_CLUSTER_OWNER Safe threshold exceeds owner count"
+
   CLUSTER_CONFIG="script/clusters/${name}.json"
   local salt; salt=$(cast keccak "attestmesh-indexer-cluster-${name}")
   jq -n \
