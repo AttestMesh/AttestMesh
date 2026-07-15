@@ -100,7 +100,7 @@ QUOTA_ZVOL_BYTES=$((251 * 1024 * 1024 * 1024))
 QUOTA_SOLD_MIB=237568
 QUOTA_FS_HEADROOM_MIB=18432
 QUOTA_POOL_HEADROOM_MIB=28672
-QUOTA_TOOLS_IMAGE="ghcr.io/dmvt/confidential-sandboxes@sha256:360248c7139bea2cee716d33acbd66e7aa3252f7750f8420a819c2d37ef4e938"
+QUOTA_TOOLS_IMAGE="ghcr.io/dmvt/confidential-sandboxes@sha256:3bd7c80c2dda9f09866266deca9c763902361e750eddacca2d7217d667bcf00a"
 MIN_HOST_VCPUS=8
 # The VMM resource readback must still be exactly 16,384 MiB. Inside this TDX image that allocation
 # exposes about 15,034 MiB after confidential-guest firmware/kernel reservations, so retain a
@@ -278,11 +278,11 @@ zfs set quota="$DOCKER_DATA_LIMIT" refquota="$DOCKER_DATA_LIMIT" "$DOCKER_DATASE
   exit 1
 }
 
-# Older sandboxd releases set `unless-stopped` on tenant containers, while compose sets it on the
-# daemon itself. Neutralize and stop both before restarting dockerd; otherwise the old daemon or
-# untrusted code could auto-start before the host firewall is restored. Compose starts the daemon
-# after pre-launch, and the manager then resumes only durable rows recorded as running. Any failure
-# aborts the restart.
+# Older sandboxd releases set `unless-stopped` on tenant and daemon containers. Neutralize and stop
+# both before restarting dockerd; otherwise sandboxd can bind the underlying quota-mount directory
+# before XFS is mounted, or untrusted code can start before the host firewall is restored. The new
+# compose also pins sandboxd to `restart: no`, so the dstack runner starts it only after pre-launch
+# has mounted XFS. The manager then resumes only durable rows recorded as running. Any failure aborts.
 managed_ids=$(docker container ls -aq --filter label=cs.managed=1)
 daemon_ids=$(docker container ls -aq --filter label=com.docker.compose.service=sandboxd)
 legacy_backup_ids=$(docker container ls -aq --filter label=com.docker.compose.service=sandboxd-backup)
