@@ -100,7 +100,7 @@ QUOTA_ZVOL_BYTES=$((250 * 1024 * 1024 * 1024))
 QUOTA_SOLD_MIB=237568
 QUOTA_FS_HEADROOM_MIB=18432
 QUOTA_POOL_HEADROOM_MIB=28672
-QUOTA_TOOLS_IMAGE="ghcr.io/dmvt/confidential-sandboxes@sha256:743d2815561fd0a89557313098ef74923a2e5bb243891a18085259736fae1a33"
+QUOTA_TOOLS_IMAGE="ghcr.io/dmvt/confidential-sandboxes@sha256:0ee022e38f5a66ced205428c60450e9ab054e4d31fff292821b2e5760dc4ac75"
 MIN_HOST_VCPUS=8
 # The VMM resource readback must still be exactly 16,384 MiB. Inside this TDX image that allocation
 # exposes about 15,034 MiB after confidential-guest firmware/kernel reservations, so retain a
@@ -370,40 +370,48 @@ fi
 # public internet traffic to Docker's normal forwarding/NAT path.
 docker run --rm --privileged --network host \
   --entrypoint sh "$QUOTA_TOOLS_IMAGE" -ceu '
-    IPT="iptables -w 5"
-    $IPT -nL DOCKER-USER >/dev/null
-    $IPT -N SANDBOXD-TENANT 2>/dev/null || true
-    $IPT -F SANDBOXD-TENANT
-    $IPT -A SANDBOXD-TENANT -d 10.192.0.0/10 -m physdev --physdev-is-bridged -j RETURN
+    IPT=
+    for backend in iptables-legacy iptables-nft iptables; do
+      command -v "$backend" >/dev/null 2>&1 || continue
+      if "$backend" -w 5 -nL DOCKER-USER >/dev/null 2>&1; then
+        IPT="$backend"
+        break
+      fi
+    done
+    [ -n "$IPT" ] || { echo "no iptables backend owns DOCKER-USER" >&2; exit 1; }
+    ipt() { "$IPT" -w 5 "$@"; }
+    ipt -N SANDBOXD-TENANT 2>/dev/null || true
+    ipt -F SANDBOXD-TENANT
+    ipt -A SANDBOXD-TENANT -d 10.192.0.0/10 -m physdev --physdev-is-bridged -j RETURN
     for cidr in \
       0.0.0.0/8 10.0.0.0/8 100.64.0.0/10 127.0.0.0/8 \
       169.254.0.0/16 172.16.0.0/12 192.0.0.0/24 192.0.2.0/24 \
       192.168.0.0/16 198.18.0.0/15 198.51.100.0/24 203.0.113.0/24 \
       224.0.0.0/4 240.0.0.0/4; do
-      $IPT -A SANDBOXD-TENANT -d "$cidr" -j REJECT
+      ipt -A SANDBOXD-TENANT -d "$cidr" -j REJECT
     done
-    $IPT -A SANDBOXD-TENANT -j RETURN
-    # A correctly populated DOCKER-USER chain is inert if Docker's FORWARD hook was removed or
+    ipt -A SANDBOXD-TENANT -j RETURN
+    # A correctly populated DOCKER-USER chain is inert if the Docker FORWARD hook was removed or
     # reordered. Canonicalize the hook as the first forwarding rule and verify it explicitly.
-    while $IPT -C FORWARD -j DOCKER-USER 2>/dev/null; do
-      $IPT -D FORWARD -j DOCKER-USER
+    while ipt -C FORWARD -j DOCKER-USER 2>/dev/null; do
+      ipt -D FORWARD -j DOCKER-USER
     done
-    $IPT -I FORWARD 1 -j DOCKER-USER
-    while $IPT -C DOCKER-USER -i "csb+" -j SANDBOXD-TENANT 2>/dev/null; do
-      $IPT -D DOCKER-USER -i "csb+" -j SANDBOXD-TENANT
+    ipt -I FORWARD 1 -j DOCKER-USER
+    while ipt -C DOCKER-USER -i "csb+" -j SANDBOXD-TENANT 2>/dev/null; do
+      ipt -D DOCKER-USER -i "csb+" -j SANDBOXD-TENANT
     done
-    $IPT -I DOCKER-USER 1 -i "csb+" -j SANDBOXD-TENANT
-    while $IPT -C INPUT -i "csb+" -j REJECT 2>/dev/null; do
-      $IPT -D INPUT -i "csb+" -j REJECT
+    ipt -I DOCKER-USER 1 -i "csb+" -j SANDBOXD-TENANT
+    while ipt -C INPUT -i "csb+" -j REJECT 2>/dev/null; do
+      ipt -D INPUT -i "csb+" -j REJECT
     done
-    $IPT -I INPUT 1 -i "csb+" -j REJECT
-    first_forward="$($IPT -S FORWARD | sed -n '/^-A FORWARD /{p;q;}')"
-    [ "$first_forward" = '-A FORWARD -j DOCKER-USER' ]
-    $IPT -C DOCKER-USER -i "csb+" -j SANDBOXD-TENANT
-    $IPT -C INPUT -i "csb+" -j REJECT
-    $IPT -C SANDBOXD-TENANT -d 10.192.0.0/10 -m physdev --physdev-is-bridged -j RETURN
-    $IPT -C SANDBOXD-TENANT -d 10.0.0.0/8 -j REJECT
-    $IPT -C SANDBOXD-TENANT -d 169.254.0.0/16 -j REJECT
+    ipt -I INPUT 1 -i "csb+" -j REJECT
+    first_forward="$(ipt -S FORWARD | sed -n "/^-A FORWARD /{p;q;}")"
+    [ "$first_forward" = "-A FORWARD -j DOCKER-USER" ]
+    ipt -C DOCKER-USER -i "csb+" -j SANDBOXD-TENANT
+    ipt -C INPUT -i "csb+" -j REJECT
+    ipt -C SANDBOXD-TENANT -d 10.192.0.0/10 -m physdev --physdev-is-bridged -j RETURN
+    ipt -C SANDBOXD-TENANT -d 10.0.0.0/8 -j REJECT
+    ipt -C SANDBOXD-TENANT -d 169.254.0.0/16 -j REJECT
   '
 
 # Persistent sandbox storage is a separate XFS filesystem with project-quota enforcement. A sparse
