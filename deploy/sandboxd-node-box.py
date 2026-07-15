@@ -102,8 +102,10 @@ QUOTA_FS_HEADROOM_MIB=18432
 QUOTA_POOL_HEADROOM_MIB=28672
 QUOTA_TOOLS_IMAGE="ghcr.io/dmvt/confidential-sandboxes@sha256:743d2815561fd0a89557313098ef74923a2e5bb243891a18085259736fae1a33"
 MIN_HOST_VCPUS=8
-# A 16 GiB guest reports slightly less than 16,384 MiB after firmware/kernel reservations.
-MIN_HOST_MEMORY_MIB=16000
+# The VMM resource readback must still be exactly 16,384 MiB. Inside this TDX image that allocation
+# exposes about 15,034 MiB after confidential-guest firmware/kernel reservations, so retain a
+# conservative 14.5 GiB guest-visible floor while still rejecting every old 8 GiB node.
+MIN_HOST_MEMORY_MIB=14848
 
 # Registry credentials are sealed into the CVM but need not persist on its host filesystem.
 DOCKER_CONFIG="/run/sandboxd-prelaunch-docker-auth"
