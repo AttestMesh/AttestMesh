@@ -32,6 +32,8 @@ use anyhow::{Context, Result};
 use rand::Rng;
 use std::collections::{HashMap, VecDeque};
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+use std::os::unix::fs::PermissionsExt;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
@@ -1177,14 +1179,13 @@ async fn serve_agent_grpc(
     bundler: Arc<BundlerClient>,
     socket_path: String,
 ) {
-    if let Some(dir) = std::path::Path::new(&socket_path).parent() {
-        let _ = std::fs::create_dir_all(dir);
-    }
-    let _ = std::fs::remove_file(&socket_path);
-    let uds = match tokio::net::UnixListener::bind(&socket_path) {
+    // TODO(security, M4): If the co-located app uses another uid/container, add
+    // SO_PEERCRED-based uid/gid allowlisting; same-uid file permissions cannot
+    // distinguish the trusted app from other processes running under that uid.
+    let uds = match prepare_agent_socket(Path::new(&socket_path)) {
         Ok(l) => l,
         Err(e) => {
-            tracing::error!(error = %e, path = %socket_path, "agent gRPC UDS bind failed");
+            tracing::error!(error = %e, path = %socket_path, "agent gRPC UDS setup failed");
             return;
         }
     };
@@ -1210,6 +1211,39 @@ async fn serve_agent_grpc(
     }
 }
 
+fn prepare_agent_socket(socket_path: &Path) -> Result<tokio::net::UnixListener> {
+    if let Some(dir) = socket_path.parent() {
+        std::fs::create_dir_all(dir)
+            .with_context(|| format!("create agent gRPC socket dir {}", dir.display()))?;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+            .with_context(|| format!("chmod agent gRPC socket dir {}", dir.display()))?;
+    }
+    match std::fs::remove_file(socket_path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            return Err(e).with_context(|| {
+                format!("remove stale agent gRPC socket {}", socket_path.display())
+            })
+        }
+    }
+    let uds = tokio::net::UnixListener::bind(socket_path)
+        .with_context(|| format!("bind agent gRPC socket {}", socket_path.display()))?;
+    // IMPORTANT: 0600 assumes the trusted app shares the sidecar's uid. A
+    // different-uid app would lose its intended CSK access and requires an
+    // explicitly configured shared group with a 0660 socket (and directory
+    // traversal), or SO_PEERCRED-based allowlisting instead.
+    if let Err(e) = std::fs::set_permissions(socket_path, std::fs::Permissions::from_mode(0o600)) {
+        // This UDS gates intentional CSK export and node-authored send RPCs. Drop
+        // and unlink it rather than serving with ambient-umask permissions.
+        drop(uds);
+        let _ = std::fs::remove_file(socket_path);
+        return Err(e)
+            .with_context(|| format!("chmod agent gRPC socket {}", socket_path.display()));
+    }
+    Ok(uds)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1219,6 +1253,25 @@ mod tests {
     use axum::{Json, Router};
     use rand::rngs::OsRng;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[tokio::test]
+    async fn prepare_agent_socket_sets_private_permissions() {
+        let temp = tempfile::tempdir().unwrap();
+        let socket_dir = temp.path().join("agent");
+        let socket_path = socket_dir.join("agent.sock");
+
+        let listener = prepare_agent_socket(&socket_path).unwrap();
+
+        let socket_mode = std::fs::metadata(&socket_path)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        let dir_mode = std::fs::metadata(&socket_dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(socket_mode, 0o600);
+        assert_eq!(dir_mode, 0o700);
+        drop(listener);
+    }
 
     #[derive(Clone)]
     struct RejectLogsRpc {

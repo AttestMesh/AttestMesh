@@ -185,10 +185,9 @@ services:
     # v21 = user-visible orchestrator failure details in enclave deploys;
     # v20 = CLUSTER_NETWORKS-only live mesh config + structured orchestrator errors;
     # v19 = Apps → Sandboxes rename (labels only, wire stays app).
-    # v45 = fleet-control main db9cab8 — operate the Stripe test catalog from the production origin;
-    #       test Checkout is allowed while live billing, tax automation, and meter delivery stay off.
-    # v44 = fleet-control main 1cb4ebb — sandbox-first Stripe billing foundation.
-    image: ghcr.io/dmvt/synclave-app:prod-db9cab8@sha256:71b90cffc7863e4e8a9c42094bd72b899ee0dedb419412ca1658ac2c504ecf99
+    # v46 = fleet-control main 3536566 — full app.synclave.net hosted-app domain;
+    #       includes the v45 test-catalog controls and v44 sandbox-first billing foundation.
+    image: ghcr.io/dmvt/synclave-app:full-domain-3536566@sha256:466758dbb249703c805048a6b9ba43fe0fd2bfa1d0a00a97efaac3a95aef04a4
     environment:
       API_HOST: 0.0.0.0
       API_PORT: 80

@@ -51,7 +51,7 @@ SANDBOX_DAEMON_TOKEN="${SANDBOX_DAEMON_TOKEN:-$(sed -nE 's/^SANDBOX_DAEMON_TOKEN
 PUBLIC_BASE_URL="${PUBLIC_BASE_URL:-https://synclave.net}"
 CORS_ORIGIN="${CORS_ORIGIN:-https://synclave.net}"
 CONSOLE_HOST="${CONSOLE_HOST:-synclave.net}"
-APP_DOMAIN="${APP_DOMAIN:-app.s.n}"
+APP_DOMAIN="${APP_DOMAIN:-app.synclave.net}"
 INDEXER_URL="${INDEXER_URL:-http://10.0.100.1:8787}"
 GITHUB_OAUTH_CALLBACK_URL="${GITHUB_OAUTH_CALLBACK_URL:-https://synclave.net/api/v1/auth/github/callback}"
 # CF app-fronting (non-secret): the attestmesh.xyz zone + the origin the proxied

@@ -1,6 +1,7 @@
-//! App-facing gRPC façade over a unix domain socket (sidecar spec §12). The app
-//! never holds AttestMesh keys, sees ciphertexts, or talks to the chain/Indexer
-//! directly — only this surface. Message stream is decryption-filtered.
+//! App-facing gRPC façade for the trusted co-tenant app over a
+//! filesystem-permission-restricted unix domain socket (sidecar spec §12). This
+//! surface intentionally gives the app the plaintext CSK and the ability to author
+//! node sends, along with decrypted message and mesh-state streams.
 
 use crate::chain::bundler::BundlerClient;
 use crate::chain::{message_facet, userop, ChainClient};
