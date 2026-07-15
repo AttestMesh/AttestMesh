@@ -290,16 +290,16 @@ update_member() {
   _load; _require_env
   [ -n "${X:-}" ] && [ -n "${VM_ID:-}" ] && [ -n "${CLUSTER:-}" ] || die "need X/VM_ID/CLUSTER in $STATE"
   [ -z "${REPLACEMENT_PHASE:-}" ] || die "cannot update during replacement phase $REPLACEMENT_PHASE"
-  local nh out j current
+  local nh out j current target_h
   current=$(_box_run describe "" "$VM_ID") || die "could not read current VM resources"
   j=$(echo "$current" | grep '"vm_id"' | tail -1)
   echo "$j" | jq -e \
     --arg vcpu "$BOX_VCPU" --arg memory "$BOX_MEM" --arg disk "$BOX_DISK" \
     '.found == true and
-     (.vcpu | tonumber) >= ($vcpu | tonumber) and
-     (.memory | tonumber) >= ($memory | tonumber) and
-     (.disk_size | tonumber) >= ($disk | tonumber)' >/dev/null \
-    || die "current VM is below the measured capacity profile; use replace (never in-place autoscale)"
+     (.vcpu | tonumber) == ($vcpu | tonumber) and
+     (.memory | tonumber) == ($memory | tonumber) and
+     (.disk_size | tonumber) == ($disk | tonumber)' >/dev/null \
+    || die "current VM differs from the exact measured profile; use a reviewed replacement (never in-place autoscale)"
   nh=$(_box_run hash | grep -oE '^[0-9a-f]{64}$' | tail -1)
   [ -n "$nh" ] || die "could not compute new compose_hash"
   log "new compose_hash=0x$nh"
@@ -308,9 +308,26 @@ update_member() {
   out=$(_box_run update "$X" "$VM_ID") || die "in-place update failed"
   echo "$out"
   j=$(echo "$out" | grep '"app_id"' | tail -1)
-  H=$(echo "$j" | jq -r .compose_hash)
+  target_h=$(echo "$j" | jq -er .compose_hash) \
+    || die "in-place update returned no compose hash; recorded hash remains $H"
+  [ "${target_h,,}" = "${nh,,}" ] \
+    || die "in-place update returned unexpected compose hash $target_h (expected $nh); recorded hash remains $H"
+  current=$(_box_run describe "" "$VM_ID") \
+    || die "could not read back updated VM; target=$target_h recorded=$H"
+  j=$(echo "$current" | grep '"vm_id"' | tail -1)
+  echo "$j" | jq -e --arg target "$target_h" \
+    '.found == true and
+     (((.compose_hash // "") | ascii_downcase) == ($target | ascii_downcase))' >/dev/null \
+    || die "VMM did not read back target compose; target=$target_h recorded=$H"
+  # UpgradeApp/start is asynchronous. Do not commit the target hash to the durable journal until
+  # the gateway proves that exact measured app is healthy and no second same-app VM is active.
+  _wait_health 45 10 "$target_h" \
+    || die "updated VM did not prove target health; target=$target_h recorded=$H (restore the recorded measured compose before retrying)"
+  _inventory_matches "$VM_ID" \
+    || die "same-app inventory changed during update health gate; recorded hash remains $H"
+  H="$target_h"
   _save
-  log "✔ sandboxd update complete vm=$VM_ID"
+  log "✔ sandboxd update complete and healthy vm=$VM_ID compose_hash=$H"
 }
 
 _validate_replacement_vm() {

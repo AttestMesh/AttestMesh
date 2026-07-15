@@ -82,7 +82,7 @@ services:
         - >-
           curl -fsS --max-time 3 http://10.191.255.250:8088/healthz |
           grep -Eq '"ok":[[:space:]]*true.*"dstack_socket_present":[[:space:]]*true' &&
-          docker info --format '{{.ServerVersion}}' >/dev/null &&
+          test "$$(docker info --format '{{.NCPU}}')" = 8 &&
           xfs_quota -x -c 'state -p' "$${SANDBOX_DISK_ROOT}" |
           grep -q 'Enforcement: ON'
       interval: 30s

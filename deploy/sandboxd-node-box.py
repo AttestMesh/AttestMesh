@@ -101,7 +101,7 @@ QUOTA_SOLD_MIB=237568
 QUOTA_FS_HEADROOM_MIB=18432
 QUOTA_POOL_HEADROOM_MIB=28672
 QUOTA_TOOLS_IMAGE="ghcr.io/dmvt/confidential-sandboxes@sha256:3bd7c80c2dda9f09866266deca9c763902361e750eddacca2d7217d667bcf00a"
-MIN_HOST_VCPUS=8
+EXPECTED_HOST_VCPUS=8
 # The VMM resource readback must still be exactly 16,384 MiB. Inside this TDX image that allocation
 # exposes about 15,034 MiB after confidential-guest firmware/kernel reservations, so retain a
 # conservative 14.5 GiB guest-visible floor while still rejecting every old 8 GiB node.
@@ -109,12 +109,14 @@ MIN_HOST_MEMORY_MIB=14848
 
 # Registry credentials are sealed into the CVM but need not persist on its host filesystem.
 DOCKER_CONFIG="/run/sandboxd-prelaunch-docker-auth"
+DOCKER_AFFINITY_DIR="/etc/systemd/system/docker.service.d"
+DOCKER_AFFINITY_TMP="$DOCKER_AFFINITY_DIR/.sandboxd-affinity.$$"
 export DOCKER_CONFIG
 mkdir -p "$DOCKER_CONFIG"
 chmod 0700 "$DOCKER_CONFIG"
-trap 'rm -rf "$DOCKER_CONFIG"' EXIT
+trap 'rm -rf "$DOCKER_CONFIG"; rm -f "$DOCKER_AFFINITY_TMP"' EXIT
 
-for tool in awk curl df docker find grep head jq mount rm sed zfs zpool; do
+for tool in awk curl df docker find grep head jq mount rm sed systemctl zfs zpool; do
   command -v "$tool" >/dev/null 2>&1 || {
     echo "missing required sandboxd host tool: $tool" >&2
     exit 1
@@ -133,8 +135,8 @@ esac
 case "$actual_memory_kib" in
   ''|*[!0-9]*) echo "invalid guest memory readback: $actual_memory_kib" >&2; exit 1 ;;
 esac
-[ "$actual_vcpus" -ge "$MIN_HOST_VCPUS" ] || {
-  echo "sandboxd guest has $actual_vcpus vCPUs; need at least $MIN_HOST_VCPUS" >&2
+[ "$actual_vcpus" -eq "$EXPECTED_HOST_VCPUS" ] || {
+  echo "sandboxd guest has $actual_vcpus vCPUs; require exactly $EXPECTED_HOST_VCPUS" >&2
   exit 1
 }
 [ "$actual_memory_kib" -ge $((MIN_HOST_MEMORY_MIB * 1024)) ] || {
@@ -335,14 +337,42 @@ else
 JSON
 fi
 
-if command -v systemctl >/dev/null 2>&1; then
-  systemctl restart docker
-elif command -v service >/dev/null 2>&1; then
-  service docker restart
-else
-  echo "no docker service manager found" >&2
+# dstack 0.5.11 ships a vendor docker.service drop-in named override.conf that pins dockerd to CPU
+# 0. Moby validates NanoCPUs (`docker --cpus`) against dockerd's own process affinity, so leaving
+# that vendor default in place makes an eight-vCPU guest reject every sandbox over one vCPU. Shadow
+# the exact vendor filename from /etc with this measured, fixed eight-vCPU profile. A future machine
+# upsize must change the VMM profile, EXPECTED_HOST_VCPUS, this explicit list, and (if desired) the
+# separately fixed tenant admission budget in one reviewed deployment; it never expands implicitly.
+mkdir -p "$DOCKER_AFFINITY_DIR"
+cat > "$DOCKER_AFFINITY_TMP" <<'SYSTEMD'
+[Service]
+CPUAffinity=0 1 2 3 4 5 6 7
+SYSTEMD
+chmod 0644 "$DOCKER_AFFINITY_TMP"
+mv -f "$DOCKER_AFFINITY_TMP" "$DOCKER_AFFINITY_DIR/override.conf"
+systemctl daemon-reload
+systemctl restart docker
+
+# Fail before the firewall and app start if the service manager, process affinity, or Docker API
+# disagrees with the measured machine profile. This catches a vendor drop-in regression instead of
+# advertising capacity that Docker cannot apply.
+docker_main_pid=$(systemctl show docker.service --property MainPID --value)
+case "$docker_main_pid" in
+  ''|*[!0-9]*|0) echo "invalid docker.service MainPID: $docker_main_pid" >&2; exit 1 ;;
+esac
+docker_cpu_affinity=$(awk '/^Cpus_allowed_list:/ {print $2}' "/proc/$docker_main_pid/status")
+[ "$docker_cpu_affinity" = "0-7" ] || {
+  echo "dockerd CPU affinity is $docker_cpu_affinity; require exactly 0-7" >&2
   exit 1
-fi
+}
+docker_ncpu=$(docker info --format '{{.NCPU}}')
+case "$docker_ncpu" in
+  ''|*[!0-9]*) echo "invalid Docker CPU readback: $docker_ncpu" >&2; exit 1 ;;
+esac
+[ "$docker_ncpu" -eq "$EXPECTED_HOST_VCPUS" ] || {
+  echo "Docker reports $docker_ncpu CPUs; require exactly $EXPECTED_HOST_VCPUS" >&2
+  exit 1
+}
 [ "$(docker info --format '{{.DockerRootDir}}')" = "$DOCKER_DATA_ROOT" ] || {
   echo "dockerd did not switch to managed data-root" >&2
   exit 1
@@ -632,17 +662,17 @@ def main() -> None:
     mode = sys.argv[1] if len(sys.argv) > 1 else "hash"
 
     # The measured compose admits up to 5 vCPU / 10 GiB / 232 GiB / 16,384 PIDs of tenant resources.
-    # Refuse an accidental undersized VM override; a larger explicit provisioning remains safe but
-    # does not automatically raise admission ceilings.
-    undersized = []
-    if VCPU < 8:
-        undersized.append(f"vcpu={VCPU} < 8")
-    if MEM < 16384:
-        undersized.append(f"memory={MEM} < 16384 MiB")
-    if DISK < 300:
-        undersized.append(f"disk={DISK} < 300 GiB")
-    if undersized:
-        raise SystemExit("refusing undersized sandboxd VM: " + ", ".join(undersized))
+    # This release has one exact measured machine profile. An explicit future upsize must update
+    # these values, the guest preflight/affinity, and any intended admission-budget change together.
+    mismatched = []
+    if VCPU != 8:
+        mismatched.append(f"vcpu={VCPU} != 8")
+    if MEM != 16384:
+        mismatched.append(f"memory={MEM} != 16384 MiB")
+    if DISK != 300:
+        mismatched.append(f"disk={DISK} != 300 GiB")
+    if mismatched:
+        raise SystemExit("refusing non-production sandboxd VM profile: " + ", ".join(mismatched))
 
     if mode == "deploy":
         compose_file, compose_hash = app_compose_and_hash(ENV_KEYS + ["DSTACK_DOCKER_REGISTRY"])
