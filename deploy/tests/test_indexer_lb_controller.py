@@ -4,12 +4,19 @@
 import json
 import http.client
 import os
+import csv
+import io
+import shutil
+import socket
 import subprocess
 import tempfile
+import textwrap
 import threading
+import time
 import unittest
 import urllib.error
 import urllib.request
+import uuid
 from pathlib import Path
 from unittest import mock
 
@@ -21,6 +28,9 @@ ADMIN_KEY = "test-admin-key"
 LB_CLUSTER = "0x" + ("a" * 40)
 OPERATION_1 = "1" * 64
 OPERATION_2 = "2" * 64
+HAPROXY_IMAGE = (
+    "haproxy@sha256:dee54db8b27cd6c21519ea4f0ba0604f3742e8e7369bc16fb5b69133dec3f47f"
+)
 
 
 def controller_source() -> str:
@@ -62,6 +72,7 @@ def point_state_at(controller: dict, directory: str) -> None:
         "ACTIVE_OPERATION_PATH": "active_operation",
         "ACTIVE_STATE_PATH": "active.json",
         "PREPARED_PATH": "prepared.json",
+        "DRAIN_RESERVATIONS_PATH": "drain-reservations.json",
     }.items():
         controller[key] = str(Path(directory) / filename)
 
@@ -73,6 +84,40 @@ class ControllerPoolTests(unittest.TestCase):
         self.assertIn("option httpchk GET /healthz", COMPOSE.read_text())
         self.assertIn("check port 9090 disabled", COMPOSE.read_text())
         self.assertIn("on-marked-down shutdown-sessions", COMPOSE.read_text())
+
+    def test_lb_compose_renders_with_sealed_environment(self) -> None:
+        if not shutil.which("docker"):
+            self.skipTest("docker is unavailable")
+        version = subprocess.run(
+            ["docker", "compose", "version"],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=20,
+        )
+        if version.returncode != 0:
+            self.skipTest("docker compose is unavailable")
+        environment = {
+            **os.environ,
+            "APP_ENV_B64": "SU5ERVhFUl9MQl9BRE1JTl9LRVk9dGVzdAo=",
+            "BUNDLER_URL": "https://bundler.invalid",
+            "CHAIN_ID": "8453",
+            "CLUSTER": "0x" + ("1" * 40),
+            "GAS_POLICY_ID": "test-policy",
+            "GATEWAY_DOMAIN": "gateway.invalid",
+            "INDEXER_REGISTRY_ADDR": "0x" + ("2" * 40),
+            "RPC_URL": "https://rpc.invalid",
+        }
+        rendered = subprocess.run(
+            ["docker", "compose", "-f", str(COMPOSE), "config", "--quiet"],
+            cwd=ROOT,
+            env=environment,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=30,
+        )
+        self.assertEqual(rendered.returncode, 0, rendered.stderr)
 
     def test_haproxy_cli_errors_are_not_treated_as_success(self) -> None:
         controller = load_controller()
@@ -132,6 +177,184 @@ class ControllerPoolTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "runtime address mismatch"):
             controller["verify_runtime_pool"](["10.0.0.2", "10.0.0.3"])
 
+    def test_backend_addresses_reject_self_loops_and_non_rfc1918(self) -> None:
+        controller = load_controller()
+        self.assertEqual(controller["validate_backend"]("10.0.0.2"), "10.0.0.2")
+        for invalid in ("127.0.0.1", "0.0.0.0", "169.254.1.1", "224.0.0.1"):
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                controller["validate_backend"](invalid)
+        controller["local_ipv4_addresses"] = lambda: {"10.0.0.9"}
+        with self.assertRaisesRegex(ValueError, "LB itself"):
+            controller["validate_backend"]("10.0.0.9")
+
+    def test_bounded_backend_http_rejects_oversize_and_redirect(self) -> None:
+        controller = load_controller()
+
+        class Headers:
+            def __init__(self, values):
+                self.values = values
+
+            def get_all(self, _name, _default=None):
+                return self.values
+
+        class Response:
+            def __init__(self, values, body=b"{}"):
+                self.headers = Headers(values)
+                self.body = body
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def read(self, limit):
+                return self.body[:limit]
+
+        controller["BACKEND_HTTP"] = mock.Mock()
+        controller["BACKEND_HTTP"].open.return_value = Response(["65537"])
+        with self.assertRaisesRegex(RuntimeError, "too large"):
+            controller["bounded_backend_get"]("10.0.0.2", "/status")
+        controller["BACKEND_HTTP"].open.return_value = Response(
+            [], b"x" * 65537
+        )
+        with self.assertRaisesRegex(RuntimeError, "exceeded 64KiB"):
+            controller["bounded_backend_get"]("10.0.0.2", "/status")
+        controller["BACKEND_HTTP"].open.side_effect = urllib.error.HTTPError(
+            "http://10.0.0.2:9090/status", 302, "redirect", {}, None
+        )
+        with self.assertRaises(urllib.error.HTTPError):
+            controller["bounded_backend_get"]("10.0.0.2", "/status")
+
+    def test_shared_restart_tolerates_only_identity_bound_degradation(self) -> None:
+        controller = load_controller()
+        state = {
+            "backends": ["10.0.0.2", "10.0.0.3"],
+            "pubkey": "0x" + ("1" * 64),
+            "code_id": "0x" + ("2" * 64),
+            "cluster": "0x" + ("b" * 40),
+            "members": ["0x" + ("3" * 64), "0x" + ("4" * 64)],
+            "operation_id": OPERATION_1,
+        }
+
+        def identity(ip, *_args, **_kwargs):
+            if ip == "10.0.0.2":
+                raise OSError("down")
+            return {"status": {"health": {"ok": True, "grpcAccepting": True}}}
+
+        controller["probe_backend"] = identity
+        controller["bounded_backend_get"] = lambda *_args: b'{"status":"ok"}'
+        controller["socket"].create_connection = mock.Mock(
+            return_value=mock.MagicMock()
+        )
+        self.assertEqual(
+            controller["validate_active_before_reopen"](
+                state, tolerate_unavailable=True
+            ),
+            ["10.0.0.3"],
+        )
+
+        def mismatch(ip, *_args, **_kwargs):
+            if ip == "10.0.0.2":
+                raise controller["BackendIdentityError"]("reused address")
+            return {"status": {"health": {"ok": True, "grpcAccepting": True}}}
+
+        controller["probe_backend"] = mismatch
+        with self.assertRaisesRegex(controller["BackendIdentityError"], "reused"):
+            controller["validate_active_before_reopen"](
+                state, tolerate_unavailable=True
+            )
+
+        controller["probe_backend"] = lambda *_args, **_kwargs: {
+            "status": {"health": {"ok": True, "grpcAccepting": True}}
+        }
+
+        def health(ip, _path):
+            if ip == "10.0.0.2":
+                raise urllib.error.HTTPError(
+                    "http://10.0.0.2:9090/healthz", 503, "down", {}, None
+                )
+            return b'{"status":"ok"}'
+
+        controller["bounded_backend_get"] = health
+        self.assertEqual(
+            controller["validate_active_before_reopen"](
+                state, tolerate_unavailable=True
+            ),
+            ["10.0.0.3"],
+        )
+
+    def test_periodic_identity_refresh_reenables_recovered_slots(self) -> None:
+        controller = load_controller()
+        state = {
+            "backends": ["10.0.0.2", "10.0.0.3"],
+            "pubkey": "0x" + ("1" * 64),
+            "code_id": "0x" + ("2" * 64),
+            "cluster": "0x" + ("b" * 40),
+            "members": ["0x" + ("3" * 64), "0x" + ("4" * 64)],
+            "operation_id": OPERATION_1,
+        }
+        calls = []
+        controller["socket_generation"] = lambda: (1, 2, 3)
+        controller["read_prepared"] = lambda: {}
+        controller["active_state"] = lambda: state
+        controller["validate_active_before_reopen"] = (
+            lambda _state, **_kwargs: ["10.0.0.2", "10.0.0.3"]
+        )
+        controller["set_pool"] = lambda backends, **kwargs: calls.append(
+            (list(backends), kwargs["enabled_backends"])
+        )
+        controller["frontends"] = lambda enabled: calls.append(("frontends", enabled))
+        with mock.patch.object(
+            controller["time"], "monotonic", side_effect=[0, 16, 16]
+        ), mock.patch.object(
+            controller["time"], "sleep", side_effect=SystemExit
+        ):
+            with self.assertRaises(SystemExit):
+                controller["watch_haproxy"]((1, 2, 3))
+        self.assertIn(
+            (["10.0.0.2", "10.0.0.3"], ["10.0.0.2", "10.0.0.3"]),
+            calls,
+        )
+
+    def test_stale_refresh_failure_cannot_quarantine_new_generation(self) -> None:
+        controller = load_controller()
+        old = {
+            "backends": ["10.0.0.2", "10.0.0.3"],
+            "pubkey": "0x" + ("1" * 64),
+            "code_id": "0x" + ("2" * 64),
+            "cluster": "0x" + ("b" * 40),
+            "members": ["0x" + ("3" * 64), "0x" + ("4" * 64)],
+            "operation_id": OPERATION_1,
+        }
+        new = {
+            **old,
+            "backends": ["10.0.0.8"],
+            "members": [],
+            "cluster": "",
+            "operation_id": OPERATION_2,
+        }
+        current = {"state": old}
+        quarantined = []
+        controller["socket_generation"] = lambda: (1, 2, 3)
+        controller["read_prepared"] = lambda: {}
+        controller["active_state"] = lambda: current["state"]
+
+        def stale_probe(_state, **_kwargs):
+            current["state"] = new
+            raise controller["BackendIdentityError"]("old generation failed")
+
+        controller["validate_active_before_reopen"] = stale_probe
+        controller["quarantine_runtime_pool"] = lambda: quarantined.append(True)
+        with mock.patch.object(
+            controller["time"], "monotonic", side_effect=[0, 16, 16]
+        ), mock.patch.object(
+            controller["time"], "sleep", side_effect=SystemExit
+        ):
+            with self.assertRaises(SystemExit):
+                controller["watch_haproxy"]((1, 2, 3))
+        self.assertEqual(quarantined, [])
+
     def test_active_state_is_atomic_json_authority(self) -> None:
         controller = load_controller()
         with tempfile.TemporaryDirectory() as tmp:
@@ -173,10 +396,10 @@ class ControllerPoolTests(unittest.TestCase):
             )
             calls = []
             controller["frontends"] = lambda enabled: calls.append(("frontends", enabled))
-            controller["validate_active_before_reopen"] = lambda state: calls.append(
+            controller["validate_active_before_reopen"] = lambda state, **_kwargs: calls.append(
                 ("validate", state["backends"])
             )
-            controller["set_pool"] = lambda backends: calls.append(
+            controller["set_pool"] = lambda backends, **_kwargs: calls.append(
                 ("set_pool", list(backends))
             ) or {}
             real_reconcile = controller["reconcile_haproxy"]
@@ -208,7 +431,7 @@ class ControllerPoolTests(unittest.TestCase):
                 }
             )
             calls.clear()
-            controller["restore_state"] = lambda state, close_existing: calls.append(
+            controller["restore_state"] = lambda state, close_existing, **_kwargs: calls.append(
                 ("restore", state["backends"], close_existing)
             ) or {}
             result = real_reconcile("prepared-restart")
@@ -249,10 +472,10 @@ class ControllerPoolTests(unittest.TestCase):
             controller["frontends"] = lambda enabled: calls.append(
                 ("frontends", enabled)
             )
-            controller["validate_active_before_reopen"] = lambda state: calls.append(
+            controller["validate_active_before_reopen"] = lambda state, **_kwargs: calls.append(
                 ("validate", state["operation_id"])
             )
-            controller["set_pool"] = lambda backends: calls.append(
+            controller["set_pool"] = lambda backends, **_kwargs: calls.append(
                 ("set_pool", list(backends))
             ) or {}
             result = controller["reconcile_haproxy"]("commit-complete-restart")
@@ -285,7 +508,7 @@ class ControllerPoolTests(unittest.TestCase):
                 }
             )
             calls.clear()
-            controller["restore_state"] = lambda state, close_existing: calls.append(
+            controller["restore_state"] = lambda state, close_existing, **_kwargs: calls.append(
                 ("restore", state["backends"], close_existing)
             ) or {}
             result = controller["reconcile_haproxy"]("rolled-back-marker-restart")
@@ -435,8 +658,10 @@ class ControllerPoolTests(unittest.TestCase):
 
             controller["prepare_from_body"] = prepare
             controller["frontends"] = lambda _enabled: None
-            controller["validate_active_before_reopen"] = lambda _state: None
-            controller["restore_state"] = lambda _state, close_existing: {}
+            controller["validate_active_before_reopen"] = (
+                lambda _state, **_kwargs: None
+            )
+            controller["restore_state"] = lambda _state, close_existing, **_kwargs: {}
             server = controller["BoundedThreadingHTTPServer"](
                 ("127.0.0.1", 0), controller["Handler"]
             )
@@ -464,6 +689,7 @@ class ControllerPoolTests(unittest.TestCase):
                 "backend": "10.0.0.2",
                 "expected_pubkey": "0x" + ("1" * 64),
                 "expected_code_id": "0x" + ("2" * 64),
+                "expected_previous": controller["active_state"](),
             }
             results = {}
             first = threading.Thread(
@@ -568,7 +794,7 @@ class ControllerPoolTests(unittest.TestCase):
                 operation_id=OPERATION_1,
             )
             verified = []
-            controller["verify_runtime_pool"] = lambda backends: verified.append(
+            controller["verify_runtime_pool"] = lambda backends, **_kwargs: verified.append(
                 list(backends)
             )
             server = controller["BoundedThreadingHTTPServer"](
@@ -577,9 +803,9 @@ class ControllerPoolTests(unittest.TestCase):
             thread = threading.Thread(target=server.serve_forever, daemon=True)
             thread.start()
 
-            def post(body: dict) -> tuple[int, dict]:
+            def post(body: dict, path: str = "/assert-drained") -> tuple[int, dict]:
                 request = urllib.request.Request(
-                    f"http://127.0.0.1:{server.server_port}/assert-drained",
+                    f"http://127.0.0.1:{server.server_port}{path}",
                     data=json.dumps(body).encode(),
                     headers={
                         "Authorization": f"Bearer {ADMIN_KEY}",
@@ -608,13 +834,60 @@ class ControllerPoolTests(unittest.TestCase):
                 )
                 self.assertEqual(status, 200)
                 self.assertTrue(body["drained"])
+                self.assertRegex(body["reservation_id"], r"^[0-9a-f]{64}$")
+                self.assertRegex(body["release_token"], r"^[0-9a-f]{64}$")
+                self.assertEqual(body["reserved_at_operation_id"], OPERATION_1)
                 self.assertEqual(verified, [["10.0.0.2"]])
+
+                status, retry = post(
+                    {"operation_id": OPERATION_1, "backend": "10.0.0.3"}
+                )
+                self.assertEqual(status, 200)
+                self.assertTrue(retry["idempotent"])
+                self.assertEqual(retry["reservation_id"], body["reservation_id"])
+                self.assertEqual(retry["release_token"], body["release_token"])
+
+                # A newer active generation does not overwrite the original
+                # reservation/token, but retries are bound to the current one.
+                controller["persist_active"](
+                    ["10.0.0.2"],
+                    "0x" + ("1" * 64),
+                    code_id="0x" + ("2" * 64),
+                    operation_id=OPERATION_2,
+                )
+                status, advanced = post(
+                    {"operation_id": OPERATION_2, "backend": "10.0.0.3"}
+                )
+                self.assertEqual(status, 200)
+                self.assertEqual(advanced["operation_id"], OPERATION_2)
+                self.assertEqual(advanced["reserved_at_operation_id"], OPERATION_1)
+                self.assertEqual(advanced["release_token"], body["release_token"])
+
+                release = {
+                    "operation_id": OPERATION_2,
+                    "backend": "10.0.0.3",
+                    "reservation_id": body["reservation_id"],
+                    "release_token": body["release_token"],
+                }
+                self.assertEqual(
+                    post({**release, "release_token": OPERATION_1}, "/release-drain")[0],
+                    409,
+                )
+                status, released = post(release, "/release-drain")
+                self.assertEqual(status, 200)
+                self.assertFalse(released["idempotent"])
+                # Response loss after durable deletion is safely retryable from
+                # the bounded release tombstone.
+                status, released_retry = post(release, "/release-drain")
+                self.assertEqual(status, 200)
+                self.assertTrue(released_retry["idempotent"])
+                self.assertEqual(controller["read_drain_reservations"](), {})
 
                 controller["write_prepared"](
                     {"operation_id": OPERATION_2, "previous": {}}
                 )
                 self.assertEqual(
-                    post({"operation_id": OPERATION_1, "backend": "10.0.0.3"})[0],
+                    post({"operation_id": OPERATION_2, "backend": "10.0.0.3"})[0],
                     409,
                 )
             finally:
@@ -668,17 +941,7 @@ ZERO32=0x0000000000000000000000000000000000000000000000000000000000000000
     def test_partial_commit_restores_pool_and_evicts_candidate_sessions(self) -> None:
         controller = load_controller(include_handler=True)
         with tempfile.TemporaryDirectory() as tmp:
-            for key, filename in {
-                "ACTIVE_BACKEND_PATH": "active_backend",
-                "ACTIVE_PUBKEY_PATH": "active_pubkey",
-                "ACTIVE_CODE_ID_PATH": "active_code_id",
-                "ACTIVE_CLUSTER_PATH": "active_cluster",
-                "ACTIVE_MEMBERS_PATH": "active_members",
-                "ACTIVE_OPERATION_PATH": "active_operation",
-                "ACTIVE_STATE_PATH": "active.json",
-                "PREPARED_PATH": "prepared.json",
-            }.items():
-                controller[key] = str(Path(tmp) / filename)
+            point_state_at(controller, tmp)
 
             old = {
                 "backends": ["10.0.0.1"],
@@ -706,7 +969,8 @@ ZERO32=0x0000000000000000000000000000000000000000000000000000000000000000
                 }
             )
             controller["wait_until_serving"] = lambda _prepared: []
-            controller["verify_runtime_pool"] = lambda _backends: None
+            controller["verify_runtime_pool"] = lambda _backends, **_kwargs: None
+            controller["frontends"] = lambda _enabled: None
 
             commands: list[str] = []
             failed = False
@@ -768,6 +1032,172 @@ ZERO32=0x0000000000000000000000000000000000000000000000000000000000000000
             )
             self.assertLess(restored, candidate_closed)
             self.assertNotIn("enable frontend indexer_grpc", commands[failure_index + 1 :])
+
+
+class PinnedHaproxyRuntimeTests(unittest.TestCase):
+    def test_pinned_runtime_frontend_slot_and_check_port_semantics(self) -> None:
+        if not shutil.which("docker"):
+            self.skipTest("docker is unavailable")
+        info = subprocess.run(
+            ["docker", "info"], capture_output=True, text=True, check=False, timeout=20
+        )
+        if info.returncode != 0:
+            self.skipTest("docker daemon is unavailable")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            run_dir = root / "run"
+            run_dir.mkdir(mode=0o777)
+            os.chmod(run_dir, 0o777)
+            config = root / "haproxy.cfg"
+            config.write_text(
+                textwrap.dedent(
+                    """
+                    global
+                      stats socket /runtime/admin.sock mode 666 level admin
+                    defaults
+                      mode tcp
+                      timeout connect 1s
+                      timeout client 10s
+                      timeout server 10s
+                      timeout check 1s
+                    frontend indexer_grpc
+                      bind :50052
+                      default_backend indexer_grpc_active
+                    backend indexer_grpc_active
+                      option httpchk GET /healthz
+                      http-check expect status 200
+                      server worker1 127.0.0.1:1 check port 9090 disabled
+                    frontend indexer_http
+                      mode http
+                      bind :9090
+                      default_backend indexer_http_active
+                    backend indexer_http_active
+                      mode http
+                      option httpchk GET /healthz
+                      http-check expect status 200
+                      server worker1 127.0.0.1:1 check disabled
+                    """
+                ).strip()
+                + "\n",
+                encoding="utf-8",
+            )
+            name = f"indexer-lb-haproxy-test-{uuid.uuid4().hex[:12]}"
+            started = subprocess.run(
+                [
+                    "docker",
+                    "run",
+                    "--rm",
+                    "-d",
+                    "--name",
+                    name,
+                    "--user",
+                    "0:0",
+                    "-v",
+                    f"{config}:/cfg/haproxy.cfg:ro",
+                    "-v",
+                    f"{run_dir}:/runtime",
+                    "--entrypoint",
+                    "haproxy",
+                    HAPROXY_IMAGE,
+                    "-f",
+                    "/cfg/haproxy.cfg",
+                    "-db",
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=120,
+            )
+            self.assertEqual(started.returncode, 0, started.stderr)
+            socket_path = run_dir / "admin.sock"
+
+            def admin(command: str) -> str:
+                client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                try:
+                    client.settimeout(5)
+                    client.connect(str(socket_path))
+                    client.sendall((command + "\n").encode())
+                    client.shutdown(socket.SHUT_WR)
+                    chunks = []
+                    while True:
+                        chunk = client.recv(65536)
+                        if not chunk:
+                            break
+                        chunks.append(chunk)
+                    return b"".join(chunks).decode()
+                finally:
+                    client.close()
+
+            def frontend_statuses() -> dict[str, str]:
+                raw = admin("show stat")
+                rows = csv.DictReader(io.StringIO(raw[2:]))
+                return {
+                    row["pxname"]: row["status"]
+                    for row in rows
+                    if row["svname"] == "FRONTEND"
+                }
+
+            try:
+                for _ in range(50):
+                    if socket_path.exists():
+                        break
+                    time.sleep(0.1)
+                self.assertTrue(socket_path.exists(), started.stdout)
+                self.assertEqual(frontend_statuses()["indexer_grpc"], "OPEN")
+                self.assertEqual(frontend_statuses()["indexer_http"], "OPEN")
+                admin("disable frontend indexer_grpc")
+                admin("disable frontend indexer_http")
+                self.assertEqual(frontend_statuses()["indexer_grpc"], "PAUSED")
+                self.assertEqual(frontend_statuses()["indexer_http"], "PAUSED")
+                admin("enable frontend indexer_grpc")
+                admin("enable frontend indexer_http")
+                self.assertEqual(frontend_statuses()["indexer_grpc"], "OPEN")
+                self.assertEqual(frontend_statuses()["indexer_http"], "OPEN")
+
+                admin(
+                    "set server indexer_grpc_active/worker1 addr 10.0.0.2 port 50052"
+                )
+                admin("enable server indexer_grpc_active/worker1")
+                stat_rows = list(csv.DictReader(io.StringIO(admin("show stat")[2:])))
+                worker = next(
+                    row
+                    for row in stat_rows
+                    if row["pxname"] == "indexer_grpc_active"
+                    and row["svname"] == "worker1"
+                )
+                self.assertEqual(worker["addr"], "10.0.0.2:50052")
+                self.assertFalse(worker["status"].startswith("MAINT"))
+
+                state_lines = [
+                    line for line in admin("show servers state").splitlines() if line
+                ]
+                header_index = next(
+                    index for index, line in enumerate(state_lines) if line.startswith("# ")
+                )
+                header = state_lines[header_index].removeprefix("# ").split()
+                states = [
+                    dict(zip(header, line.split()))
+                    for line in state_lines[header_index + 1 :]
+                    if not line.startswith("#")
+                ]
+                grpc = next(
+                    row
+                    for row in states
+                    if row["be_name"] == "indexer_grpc_active"
+                    and row["srv_name"] == "worker1"
+                )
+                self.assertEqual(grpc["srv_port"], "50052")
+                self.assertEqual(grpc["srv_check_port"], "9090")
+                admin("shutdown sessions server indexer_grpc_active/worker1")
+            finally:
+                subprocess.run(
+                    ["docker", "rm", "-f", name],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                    timeout=20,
+                )
 
 
 if __name__ == "__main__":

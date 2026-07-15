@@ -7,10 +7,16 @@ on:
   push:
     paths:
       - "indexer/**"
-      - "sidecar/proto/**"
+      - "sidecar/**"
+      - "contracts/**"
       - "deploy/indexer*.sh"
+      - "deploy/generic-node.sh"
+      - "deploy/generic-node-box.py"
+      - "deploy/env.sh"
+      - "deploy/lib.sh"
       - "deploy/onchain.sh"
       - "deploy/compose/indexer-*.yaml"
+      - "deploy/tests/**"
       - "deploy/indexer-lb-runbook.md"
       - "docs/specs/indexer-ha.md"
       - ".github/workflows/build-indexer.yml"
@@ -49,16 +55,64 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Host-only deployment tests use real `cast` for calldata/create2 vectors.
+      - uses: foundry-rs/foundry-toolchain@v1
+
       - name: Parse deployment scripts
-        run: bash -n deploy/indexer*.sh deploy/onchain.sh
+        run: bash -n deploy/indexer*.sh deploy/generic-node.sh deploy/onchain.sh
 
       - name: Lint deployment scripts
         # Warning+ keeps real deployment defects gating while avoiding
         # version-dependent informational findings in the existing scripts.
-        run: shellcheck -S warning -x -e SC1090,SC1091,SC2018,SC2019 deploy/indexer*.sh deploy/onchain.sh
+        run: shellcheck -S warning -x -e SC1090,SC1091,SC2018,SC2019 deploy/indexer*.sh deploy/generic-node.sh deploy/onchain.sh
+
+      - name: Test deployment controllers and workers
+        run: |
+          python3 -m py_compile \
+            deploy/generic-node-box.py \
+            deploy/tests/test_indexer_ha_replica.py \
+            deploy/tests/test_indexer_lb_controller.py \
+            deploy/tests/test_indexer_lb_driver.py \
+            deploy/tests/test_indexer_member_registration.py \
+            deploy/tests/test_onchain_indexer_cluster.py
+          python3 -m unittest \
+            deploy.tests.test_indexer_ha_replica \
+            deploy.tests.test_indexer_lb_controller \
+            deploy.tests.test_indexer_lb_driver \
+            deploy.tests.test_indexer_member_registration \
+            deploy.tests.test_onchain_indexer_cluster
+
+      - name: Render Indexer deployment compose files
+        env:
+          CHAIN_ID: "8453"
+          RPC_URL: https://rpc.invalid
+          BUNDLER_URL: https://bundler.invalid
+          GAS_POLICY_ID: ci-test
+          INDEXER_REGISTRY_ADDR: "0x1111111111111111111111111111111111111111"
+          GATEWAY_DOMAIN: example.invalid
+          CLUSTER: "0x2222222222222222222222222222222222222222"
+          APP_ENV_B64: QQ==
+        run: |
+          docker compose -f deploy/compose/indexer-ha-replica-node.yaml config >/dev/null
+          docker compose -f deploy/compose/indexer-lb-node.yaml config >/dev/null
+
+  contracts-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: foundry-rs/foundry-toolchain@v1
+
+      - name: Check contract formatting
+        working-directory: contracts
+        run: forge fmt --check
+
+      - name: Test contracts
+        working-directory: contracts
+        run: forge test
 
   build:
-    needs: [test, deploy-check]
+    needs: [test, deploy-check, contracts-check]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
