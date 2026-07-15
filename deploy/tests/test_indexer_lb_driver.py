@@ -3,11 +3,13 @@
 
 import json
 import hashlib
+import http.server
 import os
 import shlex
 import subprocess
 import tempfile
 import textwrap
+import threading
 import unittest
 from pathlib import Path
 
@@ -35,6 +37,7 @@ LOAD_LB = between("_load_lb() {", "_save_lb() {")
 ENSURE_SECRETS = between("_ensure_secrets() {", "_acquire_cutover_lock() {")
 DISCOVER_MESH_IP = between("_discover_mesh_ip() {", "_bridge_ip_for_vm() {")
 CONTROL_FUNCTIONS = between("_control_request_to() {", "_registry_owner_preflight() {")
+RPC_PUBLISH = between("_rpc_publish_raw() {", "_build_registry_tx() {")
 TX_FUNCTIONS = PRIVATE_JSON_READER + between(
     "_atomic_json_write() {", "_operation_status() {"
 )
@@ -1132,6 +1135,118 @@ class DriverTransactionTests(unittest.TestCase):
             self.assertNotIn(forbidden, SOURCE)
         self.assertIn("printf '%s' \"$raw\" | cast keccak", SOURCE)
         self.assertIn("_rpc_publish_raw", SOURCE)
+
+    def test_sensitive_http_clients_ignore_ambient_proxies_and_ssh_joining(self) -> None:
+        direct_requests: list[tuple[str, str | None, bytes]] = []
+        proxy_requests: list[tuple[str, str | None, bytes]] = []
+
+        class DirectHandler(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *_args) -> None:
+                pass
+
+            def do_POST(self) -> None:
+                length = int(self.headers.get("Content-Length", "0"))
+                body = self.rfile.read(length)
+                direct_requests.append(
+                    (self.path, self.headers.get("Authorization"), body)
+                )
+                if self.path == "/rpc":
+                    response = json.dumps(
+                        {"jsonrpc": "2.0", "id": 1, "result": HASH}
+                    ).encode()
+                else:
+                    response = b'{"accepted":true}'
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(response)))
+                self.end_headers()
+                self.wfile.write(response)
+
+        class ProxyHandler(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *_args) -> None:
+                pass
+
+            def do_POST(self) -> None:
+                length = int(self.headers.get("Content-Length", "0"))
+                proxy_requests.append(
+                    (
+                        self.path,
+                        self.headers.get("Authorization"),
+                        self.rfile.read(length),
+                    )
+                )
+                self.send_error(502)
+
+        direct = http.server.ThreadingHTTPServer(("127.0.0.1", 0), DirectHandler)
+        proxy = http.server.ThreadingHTTPServer(("127.0.0.1", 0), ProxyHandler)
+        threads = [
+            threading.Thread(target=server.serve_forever, daemon=True)
+            for server in (direct, proxy)
+        ]
+        for thread in threads:
+            thread.start()
+        try:
+            direct_port = direct.server_address[1]
+            proxy_port = proxy.server_address[1]
+            control_functions = CONTROL_FUNCTIONS.replace(
+                "printf 'http://%s:50053%s\\n' \"$mesh_ip\" \"$path\"",
+                f"printf 'http://%s:{direct_port}%s\\n' \"$mesh_ip\" \"$path\"",
+            )
+            self.assertNotEqual(control_functions, CONTROL_FUNCTIONS)
+            script = textwrap.dedent(
+                f"""
+                set -euo pipefail
+                die() {{ printf '%s\n' "$*" >&2; exit 87; }}
+                _validate_private_ipv4() {{ printf '%s\n' "$1"; }}
+                _ensure_secrets() {{ INDEXER_LB_ADMIN_KEY=ilb_{'1' * 64}; }}
+                ssh_mesh() {{
+                  local joined="" arg
+                  for arg in "$@"; do
+                    [ -z "$joined" ] || joined="$joined "
+                    joined="${{joined}}${{arg}}"
+                  done
+                  /bin/sh -c "$joined"
+                }}
+                {control_functions}
+                {RPC_PUBLISH}
+                proxy=http://127.0.0.1:{proxy_port}
+                export HTTP_PROXY="$proxy" HTTPS_PROXY="$proxy"
+                export http_proxy="$proxy" https_proxy="$proxy"
+                export ALL_PROXY="$proxy" all_proxy="$proxy"
+                export NO_PROXY= no_proxy=
+                _control_request_to 127.0.0.1 POST /prepare '{{"probe":true}}' >/dev/null
+                RPC_URL=http://127.0.0.1:{direct_port}/rpc
+                [ "$(_rpc_publish_raw 0x12)" = {HASH} ]
+                """
+            )
+            result = run_bash(script)
+            self.assertEqual(result.returncode, 0, result.stderr)
+        finally:
+            direct.shutdown()
+            proxy.shutdown()
+            direct.server_close()
+            proxy.server_close()
+            for thread in threads:
+                thread.join(timeout=2)
+
+        self.assertEqual(proxy_requests, [])
+        self.assertEqual([request[0] for request in direct_requests], ["/prepare", "/rpc"])
+        self.assertEqual(
+            direct_requests[0][1], "Bearer ilb_" + ("1" * 64)
+        )
+        self.assertEqual(direct_requests[0][2], b'{"probe":true}')
+        rpc_body = json.loads(direct_requests[1][2])
+        self.assertEqual(rpc_body["method"], "eth_sendRawTransaction")
+        self.assertEqual(rpc_body["params"], ["0x12"])
+
+    def test_every_sensitive_http_client_explicitly_disables_proxies(self) -> None:
+        curl_lines = [line for line in SOURCE.splitlines() if "curl " in line]
+        self.assertEqual(len(curl_lines), 5)
+        for line in curl_lines:
+            self.assertIn("--noproxy '*'", line)
+        self.assertNotIn("urllib.request.urlopen(", SOURCE)
+        self.assertEqual(SOURCE.count("urllib.request.ProxyHandler({})"), 2)
+        self.assertEqual(SOURCE.count("NoRedirect()"), 2)
+        self.assertIn("remote_client_b64", CONTROL_FUNCTIONS)
 
 
 if __name__ == "__main__":

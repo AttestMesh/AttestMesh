@@ -226,6 +226,30 @@ class ControllerPoolTests(unittest.TestCase):
         with self.assertRaises(urllib.error.HTTPError):
             controller["bounded_backend_get"]("10.0.0.2", "/status")
 
+    def test_backend_identity_opener_ignores_ambient_proxies(self) -> None:
+        with mock.patch.dict(
+            os.environ,
+            {
+                "HTTP_PROXY": "http://127.0.0.1:1",
+                "HTTPS_PROXY": "http://127.0.0.1:2",
+                "http_proxy": "http://127.0.0.1:3",
+                "https_proxy": "http://127.0.0.1:4",
+                "NO_PROXY": "",
+                "no_proxy": "",
+            },
+        ):
+            controller = load_controller()
+        proxy_configs = [
+            handler.proxies
+            for handler in controller["BACKEND_HTTP"].handlers
+            if hasattr(handler, "proxies")
+        ]
+        self.assertTrue(all(config == {} for config in proxy_configs))
+        self.assertIn(
+            "urllib.request.ProxyHandler({}), RejectRedirects()",
+            controller_source(),
+        )
+
     def test_shared_restart_tolerates_only_identity_bound_degradation(self) -> None:
         controller = load_controller()
         state = {

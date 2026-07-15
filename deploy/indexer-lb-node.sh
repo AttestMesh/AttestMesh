@@ -1290,14 +1290,14 @@ _backend_ip() {
 
 _backend_http() {
   local ip="$1" path="$2" out rc invalid_response=0
-  if out=$(ssh_box "curl -fsS --max-time 12 --max-filesize 65536 --location --max-redirs 0 --proto '=http' 'http://$ip:9090$path'" 2>/dev/null); then
+  if out=$(ssh_box "curl -fsS --noproxy '*' --max-time 12 --max-filesize 65536 --location --max-redirs 0 --proto '=http' 'http://$ip:9090$path'" 2>/dev/null); then
     printf '%s\n' "$out"
     return 0
   else
     rc=$?
     case "$rc" in 6|7|28|255) ;; *) invalid_response=1 ;; esac
   fi
-  if out=$(ssh_mesh "curl -fsS --max-time 12 --max-filesize 65536 --location --max-redirs 0 --proto '=http' 'http://$ip:9090$path'" 2>/dev/null); then
+  if out=$(ssh_mesh "curl -fsS --noproxy '*' --max-time 12 --max-filesize 65536 --location --max-redirs 0 --proto '=http' 'http://$ip:9090$path'" 2>/dev/null); then
     printf '%s\n' "$out"
     return 0
   else
@@ -1316,7 +1316,7 @@ _current_registry_cluster_count() {
   value=$(cast call "$REGISTRY" 'current()(string,bytes32,bytes32,uint64)' \
     --json --rpc-url "$RPC_URL" 2>/dev/null) || return 1
   endpoint=$(echo "$value" | jq -er '.[0] | select(length > 0)') || return 1
-  status=$(curl -fsS --max-time 12 --max-filesize 65536 --location --max-redirs 0 \
+  status=$(curl -fsS --noproxy '*' --max-time 12 --max-filesize 65536 --location --max-redirs 0 \
     --proto '=https' "${endpoint/-50052./-9090.}/status" 2>/dev/null) \
     || return 1
   echo "$status" | jq -er '.readModel.clusterCount | select(type == "number" and . > 0)'
@@ -1523,7 +1523,7 @@ _resolve_switch_pool() {
 }
 
 _control_request_to() {
-  local mesh_ip="$1" method="$2" path="$3" payload="${4:-}" timeout remote_client
+  local mesh_ip="$1" method="$2" path="$3" payload="${4:-}" timeout remote_client remote_client_b64
   mesh_ip="$(_validate_private_ipv4 "$mesh_ip")"
   _ensure_secrets
   case "$method" in
@@ -1561,7 +1561,10 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
 
 request = urllib.request.Request(url, data=data, headers=headers, method=method)
 try:
-    with urllib.request.build_opener(NoRedirect).open(request, timeout=timeout) as response:
+    opener = urllib.request.build_opener(
+        urllib.request.ProxyHandler({}), NoRedirect()
+    )
+    with opener.open(request, timeout=timeout) as response:
         body = response.read(65537)
 except urllib.error.HTTPError as exc:
     body = exc.read(65537)
@@ -1574,13 +1577,17 @@ if len(body) > 65536:
 sys.stdout.buffer.write(body)
 PY
 )
+  remote_client_b64=$(printf '%s' "$remote_client" | base64 | tr -d '\n') \
+    || die "could not encode LB control client"
+  [[ "$remote_client_b64" =~ ^[A-Za-z0-9+/=]+$ ]] \
+    || die "encoded LB control client is malformed"
   {
     printf '%s\n' "$INDEXER_LB_ADMIN_KEY"
     printf '%s\n' "$method"
     printf 'http://%s:50053%s\n' "$mesh_ip" "$path"
     printf '%s\n' "$timeout"
     printf '%s' "$payload"
-  } | ssh_mesh python3 -c "$remote_client"
+  } | ssh_mesh "python3 -c 'import base64,sys;exec(base64.b64decode(sys.argv[1]))' '$remote_client_b64'"
 }
 
 _control_request() {
@@ -1822,8 +1829,16 @@ body = json.dumps(
 request = urllib.request.Request(
     rpc_url, data=body, headers={"Content-Type": "application/json"}, method="POST"
 )
+
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
 try:
-    with urllib.request.urlopen(request, timeout=45) as response:
+    opener = urllib.request.build_opener(
+        urllib.request.ProxyHandler({}), NoRedirect()
+    )
+    with opener.open(request, timeout=45) as response:
         reply = response.read(65537)
 except (OSError, urllib.error.URLError) as exc:
     raise SystemExit(f"raw transaction publication failed: {exc}") from exc
@@ -2649,7 +2664,7 @@ verify_sidecar_health() {
     # though its mesh route and CSK are ready. The authenticated control request in
     # `switch_backend` is the end-to-end mesh proof; here require its prerequisites
     # without treating an intentional HTTP 503 as an absent response.
-    body=$(ssh_box "curl -sS --max-time 8 'http://$bridge:9091/healthz'" 2>/dev/null || true)
+    body=$(ssh_box "curl -sS --noproxy '*' --max-time 8 'http://$bridge:9091/healthz'" 2>/dev/null || true)
     if echo "$body" | jq -e '.csk_acquired == true and (.live_peers // 0) > 0' >/dev/null 2>&1; then
       log "✔ Indexer LB sidecar mesh-ready (health remains convergence+CSK): $body"
       return 0
@@ -2682,7 +2697,7 @@ verify_lb() {
   active_cluster=$(echo "$control" | jq -r '.active_cluster // empty' | tr 'A-F' 'a-f')
   if [ -n "$active_pub" ]; then
     stable="$(_stable_endpoint)"
-    status=$(curl -fsS --max-time 15 --max-filesize 65536 --location --max-redirs 0 \
+    status=$(curl -fsS --noproxy '*' --max-time 15 --max-filesize 65536 --location --max-redirs 0 \
       --proto '=https' "${stable/-50052./-9090.}/status") \
       || die "stable Indexer HTTP endpoint unavailable"
     [ "$(echo "$status" | jq -r '.pubKey // empty' | tr 'A-F' 'a-f')" = "${active_pub,,}" ] \

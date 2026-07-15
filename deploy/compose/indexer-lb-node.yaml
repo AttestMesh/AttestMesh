@@ -485,7 +485,9 @@ services:
             def redirect_request(self, req, fp, code, msg, headers, newurl):
                 return None
 
-        BACKEND_HTTP = urllib.request.build_opener(RejectRedirects())
+        BACKEND_HTTP = urllib.request.build_opener(
+            urllib.request.ProxyHandler({}), RejectRedirects()
+        )
 
         def bounded_backend_get(ip: str, path: str) -> bytes:
             url = f"http://{validate_backend(ip)}:9090{path}"
