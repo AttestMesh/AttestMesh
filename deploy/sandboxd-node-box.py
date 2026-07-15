@@ -112,7 +112,7 @@ mkdir -p "$DOCKER_CONFIG"
 chmod 0700 "$DOCKER_CONFIG"
 trap 'rm -rf "$DOCKER_CONFIG"' EXIT
 
-for tool in awk curl df docker find getconf grep head jq mount rm sed zfs zpool; do
+for tool in awk curl df docker find grep head jq mount rm sed zfs zpool; do
   command -v "$tool" >/dev/null 2>&1 || {
     echo "missing required sandboxd host tool: $tool" >&2
     exit 1
@@ -121,7 +121,9 @@ done
 
 # UpgradeApp does not resize an existing VM. Validate the resources visible inside the guest so an
 # update of an old 4-vCPU/8-GiB node cannot install admission budgets intended for the new profile.
-actual_vcpus=$(getconf _NPROCESSORS_ONLN)
+# dstack's minimal host image does not ship getconf. Count the online processors from procfs using
+# awk, which is already a required pre-launch tool, and still validate the result as an integer.
+actual_vcpus=$(awk -F: '/^processor[[:space:]]*:/ {count++} END {print count + 0}' /proc/cpuinfo)
 actual_memory_kib=$(awk '/^MemTotal:/ {print $2}' /proc/meminfo)
 case "$actual_vcpus" in
   ''|*[!0-9]*) echo "invalid guest vCPU readback: $actual_vcpus" >&2; exit 1 ;;
@@ -526,6 +528,12 @@ def describe_vm(vm_id: str) -> dict[str, object]:
     response = m.vmm("GetInfo", {"id": vm_id})
     info = response.get("info") or {}
     config = info.get("configuration") or {}
+    compose_file = config.get("compose_file")
+    compose_hash = (
+        hashlib.sha256(compose_file.encode()).hexdigest()
+        if isinstance(compose_file, str) and compose_file
+        else None
+    )
     return {
         "vm_id": vm_id,
         "found": bool(response.get("found")),
@@ -536,6 +544,7 @@ def describe_vm(vm_id: str) -> dict[str, object]:
         "memory": config.get("memory"),
         "disk_size": config.get("disk_size"),
         "app_id": config.get("app_id"),
+        "compose_hash": compose_hash,
     }
 
 
@@ -687,18 +696,27 @@ def main() -> None:
         print(json.dumps(result))
         return
 
-    if mode == "update":
+    if mode in {"update", "upgrade-stopped"}:
         app_id = sys.argv[2] if len(sys.argv) > 2 else ""
         vm_id = sys.argv[3] if len(sys.argv) > 3 else ""
         if not app_id or not vm_id:
-            raise SystemExit("usage: sandboxd-node-box.py update <app_id> <vm_id>")
+            raise SystemExit(f"usage: sandboxd-node-box.py {mode} <app_id> <vm_id>")
         env = build_env(app_id)
         compose_file, compose_hash = app_compose_and_hash(list(env.keys()))
         sealed = dict(env)
         sealed["APP_ID"] = app_id
-        # Never upgrade while the old workload is merely "stopping" or the VMM state is unknown.
-        # The same exact terminal-state proof used by replacement rollback applies here.
-        stop_vm(vm_id)
+        # Never upgrade while a workload is merely "stopping" or the VMM state is unknown. A
+        # rolled-back replacement uses upgrade-stopped so its corrected measured compose can be
+        # installed without ever starting alongside the active old VM.
+        if mode == "update":
+            stop_vm(vm_id)
+        else:
+            before = describe_vm(vm_id)
+            if not before["found"] or str(before.get("status") or "").lower() not in {
+                "stopped",
+                "exited",
+            }:
+                raise SystemExit("upgrade-stopped requires an exactly stopped replacement VM")
         upgrade = m.vmm(
             "UpgradeApp",
             {
@@ -713,6 +731,25 @@ def main() -> None:
                 "gateway_urls": [m.GATEWAY_RPC] if GATEWAY_ENABLED else [],
             },
         )
+        if mode == "upgrade-stopped":
+            after = describe_vm(vm_id)
+            if (
+                str(after.get("status") or "").lower() not in {"stopped", "exited"}
+                or after.get("compose_hash") != compose_hash
+            ):
+                raise SystemExit("UpgradeApp did not preserve stopped state and exact compose hash")
+            print(
+                json.dumps(
+                    {
+                        "app_id": app_id,
+                        "compose_hash": compose_hash,
+                        "vm_id": vm_id,
+                        "status": after.get("status"),
+                        "upgrade": upgrade,
+                    }
+                )
+            )
+            return
         start = m.vmm("StartVm", {"id": vm_id})
         print(json.dumps({"app_id": app_id, "compose_hash": compose_hash, "vm_id": vm_id, "upgrade": upgrade, "start": start}))
         return
@@ -720,7 +757,7 @@ def main() -> None:
     raise SystemExit(
         "usage: sandboxd-node-box.py "
         "[deploy|create-replacement <app_id>|hash|inventory-app <app_id>|describe <vm_id>|stop <vm_id>|"
-        "start <vm_id>|update <app_id> <vm_id>]"
+        "start <vm_id>|update <app_id> <vm_id>|upgrade-stopped <app_id> <vm_id>]"
     )
 
 

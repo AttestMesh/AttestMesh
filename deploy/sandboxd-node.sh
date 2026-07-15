@@ -8,7 +8,7 @@ source "$HERE/lib.sh"
 : "${RPC_URL:?source deploy/env.sh first}"
 require PRIVATE_KEY RPC_URL CHAIN_ID DEPLOYER_ADDR
 
-NODE="${1:?usage: sandboxd-node.sh <node-name> [deploy|prime|bind|start|verify-health|smoke|update|replace|all]}"
+NODE="${1:?usage: sandboxd-node.sh <node-name> [deploy|prime|bind|start|verify-health|smoke|update|replace|rollback|all]}"
 ACTION="${2:-all}"
 BOX_HOST="${BOX_HOST:-ubuntu@173.231.234.133}"
 BOX_PY="${BOX_PY:-/opt/dstack-mcp/venv/bin/python}"
@@ -43,6 +43,7 @@ PREVIOUS_VM_ID=${PREVIOUS_VM_ID:-}
 REPLACEMENT_VM_ID=${REPLACEMENT_VM_ID:-}
 REPLACEMENT_OLD_VM_ID=${REPLACEMENT_OLD_VM_ID:-}
 REPLACEMENT_H=${REPLACEMENT_H:-}
+REPLACEMENT_PREVIOUS_H=${REPLACEMENT_PREVIOUS_H:-}
 REPLACEMENT_PHASE=${REPLACEMENT_PHASE:-}
 REPLACEMENT_VCPU=${REPLACEMENT_VCPU:-}
 REPLACEMENT_MEM=${REPLACEMENT_MEM:-}
@@ -313,13 +314,13 @@ update_member() {
 }
 
 _validate_replacement_vm() {
-  local vm_id="${1:?replacement VM id required}" out j
+  local vm_id="${1:?replacement VM id required}" expected_hash="${2:-}" out j
   out=$(_box_run describe "" "$vm_id") || return 1
   j=$(echo "$out" | grep '"vm_id"' | tail -1)
   [ -n "$j" ] || { log "replacement describe returned no JSON: $out"; return 1; }
   if ! echo "$j" | jq -e \
     --arg vcpu "$REPLACEMENT_VCPU" --arg memory "$REPLACEMENT_MEM" --arg disk "$REPLACEMENT_DISK" \
-    --arg app "$X" \
+    --arg app "$X" --arg expected_hash "$expected_hash" \
     '.found == true and
      (.vcpu | tonumber) == ($vcpu | tonumber) and
      (.memory | tonumber) == ($memory | tonumber) and
@@ -327,11 +328,38 @@ _validate_replacement_vm() {
      (((.app_id // "") | ascii_downcase | ltrimstr("0x")) ==
        ($app | ascii_downcase | ltrimstr("0x"))) and
      (((.status // "") | ascii_downcase) as $status |
-       ($status == "stopped" or $status == "exited"))' >/dev/null; then
+       ($status == "stopped" or $status == "exited")) and
+     ($expected_hash == "" or
+       (((.compose_hash // "") | ascii_downcase) == ($expected_hash | ascii_downcase)))' >/dev/null; then
     log "replacement VM identity/resource/stopped readback mismatch: $j"
     return 1
   fi
   log "✔ replacement VM is stopped with the expected app id and ${REPLACEMENT_VCPU} vCPU / ${REPLACEMENT_MEM} MiB / ${REPLACEMENT_DISK} GiB: $vm_id"
+}
+
+_resume_replacement_rebase() {
+  local out
+  [ "$REPLACEMENT_PHASE" = rebasing ] || die "replacement rebase called from $REPLACEMENT_PHASE"
+  [ -n "${REPLACEMENT_PREVIOUS_H:-}" ] || die "replacement rebase lacks its previous compose hash"
+  _inventory_matches "$REPLACEMENT_OLD_VM_ID" \
+    || die "old VM is not the only active same-app VM during stopped replacement rebase"
+
+  if _validate_replacement_vm "$REPLACEMENT_VM_ID" "$REPLACEMENT_H"; then
+    log "replacement rebase was already applied before journal completion"
+  else
+    # A readback of the exact previous hash proves UpgradeApp did not take effect, so retrying the
+    # same stopped-only mutation is safe. Any third hash is ambiguous and fails closed.
+    _validate_replacement_vm "$REPLACEMENT_VM_ID" "$REPLACEMENT_PREVIOUS_H" \
+      || die "replacement rebase outcome is ambiguous; VM hash is neither previous nor target"
+    out=$(_box_run upgrade-stopped "$X" "$REPLACEMENT_VM_ID") \
+      || die "stopped replacement UpgradeApp failed or became ambiguous"
+    echo "$out"
+    _validate_replacement_vm "$REPLACEMENT_VM_ID" "$REPLACEMENT_H" \
+      || die "stopped replacement did not read back the target compose hash"
+  fi
+  REPLACEMENT_PREVIOUS_H=
+  REPLACEMENT_PHASE=created
+  _save
 }
 
 _inventory_matches() {
@@ -367,6 +395,7 @@ _wait_inventory() {
 
 _rollback_replacement() {
   local reason="${1:-replacement failed}"
+  local return_after_rollback="${2:-0}" health_recovered=1
   log "⚠ replacement cutover failed; rolling back without starting two copies: $reason"
   REPLACEMENT_PHASE=rolling-back
   _save
@@ -399,9 +428,24 @@ _rollback_replacement() {
   REPLACEMENT_PHASE=rolled-back
   _save
   if ! _wait_health 18 10 "$H" 1; then
+    health_recovered=0
     log "⚠ old VM restart was requested but gateway health has not recovered; replacement state is retained"
   fi
+  if [ "$return_after_rollback" = 1 ]; then
+    [ "$health_recovered" = 1 ] \
+      || die "replacement is stopped and old-only inventory is restored, but old gateway health did not recover"
+    log "✔ operator rollback restored old VM $REPLACEMENT_OLD_VM_ID; replacement remains stopped for retry"
+    return 0
+  fi
   die "replacement rolled back to old VM $REPLACEMENT_OLD_VM_ID: $reason"
+}
+
+rollback_cvm() {
+  _load; _require_env
+  [ -n "${REPLACEMENT_PHASE:-}" ] || die "no replacement journal exists to roll back"
+  [ -n "${REPLACEMENT_VM_ID:-}" ] && [ -n "${REPLACEMENT_OLD_VM_ID:-}" ] \
+    || die "replacement journal lacks the exact old/new VM identities"
+  _rollback_replacement "operator-requested rollback from phase $REPLACEMENT_PHASE" 1
 }
 
 _resume_replacement() {
@@ -419,11 +463,14 @@ _resume_replacement() {
         REPLACEMENT_PHASE=created
         _save
         ;;
+      rebasing)
+        _resume_replacement_rebase
+        ;;
       creating)
         die "replacement CreateVm outcome is ambiguous and has no recorded VM id; inspect the VMM before retrying"
         ;;
       created)
-        _validate_replacement_vm "$REPLACEMENT_VM_ID" \
+        _validate_replacement_vm "$REPLACEMENT_VM_ID" "$REPLACEMENT_H" \
           || _rollback_replacement "replacement VM resource validation failed"
         _inventory_matches "$REPLACEMENT_OLD_VM_ID" \
           || _rollback_replacement "old VM is not the only active same-app VM before cutover"
@@ -438,7 +485,7 @@ _resume_replacement() {
       old-stopped)
         _inventory_matches none \
           || _rollback_replacement "same-app inventory is not quiescent before replacement start"
-        _validate_replacement_vm "$REPLACEMENT_VM_ID" \
+        _validate_replacement_vm "$REPLACEMENT_VM_ID" "$REPLACEMENT_H" \
           || _rollback_replacement "replacement stopped-state/identity changed before start"
         log "▶ starting replacement sandboxd VM $REPLACEMENT_VM_ID"
         _box_run start "" "$REPLACEMENT_VM_ID" >/dev/null \
@@ -463,6 +510,7 @@ _resume_replacement() {
         REPLACEMENT_VM_ID=
         REPLACEMENT_OLD_VM_ID=
         REPLACEMENT_H=
+        REPLACEMENT_PREVIOUS_H=
         REPLACEMENT_PHASE=
         REPLACEMENT_VCPU=
         REPLACEMENT_MEM=
@@ -496,14 +544,34 @@ replace_cvm() {
     || die "existing app id is not allowlisted; refusing replacement: $X"
 
   if [ -n "${REPLACEMENT_PHASE:-}" ]; then
-    [ "${REPLACEMENT_H:-}" = "$nh" ] \
-      || die "measured compose changed during replacement (recorded=$REPLACEMENT_H current=$nh); refusing to mix builds"
     [ "${REPLACEMENT_OLD_VM_ID:-}" = "$VM_ID" ] \
       || die "active VM changed during replacement (recorded=$REPLACEMENT_OLD_VM_ID current=$VM_ID)"
     [ "${REPLACEMENT_VCPU:-}/${REPLACEMENT_MEM:-}/${REPLACEMENT_DISK:-}" = "$BOX_VCPU/$BOX_MEM/$BOX_DISK" ] \
       || die "replacement resource target changed during cutover; refusing to mix provisioning profiles"
     [ "${REPLACEMENT_STATE_RESET_APPROVED:-}" = "1" ] \
       || die "replacement journal lacks the explicit empty-state reset approval"
+    if [ "$REPLACEMENT_PHASE" = rolled-back ] && \
+       { [ "${REPLACEMENT_H:-}" != "$nh" ] || [ -n "${REPLACEMENT_PREVIOUS_H:-}" ]; }; then
+      # The failed replacement is already the explicitly provisioned 8/16/300 VM. Reuse it by
+      # installing the corrected compose while it remains stopped; never allocate a duplicate and
+      # never start it alongside the healthy old VM. The two hashes make a crash during UpgradeApp
+      # reconcilable from VMM readback.
+      _inventory_matches "$VM_ID" \
+        || die "old VM is not the only active same-app VM before replacement rebase"
+      if [ "${REPLACEMENT_H:-}" != "$nh" ]; then
+        [ -z "${REPLACEMENT_PREVIOUS_H:-}" ] \
+          || die "replacement journal contains conflicting previous and target compose hashes"
+        _validate_replacement_vm "$REPLACEMENT_VM_ID" "$REPLACEMENT_H" \
+          || die "rolled-back replacement identity or recorded compose hash changed"
+        REPLACEMENT_PREVIOUS_H="$REPLACEMENT_H"
+        REPLACEMENT_H="$nh"
+      fi
+      REPLACEMENT_PHASE=rebasing
+      _save
+    else
+      [ "${REPLACEMENT_H:-}" = "$nh" ] \
+        || die "measured compose changed during replacement (recorded=$REPLACEMENT_H current=$nh); refusing to mix builds"
+    fi
     _resume_replacement
     return
   fi
@@ -633,7 +701,7 @@ PY
 }
 
 case "$ACTION" in
-  deploy|prime|bind|start|verify-health|smoke|update|replace|setup|all)
+  deploy|prime|bind|start|verify-health|smoke|update|replace|rollback|setup|all)
     command -v flock >/dev/null 2>&1 || die "flock is required for duplicate-safe deployment"
     exec {DEPLOY_LOCK_FD}>"${STATE}.deployment.lock" \
       || die "could not open deployment lock for $STATE"
@@ -652,7 +720,8 @@ case "$ACTION" in
   smoke) smoke ;;
   update) update_member ;;
   replace) replace_cvm ;;
+  rollback) rollback_cvm ;;
   setup) deploy_cvm; prime_gate; bind_member; start_cvm ;;
   all) deploy_cvm; prime_gate; bind_member; start_cvm; verify_health; smoke ;;
-  *) die "usage: sandboxd-node.sh <node-name> [deploy|prime|bind|start|verify-health|smoke|update|replace|setup|all]" ;;
+  *) die "usage: sandboxd-node.sh <node-name> [deploy|prime|bind|start|verify-health|smoke|update|replace|rollback|setup|all]" ;;
 esac
