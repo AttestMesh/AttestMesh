@@ -32,6 +32,7 @@ error ClusterDestroyed(); // reserved for milestone B; not used in v1
 // ── Member contract / EIP-4337 ──────────────────────────────────────────────
 error OnlyEntryPoint();
 error OnlyCluster();
+error AlreadyBound();
 error OwnerAlreadySet();
 error InvalidBootstrapCall();
 error NotInternalCall();
