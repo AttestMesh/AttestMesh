@@ -39,6 +39,9 @@ GATEWAY_DOMAIN="${GATEWAY_DOMAIN:-gateway.attestmesh.xyz}"
 #   GITHUB_CLIENT_ID GITHUB_CLIENT_SECRET CLOUDFLARE_API_TOKEN ADMIN_API_KEY
 #   TLS_FULLCHAIN_B64 TLS_KEY_B64   (optional: DATABASE_URL)
 SECRETS_FILE="${SECRETS_FILE:-$HOME/.attestmesh/synclave.env}"
+WEBHOST_SECRETS_FILE="${WEBHOST_SECRETS_FILE:-$HOME/.attestmesh/webhost.env}"
+SYNCLAVE_CF_SECRETS_FILE="${SYNCLAVE_CF_SECRETS_FILE:-$HOME/.attestmesh/cloudflare-synclave-net.toml}"
+CUSTOM_DOMAIN_CF_SECRETS_FILE="${CUSTOM_DOMAIN_CF_SECRETS_FILE:-$HOME/.attestmesh/cloudflare-synclave-name.toml}"
 
 # confidential-sandboxes (sandboxd) wiring for the "Provision sandbox" button. URL/image/plan are
 # non-secret config; the token is the sandboxd daemon secret (reused from its own secrets file).
@@ -58,6 +61,11 @@ GITHUB_OAUTH_CALLBACK_URL="${GITHUB_OAUTH_CALLBACK_URL:-https://synclave.net/api
 # <slug>.app records point at (the box haproxy public IP).
 CLOUDFLARE_ZONE_ID="${CLOUDFLARE_ZONE_ID:-5b276342195bda12c978f20ed38a3757}"
 CLOUDFLARE_ORIGIN_IP="${CLOUDFLARE_ORIGIN_IP:-173.231.234.133}"
+CUSTOM_DOMAIN_KV_PROPAGATION_SEC="${CUSTOM_DOMAIN_KV_PROPAGATION_SEC:-60}"
+CLOUDFLARE_SAAS_ZONE_ID="${CLOUDFLARE_SAAS_ZONE_ID:-e58a44e83160efd73bc2a6be8c2bc309}"
+CUSTOM_DOMAIN_CNAME_ZONE="${CUSTOM_DOMAIN_CNAME_ZONE:-synclave.name}"
+CLOUDFLARE_ACCOUNT_ID="${CLOUDFLARE_ACCOUNT_ID:-29754b422e1b4541962d00b9abd21543}"
+CLOUDFLARE_CUSTOM_DOMAIN_KV_NAMESPACE_ID="${CLOUDFLARE_CUSTOM_DOMAIN_KV_NAMESPACE_ID:-5e9329901de94c43a6283163e81da30c}"
 
 # CVM sizing (tee-daemon spawns tenant containers → give it headroom; confirm vs live).
 export BOX_VCPU="${BOX_VCPU:-4}" BOX_MEM="${BOX_MEM:-8192}" BOX_DISK="${BOX_DISK:-60}"
@@ -100,13 +108,35 @@ _require_env() {
   INDEXER_REGISTRY_ADDR="${INDEXER_REGISTRY_ADDR:-$indexer}"
   [ -n "${BUNDLER_URL:-}" ] || BUNDLER_URL="$RPC_URL"
   [ -n "$INDEXER_REGISTRY_ADDR" ] && [ "$INDEXER_REGISTRY_ADDR" != null ] || die "missing INDEXER_REGISTRY_ADDR"
+  # Use the authenticated box-local Base node for the long-running sidecar.
+  # Public endpoints rate-limit its bounded startup reads and can strand pg-ha.
+  SYNCLAVE_CVM_RPC_URL="${SYNCLAVE_CVM_RPC_URL:-$(box_local_rpc_url "$BOX_HOST" synclave)}"
 
   [ -f "$SECRETS_FILE" ] || die "missing secrets file: $SECRETS_FILE"
   # shellcheck disable=SC1090
   source "$SECRETS_FILE"
+  DAEMON_URL="${DAEMON_URL:-https://daemon.synclave.net}"
+  if ! [[ "$DAEMON_URL" =~ ^https://[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?([:][0-9]{1,5})?/?$ ]]; then
+    die "DAEMON_URL must be a credential-free HTTPS origin (got an invalid value)"
+  fi
+  [ -f "$WEBHOST_SECRETS_FILE" ] || die "missing Webhost secrets file for token-parity check: $WEBHOST_SECRETS_FILE"
+  local webhost_daemon_token
+  webhost_daemon_token=$(bash -c 'unset TEE_DAEMON_TOKEN; source "$1"; printf %s "${TEE_DAEMON_TOKEN:-}"' _ "$WEBHOST_SECRETS_FILE") \
+    || die "could not read TEE_DAEMON_TOKEN from $WEBHOST_SECRETS_FILE"
+  [ -n "$webhost_daemon_token" ] || die "TEE_DAEMON_TOKEN is empty in $WEBHOST_SECRETS_FILE"
+  [ "$TEE_DAEMON_TOKEN" = "$webhost_daemon_token" ] \
+    || die "TEE_DAEMON_TOKEN mismatch between Synclave and Webhost secret files"
+  unset webhost_daemon_token
+  SYNCLAVE_CLOUDFLARE_API_TOKEN="${SYNCLAVE_CLOUDFLARE_API_TOKEN:-$(sed -nE 's/^[[:space:]]*api_token[[:space:]]*=[[:space:]]*"?([^"#[:space:]]+)"?.*/\1/p' "$SYNCLAVE_CF_SECRETS_FILE" 2>/dev/null)}"
+  local custom_domain_cloudflare_token
+  custom_domain_cloudflare_token=$(sed -nE 's/^[[:space:]]*api_token[[:space:]]*=[[:space:]]*"?([^"#[:space:]]+)"?.*/\1/p' "$CUSTOM_DOMAIN_CF_SECRETS_FILE" 2>/dev/null)
+  CLOUDFLARE_SAAS_API_TOKEN="${CLOUDFLARE_SAAS_API_TOKEN:-$custom_domain_cloudflare_token}"
+  CLOUDFLARE_KV_API_TOKEN="${CLOUDFLARE_KV_API_TOKEN:-$custom_domain_cloudflare_token}"
   local k
   for k in POSTGRES_PASSWORD TEE_DAEMON_TOKEN SESSION_SECRET PRIVY_APP_ID PRIVY_APP_SECRET \
-           GITHUB_CLIENT_ID GITHUB_CLIENT_SECRET CLOUDFLARE_API_TOKEN ADMIN_API_KEY \
+           GITHUB_CLIENT_ID GITHUB_CLIENT_SECRET CLOUDFLARE_API_TOKEN SYNCLAVE_CLOUDFLARE_API_TOKEN ADMIN_API_KEY \
+           CLOUDFLARE_SAAS_API_TOKEN CLOUDFLARE_SAAS_ZONE_ID CUSTOM_DOMAIN_CNAME_ZONE \
+           CLOUDFLARE_KV_API_TOKEN CLOUDFLARE_ACCOUNT_ID CLOUDFLARE_CUSTOM_DOMAIN_KV_NAMESPACE_ID \
            TLS_FULLCHAIN_B64 TLS_KEY_B64; do
     [ -n "${!k:-}" ] || die "secret $k not set in $SECRETS_FILE"
   done
@@ -131,11 +161,13 @@ _box_run() {
   guser=$(grep -E '^\s*username\s*=' "$HOME/.teesql/ghcr-pull.toml" 2>/dev/null | head -1 | sed -E 's/.*=\s*//' | tr -d "\"' ")
   gtok=$(grep  -E '^\s*token\s*='    "$HOME/.teesql/ghcr-pull.toml" 2>/dev/null | head -1 | sed -E 's/.*=\s*//' | tr -d "\"' ")
   [ -n "$gtok" ] || die "no ghcr token in ~/.teesql/ghcr-pull.toml"
-  scp -o BatchMode=yes -q "$COMPOSE" "$BOX_HOST:/tmp/${NODE}.yaml"
-  scp -o BatchMode=yes -q "$HERE/synclave-node-box.py" "$BOX_HOST:/tmp/synclave-node-box.py"
+  scp -o BatchMode=yes -q "$COMPOSE" "$BOX_HOST:/tmp/${NODE}.yaml" \
+    || die "failed to copy Synclave compose to $BOX_HOST"
+  scp -o BatchMode=yes -q "$HERE/synclave-node-box.py" "$BOX_HOST:/tmp/synclave-node-box.py" \
+    || die "failed to copy Synclave box helper to $BOX_HOST"
   {
     printf 'E_CHAIN_ID=%q\n'                 "$CHAIN_ID"
-    printf 'E_RPC_URL=%q\n'                  "${CVM_RPC_URL:-$RPC_URL}"
+    printf 'E_RPC_URL=%q\n'                  "$SYNCLAVE_CVM_RPC_URL"
     printf 'E_BUNDLER_URL=%q\n'              "${CVM_BUNDLER_URL:-${BUNDLER_URL:-$RPC_URL}}"
     printf 'E_GAS_POLICY_ID=%q\n'            "${GAS_POLICY_ID:-}"
     printf 'E_INDEXER_REGISTRY_ADDR=%q\n'    "$INDEXER_REGISTRY_ADDR"
@@ -149,7 +181,7 @@ _box_run() {
     printf 'E_GITHUB_CLIENT_ID=%q\n'         "$GITHUB_CLIENT_ID"
     printf 'E_GITHUB_CLIENT_SECRET=%q\n'     "$GITHUB_CLIENT_SECRET"
     printf 'E_GITHUB_OAUTH_CALLBACK_URL=%q\n' "$GITHUB_OAUTH_CALLBACK_URL"
-    printf 'E_DAEMON_URL=%q\n'               "${DAEMON_URL:-}"
+    printf 'E_DAEMON_URL=%q\n'               "$DAEMON_URL"
     printf 'E_PUBLIC_BASE_URL=%q\n'          "$PUBLIC_BASE_URL"
     printf 'E_APP_DOMAIN=%q\n'               "$APP_DOMAIN"
     printf 'E_INDEXER_URL=%q\n'              "$INDEXER_URL"
@@ -161,6 +193,7 @@ _box_run() {
     printf 'E_PLATFORM_ADMIN_EMAILS=%q\n'    "${PLATFORM_ADMIN_EMAILS:-}"
     printf 'E_TELEGRAM_BOT_TOKEN=%q\n'       "${TELEGRAM_BOT_TOKEN:-}"
     printf 'E_TELEGRAM_WAITLIST_CHAT_ID=%q\n' "${TELEGRAM_WAITLIST_CHAT_ID:-}"
+    printf 'E_TELEGRAM_FEEDBACK_CHAT_ID=%q\n' "${TELEGRAM_FEEDBACK_CHAT_ID:-}"
     printf 'E_STRIPE_SECRET_KEY=%q\n'        "${STRIPE_SECRET_KEY:-}"
     printf 'E_STRIPE_WEBHOOK_SECRET=%q\n'    "${STRIPE_WEBHOOK_SECRET:-}"
     printf 'E_STRIPE_ALLOW_TEST_MODE=%q\n'   "${STRIPE_ALLOW_TEST_MODE:-}"
@@ -171,8 +204,16 @@ _box_run() {
     printf 'E_BILLING_WORKER_INTERVAL_SEC=%q\n' "${BILLING_WORKER_INTERVAL_SEC:-10}"
     printf 'E_BILLING_CATALOG_RECONCILE_INTERVAL_SEC=%q\n' "${BILLING_CATALOG_RECONCILE_INTERVAL_SEC:-3600}"
     printf 'E_CLOUDFLARE_API_TOKEN=%q\n'     "$CLOUDFLARE_API_TOKEN"
+    printf 'E_SYNCLAVE_CLOUDFLARE_API_TOKEN=%q\n' "$SYNCLAVE_CLOUDFLARE_API_TOKEN"
     printf 'E_CLOUDFLARE_ZONE_ID=%q\n'       "$CLOUDFLARE_ZONE_ID"
     printf 'E_CLOUDFLARE_ORIGIN_IP=%q\n'     "$CLOUDFLARE_ORIGIN_IP"
+    printf 'E_CLOUDFLARE_SAAS_API_TOKEN=%q\n' "${CLOUDFLARE_SAAS_API_TOKEN:-}"
+    printf 'E_CLOUDFLARE_SAAS_ZONE_ID=%q\n'  "${CLOUDFLARE_SAAS_ZONE_ID:-}"
+    printf 'E_CUSTOM_DOMAIN_CNAME_ZONE=%q\n' "${CUSTOM_DOMAIN_CNAME_ZONE:-}"
+    printf 'E_CLOUDFLARE_KV_API_TOKEN=%q\n'  "${CLOUDFLARE_KV_API_TOKEN:-}"
+    printf 'E_CLOUDFLARE_ACCOUNT_ID=%q\n'    "${CLOUDFLARE_ACCOUNT_ID:-}"
+    printf 'E_CLOUDFLARE_CUSTOM_DOMAIN_KV_NAMESPACE_ID=%q\n' "${CLOUDFLARE_CUSTOM_DOMAIN_KV_NAMESPACE_ID:-}"
+    printf 'E_CUSTOM_DOMAIN_KV_PROPAGATION_SEC=%q\n' "$CUSTOM_DOMAIN_KV_PROPAGATION_SEC"
     printf 'E_ADMIN_API_KEY=%q\n'            "$ADMIN_API_KEY"
     printf 'E_LABELS_WRITE_TOKENS=%q\n'      "${LABELS_WRITE_TOKENS:-}"
     printf 'E_TLS_FULLCHAIN_B64=%q\n'        "$TLS_FULLCHAIN_B64"
@@ -269,28 +310,32 @@ verify() {
 # app HTML). Pass = /healthz returns HTTP 200 AND / serves <title>Synclave</title>.
 verify_app() {
   _load
-  local url="${VERIFY_URL:-$PUBLIC_BASE_URL}" host="$CONSOLE_HOST" i code resolve=()
+  local host="$CONSOLE_HOST" i api root headers
   if [ -n "${SYNCLAVE_CVM_IP:-}" ]; then
-    resolve=(--resolve "${host}:443:${SYNCLAVE_CVM_IP}")
     log "verify-app: CVM-direct via --resolve ${host}->${SYNCLAVE_CVM_IP}"
   else
     log "verify-app: public https://${host} (needs the box haproxy backend re-pointed to this CVM)"
   fi
   for i in $(seq 1 30); do
-    code=$(curl -sk -o /dev/null -w '%{http_code}' --max-time 10 "${resolve[@]}" "https://${host}/healthz" 2>/dev/null || true)
-    if [ "$code" = 200 ]; then
-      local root; root=$(curl -sk --max-time 10 "${resolve[@]}" "https://${host}/" 2>/dev/null || true)
-      if printf '%s' "$root" | grep -qi '<title>Synclave</title>'; then
-        log "✔ synclave app healthy: /healthz 200 + console <title>Synclave</title>"
-        return 0
-      fi
-      log "… /healthz 200 but console title not seen yet ($i/30)"
+    if [ -n "${SYNCLAVE_CVM_IP:-}" ]; then
+      api=$(ssh_box "curl --fail --silent --show-error --proto '=https' --tlsv1.2 --max-time 10 --resolve '${host}:443:${SYNCLAVE_CVM_IP}' 'https://${host}/api/v1/healthz'" 2>/dev/null || true)
+      root=$(ssh_box "curl --fail --silent --show-error --proto '=https' --tlsv1.2 --max-time 10 --resolve '${host}:443:${SYNCLAVE_CVM_IP}' 'https://${host}/'" 2>/dev/null || true)
+      headers=$(ssh_box "curl --fail --silent --show-error --proto '=https' --tlsv1.2 --max-time 10 --resolve '${host}:443:${SYNCLAVE_CVM_IP}' --dump-header - --output /dev/null 'https://${host}/'" 2>/dev/null || true)
     else
-      log "… synclave app not ready ($i/30, /healthz -> ${code:-000})"
+      api=$(curl --fail --silent --show-error --proto '=https' --tlsv1.2 --max-time 10 "https://${host}/api/v1/healthz" 2>/dev/null || true)
+      root=$(curl --fail --silent --show-error --proto '=https' --tlsv1.2 --max-time 10 "https://${host}/" 2>/dev/null || true)
+      headers=$(curl --fail --silent --show-error --proto '=https' --tlsv1.2 --max-time 10 --dump-header - --output /dev/null "https://${host}/" 2>/dev/null || true)
     fi
+    if printf '%s' "$api" | jq -e '.status == "ok" and .db != "down"' >/dev/null 2>&1 \
+       && printf '%s' "$root" | grep -qi '<title>Synclave</title>' \
+       && printf '%s' "$headers" | grep -qi '^strict-transport-security:'; then
+      log "✔ Synclave UI and DB-backed API are healthy over verified TLS"
+      return 0
+    fi
+    log "… Synclave UI/API/TLS readiness not complete ($i/30)"
     sleep 10
   done
-  die "synclave app did not become healthy at https://${host}"
+  die "Synclave UI/API did not become healthy over verified TLS at https://${host}"
 }
 
 # Daemon reachability. Synclave is control-plane only now; the app-hosting
@@ -321,6 +366,8 @@ update_member() {
     allowed=$(cast call "$CLUSTER" 'allowedComposeHashes(bytes32)(bool)' "0x$nh" --rpc-url "$RPC_URL" 2>/dev/null)
     [ "$allowed" = true ] || die "compose hash still not allowlisted after send — aborting before UpgradeApp"
   fi
+  wait_box_local_allowlist_propagation \
+    "$BOX_HOST" "$SYNCLAVE_CVM_RPC_URL" "$CLUSTER" "$nh" "$RPC_URL" 300
   out=$(_box_run update "$X" "$VM_ID") || die "in-place update failed"
   echo "$out"
   j=$(echo "$out" | grep '"app_id"' | tail -1)

@@ -22,6 +22,14 @@
 # No secrets are committed here; all ${VAR} values are sealed into the CVM by
 # deploy/synclave-node.sh (key NAMES are measured into the compose_hash, VALUES
 # are sealed to the app's X25519 key).
+name: attestmesh-synclave
+
+x-logging: &production-logging
+  driver: json-file
+  options:
+    max-size: "20m"
+    max-file: "5"
+
 services:
   # --- AttestMesh sidecar: on-chain self-registration + wg mesh (Path A) --------
   sidecar:
@@ -97,7 +105,7 @@ services:
       - no-new-privileges:true
 
   pg2-proxy:
-    image: alpine/socat:1.8.0.0
+    image: docker.io/alpine/socat:1.8.0.0@sha256:a6be4c0262b339c53ddad723cdd178a1a13271e1137c65e27f90a08c16de02b8
     restart: unless-stopped
     network_mode: service:sidecar
     depends_on:
@@ -110,7 +118,7 @@ services:
       - no-new-privileges:true
 
   pg3-proxy:
-    image: alpine/socat:1.8.0.0
+    image: docker.io/alpine/socat:1.8.0.0@sha256:a6be4c0262b339c53ddad723cdd178a1a13271e1137c65e27f90a08c16de02b8
     restart: unless-stopped
     network_mode: service:sidecar
     depends_on:
@@ -210,10 +218,13 @@ services:
       SANDBOX_DEFAULT_PLAN: ${SANDBOX_DEFAULT_PLAN}
       # Webhost admin panel operators (comma-separated emails).
       PLATFORM_ADMIN_EMAILS: ${PLATFORM_ADMIN_EMAILS:-}
-      # Waitlist → Telegram bot: turned-away sign-ups post to the Synclave channel. Both optional
-      # (unset ⇒ the send is a no-op; the email is still captured in the DB).
+      # Waitlist + concierge feedback → Telegram bot. All optional (unset ⇒ the send is a
+      # no-op; the row is still captured in the DB). Chat ids accept a "/<topicId>" forum-topic
+      # suffix (services/api/src/core/telegram.ts) — waitlist and work orders land in separate
+      # topics of the Synclave Team group.
       TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
       TELEGRAM_WAITLIST_CHAT_ID: ${TELEGRAM_WAITLIST_CHAT_ID:-}
+      TELEGRAM_FEEDBACK_CHAT_ID: ${TELEGRAM_FEEDBACK_CHAT_ID:-}
       # Billing (Stripe). Keys may stay empty. Even with a live key, Checkout/meter delivery
       # remain inert until their independent switches are explicitly enabled after approval.
       STRIPE_SECRET_KEY: ${STRIPE_SECRET_KEY:-}
@@ -237,11 +248,44 @@ services:
       # record in this zone pointing at the origin (the box haproxy).
       CLOUDFLARE_ZONE_ID: ${CLOUDFLARE_ZONE_ID}
       CLOUDFLARE_ORIGIN_IP: ${CLOUDFLARE_ORIGIN_IP}
+      # Custom-domain control plane. These stay empty while rollout is dark;
+      # readiness fails closed before any org can be enabled without the full set.
+      CLOUDFLARE_SAAS_API_TOKEN: ${CLOUDFLARE_SAAS_API_TOKEN:-}
+      CLOUDFLARE_SAAS_ZONE_ID: ${CLOUDFLARE_SAAS_ZONE_ID:-}
+      CUSTOM_DOMAIN_CNAME_ZONE: ${CUSTOM_DOMAIN_CNAME_ZONE:-}
+      CLOUDFLARE_KV_API_TOKEN: ${CLOUDFLARE_KV_API_TOKEN:-}
+      CLOUDFLARE_ACCOUNT_ID: ${CLOUDFLARE_ACCOUNT_ID:-}
+      CLOUDFLARE_CUSTOM_DOMAIN_KV_NAMESPACE_ID: ${CLOUDFLARE_CUSTOM_DOMAIN_KV_NAMESPACE_ID:-}
+      CUSTOM_DOMAIN_KV_PROPAGATION_SEC: ${CUSTOM_DOMAIN_KV_PROPAGATION_SEC:-60}
       ADMIN_API_KEY: ${ADMIN_API_KEY}
       # Nameserver service tokens (member naming ingest/rename for box-admin — spec §G).
       LABELS_WRITE_TOKENS: ${LABELS_WRITE_TOKENS:-}
     expose:
       - "80"
+    init: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: 4g
+    cpus: 2.0
+    pids_limit: 1024
+    logging: *production-logging
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - >-
+          fetch('http://127.0.0.1:80/api/v1/healthz')
+          .then(async response => {
+            const value = await response.json();
+            process.exit(response.ok && value.status === 'ok' && value.db !== 'down' ? 0 : 1);
+          }).catch(() => process.exit(1))
+      interval: 15s
+      timeout: 5s
+      retries: 8
+      start_period: 45s
     depends_on:
       pg-provision:
         condition: service_completed_successfully
@@ -253,11 +297,48 @@ services:
         condition: service_started
     restart: unless-stopped
 
+  # Public apps directory. Kept separate from the database-backed control-plane API
+  # so apps.synclave.net stays available during console/database maintenance.
+  directory:
+    image: ghcr.io/dmvt/synclave-directory:back-to-synclave-20260715-v4@sha256:0aa8f69031ec5229c9f84166b39a2081e77528e0c9588308aae5df4f56e2c7dc
+    environment:
+      # Cloudflare-proxied, token-gated route to the isolated Webhost CVM.
+      # The Webhost origin address is not published by this service hostname.
+      DAEMON_URL: https://daemon.synclave.net
+      TEE_DAEMON_TOKEN: ${TEE_DAEMON_TOKEN}
+      PORT: "8080"
+    expose:
+      - "8080"
+    read_only: true
+    init: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    restart: unless-stopped
+    mem_limit: 256m
+    cpus: 0.5
+    pids_limit: 128
+    logging: *production-logging
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - >-
+          fetch('http://127.0.0.1:8080/healthz')
+          .then(response => process.exit(response.ok ? 0 : 1))
+          .catch(() => process.exit(1))
+      interval: 15s
+      timeout: 5s
+      retries: 6
+      start_period: 10s
+
   # Control-plane only: fronts the console host → the app (UI + API). Tenant-app and concierge
   # traffic is NOT served here (that lives in Cluster 2), so the daemon/concierge upstreams point
   # back at the app as harmless placeholders — no <slug>.app or /concierge route reaches this node.
   frontproxy:
-    image: ghcr.io/dmvt/webhost-frontproxy:unverified-v1
+    image: ghcr.io/dmvt/webhost-frontproxy:trusted-host-f340fd9-20260715@sha256:2e29bbb4487c4465b9b448290a6a42c781aa306b5b3c59830f939509aa7fecad
     environment:
       APP_DOMAIN: ${APP_DOMAIN}
       CONSOLE_HOST: ${CONSOLE_HOST}
@@ -267,24 +348,73 @@ services:
       FRONTPROXY_PORT: "8088"
     expose:
       - "8088"
+    read_only: true
+    init: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: 256m
+    cpus: 0.5
+    pids_limit: 128
+    logging: *production-logging
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - >-
+          require('http').get({host:'127.0.0.1',port:8088,path:'/api/v1/healthz',headers:{host:process.env.CONSOLE_HOST}},
+          response => process.exit(response.statusCode === 200 ? 0 : 1))
+          .on('error', () => process.exit(1))
+      interval: 15s
+      timeout: 5s
+      retries: 8
+      start_period: 45s
     depends_on:
-      - app
+      app:
+        condition: service_healthy
     restart: unless-stopped
 
   tlsproxy:
-    image: ghcr.io/dmvt/synclave-tlsproxy:v4@sha256:2f9686cd836e15aba287e6412a1612145c1658616a581e4b817f65a20042be09
+    image: ghcr.io/dmvt/synclave-tlsproxy:apps-directory-20260715-v3@sha256:0167220c836004c5435cfb3dde70d70d0219ea5e2c1b2666d9437aecd5ac952b
     environment:
-      CLOUDFLARE_API_TOKEN: ${CLOUDFLARE_API_TOKEN}
+      SYNCLAVE_CLOUDFLARE_API_TOKEN: ${SYNCLAVE_CLOUDFLARE_API_TOKEN}
       TLS_FULLCHAIN_B64: ${TLS_FULLCHAIN_B64}
       TLS_KEY_B64: ${TLS_KEY_B64}
     ports:
       - "443:443"
+    init: true
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_BIND_SERVICE
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: 256m
+    cpus: 0.5
+    pids_limit: 128
+    logging: *production-logging
     volumes:
       - caddy_data:/data
       - caddy_config:/config
     depends_on:
-      - frontproxy
+      frontproxy:
+        condition: service_healthy
+      directory:
+        condition: service_healthy
     restart: unless-stopped
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          curl --fail --silent --show-error --proto '=https' --tlsv1.2
+          --max-time 8 --resolve 'synclave.net:443:127.0.0.1'
+          'https://synclave.net/api/v1/healthz' >/dev/null
+      interval: 30s
+      timeout: 10s
+      retries: 8
+      start_period: 90s
 
 volumes:
   sidecar-state:
