@@ -187,7 +187,7 @@ services:
     # v19 = Apps → Sandboxes rename (labels only, wire stays app).
     # v44 = fleet-control main 1cb4ebb — sandbox-first Stripe billing foundation;
     #       production stays keyless/inert until separately approved credentials and switches arrive.
-    image: ghcr.io/dmvt/synclave-app:prod-1cb4ebb@sha256:a7940ec3be39337df1fd3ee044523350d232754dad11bcf1aa2229b9718ccf36
+    image: ghcr.io/dmvt/synclave-app:full-domain-3536566@sha256:466758dbb249703c805048a6b9ba43fe0fd2bfa1d0a00a97efaac3a95aef04a4
     environment:
       API_HOST: 0.0.0.0
       API_PORT: 80
