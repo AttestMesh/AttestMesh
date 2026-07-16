@@ -8,6 +8,7 @@ import json
 import os
 import sys
 import time
+from pathlib import Path
 
 sys.path.insert(0, "/opt/dstack-mcp")
 import mcp_dstack as m  # noqa: E402
@@ -18,7 +19,7 @@ VCPU = int(os.environ.get("BOX_VCPU", "8"))
 MEM = int(os.environ.get("BOX_MEM", "16384"))
 DISK = int(os.environ.get("BOX_DISK", "300"))
 PORTS = json.loads(os.environ.get("BOX_PORTS", "[]"))
-NET_MODE = (os.environ.get("BOX_NET_MODE", "bridge").strip().lower() or "bridge")
+NET_MODE = os.environ.get("BOX_NET_MODE", "bridge").strip().lower() or "bridge"
 GATEWAY_ENABLED = os.environ.get("BOX_GATEWAY_ENABLED", "true").strip().lower() in {
     "1",
     "true",
@@ -60,11 +61,15 @@ def build_env(app_id: str = "", compose_hash: str = "") -> dict[str, str]:
 
 
 def app_compose_and_hash(env_keys: list[str]) -> tuple[str, str]:
+    # Snapshot the operator input exactly once. The rendered string returned here is both hashed
+    # and handed to the VMM; callers must never reopen COMPOSE_PATH between authorization and
+    # mutation.
+    docker_compose_file = Path(COMPOSE_PATH).read_text()
     app_compose = {
         "manifest_version": 2,
         "name": NAME,
         "runner": "docker-compose",
-        "docker_compose_file": open(COMPOSE_PATH).read(),
+        "docker_compose_file": docker_compose_file,
         "kms_enabled": True,
         "gateway_enabled": GATEWAY_ENABLED,
         "local_key_provider_enabled": False,
@@ -87,7 +92,7 @@ def app_compose_and_hash(env_keys: list[str]) -> tuple[str, str]:
         "no_instance_id": False,
         "secure_time": False,
     }
-    app_compose["pre_launch_script"] = r'''set -euo pipefail
+    app_compose["pre_launch_script"] = r"""set -euo pipefail
 RUNSC_URL="https://storage.googleapis.com/gvisor/releases/release/20260420.0/x86_64/runsc"
 RUNSC_SHA512="9efeefada7b9a7bcc21dc3a1ad3531d11dfac267808cced45d047aab742f15ecb91b2bb635dea78a4ae36817f76e5ed223b7ad80f3165f15dd24de9b0c95726f"
 INSTALL_DIR="/dstack/persistent/bin"
@@ -112,7 +117,7 @@ QUOTA_ZVOL_BYTES=$((251 * 1024 * 1024 * 1024))
 QUOTA_SOLD_MIB=237568
 QUOTA_FS_HEADROOM_MIB=18432
 QUOTA_POOL_HEADROOM_MIB=28672
-QUOTA_TOOLS_IMAGE="ghcr.io/dmvt/confidential-sandboxes@sha256:1d333c0b8a3861bc99c31ee3b7ab619989a3b817abdfc6858bb72460135d1611"
+QUOTA_TOOLS_IMAGE="ghcr.io/dmvt/confidential-sandboxes@sha256:cdd55b4e534e0c73949a7fd67ad51bba680c1bf96fee8525ddb4dca42eb03497"
 EXPECTED_HOST_VCPUS=8
 # The VMM resource readback must still be exactly 16,384 MiB. Inside this TDX image that allocation
 # exposes about 15,034 MiB after confidential-guest firmware/kernel reservations, so retain a
@@ -570,7 +575,7 @@ required_fs_bytes=$(((QUOTA_SOLD_MIB + QUOTA_FS_HEADROOM_MIB) * 1024 * 1024))
 }
 chmod 0711 "$QUOTA_MOUNT"
 
-'''
+"""
     rendered = json.dumps(app_compose, indent=4, ensure_ascii=False)
     return rendered, hashlib.sha256(rendered.encode()).hexdigest()
 
@@ -579,7 +584,9 @@ def kms_urls() -> list[str]:
     return ["https://10.0.2.2:9101"] if NET_MODE == "bridge" else m.KMS_URLS
 
 
-def create_vm(app_id: str, compose_file: str, env: dict[str, str], *, stopped: bool) -> dict:
+def create_vm(
+    app_id: str, compose_file: str, env: dict[str, str], *, stopped: bool
+) -> dict:
     sealed = dict(env)
     sealed["APP_ID"] = app_id
     return m.vmm(
@@ -654,6 +661,467 @@ def app_inventory(app_id: str) -> dict[str, object]:
     return {"app_id": "0x" + wanted, "vms": vms}
 
 
+def canonical_app_id(value: object) -> str:
+    app_id = str(value or "").lower().removeprefix("0x")
+    if len(app_id) != 40 or any(char not in "0123456789abcdef" for char in app_id):
+        raise SystemExit(f"invalid app id: {value}")
+    return "0x" + app_id
+
+
+def canonical_compose_hash(value: object, *, label: str) -> str:
+    compose_hash = str(value or "").lower().removeprefix("0x")
+    if len(compose_hash) != 64 or any(
+        char not in "0123456789abcdef" for char in compose_hash
+    ):
+        raise SystemExit(f"invalid {label} compose hash: {value}")
+    return compose_hash
+
+
+def exact_resource_int(value: object, *, label: str) -> int:
+    # bool is a subclass of int in Python; reject it explicitly. VMM JSON may expose integer fields
+    # as decimal strings, but floats and non-decimal spellings are not exact resource readbacks.
+    if type(value) is int:  # noqa: E721 - exact type is the security property here
+        return value
+    if isinstance(value, str) and value.isdecimal():
+        return int(value)
+    raise SystemExit(f"invalid exact integer resource {label}: {value}")
+
+
+def checked_profile(vcpu: object, memory: object, disk: object) -> tuple[int, int, int]:
+    try:
+        expected = (
+            exact_resource_int(vcpu, label="vcpu"),
+            exact_resource_int(memory, label="memory"),
+            exact_resource_int(disk, label="disk"),
+        )
+    except SystemExit as error:
+        raise SystemExit("invalid expected VM resource profile") from error
+    configured = (VCPU, MEM, DISK)
+    if expected != configured:
+        raise SystemExit(
+            "expected VM resource profile does not match the measured helper profile: "
+            f"expected={expected} helper={configured}"
+        )
+    return expected
+
+
+def is_terminal_status(value: object) -> bool:
+    return str(value or "").lower() in {"stopped", "exited"}
+
+
+def is_running_status(value: object) -> bool:
+    status = str(value or "").lower()
+    return status in {"running", "started"}
+
+
+def require_exact_vm(
+    vm_id: str,
+    app_id: str,
+    compose_hash: str,
+    profile: tuple[int, int, int],
+    *,
+    stopped: bool | None = None,
+    context: str,
+) -> dict[str, object]:
+    expected_app = canonical_app_id(app_id)
+    expected_hash = canonical_compose_hash(compose_hash, label="expected")
+    current = describe_vm(vm_id)
+    actual_app = (
+        canonical_app_id(current.get("app_id")) if current.get("app_id") else ""
+    )
+    actual_hash = (
+        canonical_compose_hash(current.get("compose_hash"), label="VMM readback")
+        if current.get("compose_hash")
+        else ""
+    )
+    try:
+        actual_profile = (
+            exact_resource_int(current.get("vcpu"), label="VMM vcpu"),
+            exact_resource_int(current.get("memory"), label="VMM memory"),
+            exact_resource_int(current.get("disk_size"), label="VMM disk"),
+        )
+    except SystemExit:
+        actual_profile = ()
+    terminal = is_terminal_status(current.get("status"))
+    status_matches = stopped is None or terminal is stopped
+    if not (
+        current.get("found") is True
+        and current.get("vm_id") == vm_id
+        and actual_app == expected_app
+        and actual_hash == expected_hash
+        and actual_profile == profile
+        and status_matches
+    ):
+        raise SystemExit(
+            f"{context} VM identity/hash/profile/status mismatch: "
+            + json.dumps(current, sort_keys=True)
+        )
+    return current
+
+
+def require_exact_inventory(
+    app_id: str,
+    expected_vm_id: str,
+    *,
+    stopped: bool,
+    context: str,
+) -> None:
+    inventory = app_inventory(app_id)
+    vms = inventory.get("vms")
+    if not isinstance(vms, list):
+        raise SystemExit(f"{context} same-app inventory is malformed")
+    entry = vms[0] if len(vms) == 1 and isinstance(vms[0], dict) else None
+    status = entry.get("status") if entry else None
+    status_matches = (
+        is_terminal_status(status) if stopped else is_running_status(status)
+    )
+    if not (
+        entry is not None
+        and entry.get("vm_id") == expected_vm_id
+        and canonical_app_id(entry.get("app_id")) == canonical_app_id(app_id)
+        and status_matches
+    ):
+        raise SystemExit(
+            f"{context} same-app inventory mismatch: "
+            + json.dumps(
+                {
+                    "expected_vm_id": expected_vm_id,
+                    "expected_stopped": stopped,
+                    "vms": vms,
+                },
+                sort_keys=True,
+            )
+        )
+
+
+def require_retirement_inventory(
+    app_id: str,
+    current_vm_id: str,
+    previous_vm_id: str,
+    *,
+    context: str,
+) -> None:
+    """Require exactly one steady current VM and one terminal previous VM."""
+
+    inventory = app_inventory(app_id)
+    vms = inventory.get("vms")
+    if not isinstance(vms, list):
+        raise SystemExit(f"{context} same-app inventory is malformed")
+    by_id = {
+        vm.get("vm_id"): vm
+        for vm in vms
+        if isinstance(vm, dict) and isinstance(vm.get("vm_id"), str)
+    }
+    current = by_id.get(current_vm_id)
+    previous = by_id.get(previous_vm_id)
+    if not (
+        len(vms) == 2
+        and len(by_id) == 2
+        and current is not None
+        and previous is not None
+        and canonical_app_id(current.get("app_id")) == canonical_app_id(app_id)
+        and canonical_app_id(previous.get("app_id")) == canonical_app_id(app_id)
+        and is_running_status(current.get("status"))
+        and is_terminal_status(previous.get("status"))
+    ):
+        raise SystemExit(
+            f"{context} retirement inventory mismatch: "
+            + json.dumps(
+                {
+                    "current_vm_id": current_vm_id,
+                    "previous_vm_id": previous_vm_id,
+                    "vms": vms,
+                },
+                sort_keys=True,
+            )
+        )
+
+
+def exact_profile(
+    vcpu: object,
+    memory: object,
+    disk: object,
+    *,
+    label: str,
+) -> tuple[int, int, int]:
+    profile = (
+        exact_resource_int(vcpu, label=f"{label} vcpu"),
+        exact_resource_int(memory, label=f"{label} memory"),
+        exact_resource_int(disk, label=f"{label} disk"),
+    )
+    if any(value <= 0 for value in profile):
+        raise SystemExit(f"invalid non-positive {label} VM resource profile: {profile}")
+    return profile
+
+
+def checked_retire_previous_vm(
+    app_id: str,
+    current_vm_id: str,
+    current_hash: str,
+    previous_vm_id: str,
+    previous_hash: str,
+    current_profile: tuple[int, int, int],
+    previous_profile: tuple[int, int, int],
+) -> dict[str, object]:
+    """Remove one explicitly journaled stopped predecessor without touching the current VM."""
+
+    if not current_vm_id or not previous_vm_id or current_vm_id == previous_vm_id:
+        raise SystemExit("retirement requires distinct current and previous VM ids")
+    app_id = canonical_app_id(app_id)
+    current_hash = canonical_compose_hash(current_hash, label="current")
+    previous_hash = canonical_compose_hash(previous_hash, label="previous")
+
+    current = require_exact_vm(
+        current_vm_id,
+        app_id,
+        current_hash,
+        current_profile,
+        stopped=False,
+        context="pre-retirement current",
+    )
+    if not is_running_status(current.get("status")):
+        raise SystemExit("pre-retirement current VM is not exactly running/started")
+
+    previous = describe_vm(previous_vm_id)
+    if previous.get("found") is not True:
+        # Crash recovery after an applied RemoveVm is idempotent only if the exact current VM is now
+        # the sole same-app entry. Never interpret an absent predecessor as success in a larger or
+        # malformed inventory.
+        require_exact_inventory(
+            app_id,
+            current_vm_id,
+            stopped=False,
+            context="already-retired",
+        )
+        return {
+            "app_id": app_id,
+            "current_vm_id": current_vm_id,
+            "previous_vm_id": previous_vm_id,
+            "already_removed": True,
+        }
+
+    require_exact_vm(
+        previous_vm_id,
+        app_id,
+        previous_hash,
+        previous_profile,
+        stopped=True,
+        context="pre-retirement previous",
+    )
+    # This is the final VMM proof before RemoveVm. The shared node lock prevents all normal
+    # deployment helpers from changing either entry between this exact inventory and mutation.
+    require_retirement_inventory(
+        app_id,
+        current_vm_id,
+        previous_vm_id,
+        context="pre-retirement",
+    )
+
+    try:
+        remove_result: object = m.vmm("RemoveVm", {"id": previous_vm_id})
+    except Exception as error:
+        # A transport error can occur after the VMM has durably removed the VM. Continue only when
+        # exact postconditions prove that outcome; otherwise the shell keeps its retirement journal.
+        after_error = describe_vm(previous_vm_id)
+        if after_error.get("found") is True:
+            raise
+        remove_result = {"remove_error": str(error)}
+
+    for _ in range(60):
+        if describe_vm(previous_vm_id).get("found") is not True:
+            break
+        time.sleep(2)
+    else:
+        raise SystemExit(
+            f"timed out waiting for retired VM to disappear: {previous_vm_id}"
+        )
+
+    current = require_exact_vm(
+        current_vm_id,
+        app_id,
+        current_hash,
+        current_profile,
+        stopped=False,
+        context="post-retirement current",
+    )
+    if not is_running_status(current.get("status")):
+        raise SystemExit("post-retirement current VM is not exactly running/started")
+    require_exact_inventory(
+        app_id,
+        current_vm_id,
+        stopped=False,
+        context="post-retirement",
+    )
+    return {
+        "app_id": app_id,
+        "current_vm_id": current_vm_id,
+        "previous_vm_id": previous_vm_id,
+        "already_removed": False,
+        "remove": remove_result,
+    }
+
+
+def stop_vm_for_checked_update(
+    vm_id: str,
+    app_id: str,
+    previous_hash: str,
+    profile: tuple[int, int, int],
+) -> dict[str, object]:
+    """Prove the exact old VM/inventory, stop it, then prove old/stopped/quiescent."""
+
+    before = require_exact_vm(
+        vm_id,
+        app_id,
+        previous_hash,
+        profile,
+        context="pre-update",
+    )
+    already_stopped = is_terminal_status(before.get("status"))
+    if not already_stopped and not is_running_status(before.get("status")):
+        raise SystemExit(
+            "pre-update VM is neither exactly stopped/exited nor running/started: "
+            f"{before.get('status')}"
+        )
+    require_exact_inventory(
+        app_id,
+        vm_id,
+        stopped=already_stopped,
+        context="pre-update",
+    )
+
+    result: object = {"already_stopped": True}
+    if not already_stopped:
+        try:
+            result = m.vmm("StopVm", {"id": vm_id})
+        except Exception as error:
+            # A transport error after StopVm may still have applied. Continue only if the exact old
+            # VM is now stopped; every other outcome remains ambiguous and is left to the durable
+            # shell journal for operator recovery.
+            require_exact_vm(
+                vm_id,
+                app_id,
+                previous_hash,
+                profile,
+                stopped=True,
+                context="post-stop-error",
+            )
+            result = {"stop_error": str(error)}
+
+    stopped_vm: dict[str, object] | None = None
+    for _ in range(60):
+        current = require_exact_vm(
+            vm_id,
+            app_id,
+            previous_hash,
+            profile,
+            context="post-stop",
+        )
+        if is_terminal_status(current.get("status")):
+            stopped_vm = current
+            break
+        time.sleep(2)
+    if stopped_vm is None:
+        raise SystemExit(f"timed out waiting for exact old VM to stop: {vm_id}")
+    require_exact_vm(
+        vm_id,
+        app_id,
+        previous_hash,
+        profile,
+        stopped=True,
+        context="post-stop",
+    )
+    require_exact_inventory(app_id, vm_id, stopped=True, context="post-stop")
+    return {"vm_id": vm_id, "status": stopped_vm.get("status"), "result": result}
+
+
+def checked_start_vm(
+    vm_id: str,
+    app_id: str,
+    target_hash: str,
+    profile: tuple[int, int, int],
+) -> dict[str, object]:
+    """Start only an exact stopped target while the same-app active inventory is empty."""
+
+    before = require_exact_vm(
+        vm_id,
+        app_id,
+        target_hash,
+        profile,
+        stopped=True,
+        context="checked-start",
+    )
+    # This is intentionally the last VMM call before StartVm. The remote node-wide flock prevents a
+    # second measured helper invocation from changing the same app inventory between the proof and
+    # mutation.
+    require_exact_inventory(app_id, vm_id, stopped=True, context="checked-start")
+    result = m.vmm("StartVm", {"id": vm_id})
+    return {"vm_id": vm_id, "status_before": before.get("status"), "result": result}
+
+
+def checked_update_vm(
+    app_id: str,
+    vm_id: str,
+    previous_hash: str,
+    target_hash: str,
+    profile: tuple[int, int, int],
+) -> dict[str, object]:
+    """Perform one hash-bound, resource-bound, inventory-safe in-place update."""
+
+    previous_hash = canonical_compose_hash(previous_hash, label="previous")
+    target_hash = canonical_compose_hash(target_hash, label="target")
+    env = build_env(app_id)
+    # app_compose_and_hash snapshots COMPOSE_PATH once. Keep this exact string through hashing,
+    # sealing, UpgradeApp, and target readback; a concurrent path swap cannot change the payload.
+    compose_file, compose_hash = app_compose_and_hash(list(env.keys()))
+    if compose_hash != target_hash:
+        raise SystemExit(
+            "measured compose input does not match journaled target before StopVm: "
+            f"measured={compose_hash} target={target_hash}"
+        )
+    sealed = dict(env)
+    sealed["APP_ID"] = canonical_app_id(app_id)
+    encrypted_env = m._seal_env(sealed, m._app_env_encrypt_pubkey(app_id))
+    parsed_ports = [m._parse_port(port) for port in PORTS]
+    target_kms_urls = kms_urls()
+    target_gateway_urls = [m.GATEWAY_RPC] if GATEWAY_ENABLED else []
+
+    stop = stop_vm_for_checked_update(vm_id, app_id, previous_hash, profile)
+    upgrade = m.vmm(
+        "UpgradeApp",
+        {
+            "id": vm_id,
+            "compose_file": compose_file,
+            "encrypted_env": encrypted_env,
+            "update_ports": True,
+            "ports": parsed_ports,
+            "update_kms_urls": True,
+            "kms_urls": target_kms_urls,
+            "update_gateway_urls": True,
+            "gateway_urls": target_gateway_urls,
+        },
+    )
+    # UpgradeApp must preserve stopped state and exact immutable resources. Re-prove an empty
+    # inventory, then repeat the same checks immediately at the checked StartVm boundary.
+    require_exact_vm(
+        vm_id,
+        app_id,
+        target_hash,
+        profile,
+        stopped=True,
+        context="post-upgrade",
+    )
+    require_exact_inventory(app_id, vm_id, stopped=True, context="post-upgrade")
+    start = checked_start_vm(vm_id, app_id, target_hash, profile)
+    return {
+        "app_id": canonical_app_id(app_id),
+        "compose_hash": compose_hash,
+        "vm_id": vm_id,
+        "stop": stop,
+        "upgrade": upgrade,
+        "start": start,
+    }
+
+
 def stop_vm(vm_id: str) -> dict[str, object]:
     """Idempotently stop one exact VM and wait for a stopped readback."""
     before = describe_vm(vm_id)
@@ -713,10 +1181,14 @@ def main() -> None:
     if DISK != 300:
         mismatched.append(f"disk={DISK} != 300 GiB")
     if mismatched:
-        raise SystemExit("refusing non-production sandboxd VM profile: " + ", ".join(mismatched))
+        raise SystemExit(
+            "refusing non-production sandboxd VM profile: " + ", ".join(mismatched)
+        )
 
     if mode == "deploy":
-        compose_file, compose_hash = app_compose_and_hash(ENV_KEYS + ["DSTACK_DOCKER_REGISTRY"])
+        compose_file, compose_hash = app_compose_and_hash(
+            ENV_KEYS + ["DSTACK_DOCKER_REGISTRY"]
+        )
         app_id = m._deploy_app_contract(compose_hash)
         env = build_env(app_id, compose_hash)
         result = create_vm(app_id, compose_file, env, stopped=True)
@@ -779,27 +1251,99 @@ def main() -> None:
         print(json.dumps(result))
         return
 
-    if mode in {"update", "upgrade-stopped"}:
+    if mode == "checked-start":
+        app_id = sys.argv[2] if len(sys.argv) > 2 else ""
+        vm_id = sys.argv[3] if len(sys.argv) > 3 else ""
+        target_hash = sys.argv[4] if len(sys.argv) > 4 else ""
+        if len(sys.argv) != 8 or not app_id or not vm_id:
+            raise SystemExit(
+                "usage: sandboxd-node-box.py checked-start "
+                "<app_id> <vm_id> <target_hash> <vcpu> <memory> <disk>"
+            )
+        profile = checked_profile(sys.argv[5], sys.argv[6], sys.argv[7])
+        print(json.dumps(checked_start_vm(vm_id, app_id, target_hash, profile)))
+        return
+
+    if mode == "update":
+        app_id = sys.argv[2] if len(sys.argv) > 2 else ""
+        vm_id = sys.argv[3] if len(sys.argv) > 3 else ""
+        previous_hash = sys.argv[4] if len(sys.argv) > 4 else ""
+        target_hash = sys.argv[5] if len(sys.argv) > 5 else ""
+        if len(sys.argv) != 9 or not app_id or not vm_id:
+            raise SystemExit(
+                "usage: sandboxd-node-box.py update "
+                "<app_id> <vm_id> <previous_hash> <target_hash> <vcpu> <memory> <disk>"
+            )
+        profile = checked_profile(sys.argv[6], sys.argv[7], sys.argv[8])
+        print(
+            json.dumps(
+                checked_update_vm(
+                    app_id,
+                    vm_id,
+                    previous_hash,
+                    target_hash,
+                    profile,
+                )
+            )
+        )
+        return
+
+    if mode == "retire-previous":
+        app_id = sys.argv[2] if len(sys.argv) > 2 else ""
+        current_vm_id = sys.argv[3] if len(sys.argv) > 3 else ""
+        current_hash = sys.argv[4] if len(sys.argv) > 4 else ""
+        previous_vm_id = sys.argv[5] if len(sys.argv) > 5 else ""
+        previous_hash = sys.argv[6] if len(sys.argv) > 6 else ""
+        if len(sys.argv) != 13 or not app_id or not current_vm_id or not previous_vm_id:
+            raise SystemExit(
+                "usage: sandboxd-node-box.py retire-previous "
+                "<app_id> <current_vm_id> <current_hash> <previous_vm_id> <previous_hash> "
+                "<current_vcpu> <current_memory> <current_disk> "
+                "<previous_vcpu> <previous_memory> <previous_disk>"
+            )
+        current_profile = checked_profile(sys.argv[7], sys.argv[8], sys.argv[9])
+        previous_profile = exact_profile(
+            sys.argv[10],
+            sys.argv[11],
+            sys.argv[12],
+            label="previous",
+        )
+        print(
+            json.dumps(
+                checked_retire_previous_vm(
+                    app_id,
+                    current_vm_id,
+                    current_hash,
+                    previous_vm_id,
+                    previous_hash,
+                    current_profile,
+                    previous_profile,
+                )
+            )
+        )
+        return
+
+    if mode == "upgrade-stopped":
         app_id = sys.argv[2] if len(sys.argv) > 2 else ""
         vm_id = sys.argv[3] if len(sys.argv) > 3 else ""
         if not app_id or not vm_id:
-            raise SystemExit(f"usage: sandboxd-node-box.py {mode} <app_id> <vm_id>")
+            raise SystemExit(
+                "usage: sandboxd-node-box.py upgrade-stopped <app_id> <vm_id>"
+            )
         env = build_env(app_id)
         compose_file, compose_hash = app_compose_and_hash(list(env.keys()))
         sealed = dict(env)
         sealed["APP_ID"] = app_id
-        # Never upgrade while a workload is merely "stopping" or the VMM state is unknown. A
-        # rolled-back replacement uses upgrade-stopped so its corrected measured compose can be
+        # A rolled-back replacement uses upgrade-stopped so its corrected measured compose can be
         # installed without ever starting alongside the active old VM.
-        if mode == "update":
-            stop_vm(vm_id)
-        else:
-            before = describe_vm(vm_id)
-            if not before["found"] or str(before.get("status") or "").lower() not in {
-                "stopped",
-                "exited",
-            }:
-                raise SystemExit("upgrade-stopped requires an exactly stopped replacement VM")
+        before = describe_vm(vm_id)
+        if not before["found"] or str(before.get("status") or "").lower() not in {
+            "stopped",
+            "exited",
+        }:
+            raise SystemExit(
+                "upgrade-stopped requires an exactly stopped replacement VM"
+            )
         upgrade = m.vmm(
             "UpgradeApp",
             {
@@ -814,33 +1358,35 @@ def main() -> None:
                 "gateway_urls": [m.GATEWAY_RPC] if GATEWAY_ENABLED else [],
             },
         )
-        if mode == "upgrade-stopped":
-            after = describe_vm(vm_id)
-            if (
-                str(after.get("status") or "").lower() not in {"stopped", "exited"}
-                or after.get("compose_hash") != compose_hash
-            ):
-                raise SystemExit("UpgradeApp did not preserve stopped state and exact compose hash")
-            print(
-                json.dumps(
-                    {
-                        "app_id": app_id,
-                        "compose_hash": compose_hash,
-                        "vm_id": vm_id,
-                        "status": after.get("status"),
-                        "upgrade": upgrade,
-                    }
-                )
+        after = describe_vm(vm_id)
+        if (
+            str(after.get("status") or "").lower() not in {"stopped", "exited"}
+            or after.get("compose_hash") != compose_hash
+        ):
+            raise SystemExit(
+                "UpgradeApp did not preserve stopped state and exact compose hash"
             )
-            return
-        start = m.vmm("StartVm", {"id": vm_id})
-        print(json.dumps({"app_id": app_id, "compose_hash": compose_hash, "vm_id": vm_id, "upgrade": upgrade, "start": start}))
+        print(
+            json.dumps(
+                {
+                    "app_id": app_id,
+                    "compose_hash": compose_hash,
+                    "vm_id": vm_id,
+                    "status": after.get("status"),
+                    "upgrade": upgrade,
+                }
+            )
+        )
         return
 
     raise SystemExit(
         "usage: sandboxd-node-box.py "
         "[deploy|create-replacement <app_id>|hash|inventory-app <app_id>|describe <vm_id>|stop <vm_id>|"
-        "start <vm_id>|update <app_id> <vm_id>|upgrade-stopped <app_id> <vm_id>]"
+        "start <vm_id>|checked-start <app_id> <vm_id> <target_hash> <vcpu> <memory> <disk>|"
+        "update <app_id> <vm_id> <previous_hash> <target_hash> <vcpu> <memory> <disk>|"
+        "retire-previous <app_id> <current_vm_id> <current_hash> <previous_vm_id> <previous_hash> "
+        "<current_vcpu> <current_memory> <current_disk> <previous_vcpu> <previous_memory> <previous_disk>|"
+        "upgrade-stopped <app_id> <vm_id>]"
     )
 
 

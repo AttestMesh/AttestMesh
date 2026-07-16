@@ -101,6 +101,16 @@ _inventory_matches() {{
     [ "$expected" = "$VM_ID" ] && [ "$status" != stopped ] && [ "$status" != exited ]
   fi
 }}
+_inventory_exact_single() {{
+  local expected="$1" expected_state="$2" status
+  status=$(cat "$STATUS_FILE")
+  [ "$expected" = "$VM_ID" ] || return 1
+  if [ "$expected_state" = terminal ]; then
+    [ "$status" = stopped ] || [ "$status" = exited ]
+  else
+    [ "$status" = running ] || [ "$status" = started ]
+  fi
+}}
 _wait_inventory() {{ _inventory_matches "$1"; }}
 _allowlist_compose_hash() {{ :; }}
 _wait_health() {{
@@ -125,7 +135,7 @@ _box_run() {{
       printf '{{"app_id":"%s","compose_hash":"%s","vm_id":"%s"}}\n' \
         "$X" "$TARGET_HASH" "$VM_ID"
       ;;
-    start)
+    start|checked-start)
       printf 'start\n' >> "$CALLS_FILE"
       printf 'running' > "$STATUS_FILE"
       ;;

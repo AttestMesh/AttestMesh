@@ -34,6 +34,23 @@ deploy/sandboxd-node.sh sandboxd verify-health
 deploy/sandboxd-node.sh sandboxd smoke
 ```
 
+A successful whole-VM replacement deliberately retains its stopped predecessor in
+`PREVIOUS_VM_ID` for an operator rollback. The in-place updater will not run while that dormant
+same-app VM exists: it still owns storage and could be started later. Once the rollback window is
+explicitly over, inspect that exact stopped VM and retire it with its full journaled id:
+
+```sh
+SANDBOXD_RETIRE_PREVIOUS_VM_ID=<exact-PREVIOUS_VM_ID> \
+  deploy/sandboxd-node.sh sandboxd retire-previous
+```
+
+This destructive action accepts only the journaled predecessor, never the current VM. Before
+`RemoveVm`, it durably records both VM identities, both measured hashes, and both resource profiles,
+then independently proves an inventory containing exactly the steady current VM and that stopped
+predecessor. It clears `PREVIOUS_VM_ID` only after the predecessor is absent and the exact current
+VM is the sole same-app entry. A crash or lost RPC response leaves a resumable retirement journal;
+all other deployment actions remain blocked until the same exact-id command reconciles it.
+
 An in-place update writes its VM id, previous compose hash, target compose hash, and phase to the
 state journal before stopping the VM. If the command is interrupted, leave the compose and journal
 unchanged and rerun `update`; recovery accepts only the recorded previous or target hash, resumes the
@@ -65,6 +82,20 @@ last-known-good `H` is deliberately preserved until the hotfix proves exact heal
 inventory. A missing/wrong opt-in, healthy old target, different VM, resource drift, app drift,
 third compose hash, or ambiguous inventory fails before allowlisting or VMM mutation. Do not use
 the legacy `SANDBOXD_UPDATE_RECOVERY_FROM_HASH` path for a journaled failed target.
+
+Every box-helper invocation receives a fresh root-owned `0700` directory containing read-only
+compose/helper snapshots and runs under one node-wide remote `flock`; fixed `/tmp` inputs are
+forbidden. The update call passes both durable journal hashes and the exact 8/16,384/300 profile to
+that helper. Before `StopVm`, it rejects a compose snapshot whose hash differs from `UPDATE_H`, then
+proves the current VM is exactly `UPDATE_PREVIOUS_H`, has the recorded app and resources, is either
+running/started or stopped, and is the sole same-app inventory entry in either state. After stopping
+it re-proves the old hash, stopped state, resources, identity, and absence of any duplicate entry.
+`UpgradeApp` receives the
+same in-memory compose string that was hashed; before `StartVm`, the helper twice proves the exact
+target hash, stopped state, identity/resources, and sole same-app inventory. A resumed stopped
+target uses the same checked-start operation. Transitional/unknown status, input replacement, a
+third hash, resource drift, or any active/dormant duplicate therefore fails before the next VMM
+mutation.
 
 Pre-launch stops managed workloads before restarting Docker, restores the host firewall before the
 daemon resumes durable rows, and fails closed unless all of these are true:

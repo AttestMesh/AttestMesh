@@ -8,7 +8,7 @@ source "$HERE/lib.sh"
 : "${RPC_URL:?source deploy/env.sh first}"
 require PRIVATE_KEY RPC_URL CHAIN_ID DEPLOYER_ADDR
 
-NODE="${1:?usage: sandboxd-node.sh <node-name> [deploy|prime|bind|start|verify-health|smoke|update|replace|rollback|all]}"
+NODE="${1:?usage: sandboxd-node.sh <node-name> [deploy|prime|bind|start|verify-health|smoke|update|retire-previous|replace|rollback|all]}"
 ACTION="${2:-all}"
 BOX_HOST="${BOX_HOST:-ubuntu@173.231.234.133}"
 BOX_PY="${BOX_PY:-/opt/dstack-mcp/venv/bin/python}"
@@ -44,6 +44,18 @@ UPDATE_VM_ID=${UPDATE_VM_ID:-}
 UPDATE_H=${UPDATE_H:-}
 UPDATE_PREVIOUS_H=${UPDATE_PREVIOUS_H:-}
 PREVIOUS_VM_ID=${PREVIOUS_VM_ID:-}
+PREVIOUS_RETIRE_PHASE=${PREVIOUS_RETIRE_PHASE:-}
+PREVIOUS_RETIRE_APP_ID=${PREVIOUS_RETIRE_APP_ID:-}
+PREVIOUS_RETIRE_CURRENT_VM_ID=${PREVIOUS_RETIRE_CURRENT_VM_ID:-}
+PREVIOUS_RETIRE_VM_ID=${PREVIOUS_RETIRE_VM_ID:-}
+PREVIOUS_RETIRE_CURRENT_H=${PREVIOUS_RETIRE_CURRENT_H:-}
+PREVIOUS_RETIRE_CURRENT_VCPU=${PREVIOUS_RETIRE_CURRENT_VCPU:-}
+PREVIOUS_RETIRE_CURRENT_MEM=${PREVIOUS_RETIRE_CURRENT_MEM:-}
+PREVIOUS_RETIRE_CURRENT_DISK=${PREVIOUS_RETIRE_CURRENT_DISK:-}
+PREVIOUS_RETIRE_H=${PREVIOUS_RETIRE_H:-}
+PREVIOUS_RETIRE_VCPU=${PREVIOUS_RETIRE_VCPU:-}
+PREVIOUS_RETIRE_MEM=${PREVIOUS_RETIRE_MEM:-}
+PREVIOUS_RETIRE_DISK=${PREVIOUS_RETIRE_DISK:-}
 REPLACEMENT_VM_ID=${REPLACEMENT_VM_ID:-}
 REPLACEMENT_OLD_VM_ID=${REPLACEMENT_OLD_VM_ID:-}
 REPLACEMENT_H=${REPLACEMENT_H:-}
@@ -137,12 +149,70 @@ _allowlist_compose_hash() {
 
 _box_run() {
   local mode="$1" app_id="${2:-}" vm_id="${3:-}" guser gtok public_base
+  local remote_dir remote_compose remote_helper lock_key lock_file helper_sha remote_helper_sha
+  local helper_command cleanup_command remote_script remote_command rc
+  local -a helper_args extra_args
+  extra_args=("${@:4}")
+  case "$mode" in
+    deploy|hash)
+      helper_args=("$mode")
+      ;;
+    create-replacement|inventory-app)
+      helper_args=("$mode" "$app_id")
+      ;;
+    start|stop|describe)
+      helper_args=("$mode" "$vm_id")
+      ;;
+    update|upgrade-stopped|checked-start|retire-previous)
+      helper_args=("$mode" "$app_id" "$vm_id" "${extra_args[@]}")
+      ;;
+    *)
+      die "unsupported sandboxd box helper mode: $mode"
+      ;;
+  esac
   guser=$(grep -E '^\s*username\s*=' "$HOME/.teesql/ghcr-pull.toml" 2>/dev/null | head -1 | sed -E 's/.*=\s*//' | tr -d "\"' ")
   gtok=$(grep  -E '^\s*token\s*='    "$HOME/.teesql/ghcr-pull.toml" 2>/dev/null | head -1 | sed -E 's/.*=\s*//' | tr -d "\"' ")
   [ -n "$gtok" ] || die "no ghcr token in ~/.teesql/ghcr-pull.toml"
   public_base="${GATEWAY_URL:-}"
-  scp -o BatchMode=yes -q "$COMPOSE" "$BOX_HOST:/tmp/${NODE}.yaml"
-  scp -o BatchMode=yes -q "$HERE/sandboxd-node-box.py" "$BOX_HOST:/tmp/sandboxd-node-box.py"
+
+  # Never reuse a remote compose/helper pathname: a concurrent invocation must not be able to
+  # replace an input between the hash gate and VMM mutation. mktemp plus umask creates an
+  # root-owned 0700 directory; both the remote EXIT trap and this caller attempt cleanup.
+  remote_dir=$(ssh_box "sudo bash -c 'umask 077; dir=\$(mktemp -d /tmp/sandboxd-node.XXXXXXXX) && chmod 0700 \"\$dir\" && printf \"%s\\\\n\" \"\$dir\"'") \
+    || die "could not allocate unique remote sandboxd helper directory"
+  [[ "$remote_dir" =~ ^/tmp/sandboxd-node\.[A-Za-z0-9]+$ ]] \
+    || die "remote sandboxd helper returned an unsafe temporary path"
+  remote_compose="$remote_dir/compose.yaml"
+  remote_helper="$remote_dir/sandboxd-node-box.py"
+  helper_sha=$(sha256sum "$HERE/sandboxd-node-box.py" | awk '{print $1}') \
+    || { ssh_box "sudo rm -rf -- '$remote_dir'" >/dev/null 2>&1 || true; die "could not hash local sandboxd helper"; }
+  # Stream directly through sudo into the root-owned directory. There is no user-writable remote
+  # staging window in which another BOX_HOST login could rewrite the compose or executable helper.
+  if ! ssh_box "sudo install -o root -g root -m 0400 /dev/stdin '$remote_compose'" < "$COMPOSE" \
+    || ! ssh_box "sudo install -o root -g root -m 0400 /dev/stdin '$remote_helper'" < "$HERE/sandboxd-node-box.py"; then
+    ssh_box "sudo rm -rf -- '$remote_dir'" >/dev/null 2>&1 || true
+    die "could not stage unique remote sandboxd helper inputs"
+  fi
+  remote_helper_sha=$(ssh_box "sudo sha256sum '$remote_helper'" | awk '{print $1}') \
+    || { ssh_box "sudo rm -rf -- '$remote_dir'" >/dev/null 2>&1 || true; die "could not verify remote sandboxd helper"; }
+  [ "$remote_helper_sha" = "$helper_sha" ] \
+    || { ssh_box "sudo rm -rf -- '$remote_dir'" >/dev/null 2>&1 || true; die "remote sandboxd helper integrity mismatch"; }
+
+  # Every mode for this one sandboxd node uses the same remote lock. Mixing a node lock for generic
+  # StopVm/StartVm with an app lock for update would allow the two mutation paths to race.
+  lock_key="${NODE//[^a-zA-Z0-9_.-]/_}"
+  lock_key="${lock_key,,}"
+  [ -n "$lock_key" ] || lock_key=sandboxd
+  lock_file="/run/lock/sandboxd-$lock_key.lock"
+  printf -v helper_command '%q ' "$BOX_PY" "$remote_helper" "${helper_args[@]}"
+  printf -v cleanup_command 'rm -rf -- %q' "$remote_dir"
+  printf -v remote_script \
+    'set -euo pipefail; set -a; . /dev/stdin; set +a; trap %q EXIT; command -v flock >/dev/null; flock -w 60 %q %s' \
+    "$cleanup_command" "$lock_file" "$helper_command"
+  printf -v remote_command \
+    'sudo BOX_NAME=%q BOX_COMPOSE=%q BOX_VCPU=%q BOX_MEM=%q BOX_DISK=%q BOX_PORTS=%q BOX_GATEWAY_ENABLED=%q BOX_NET_MODE=%q bash -c %q' \
+    "$NODE" "$remote_compose" "$BOX_VCPU" "$BOX_MEM" "$BOX_DISK" "$BOX_PORTS" \
+    "$BOX_GATEWAY_ENABLED" "$BOX_NET_MODE" "$remote_script"
   {
     printf 'E_CHAIN_ID=%q\n' "$CHAIN_ID"
     printf 'E_RPC_URL=%q\n' "${CVM_RPC_URL:-$RPC_URL}"
@@ -161,8 +231,12 @@ _box_run() {
     printf 'E_DSTACK_DOCKER_USERNAME=%q\n' "${guser:-dmvt}"
     printf 'E_DSTACK_DOCKER_PASSWORD=%q\n' "$gtok"
     printf 'E_DSTACK_DOCKER_REGISTRY=%q\n' "ghcr.io"
-  } | ssh_box "sudo BOX_NAME='$NODE' BOX_COMPOSE='/tmp/${NODE}.yaml' BOX_VCPU=$BOX_VCPU BOX_MEM=$BOX_MEM BOX_DISK=$BOX_DISK BOX_PORTS='$BOX_PORTS' BOX_GATEWAY_ENABLED='$BOX_GATEWAY_ENABLED' BOX_NET_MODE='$BOX_NET_MODE' \
-    bash -c 'set -a; . /dev/stdin; set +a; exec $BOX_PY /tmp/sandboxd-node-box.py $mode $app_id $vm_id'"
+  } | ssh_box "$remote_command"
+  rc=$?
+  # The remote trap is authoritative; this idempotent cleanup also covers an SSH disconnect before
+  # bash installed that trap.
+  ssh_box "sudo rm -rf -- '$remote_dir'" >/dev/null 2>&1 || true
+  return "$rc"
 }
 
 deploy_cvm() {
@@ -290,6 +364,146 @@ verify_health() {
   _wait_health 45 10 || die "sandboxd health did not become ready at $GATEWAY_URL/healthz"
 }
 
+retire_previous_cvm() {
+  _load; _require_env
+  [ -n "${X:-}" ] && [ -n "${VM_ID:-}" ] && [ -n "${PREVIOUS_VM_ID:-}" ] \
+    || die "retire-previous requires exact current and previous VM ids in $STATE"
+  [ "$VM_ID" != "$PREVIOUS_VM_ID" ] \
+    || die "refusing to retire the recorded current VM"
+  [ "${SANDBOXD_RETIRE_PREVIOUS_VM_ID:-}" = "$PREVIOUS_VM_ID" ] \
+    || die "set SANDBOXD_RETIRE_PREVIOUS_VM_ID to exact recorded predecessor $PREVIOUS_VM_ID after reviewing it"
+  [ -z "${REPLACEMENT_PHASE:-}" ] \
+    || die "cannot retire a predecessor during replacement phase $REPLACEMENT_PHASE"
+
+  local current_expected current j previous previous_j out result
+  case "${UPDATE_PHASE:-}" in
+    "")
+      current_expected="${H:-}"
+      ;;
+    upgraded)
+      [ "${UPDATE_VM_ID:-}" = "$VM_ID" ] && [ -n "${UPDATE_H:-}" ] \
+        || die "upgraded update journal does not identify the current VM/hash"
+      current_expected="$UPDATE_H"
+      ;;
+    *)
+      die "cannot retire a predecessor during ambiguous update phase ${UPDATE_PHASE:-<empty>}"
+      ;;
+  esac
+  current_expected="${current_expected#0x}"
+  current_expected="${current_expected#0X}"
+  [[ "$current_expected" =~ ^[0-9a-fA-F]{64}$ ]] \
+    || die "current compose hash is invalid during predecessor retirement"
+
+  case "${PREVIOUS_RETIRE_PHASE:-}" in
+    "")
+      current=$(_box_run describe "" "$VM_ID") \
+        || die "could not inspect current VM before predecessor retirement"
+      j=$(echo "$current" | grep '"vm_id"' | tail -1)
+      echo "$j" | jq -e \
+        --arg vm "$VM_ID" --arg app "$X" --arg hash "$current_expected" \
+        --arg vcpu "$BOX_VCPU" --arg memory "$BOX_MEM" --arg disk "$BOX_DISK" '
+        .found == true and .vm_id == $vm and
+        (((.app_id // "") | ascii_downcase | ltrimstr("0x")) ==
+         ($app | ascii_downcase | ltrimstr("0x"))) and
+        (((.compose_hash // "") | ascii_downcase | ltrimstr("0x")) ==
+         ($hash | ascii_downcase | ltrimstr("0x"))) and
+        (.vcpu | type == "number" and floor == . and . == ($vcpu | tonumber)) and
+        (.memory | type == "number" and floor == . and . == ($memory | tonumber)) and
+        (.disk_size | type == "number" and floor == . and . == ($disk | tonumber)) and
+        (((.status // "") | ascii_downcase) as $status |
+          ($status == "running" or $status == "started"))' >/dev/null \
+        || die "current VM identity/hash/profile/status is not exact before predecessor retirement"
+
+      previous=$(_box_run describe "" "$PREVIOUS_VM_ID") \
+        || die "could not inspect recorded predecessor VM"
+      previous_j=$(echo "$previous" | grep '"vm_id"' | tail -1)
+      echo "$previous_j" | jq -e \
+        --arg vm "$PREVIOUS_VM_ID" --arg app "$X" '
+        .found == true and .vm_id == $vm and
+        (((.app_id // "") | ascii_downcase | ltrimstr("0x")) ==
+         ($app | ascii_downcase | ltrimstr("0x"))) and
+        (((.status // "") | ascii_downcase) as $status |
+          ($status == "stopped" or $status == "exited")) and
+        ((.compose_hash // "") | type == "string" and test("^[0-9a-fA-F]{64}$")) and
+        (.vcpu | type == "number" and floor == . and . > 0) and
+        (.memory | type == "number" and floor == . and . > 0) and
+        (.disk_size | type == "number" and floor == . and . > 0)' >/dev/null \
+        || die "recorded predecessor is not an exact stopped same-app VM"
+
+      PREVIOUS_RETIRE_VM_ID="$PREVIOUS_VM_ID"
+      PREVIOUS_RETIRE_APP_ID="$X"
+      PREVIOUS_RETIRE_CURRENT_VM_ID="$VM_ID"
+      PREVIOUS_RETIRE_CURRENT_H="${current_expected,,}"
+      PREVIOUS_RETIRE_CURRENT_VCPU="$BOX_VCPU"
+      PREVIOUS_RETIRE_CURRENT_MEM="$BOX_MEM"
+      PREVIOUS_RETIRE_CURRENT_DISK="$BOX_DISK"
+      PREVIOUS_RETIRE_H=$(echo "$previous_j" | jq -er '.compose_hash | ascii_downcase')
+      PREVIOUS_RETIRE_VCPU=$(echo "$previous_j" | jq -er '.vcpu | tostring')
+      PREVIOUS_RETIRE_MEM=$(echo "$previous_j" | jq -er '.memory | tostring')
+      PREVIOUS_RETIRE_DISK=$(echo "$previous_j" | jq -er '.disk_size | tostring')
+      PREVIOUS_RETIRE_PHASE=prepared
+      # Persist every exact deletion precondition before the irreversible RemoveVm. A retry can
+      # safely distinguish a not-yet-applied removal from an applied removal with a stale journal.
+      _save
+      ;;
+    prepared|removing)
+      ;;
+    *)
+      die "unknown predecessor retirement phase $PREVIOUS_RETIRE_PHASE"
+      ;;
+  esac
+
+  [ "${PREVIOUS_RETIRE_APP_ID,,}" = "${X,,}" ] \
+    && [ "$PREVIOUS_RETIRE_CURRENT_VM_ID" = "$VM_ID" ] \
+    && [ "$PREVIOUS_RETIRE_VM_ID" = "$PREVIOUS_VM_ID" ] \
+    && [ "${PREVIOUS_RETIRE_CURRENT_H,,}" = "${current_expected,,}" ] \
+    || die "predecessor retirement journal no longer matches current deployment state"
+  [[ "${PREVIOUS_RETIRE_H:-}" =~ ^[0-9a-fA-F]{64}$ ]] \
+    && [[ "${PREVIOUS_RETIRE_CURRENT_VCPU:-}" =~ ^[1-9][0-9]*$ ]] \
+    && [[ "${PREVIOUS_RETIRE_CURRENT_MEM:-}" =~ ^[1-9][0-9]*$ ]] \
+    && [[ "${PREVIOUS_RETIRE_CURRENT_DISK:-}" =~ ^[1-9][0-9]*$ ]] \
+    && [[ "${PREVIOUS_RETIRE_VCPU:-}" =~ ^[1-9][0-9]*$ ]] \
+    && [[ "${PREVIOUS_RETIRE_MEM:-}" =~ ^[1-9][0-9]*$ ]] \
+    && [[ "${PREVIOUS_RETIRE_DISK:-}" =~ ^[1-9][0-9]*$ ]] \
+    || die "predecessor retirement journal is incomplete"
+
+  if [ "$PREVIOUS_RETIRE_PHASE" = prepared ]; then
+    PREVIOUS_RETIRE_PHASE=removing
+    _save
+  fi
+  out=$(_box_run retire-previous "$X" "$VM_ID" "$PREVIOUS_RETIRE_CURRENT_H" \
+    "$PREVIOUS_RETIRE_VM_ID" "$PREVIOUS_RETIRE_H" \
+    "$PREVIOUS_RETIRE_CURRENT_VCPU" "$PREVIOUS_RETIRE_CURRENT_MEM" \
+    "$PREVIOUS_RETIRE_CURRENT_DISK" \
+    "$PREVIOUS_RETIRE_VCPU" "$PREVIOUS_RETIRE_MEM" "$PREVIOUS_RETIRE_DISK") \
+    || die "checked predecessor removal failed; durable retirement journal retained"
+  echo "$out"
+  result=$(echo "$out" | grep '"current_vm_id"' | tail -1)
+  echo "$result" | jq -e \
+    --arg app "$X" --arg current "$VM_ID" --arg previous "$PREVIOUS_RETIRE_VM_ID" '
+    (((.app_id // "") | ascii_downcase | ltrimstr("0x")) ==
+     ($app | ascii_downcase | ltrimstr("0x"))) and
+    .current_vm_id == $current and .previous_vm_id == $previous and
+    (.already_removed | type == "boolean")' >/dev/null \
+    || die "checked predecessor removal returned an unexpected identity; journal retained"
+
+  PREVIOUS_VM_ID=
+  PREVIOUS_RETIRE_PHASE=
+  PREVIOUS_RETIRE_APP_ID=
+  PREVIOUS_RETIRE_CURRENT_VM_ID=
+  PREVIOUS_RETIRE_VM_ID=
+  PREVIOUS_RETIRE_CURRENT_H=
+  PREVIOUS_RETIRE_CURRENT_VCPU=
+  PREVIOUS_RETIRE_CURRENT_MEM=
+  PREVIOUS_RETIRE_CURRENT_DISK=
+  PREVIOUS_RETIRE_H=
+  PREVIOUS_RETIRE_VCPU=
+  PREVIOUS_RETIRE_MEM=
+  PREVIOUS_RETIRE_DISK=
+  _save
+  log "✔ retired obsolete predecessor; current same-app VM is unique: $VM_ID"
+}
+
 update_member() {
   _load; _require_env
   [ -n "${X:-}" ] && [ -n "${VM_ID:-}" ] && [ -n "${CLUSTER:-}" ] || die "need X/VM_ID/CLUSTER in $STATE"
@@ -319,13 +533,24 @@ update_member() {
   current_status=$(echo "$j" | jq -er '(.status // "") | ascii_downcase') \
     || die "current VM has no status"
   if [ -z "${UPDATE_PHASE:-}" ]; then
-    _inventory_matches "$VM_ID" \
-      || die "recorded VM is not the only active same-app VM before update"
+    _inventory_exact_single "$VM_ID" steady \
+      || die "recorded VM is not the sole steady same-app VM before update"
   else
-    # A crash after StopVm may leave no active copy. Resume only when this exact VM is active or
-    # the app inventory is quiescent; any different active copy remains an ambiguity.
-    _inventory_matches "$VM_ID" || _inventory_matches none \
-      || die "same-app inventory is ambiguous during in-place update recovery"
+    # A crash after StopVm may leave the exact journaled VM terminal. Require that same VM to remain
+    # the sole full inventory entry in either state; dormant duplicates are still ambiguity.
+    case "$current_status" in
+      running|started)
+        _inventory_exact_single "$VM_ID" steady \
+          || die "same-app inventory is ambiguous during running update recovery"
+        ;;
+      stopped|exited)
+        _inventory_exact_single "$VM_ID" terminal \
+          || die "same-app inventory is ambiguous during stopped update recovery"
+        ;;
+      *)
+        die "current VM is in a transitional/unknown state during update recovery: $current_status"
+        ;;
+    esac
   fi
   nh=$(_box_run hash | grep -oE '^[0-9a-f]{64}$' | tail -1)
   [ -n "$nh" ] || die "could not compute new compose_hash"
@@ -398,11 +623,13 @@ update_member() {
       current_status=$(echo "$j" | jq -er '(.status // "") | ascii_downcase') \
         || die "failed update target has no status before rebase"
       if [ "$current_status" = stopped ] || [ "$current_status" = exited ]; then
-        _inventory_matches none \
-          || die "failed update target is stopped but another same-app VM is active; refusing rebase"
+        _inventory_exact_single "$VM_ID" terminal \
+          || die "failed update target is not the sole stopped same-app VM; refusing rebase"
       else
-        _inventory_matches "$VM_ID" \
-          || die "failed update target is not the only active same-app VM; refusing rebase"
+        [ "$current_status" = running ] || [ "$current_status" = started ] \
+          || die "failed update target has a transitional/unknown status; refusing rebase"
+        _inventory_exact_single "$VM_ID" steady \
+          || die "failed update target is not the sole steady same-app VM; refusing rebase"
       fi
 
       UPDATE_PREVIOUS_H="$UPDATE_H"
@@ -430,7 +657,8 @@ update_member() {
 
   if [ "$UPDATE_PHASE" = mutating ]; then
     if [ "${current_h,,}" = "${UPDATE_PREVIOUS_H,,}" ]; then
-      out=$(_box_run update "$X" "$VM_ID") \
+      out=$(_box_run update "$X" "$VM_ID" "$UPDATE_PREVIOUS_H" "$UPDATE_H" \
+        "$BOX_VCPU" "$BOX_MEM" "$BOX_DISK") \
         || die "in-place update failed; durable update journal retained for exact readback recovery"
       echo "$out"
       j=$(echo "$out" | grep '"app_id"' | tail -1)
@@ -443,7 +671,8 @@ update_member() {
       if [ "$current_status" = stopped ] || [ "$current_status" = exited ]; then
         _inventory_matches none \
           || die "target VM is stopped but another same-app VM is active; refusing recovery start"
-        _box_run start "" "$VM_ID" >/dev/null \
+        _box_run checked-start "$X" "$VM_ID" "$UPDATE_H" \
+          "$BOX_VCPU" "$BOX_MEM" "$BOX_DISK" >/dev/null \
           || die "target VM is stopped and recovery start failed"
       fi
     else
@@ -483,7 +712,8 @@ update_member() {
   if [ "$current_status" = stopped ] || [ "$current_status" = exited ]; then
     _inventory_matches none \
       || die "upgraded VM is stopped but another same-app VM is active; refusing recovery start"
-    _box_run start "" "$VM_ID" >/dev/null \
+    _box_run checked-start "$X" "$VM_ID" "$UPDATE_H" \
+      "$BOX_VCPU" "$BOX_MEM" "$BOX_DISK" >/dev/null \
       || die "upgraded VM recovery start failed; update journal retained"
   fi
   _wait_inventory "$VM_ID" 30 2 \
@@ -491,8 +721,8 @@ update_member() {
   # Do not commit the target hash until the exact measured app is healthy and unique.
   _wait_health 45 10 "$UPDATE_H" \
     || die "updated VM did not prove target health; update journal retained"
-  _inventory_matches "$VM_ID" \
-    || die "same-app inventory changed during update health gate; update journal retained"
+  _inventory_exact_single "$VM_ID" steady \
+    || die "same-app inventory changed or gained a dormant duplicate during update health gate; update journal retained"
   H="$UPDATE_H"
   UPDATE_PHASE=
   UPDATE_VM_ID=
@@ -569,6 +799,30 @@ _inventory_matches() {
     else
       (($active | length) == 1 and $active[0].vm_id == $expected)
     end
+  ' >/dev/null
+}
+
+_inventory_exact_single() {
+  local expected="${1:?expected VM id}" expected_state="${2:?expected steady or terminal}" out j
+  [ "$expected_state" = steady ] || [ "$expected_state" = terminal ] || return 1
+  out=$(_box_run inventory-app "$X") || return 1
+  j=$(echo "$out" | grep '"vms"' | tail -1)
+  [ -n "$j" ] || { log "VMM app inventory returned no JSON: $out"; return 1; }
+  echo "$j" | jq -e --arg expected "$expected" --arg expected_state "$expected_state" '
+    def terminal:
+      ((. // "") | ascii_downcase) as $status |
+      ($status == "stopped" or $status == "exited");
+    def steady:
+      ((. // "") | ascii_downcase) as $status |
+      ($status == "running" or $status == "started");
+    (.vms | type) == "array" and
+    (.vms | length) == 1 and
+    .vms[0].vm_id == $expected and
+    (if $expected_state == "terminal" then
+       (.vms[0].status | terminal)
+     else
+       (.vms[0].status | steady)
+     end)
   ' >/dev/null
 }
 
@@ -724,6 +978,13 @@ replace_cvm() {
   [ -n "${X:-}" ] && [ -n "${VM_ID:-}" ] && [ -n "${CLUSTER:-}" ] \
     || die "need existing X/VM_ID/CLUSTER in $STATE"
   [ -n "${GATEWAY_URL:-}" ] || die "need the existing gateway URL in $STATE"
+
+  if [ -z "${REPLACEMENT_PHASE:-}" ]; then
+    [ -z "${PREVIOUS_VM_ID:-}" ] \
+      || die "retire recorded predecessor $PREVIOUS_VM_ID before allocating another replacement"
+    _inventory_exact_single "$VM_ID" steady \
+      || die "current VM must be the sole steady same-app inventory entry before replacement allocation"
+  fi
 
   local nh out j new_vm returned_x returned_h
   nh=$(_box_run hash | grep -oE '^[0-9a-f]{64}$' | tail -1)
@@ -890,7 +1151,7 @@ PY
 }
 
 case "$ACTION" in
-  deploy|prime|bind|start|verify-health|smoke|update|replace|rollback|setup|all)
+  deploy|prime|bind|start|verify-health|smoke|update|retire-previous|replace|rollback|setup|all)
     command -v flock >/dev/null 2>&1 || die "flock is required for duplicate-safe deployment"
     exec {DEPLOY_LOCK_FD}>"${STATE}.deployment.lock" \
       || die "could not open deployment lock for $STATE"
@@ -898,6 +1159,12 @@ case "$ACTION" in
       || die "another sandboxd deployment process already holds the state lock"
     ;;
 esac
+
+if [ "$ACTION" != retire-previous ]; then
+  _load
+  [ -z "${PREVIOUS_RETIRE_PHASE:-}" ] \
+    || die "predecessor retirement is unfinished ($PREVIOUS_RETIRE_PHASE); resume retire-previous before any other deployment action"
+fi
 
 log "=== confidential-sandboxes node: $NODE ==="
 case "$ACTION" in
@@ -908,9 +1175,10 @@ case "$ACTION" in
   verify-health) verify_health ;;
   smoke) smoke ;;
   update) update_member ;;
+  retire-previous) retire_previous_cvm ;;
   replace) replace_cvm ;;
   rollback) rollback_cvm ;;
   setup) deploy_cvm; prime_gate; bind_member; start_cvm ;;
   all) deploy_cvm; prime_gate; bind_member; start_cvm; verify_health; smoke ;;
-  *) die "usage: sandboxd-node.sh <node-name> [deploy|prime|bind|start|verify-health|smoke|update|replace|rollback|setup|all]" ;;
+  *) die "usage: sandboxd-node.sh <node-name> [deploy|prime|bind|start|verify-health|smoke|update|retire-previous|replace|rollback|setup|all]" ;;
 esac
