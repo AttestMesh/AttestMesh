@@ -271,21 +271,25 @@ verify_health() {
   [ -n "${VM_ID:-}" ] || die "need VM_ID (run deploy first)"
   local i out
   for i in $(seq 1 40); do
-    out=$(ssh_box "sudo bash -s" <<SCRIPT 2>/dev/null
+    if out=$(ssh_box "sudo bash -s" <<SCRIPT 2>/dev/null
 set -u
 VMID="$VM_ID"
 $(_bridge_ip_snippet)
-curl -sS --max-time 5 "http://\$IP:9090/healthz" 2>/dev/null
+curl --fail --silent --show-error --max-time 5 "http://\$IP:9090/healthz" 2>/dev/null
 SCRIPT
-)
-    if echo "$out" | grep -q '"phase"'; then
-      log "✔ sidecar healthz: $out"
-      return 0
+); then
+      if printf '%s' "$out" | jq -e '
+        (.first_converged == true or .firstConverged == true)
+        and (.csk_acquired == true or .cskAcquired == true)
+      ' >/dev/null 2>&1; then
+        log "✔ sidecar healthz: $out"
+        return 0
+      fi
     fi
-    log "… sidecar not answering yet ($i/40): ${out:-<no response>}"
+    log "… sidecar not healthy yet ($i/40): ${out:-<no HTTP 200 response>}"
     sleep 15
   done
-  die "sidecar :9090 never answered at the bridge IP — check vm_logs $VM_ID"
+  die "sidecar :9090 never reached HTTP 200 with convergence+CSK gates — check vm_logs $VM_ID"
 }
 
 # Discover the r2-host node's mesh IP from the jump host: enumerate wg peer

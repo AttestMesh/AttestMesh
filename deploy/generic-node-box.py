@@ -12,6 +12,8 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+from pathlib import Path
+import re
 import sys
 import time
 
@@ -37,6 +39,9 @@ GATEWAY_ENABLED = os.environ.get("BOX_GATEWAY_ENABLED", "true").strip().lower() 
     "yes",
     "on",
 }
+RECREATE_JOURNAL_DIR = Path(
+    os.environ.get("BOX_RECREATE_JOURNAL_DIR", "/srv/data/dstack/attestmesh-recreate")
+)
 
 ENV_KEYS = [
     "CHAIN_ID",
@@ -105,6 +110,108 @@ def stop_vm(vm_id: str) -> dict[str, object]:
             # or already-stopped VMs as cleanup success, but keep the error text.
             return {"vm_id": vm_id, "found": found, "stopped": False, "error": str(exc)}
     return {"vm_id": vm_id, "found": found, "stopped": found}
+
+
+def _vm_found(vm_id: str) -> bool:
+    if not vm_id:
+        return False
+    return bool(m.vmm("GetInfo", {"id": vm_id}).get("found", True))
+
+
+def _replacement_id(result: object) -> str:
+    """Accept the CreateVm response shapes used by dstack releases."""
+    if isinstance(result, str):
+        return result.strip()
+    if isinstance(result, dict):
+        for key in ("id", "vm_id", "vmId"):
+            value = result.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        for key in ("result", "vm", "info"):
+            value = result.get(key)
+            if value is not result:
+                found = _replacement_id(value)
+                if found:
+                    return found
+    return ""
+
+
+def _recreate_journal(app_id: str, old_vm_id: str) -> Path:
+    safe = re.sub(r"[^A-Za-z0-9_.-]", "_", f"{NAME}-{app_id}-{old_vm_id}")
+    return RECREATE_JOURNAL_DIR / f"{safe}.json"
+
+
+def _write_journal(path: Path, data: dict[str, object]) -> None:
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(data, sort_keys=True))
+    os.chmod(tmp, 0o600)
+    tmp.replace(path)
+
+
+def recreate_vm(app_id: str, old_vm_id: str, compose_file: str, sealed: dict[str, str]) -> str:
+    """Fresh-disk replacement, resumable after either destructive operation."""
+    journal = _recreate_journal(app_id, old_vm_id)
+    state: dict[str, object] = {}
+    try:
+        state = json.loads(journal.read_text())
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        pass
+
+    replacement = str(state.get("replacement_vm_id") or "")
+    if replacement and _vm_found(replacement):
+        return replacement
+
+    if not state.get("old_vm_removed"):
+        if _vm_found(old_vm_id):
+            try:
+                m.vmm("StopVm", {"id": old_vm_id})
+            except Exception:
+                pass
+            for _ in range(40):
+                info = m.vmm("GetInfo", {"id": old_vm_id})
+                status = str((info.get("info") or {}).get("status") or "").lower()
+                if not info.get("found", True) or status.startswith(("stop", "exit")):
+                    break
+                time.sleep(2)
+            try:
+                m.vmm("RemoveVm", {"id": old_vm_id})
+            except Exception:
+                # RemoveVm is not idempotent. A missing VM means the destructive
+                # step already completed and the retry may safely continue.
+                if _vm_found(old_vm_id):
+                    raise
+        state = {"app_id": app_id, "old_vm_id": old_vm_id, "old_vm_removed": True}
+        _write_journal(journal, state)
+
+    result = m.vmm(
+        "CreateVm",
+        {
+            "name": NAME,
+            "image": "dstack-0.5.11",
+            "compose_file": compose_file,
+            "vcpu": VCPU,
+            "memory": MEM,
+            "disk_size": DISK,
+            "app_id": app_id,
+            "user_config": "",
+            "ports": [m._parse_port(port) for port in PORTS],
+            "hugepages": False,
+            "pin_numa": False,
+            "stopped": False,
+            "no_tee": False,
+            "kms_urls": kms_urls(),
+            "networking": {"mode": NET_MODE},
+            "gateway_urls": [m.GATEWAY_RPC] if GATEWAY_ENABLED else [],
+            "encrypted_env": m._seal_env(sealed, m._app_env_encrypt_pubkey(app_id)),
+        },
+    )
+    replacement = _replacement_id(result)
+    if not replacement:
+        raise RuntimeError(f"CreateVm returned no replacement VM id: {result!r}")
+    state["replacement_vm_id"] = replacement
+    _write_journal(journal, state)
+    return replacement
 
 
 def main() -> None:
@@ -231,41 +338,9 @@ def main() -> None:
         compose_file, compose_hash = app_compose_and_hash(list(env.keys()))
         sealed = dict(env)
         sealed["APP_ID"] = app_id
-        try:
-            m.vmm("StopVm", {"id": vm_id})
-        except Exception:
-            pass
-        for _ in range(40):
-            info = m.vmm("GetInfo", {"id": vm_id})
-            status = str((info.get("info") or {}).get("status") or "").lower()
-            if not info.get("found", True) or status.startswith(("stop", "exit")):
-                break
-            time.sleep(2)
-        m.vmm("RemoveVm", {"id": vm_id})
-        result = m.vmm(
-            "CreateVm",
-            {
-                "name": NAME,
-                "image": "dstack-0.5.11",
-                "compose_file": compose_file,
-                "vcpu": VCPU,
-                "memory": MEM,
-                "disk_size": DISK,
-                "app_id": app_id,
-                "user_config": "",
-                "ports": [m._parse_port(port) for port in PORTS],
-                "hugepages": False,
-                "pin_numa": False,
-                "stopped": False,
-                "no_tee": False,
-                "kms_urls": kms_urls(),
-                "networking": {"mode": NET_MODE},
-                "gateway_urls": [m.GATEWAY_RPC] if GATEWAY_ENABLED else [],
-                "encrypted_env": m._seal_env(sealed, m._app_env_encrypt_pubkey(app_id)),
-            },
-        )
+        replacement_vm_id = recreate_vm(app_id, vm_id, compose_file, sealed)
         print(json.dumps({"app_id": app_id, "compose_hash": compose_hash,
-                          "vm_id": result.get("id"), "mode": "recreate"}))
+                          "vm_id": replacement_vm_id, "mode": "recreate"}))
         return
 
     raise SystemExit("usage: generic-node-box.py [deploy|hash|stop <vm_id>|update|recreate <app_id> <vm_id>]")
