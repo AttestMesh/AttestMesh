@@ -20,7 +20,7 @@ source "$HERE/lib.sh"
 : "${RPC_URL:?source deploy/env.sh first}"
 require PRIVATE_KEY RPC_URL CHAIN_ID DEPLOYER_ADDR
 
-NODE="${1:?usage: webhost-node.sh <node-name> [deploy|cluster|patha|prime|bind|verify|verify-app|verify-daemon|update|setup|all]}"
+NODE="${1:?usage: webhost-node.sh <node-name> [preflight|deploy|cluster|patha|prime|bind|verify|verify-app|verify-daemon|verify-release|update|rollback|setup|all]}"
 ACTION="${2:-all}"
 BOX_HOST="${BOX_HOST:-ubuntu@173.231.234.133}"
 BOX_PY="${BOX_PY:-/opt/dstack-mcp/venv/bin/python}"
@@ -28,8 +28,17 @@ BOX_DEPLOYER_KEY="${BOX_DEPLOYER_KEY:-/root/.attestmesh/base-deployer.json}"
 BOX_RPC="${BOX_RPC:-https://base-rpc.publicnode.com}"
 BOX_KMS_ROOT_SIGNER="${BOX_KMS_ROOT_SIGNER:-0x7fa63d99495be2129cf28eee54e2ef2724e3aa2e}"
 COMPOSE="${COMPOSE:-$ROOT/deploy/compose/webhost-node.yaml}"
+ROLLBACK_COMPOSE="${ROLLBACK_COMPOSE:-$ROOT/deploy/compose/webhost-node-v1.1.3-rollback.yaml}"
 GATEWAY_DOMAIN="${GATEWAY_DOMAIN:-gateway.attestmesh.xyz}"
 RECEIPT="$ROOT/contracts/script/deployments/${CHAIN_ID}.json"
+
+WEBHOST_RELEASE_VERSION="v1.1.3"
+WEBHOST_RELEASE_COMMIT="fa0023cb8fd43ad7102b7e1a3b7c30ae5b30361a"
+WEBHOST_RELEASE_IDENTITY="https://github.com/dmvt/webhost-control/.github/workflows/release.yml@refs/tags/${WEBHOST_RELEASE_VERSION}"
+WEBHOST_RELEASE_ISSUER="https://token.actions.githubusercontent.com"
+WEBHOST_CONTROL_IMAGE="ghcr.io/dmvt/webhost-control-control-plane@sha256:97655dfcd6d888d6f59f61abb95e5e8251dedc8c2ac587e1616deb4db1c2d2d0"
+WEBHOST_STORAGE_IMAGE="ghcr.io/dmvt/webhost-control-storage-helper@sha256:099310c8869c181720f10d5a35e87533b7f0f6490ed2643c8525ce35b72aa10b"
+WEBHOST_TLS_IMAGE="ghcr.io/dmvt/webhost-control-tlsproxy@sha256:fa2f2dfaeb9d5bf9c61540eba27a2fad789a950e4217aa0339b38b54fbc9ea81"
 
 SECRETS_FILE="${SECRETS_FILE:-$HOME/.attestmesh/webhost.env}"
 SYNCLAVE_SECRETS="${SYNCLAVE_SECRETS:-$HOME/.attestmesh/synclave.env}"
@@ -39,6 +48,7 @@ CLOUDFLARE_SYNCLAVE_TOML="${CLOUDFLARE_SYNCLAVE_TOML:-$HOME/.attestmesh/cloudfla
 
 APP_DOMAIN="${APP_DOMAIN:-app.synclave.net}"
 DIRECTORY_HOST="${DIRECTORY_HOST:-apps.synclave.net}"
+WEBHOST_ADMIN_HOST="${WEBHOST_ADMIN_HOST:-daemon.synclave.net}"
 CONSOLE_HOST="${CONSOLE_HOST:-$DIRECTORY_HOST}"
 NEXTAUTH_URL="${NEXTAUTH_URL:-https://${CONSOLE_HOST}}"
 REDPILL_BASE_URL="${REDPILL_BASE_URL:-https://api.redpill.ai/v1}"
@@ -103,6 +113,7 @@ RUNYARD_CALLBACK_SECRET=$(openssl rand -hex 32)
 GITHUB_ID=$gh_id
 GITHUB_SECRET=$gh_secret
 CLOUDFLARE_API_TOKEN=$cf_token
+ACME_EMAIL=admin@synclave.net
 REDPILL_API_KEY=$redpill
 VENICE_API_KEY=$redpill
 RUNYARD_HUB_URL=
@@ -125,7 +136,7 @@ EOF
     CLOUDFLARE_SYNCLAVE_API_TOKEN="$(sed -nE 's/^api_token *= *"?([^" ]+)"?.*/\1/p' "$CLOUDFLARE_SYNCLAVE_TOML" | head -1)"
   fi
   local k
-  for k in TEE_DAEMON_TOKEN WEBHOST_MCP_TOKEN NEXTAUTH_SECRET GITHUB_ID GITHUB_SECRET CLOUDFLARE_API_TOKEN CLOUDFLARE_SYNCLAVE_API_TOKEN REDPILL_API_KEY VENICE_API_KEY RUNYARD_CALLBACK_SECRET; do
+  for k in TEE_DAEMON_TOKEN WEBHOST_MCP_TOKEN NEXTAUTH_SECRET GITHUB_ID GITHUB_SECRET CLOUDFLARE_API_TOKEN CLOUDFLARE_SYNCLAVE_API_TOKEN ACME_EMAIL REDPILL_API_KEY VENICE_API_KEY RUNYARD_CALLBACK_SECRET; do
     [ -n "${!k:-}" ] || die "secret $k not set in $SECRETS_FILE"
   done
 }
@@ -166,6 +177,8 @@ _box_run() {
     printf 'E_NEXTAUTH_URL=%q\n' "$NEXTAUTH_URL"
     printf 'E_APP_DOMAIN=%q\n' "$APP_DOMAIN"
     printf 'E_DIRECTORY_HOST=%q\n' "$DIRECTORY_HOST"
+    printf 'E_WEBHOST_ADMIN_HOST=%q\n' "$WEBHOST_ADMIN_HOST"
+    printf 'E_ACME_EMAIL=%q\n' "$ACME_EMAIL"
     printf 'E_CONSOLE_HOST=%q\n' "$CONSOLE_HOST"
     printf 'E_REDPILL_API_KEY=%q\n' "$REDPILL_API_KEY"
     printf 'E_REDPILL_BASE_URL=%q\n' "$REDPILL_BASE_URL"
@@ -348,28 +361,183 @@ verify_daemon() {
   die "tee-daemon did not respond via ${cvm_ip}/_api/projects"
 }
 
-update_member() {
+_cvm_ip() {
+  local cvm_ip="${WEBHOST_CVM_IP:-}"
+  if [ -z "$cvm_ip" ] && [ -n "${VM_ID:-}" ]; then
+    cvm_ip=$(ssh_box "mac=\$(pgrep -af qemu-system | grep '/${VM_ID}/' | sed -nE 's/.*mac=([0-9a-f:]{17}).*/\\1/p' | head -1); [ -n \"\$mac\" ] && sudo awk -v mac=\"\$mac\" '\$2 == mac { print \$3 }' /var/lib/misc/dnsmasq-dstack-br0.leases | tail -1" 2>/dev/null || true)
+  fi
+  printf '%s\n' "$cvm_ip"
+}
+
+_render_compose() {
+  local file="$1"
+  env \
+    CHAIN_ID="$CHAIN_ID" \
+    RPC_URL="$RPC_URL" \
+    BUNDLER_URL="${BUNDLER_URL:-$RPC_URL}" \
+    GAS_POLICY_ID="${GAS_POLICY_ID:-}" \
+    INDEXER_REGISTRY_ADDR="$INDEXER_REGISTRY_ADDR" \
+    GATEWAY_DOMAIN="$GATEWAY_DOMAIN" \
+    TEE_DAEMON_TOKEN="$TEE_DAEMON_TOKEN" \
+    WEBHOST_MCP_TOKEN="$WEBHOST_MCP_TOKEN" \
+    GITHUB_ID="$GITHUB_ID" \
+    GITHUB_SECRET="$GITHUB_SECRET" \
+    NEXTAUTH_SECRET="$NEXTAUTH_SECRET" \
+    NEXTAUTH_URL="$NEXTAUTH_URL" \
+    APP_DOMAIN="$APP_DOMAIN" \
+    DIRECTORY_HOST="$DIRECTORY_HOST" \
+    CONSOLE_HOST="$CONSOLE_HOST" \
+    WEBHOST_ADMIN_HOST="$WEBHOST_ADMIN_HOST" \
+    ACME_EMAIL="$ACME_EMAIL" \
+    REDPILL_API_KEY="$REDPILL_API_KEY" \
+    REDPILL_BASE_URL="$REDPILL_BASE_URL" \
+    REDPILL_MODEL="$REDPILL_MODEL" \
+    VENICE_API_KEY="$VENICE_API_KEY" \
+    VENICE_BASE_URL="$VENICE_BASE_URL" \
+    VENICE_MODEL="$VENICE_MODEL" \
+    RUNYARD_HUB_URL="${RUNYARD_HUB_URL:-}" \
+    RUNYARD_HUB_TOKEN="${RUNYARD_HUB_TOKEN:-}" \
+    RUNYARD_CALLBACK_SECRET="$RUNYARD_CALLBACK_SECRET" \
+    RUNYARD_CALLBACK_URL="$RUNYARD_CALLBACK_URL" \
+    CLOUDFLARE_API_TOKEN="$CLOUDFLARE_API_TOKEN" \
+    CLOUDFLARE_SYNCLAVE_API_TOKEN="$CLOUDFLARE_SYNCLAVE_API_TOKEN" \
+    BACKUP_STORAGE="${BACKUP_STORAGE:-}" \
+    BACKUP_S3_ENDPOINT="${BACKUP_S3_ENDPOINT:-}" \
+    BACKUP_S3_BUCKET="${BACKUP_S3_BUCKET:-}" \
+    BACKUP_S3_REGION="${BACKUP_S3_REGION:-auto}" \
+    BACKUP_S3_ACCESS_KEY_ID="${BACKUP_S3_ACCESS_KEY_ID:-}" \
+    BACKUP_S3_SECRET_ACCESS_KEY="${BACKUP_S3_SECRET_ACCESS_KEY:-}" \
+    BACKUP_PREFIX="${BACKUP_PREFIX:-webhost}" \
+    BACKUP_APP_ID="${BACKUP_APP_ID:-${X:-}}" \
+    BACKUP_INTERVAL_SECONDS="${BACKUP_INTERVAL_SECONDS:-3600}" \
+    docker compose -f "$file" config --quiet
+}
+
+preflight() {
   _load; _require_env
   [ -n "${X:-}" ] && [ -n "${VM_ID:-}" ] && [ -n "${CLUSTER:-}" ] || die "need X/VM_ID/CLUSTER in $STATE"
-  local nh allowed out j mode
+  [ -z "${BOX_FRESH_DISK:-}" ] || die "BOX_FRESH_DISK is forbidden for the state-preserving Webhost migration"
+  [ -f "$COMPOSE" ] && [ ! -L "$COMPOSE" ] || die "candidate Compose must be a regular non-symlink file"
+  [ -f "$ROLLBACK_COMPOSE" ] && [ ! -L "$ROLLBACK_COMPOSE" ] || die "rollback Compose must be a regular non-symlink file"
+  local command image first_name second_name candidate_hash rollback_hash saved_compose
+  for command in cast cosign docker jq scp ssh; do
+    command -v "$command" >/dev/null 2>&1 || die "required command unavailable: $command"
+  done
+  [[ "$ACME_EMAIL" =~ ^[^[:space:]@]+@[^[:space:]@]+\.[^[:space:]@]+$ ]] || die "ACME_EMAIL must be a valid email address"
+  local secret_names=(TEE_DAEMON_TOKEN WEBHOST_MCP_TOKEN RUNYARD_HUB_TOKEN RUNYARD_CALLBACK_SECRET)
+  local first second
+  for ((first = 0; first < ${#secret_names[@]}; first++)); do
+    first_name="${secret_names[$first]}"
+    [ -n "${!first_name:-}" ] || continue
+    for ((second = first + 1; second < ${#secret_names[@]}; second++)); do
+      second_name="${secret_names[$second]}"
+      if [ -n "${!second_name:-}" ] && [ "${!first_name}" = "${!second_name}" ]; then
+        die "security boundary secrets must be distinct: $first_name and $second_name"
+      fi
+    done
+  done
+  grep -Fq "$WEBHOST_CONTROL_IMAGE" "$COMPOSE" || die "candidate Compose does not bind the approved control-plane digest"
+  grep -Fq "$WEBHOST_STORAGE_IMAGE" "$COMPOSE" || die "candidate Compose does not bind the approved storage-helper digest"
+  grep -Fq "$WEBHOST_TLS_IMAGE" "$COMPOSE" || die "candidate Compose does not bind the approved TLS-proxy digest"
+  grep -Fq "WEBHOST_VERSION: $WEBHOST_RELEASE_VERSION" "$COMPOSE" || die "candidate Compose does not bind the release version"
+  grep -Fq "WEBHOST_BUILD_COMMIT: $WEBHOST_RELEASE_COMMIT" "$COMPOSE" || die "candidate Compose does not bind the release commit"
+  _render_compose "$COMPOSE" || die "candidate Compose failed semantic rendering"
+  _render_compose "$ROLLBACK_COMPOSE" || die "rollback Compose failed semantic rendering"
+  for image in "$WEBHOST_CONTROL_IMAGE" "$WEBHOST_STORAGE_IMAGE" "$WEBHOST_TLS_IMAGE"; do
+    cosign verify \
+      --certificate-identity "$WEBHOST_RELEASE_IDENTITY" \
+      --certificate-oidc-issuer "$WEBHOST_RELEASE_ISSUER" \
+      "$image" >/dev/null || die "Cosign verification failed for an approved Webhost image"
+  done
+  ssh_box true >/dev/null || die "production box is unreachable: $BOX_HOST"
+  saved_compose="$COMPOSE"
+  candidate_hash=$(_box_run hash | grep -oE '^[0-9a-f]{64}$' | tail -1)
+  COMPOSE="$ROLLBACK_COMPOSE"
+  rollback_hash=$(_box_run hash | grep -oE '^[0-9a-f]{64}$' | tail -1)
+  COMPOSE="$saved_compose"
+  [ -n "$candidate_hash" ] && [ -n "$rollback_hash" ] || die "could not compute candidate and rollback compose hashes"
+  log "✔ Webhost ${WEBHOST_RELEASE_VERSION} preflight candidate=0x${candidate_hash} rollback=0x${rollback_hash} vm=${VM_ID}"
+}
+
+_upgrade_compose() {
+  local file="$1" label="$2" saved_compose="$COMPOSE" nh allowed out j mode
+  [ -z "${BOX_FRESH_DISK:-}" ] || die "BOX_FRESH_DISK is forbidden for the state-preserving Webhost migration"
+  COMPOSE="$file"
   nh=$(_box_run hash | grep -oE '^[0-9a-f]{64}$' | tail -1)
-  [ -n "$nh" ] || die "could not compute new compose_hash"
-  log "new compose_hash=0x$nh"
+  if [ -z "$nh" ]; then
+    COMPOSE="$saved_compose"
+    return 1
+  fi
+  log "$label compose_hash=0x$nh"
   allowed=$(cast call "$CLUSTER" 'allowedComposeHashes(bytes32)(bool)' "0x$nh" --rpc-url "$RPC_URL" 2>/dev/null)
   if [ "$allowed" != true ]; then
-    send_seq "webhost-update-addHash-${NODE}" "$CLUSTER" "addComposeHash(bytes32)" "0x$nh"
+    if ! send_seq "webhost-${label}-addHash-${NODE}" "$CLUSTER" "addComposeHash(bytes32)" "0x$nh"; then
+      COMPOSE="$saved_compose"
+      return 1
+    fi
   else
-    log "compose hash already allowlisted"
+    log "$label compose hash already allowlisted"
   fi
-  out=$(_box_run update "$X" "$VM_ID") || die "in-place update failed"
-  echo "$out"
+  if ! out=$(_box_run update "$X" "$VM_ID"); then
+    COMPOSE="$saved_compose"
+    return 1
+  fi
+  COMPOSE="$saved_compose"
   j=$(echo "$out" | grep '"app_id"' | tail -1)
-  H=$(echo "$j" | jq -r .compose_hash)
-  VM_ID=$(echo "$j" | jq -r '.vm_id // empty'); [ -n "$VM_ID" ] || { _load; : "${VM_ID:=}"; }
-  [ -n "$H" ] && [ "$H" != null ] || H="$nh"
-  _save
+  H=$(echo "$j" | jq -r '.compose_hash // empty')
+  [ -n "$H" ] || H="$nh"
   mode=$(echo "$j" | jq -r '.mode // "upgrade"')
-  log "✔ webhost node update complete mode=$mode vm=$VM_ID"
+  _save
+  log "✔ $label complete mode=$mode vm=$VM_ID compose_hash=0x${H#0x}"
+}
+
+_candidate_smoke() {
+  local cvm_ip i ready substrate unauth wrong authorized
+  for i in $(seq 1 36); do
+    cvm_ip=$(_cvm_ip)
+    if [ -n "$cvm_ip" ]; then
+      ready=$(ssh_box "curl -sS --max-time 10 --resolve ${WEBHOST_ADMIN_HOST}:443:${cvm_ip} https://${WEBHOST_ADMIN_HOST}/readyz" 2>/dev/null || true)
+      substrate=$(ssh_box "curl -sS --max-time 10 --resolve ${DIRECTORY_HOST}:443:${cvm_ip} https://${DIRECTORY_HOST}/_api/substrate" 2>/dev/null || true)
+      unauth=$(ssh_box "curl -sS -o /dev/null -w '%{http_code}' --max-time 10 --resolve ${WEBHOST_ADMIN_HOST}:443:${cvm_ip} https://${WEBHOST_ADMIN_HOST}/_api/projects" 2>/dev/null || true)
+      wrong=$(ssh_box "curl -sS -o /dev/null -w '%{http_code}' --max-time 10 --resolve ${WEBHOST_ADMIN_HOST}:443:${cvm_ip} -H 'Authorization: Bearer deliberately-wrong-token' https://${WEBHOST_ADMIN_HOST}/_api/projects" 2>/dev/null || true)
+      authorized=$(printf '%s\n' "$TEE_DAEMON_TOKEN" | ssh_box "read -r token; curl -sS -o /dev/null -w '%{http_code}' --max-time 10 --resolve ${WEBHOST_ADMIN_HOST}:443:${cvm_ip} -H \"Authorization: Bearer \$token\" https://${WEBHOST_ADMIN_HOST}/_api/projects" 2>/dev/null || true)
+      if printf '%s' "$ready" | jq -e '.ready == true' >/dev/null 2>&1 \
+        && printf '%s' "$substrate" | jq -e --arg version "$WEBHOST_RELEASE_VERSION" --arg commit "$WEBHOST_RELEASE_COMMIT" '.version == $version and .buildCommit == $commit' >/dev/null 2>&1 \
+        && [ "$unauth" = 401 ] && [ "$wrong" = 403 ] && [ "$authorized" = 200 ]; then
+        log "✔ Webhost ${WEBHOST_RELEASE_VERSION} ready on ${cvm_ip}; auth boundaries and build commit verified"
+        return 0
+      fi
+    fi
+    log "… Webhost ${WEBHOST_RELEASE_VERSION} candidate not ready ($i/36)"
+    sleep 10
+  done
+  return 1
+}
+
+verify_release() {
+  _load; _require_env
+  _candidate_smoke || die "Webhost ${WEBHOST_RELEASE_VERSION} readiness/version/auth smoke failed"
+}
+
+rollback_member() {
+  _load; _require_env
+  [ -n "${X:-}" ] && [ -n "${VM_ID:-}" ] && [ -n "${CLUSTER:-}" ] || die "need X/VM_ID/CLUSTER in $STATE"
+  _upgrade_compose "$ROLLBACK_COMPOSE" rollback || die "state-preserving Webhost rollback failed"
+  verify_app
+  verify_daemon
+  log "✔ legacy Webhost topology restored from the quiesced migration snapshot"
+}
+
+update_member() {
+  preflight
+  _upgrade_compose "$COMPOSE" update || die "in-place Webhost ${WEBHOST_RELEASE_VERSION} update failed"
+  if _candidate_smoke; then
+    log "✔ Webhost ${WEBHOST_RELEASE_VERSION} production update complete"
+    return 0
+  fi
+  log "candidate smoke failed; executing automatic same-VM rollback"
+  rollback_member
+  die "Webhost ${WEBHOST_RELEASE_VERSION} failed smoke and was rolled back"
 }
 
 log "=== Open webhost AttestMesh node: $NODE ==="
@@ -382,8 +550,11 @@ case "$ACTION" in
   verify) verify ;;
   verify-app) verify_app ;;
   verify-daemon) verify_daemon ;;
+  verify-release) verify_release ;;
+  preflight) preflight ;;
   update) update_member ;;
+  rollback) rollback_member ;;
   setup) deploy_cvm; deploy_cluster; patha_upgrade; prime_gate; bind_member ;;
   all) deploy_cvm; deploy_cluster; patha_upgrade; prime_gate; bind_member; verify ;;
-  *) die "usage: webhost-node.sh <node-name> [deploy|cluster|patha|prime|bind|verify|verify-app|verify-daemon|update|setup|all]" ;;
+  *) die "usage: webhost-node.sh <node-name> [preflight|deploy|cluster|patha|prime|bind|verify|verify-app|verify-daemon|verify-release|update|rollback|setup|all]" ;;
 esac
