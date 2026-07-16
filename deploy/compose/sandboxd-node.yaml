@@ -50,7 +50,7 @@ services:
       - /dev/net/tun
 
   sandboxd:
-    image: ghcr.io/dmvt/confidential-sandboxes@sha256:987d34b8dd445a9bcf175fcf245bc573d4d4659694871c3d63d7ea088ca64ab2
+    image: ghcr.io/dmvt/confidential-sandboxes@sha256:96619929983e0cd33c2b018e0500f629b1db6181d4dba11cc4ba115efa3a69b4
     # The dstack compose runner starts this service only after pre_launch_script has mounted and
     # verified the XFS quota filesystem. Dockerd must never restore it early against the underlying
     # directory during host boot; pre-launch recovery remains the sole restart authority.
@@ -128,7 +128,7 @@ services:
       SANDBOX_NETWORK_POOL: 10.192.0.0/10
       SANDBOX_NETWORK_PREFIXLEN: "29"
       SANDBOXD_REQUIRE_NETWORK_FIREWALL: "1"
-      SANDBOXD_FIREWALL_HELPER_IMAGE: ghcr.io/dmvt/confidential-sandboxes@sha256:987d34b8dd445a9bcf175fcf245bc573d4d4659694871c3d63d7ea088ca64ab2
+      SANDBOXD_FIREWALL_HELPER_IMAGE: ghcr.io/dmvt/confidential-sandboxes@sha256:96619929983e0cd33c2b018e0500f629b1db6181d4dba11cc4ba115efa3a69b4
       SANDBOXD_FIREWALL_WATCHDOG_INTERVAL_SECONDS: "15"
       # Preview URLs (/app/{id}/…) are capability URLs reachable without the daemon bearer; /_api/*
       # stays bearer-gated.
