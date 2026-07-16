@@ -1,6 +1,6 @@
-# Webhost v1.1.3 node migration
+# Webhost v1.1.4 node migration
 
-This runbook promotes the existing `open-webhost` CVM to Webhost `v1.1.3`
+This runbook promotes the existing `open-webhost` CVM to Webhost `v1.1.4`
 without creating a new VM or disk. The measured Compose project remains
 `dstack`, all six durable Docker volume names remain unchanged, and the public
 origins remain:
@@ -15,12 +15,12 @@ origins remain:
 
 The reviewed node manifest binds these immutable, keyless-Cosign-verified
 multi-platform indexes from the successful private-repository release workflow
-for `dmvt/webhost-control` tag `v1.1.3`, source commit
-`fa0023cb8fd43ad7102b7e1a3b7c30ae5b30361a`:
+for `dmvt/webhost-control` tag `v1.1.4`, source commit
+`483d6d3585a4e551eaa2d38a09a47b29b1e1b234`:
 
-- control plane: `sha256:97655dfcd6d888d6f59f61abb95e5e8251dedc8c2ac587e1616deb4db1c2d2d0`;
-- storage helper: `sha256:099310c8869c181720f10d5a35e87533b7f0f6490ed2643c8525ce35b72aa10b`;
-- TLS proxy: `sha256:fa2f2dfaeb9d5bf9c61540eba27a2fad789a950e4217aa0339b38b54fbc9ea81`.
+- control plane: `sha256:47f9a25c8145074b94bbcd21af808988637b2027bfad003e4aadfd9c8d19d802`;
+- storage helper: `sha256:e710fd41f4fac83380c42b5276ed776433e5e7e0fd316490a4a59f70b3e47ba6`;
+- TLS proxy: `sha256:58acbf1252724407da69bc6a7313001dc5685e61c6ed5dd4d185cf8739802e3d`.
 
 `preflight` re-verifies all three signatures against the exact tagged
 `.github/workflows/release.yml` identity and GitHub OIDC issuer. Mutable tags
@@ -36,7 +36,7 @@ and callback secrets must be pairwise distinct. Secret values are sent only in
 memory to the box helper and sealed to the existing app ID.
 
 The legacy Runyard values remain in the sealed allowlist for the reviewed
-rollback topology, but the v1.1.3 control plane does not consume them. The
+rollback topology, but the v1.1.4 control plane does not consume them. The
 current Runyard member exposes only an internal HTTP hub while the production
 Webhost contract requires HTTPS, and the compatibility analyzer must not use
 Runyard. Enabling that optional integration later requires a separate reviewed
@@ -58,10 +58,11 @@ the box. It does not stop or update the VM.
 
 ## State and rollback boundary
 
-The update uses dstack `UpgradeApp` on the same VM ID. Before any v1.1.3 writer
-starts, the `migration-backup` one-shot service archives and checksums these
-quiesced volumes into the persistent
-`dstack_webhost_v1_1_3_migration_backup` volume:
+The update uses dstack `UpgradeApp` on the same VM ID. The original v1.1.3
+migration attempt created the immutable local snapshot before any unified
+Webhost writer started. Before the v1.1.4 writer starts, the
+`migration-backup` one-shot service revalidates that snapshot and checksum in
+the persistent `dstack_webhost_v1_1_3_migration_backup` volume:
 
 - `dstack_daemon_data`;
 - `dstack_briefs`;
