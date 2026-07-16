@@ -2,7 +2,7 @@
 # and the general S3 namespace use separate prefixes in the same R2 bucket.
 services:
   sidecar:
-    image: ghcr.io/attestmesh/cluster-mesh-agent@sha256:8a5bfe0917bd23809f07660cf5dbf15ab593b547090c610746a417d541e86d2d
+    image: ghcr.io/attestmesh/cluster-mesh-agent@sha256:e3d53442aa6e52d47227fb3528c1141302ad4fc63c4b3fb6dc38df7ce907d486
     restart: unless-stopped
     environment:
       - CHAIN_ID=${CHAIN_ID}
@@ -73,8 +73,8 @@ services:
       - pgdata:/var/lib/postgresql/data
       - agent-sock:/var/run/attestmesh
       - walg-status:/walg-status
-    # Required for peer CVMs while this node's CSK-backed mesh sidecar is pending.
-    # The dstack host bridge is private; no public gateway route targets this port.
+    # Temporary private-bridge fallback until all three sidecars report live peers.
+    # No dstack public-gateway route targets this database port.
     ports: ["5432:5432"]
     healthcheck:
       test: [CMD-SHELL, "pg_isready -h 127.0.0.1 -U postgres -d postgres"]
