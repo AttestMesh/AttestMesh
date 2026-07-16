@@ -255,13 +255,23 @@ if docker inspect "$app_name" >/dev/null 2>&1; then
     fi
 
     mapfile -t app_networks < <(docker inspect -f '{{range $name, $_ := .NetworkSettings.Networks}}{{println $name}}{{end}}' "$app_name")
-    if [ "${#app_networks[@]}" -ne 1 ] || [ "${app_networks[0]}" != dstack_default ]; then
-      echo "app diagnostic requires the sole dstack_default attachment" >&2
+    if [ "${#app_networks[@]}" -ne 1 ]; then
+      echo "app diagnostic requires one authoritative network attachment; found: ${app_networks[*]:-none}" >&2
       exit 1
     fi
-    read -r network_id endpoint_id < <(docker inspect -f '{{with index .NetworkSettings.Networks "dstack_default"}}{{.NetworkID}} {{.EndpointID}}{{end}}' "$app_name")
+    app_network="${app_networks[0]}"
+    read -r network_id endpoint_id < <(docker inspect -f "{{with index .NetworkSettings.Networks \"$app_network\"}}{{.NetworkID}} {{.EndpointID}}{{end}}" "$app_name")
     if [ -z "$network_id" ] || [ -z "$endpoint_id" ]; then
-      echo "app diagnostic requires an active dstack_default endpoint" >&2
+      echo "app diagnostic requires an active endpoint on $app_network" >&2
+      exit 1
+    fi
+    network_actual_id="$(docker network inspect -f '{{.Id}}' "$app_network")"
+    network_project="$(docker network inspect -f '{{index .Labels "com.docker.compose.project"}}' "$app_network")"
+    network_role="$(docker network inspect -f '{{index .Labels "com.docker.compose.network"}}' "$app_network")"
+    if [ "$network_actual_id" != "$network_id" ] \
+      || [ "$network_project" != dstack ] \
+      || [ "$network_role" != default ]; then
+      echo "app diagnostic network is not the attached dstack Compose default: $app_network" >&2
       exit 1
     fi
 
@@ -275,7 +285,7 @@ if docker inspect "$app_name" >/dev/null 2>&1; then
     set +e
     timeout --foreground --signal=TERM --kill-after=5s 45s \
       docker run --rm --name "$diagnostic_name" \
-        --network dstack_default \
+        --network "$app_network" \
         --env-file "$diagnostic_env" \
         --init \
         --cap-drop ALL \
