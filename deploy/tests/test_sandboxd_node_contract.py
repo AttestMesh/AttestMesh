@@ -6,9 +6,12 @@ from __future__ import annotations
 import unittest
 from pathlib import Path
 
+import yaml
+
 
 ROOT = Path(__file__).resolve().parents[2]
 SOURCE = (ROOT / "deploy" / "sandboxd-node-box.py").read_text()
+COMPOSE_SOURCE = (ROOT / "deploy" / "compose" / "sandboxd-node.yaml").read_text()
 
 
 class SandboxdNodeContractTests(unittest.TestCase):
@@ -62,6 +65,63 @@ class SandboxdNodeContractTests(unittest.TestCase):
         self.assertRegex(compose, r'HOST_VCPU_MILLIS:\s*"5000"')
         self.assertRegex(compose, r'HOST_CPU_OVERCOMMIT:\s*"1[.]0"')
         self.assertIn("test \"$$(docker info --format '{{.NCPU}}')\" = 8", compose)
+
+    def test_host_cgroup_readback_is_measured_and_fail_closed(self) -> None:
+        compose = COMPOSE_SOURCE
+        self.assertRegex(compose, r"(?m)^\s+cgroup:\s+host$")
+        self.assertRegex(compose, r'SANDBOXD_REQUIRE_HOST_CGROUP:\s*"1"')
+        self.assertIn("SANDBOXD_HOST_CGROUP_ROOT: /host/sys/fs/cgroup", compose)
+        self.assertIn("SANDBOXD_EXPECTED_CGROUP_DRIVER: systemd", compose)
+        self.assertIn("source: /sys/fs/cgroup", compose)
+        self.assertIn("target: /host/sys/fs/cgroup", compose)
+        self.assertIn("read_only: true", compose)
+        self.assertIn("create_host_path: false", compose)
+        self.assertIn(
+            "test \"$$(docker info --format '{{.CgroupVersion}}/{{.CgroupDriver}}')\" = 2/systemd",
+            compose,
+        )
+
+        self.assertIn('"native.cgroupdriver=systemd"', SOURCE)
+        self.assertIn('."cgroup-parent" = "system.slice"', SOURCE)
+        self.assertIn('"cgroup-parent": "system.slice"', SOURCE)
+        self.assertIn("findmnt -n -o FSTYPE /sys/fs/cgroup", SOURCE)
+        self.assertIn("docker info --format '{{.CgroupVersion}}/{{.CgroupDriver}}'", SOURCE)
+        self.assertEqual(SOURCE.count('\nDOCKER_CONFIG='), 1)
+        self.assertIn(
+            'DOCKER_DAEMON_CONFIG=/etc/docker/daemon.json', SOURCE
+        )
+        validate = SOURCE.index(
+            'dockerd --validate --config-file "$DOCKER_DAEMON_CONFIG_NEW"'
+        )
+        install = SOURCE.index(
+            'mv -f "$DOCKER_DAEMON_CONFIG_NEW" "$DOCKER_DAEMON_CONFIG"'
+        )
+        restart = SOURCE.index("systemctl restart docker")
+        self.assertLess(validate, install)
+        self.assertLess(install, restart)
+
+        service = yaml.safe_load(compose)["services"]["sandboxd"]
+        self.assertEqual(service["cgroup"], "host")
+        self.assertEqual(service["pid"], "host")
+        self.assertEqual(service["environment"]["SANDBOXD_REQUIRE_HOST_CGROUP"], "1")
+        cgroup_mounts = [
+            mount
+            for mount in service["volumes"]
+            if isinstance(mount, dict)
+            and mount.get("target") == "/host/sys/fs/cgroup"
+        ]
+        self.assertEqual(
+            cgroup_mounts,
+            [
+                {
+                    "type": "bind",
+                    "source": "/sys/fs/cgroup",
+                    "target": "/host/sys/fs/cgroup",
+                    "read_only": True,
+                    "bind": {"create_host_path": False},
+                }
+            ],
+        )
 
     def test_lifetime_ledgers_have_measured_hard_caps(self) -> None:
         compose = (ROOT / "deploy" / "compose" / "sandboxd-node.yaml").read_text()

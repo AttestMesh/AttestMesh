@@ -117,7 +117,7 @@ QUOTA_ZVOL_BYTES=$((251 * 1024 * 1024 * 1024))
 QUOTA_SOLD_MIB=237568
 QUOTA_FS_HEADROOM_MIB=18432
 QUOTA_POOL_HEADROOM_MIB=28672
-QUOTA_TOOLS_IMAGE="ghcr.io/dmvt/confidential-sandboxes@sha256:cdd55b4e534e0c73949a7fd67ad51bba680c1bf96fee8525ddb4dca42eb03497"
+QUOTA_TOOLS_IMAGE="ghcr.io/dmvt/confidential-sandboxes@sha256:7ce355e2ea70b1e6a88770bd88839e3e38585817b4198223baf433857caf40c8"
 EXPECTED_HOST_VCPUS=8
 # The VMM resource readback must still be exactly 16,384 MiB. Inside this TDX image that allocation
 # exposes about 15,034 MiB after confidential-guest firmware/kernel reservations, so retain a
@@ -133,7 +133,7 @@ mkdir -p "$DOCKER_CONFIG"
 chmod 0700 "$DOCKER_CONFIG"
 trap 'rm -rf "$DOCKER_CONFIG"; rm -f "$DOCKER_AFFINITY_TMP"' EXIT
 
-for tool in awk curl df docker find grep head jq mount rm sed sysctl systemctl zfs zpool; do
+for tool in awk curl df docker dockerd find findmnt grep head jq mount rm sed sysctl systemctl zfs zpool; do
   command -v "$tool" >/dev/null 2>&1 || {
     echo "missing required sandboxd host tool: $tool" >&2
     exit 1
@@ -326,17 +326,22 @@ for container_id in $quiesce_ids; do
 done
 
 mkdir -p /etc/docker
+DOCKER_DAEMON_CONFIG=/etc/docker/daemon.json
+DOCKER_DAEMON_CONFIG_NEW=/etc/docker/daemon.json.new
 if [ -f /etc/docker/daemon.json ]; then
   jq --arg p "$RUNSC_BIN" --arg root "$DOCKER_DATA_ROOT" \
     '.runtimes.runsc = {"path": $p}
      | ."data-root" = $root
      | ."storage-driver" = "zfs"
      | ."log-driver" = "local"
-     | ."log-opts" = {"max-size": "20m", "max-file": "3"}' \
-    /etc/docker/daemon.json > /etc/docker/daemon.json.new
-  mv /etc/docker/daemon.json.new /etc/docker/daemon.json
+     | ."log-opts" = {"max-size": "20m", "max-file": "3"}
+     | ."exec-opts" = (((."exec-opts" // [])
+         | map(select((startswith("native.cgroupdriver=")) | not)))
+         + ["native.cgroupdriver=systemd"])
+     | ."cgroup-parent" = "system.slice"' \
+    "$DOCKER_DAEMON_CONFIG" > "$DOCKER_DAEMON_CONFIG_NEW"
 else
-  cat > /etc/docker/daemon.json <<JSON
+  cat > "$DOCKER_DAEMON_CONFIG_NEW" <<JSON
 {
   "runtimes": {
     "runsc": {
@@ -345,6 +350,8 @@ else
   },
   "data-root": "$DOCKER_DATA_ROOT",
   "storage-driver": "zfs",
+  "exec-opts": ["native.cgroupdriver=systemd"],
+  "cgroup-parent": "system.slice",
   "log-driver": "local",
   "log-opts": {
     "max-size": "20m",
@@ -353,6 +360,9 @@ else
 }
 JSON
 fi
+dockerd --validate --config-file "$DOCKER_DAEMON_CONFIG_NEW"
+chmod 0644 "$DOCKER_DAEMON_CONFIG_NEW"
+mv -f "$DOCKER_DAEMON_CONFIG_NEW" "$DOCKER_DAEMON_CONFIG"
 
 # dstack 0.5.11 ships a vendor docker.service drop-in named override.conf that pins dockerd to CPU
 # 0. Moby validates NanoCPUs (`docker --cpus`) against dockerd's own process affinity, so leaving
@@ -388,6 +398,15 @@ case "$docker_ncpu" in
 esac
 [ "$docker_ncpu" -eq "$EXPECTED_HOST_VCPUS" ] || {
   echo "Docker reports $docker_ncpu CPUs; require exactly $EXPECTED_HOST_VCPUS" >&2
+  exit 1
+}
+[ "$(docker info --format '{{.CgroupVersion}}/{{.CgroupDriver}}')" = "2/systemd" ] || {
+  echo "dockerd must use the systemd driver on unified cgroup v2" >&2
+  exit 1
+}
+[ "$(findmnt -n -o FSTYPE /sys/fs/cgroup)" = "cgroup2" ] \
+  && [ -r /sys/fs/cgroup/cgroup.controllers ] || {
+  echo "host cgroup-v2 hierarchy is unavailable" >&2
   exit 1
 }
 [ "$(docker info --format '{{.DockerRootDir}}')" = "$DOCKER_DATA_ROOT" ] || {

@@ -97,6 +97,11 @@ target uses the same checked-start operation. Transitional/unknown status, input
 third hash, resource drift, or any active/dormant duplicate therefore fails before the next VMM
 mutation.
 
+The first release that introduces the guest `RLIMIT_NPROC` boundary requires an empty node. Legacy
+retained containers have no safe guest-task ceiling and are rejected fail-closed; they are never
+grandfathered. Drain/destroy them and verify zero committed and pending sandbox capacity before
+running the node update. Later explicit PID upsizes use the controlled recreation path.
+
 Pre-launch stops managed workloads before restarting Docker, restores the host firewall before the
 daemon resumes durable rows, and fails closed unless all of these are true:
 
@@ -105,6 +110,10 @@ daemon resumes durable rows, and fails closed unless all of these are true:
   one-CPU vendor affinity;
 - dockerd's effective `Cpus_allowed_list` is `0-7` and `docker info .NCPU` is exactly `8`;
 - Docker uses the managed 28 GiB ZFS data root and the pinned runsc runtime;
+- Docker uses unified cgroup v2 with the systemd driver, and sandboxd's read-only host hierarchy
+  readback matches every running tenant's exact CPU, memory, zero-swap, and host-PID ceiling;
+- the trusted daemon's host PID namespace makes Docker's init PID directly comparable to the exact
+  leaf's `cgroup.procs`; tenant containers remain in private PID and cgroup namespaces;
 - XFS project block and inode quota enforcement is active;
 - the tenant firewall matches the measured rule set.
 
@@ -144,7 +153,8 @@ no-go unless it proves:
   leak;
 - an actual runsc workload launches at 4,900 CPU millis, Docker records
   `NanoCpus=4900000000`, and a multi-worker burn is bounded near 4.9 CPUs;
-- memory, PID, XFS block, and XFS inode limits fail at their declared boundaries;
+- memory, guest-task PID (`RLIMIT_NPROC`/`EAGAIN`), XFS block, and XFS inode limits fail at their
+  declared boundaries, while the separate host runsc-process PID cgroup remains exact;
 - explicit upsize succeeds, every downsize is rejected, and restart preserves the exact size;
 - two untrusted tenants have distinct private `/29` networks, cannot reach each other, the host,
   Docker, the control network, or link-local metadata directly, while public egress and canonical

@@ -50,7 +50,7 @@ services:
       - /dev/net/tun
 
   sandboxd:
-    image: ghcr.io/dmvt/confidential-sandboxes@sha256:cdd55b4e534e0c73949a7fd67ad51bba680c1bf96fee8525ddb4dca42eb03497
+    image: ghcr.io/dmvt/confidential-sandboxes@sha256:7ce355e2ea70b1e6a88770bd88839e3e38585817b4198223baf433857caf40c8
     # The dstack compose runner starts this service only after pre_launch_script has mounted and
     # verified the XFS quota filesystem. Dockerd must never restore it early against the underlying
     # directory during host boot; pre-launch recovery remains the sole restart authority.
@@ -60,6 +60,12 @@ services:
     cpus: "1.0"
     mem_limit: 1536m
     pids_limit: 1024
+    # Read-only host cgroup-v2 evidence for exact physical tenant ceiling verification. Tenants do
+    # not share this cgroup namespace or mount.
+    cgroup: host
+    # Docker reports host init PIDs. Sharing the host PID namespace lets the trusted daemon bind
+    # that exact PID to cgroup.procs; tenant containers are required to remain private.
+    pid: host
     sysctls:
       net.ipv4.ip_forward: "0"
       net.ipv6.conf.all.forwarding: "0"
@@ -82,6 +88,7 @@ services:
         - >-
           python -c 'import json,urllib.request; r=urllib.request.urlopen("http://10.191.255.250:8088/healthz",timeout=3); d=json.load(r); r.close(); raise SystemExit(not (d.get("ok") is True and d.get("dstack_socket_present") is True))' &&
           test "$$(docker info --format '{{.NCPU}}')" = 8 &&
+          test "$$(docker info --format '{{.CgroupVersion}}/{{.CgroupDriver}}')" = 2/systemd &&
           xfs_quota -x -c 'state -p' "$${SANDBOX_DISK_ROOT}" |
           grep -q 'Enforcement: ON'
       interval: 30s
@@ -134,7 +141,7 @@ services:
       SANDBOX_NETWORK_POOL: 10.192.0.0/10
       SANDBOX_NETWORK_PREFIXLEN: "29"
       SANDBOXD_REQUIRE_NETWORK_FIREWALL: "1"
-      SANDBOXD_FIREWALL_HELPER_IMAGE: ghcr.io/dmvt/confidential-sandboxes@sha256:cdd55b4e534e0c73949a7fd67ad51bba680c1bf96fee8525ddb4dca42eb03497
+      SANDBOXD_FIREWALL_HELPER_IMAGE: ghcr.io/dmvt/confidential-sandboxes@sha256:7ce355e2ea70b1e6a88770bd88839e3e38585817b4198223baf433857caf40c8
       SANDBOXD_FIREWALL_WATCHDOG_INTERVAL_SECONDS: "15"
       # Production app traffic is host-only. Every sandbox receives a stable sibling hostname; it is
       # routing metadata, while the independent per-sandbox bearer enforces access. The shared
@@ -164,6 +171,9 @@ services:
       HOST_MEMORY_OVERCOMMIT: "1.0"
       HOST_DISK_OVERCOMMIT: "1.0"
       SANDBOXD_REQUIRE_CAPACITY: "1"  # fail closed if any production ceiling is invalid/missing
+      SANDBOXD_REQUIRE_HOST_CGROUP: "1"
+      SANDBOXD_HOST_CGROUP_ROOT: /host/sys/fs/cgroup
+      SANDBOXD_EXPECTED_CGROUP_DRIVER: systemd
       SANDBOX_DISK_ROOT: /var/lib/sandboxd-data
       SANDBOXD_REQUIRE_DISK_QUOTA: "1"  # fail closed unless XFS project quotas enforce /data
       # Registry creds (CVM-sealed) so the daemon can pull PRIVATE images for runsc workloads.
@@ -179,6 +189,12 @@ services:
     volumes:
       - /var/run/dstack.sock:/var/run/dstack.sock:ro
       - /var/run/docker.sock:/var/run/docker.sock
+      - type: bind
+        source: /sys/fs/cgroup
+        target: /host/sys/fs/cgroup
+        read_only: true
+        bind:
+          create_host_path: false
       # Pre-launch creates this as dstack/sandboxd-state with exact 2 GiB quota, refquota, and
       # refreservation. It remains writable even if the separate Docker data-root reaches its cap.
       - type: bind
