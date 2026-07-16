@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import re
 import unittest
 from pathlib import Path
 
@@ -99,6 +100,61 @@ class SandboxdNodeContractTests(unittest.TestCase):
         restart = SOURCE.index("systemctl restart docker")
         self.assertLess(validate, install)
         self.assertLess(install, restart)
+
+        self.assertIn("HOST_GUEST_PIDS_BUDGET=4096", SOURCE)
+        self.assertIn("HOST_MAX_SANDBOXES=32", SOURCE)
+        self.assertIn("RUNSC_HOST_PIDS_PER_GUEST_TASK=18", SOURCE)
+        self.assertIn("RUNSC_FIXED_HOST_PID_OVERHEAD=512", SOURCE)
+        self.assertIn("HOST_TASK_RESERVE=24576", SOURCE)
+        self.assertIn("sysctl -n kernel.threads-max", SOURCE)
+        self.assertIn("sysctl -n kernel.pid_max", SOURCE)
+        self.assertIn("/sys/fs/cgroup/system.slice/pids.max", SOURCE)
+        self.assertIn(
+            "systemctl show --property ControlGroup --value -- system.slice", SOURCE
+        )
+        self.assertIn("awk 'NR == 1 {print $4}' /proc/loadavg", SOURCE)
+        self.assertNotIn("find /proc -mindepth", SOURCE)
+        self.assertIn(
+            '[ "$threads_max" -ge "$REQUIRED_HOST_TASK_CAPACITY" ]', SOURCE
+        )
+        self.assertIn(
+            '[ "$global_tasks_current" -le "$HOST_TASK_RESERVE" ]', SOURCE
+        )
+        self.assertRegex(compose, r'HOST_PIDS:\s*"4096"')
+        self.assertRegex(compose, r'HOST_MAX_SANDBOXES:\s*"32"')
+        self.assertIn('threads >= 114688 and pids > 114688', compose)
+        self.assertIn('/host/sys/fs/cgroup/system.slice/pids.max', compose)
+
+        def shell_integer(name: str) -> int:
+            match = re.search(rf"(?m)^{re.escape(name)}=([0-9]+)$", SOURCE)
+            self.assertIsNotNone(match, name)
+            return int(match.group(1))
+
+        guest_pids = shell_integer("HOST_GUEST_PIDS_BUDGET")
+        max_sandboxes = shell_integer("HOST_MAX_SANDBOXES")
+        per_guest = shell_integer("RUNSC_HOST_PIDS_PER_GUEST_TASK")
+        fixed = shell_integer("RUNSC_FIXED_HOST_PID_OVERHEAD")
+        reserve = shell_integer("HOST_TASK_RESERVE")
+        runtime_budget = per_guest * guest_pids + fixed * max_sandboxes
+        self.assertEqual(runtime_budget, 90_112)
+        self.assertEqual(runtime_budget + reserve, 114_688)
+
+        service_env = yaml.safe_load(compose)["services"]["sandboxd"]["environment"]
+        self.assertEqual(int(service_env["HOST_PIDS"]), guest_pids)
+        self.assertEqual(int(service_env["HOST_MAX_SANDBOXES"]), max_sandboxes)
+
+        static_gate = SOURCE.index(
+            '[ "$threads_max" -ge "$REQUIRED_HOST_TASK_CAPACITY" ]'
+        )
+        first_install_mutation = SOURCE.index('mkdir -p "$INSTALL_DIR"')
+        final_quiesce_check = SOURCE.index(
+            'failed to stop container before dockerd restart'
+        )
+        baseline_gate = SOURCE.index(
+            '[ "$global_tasks_current" -le "$HOST_TASK_RESERVE" ]'
+        )
+        self.assertLess(static_gate, first_install_mutation)
+        self.assertLess(final_quiesce_check, baseline_gate)
 
         service = yaml.safe_load(compose)["services"]["sandboxd"]
         self.assertEqual(service["cgroup"], "host")

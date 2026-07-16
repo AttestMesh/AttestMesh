@@ -50,7 +50,7 @@ services:
       - /dev/net/tun
 
   sandboxd:
-    image: ghcr.io/dmvt/confidential-sandboxes@sha256:7ce355e2ea70b1e6a88770bd88839e3e38585817b4198223baf433857caf40c8
+    image: ghcr.io/dmvt/confidential-sandboxes@sha256:572e315b596da38c051a99f68e2fc2de8f5a5279a0f7abf277c6f34176775040
     # The dstack compose runner starts this service only after pre_launch_script has mounted and
     # verified the XFS quota filesystem. Dockerd must never restore it early against the underlying
     # directory during host boot; pre-launch recovery remains the sole restart authority.
@@ -86,7 +86,7 @@ services:
       test:
         - CMD-SHELL
         - >-
-          python -c 'import json,urllib.request; r=urllib.request.urlopen("http://10.191.255.250:8088/healthz",timeout=3); d=json.load(r); r.close(); raise SystemExit(not (d.get("ok") is True and d.get("dstack_socket_present") is True))' &&
+          python -c 'import json,urllib.request; r=urllib.request.urlopen("http://10.191.255.250:8088/healthz",timeout=3); d=json.load(r); r.close(); threads=int(open("/proc/sys/kernel/threads-max").read()); pids=int(open("/proc/sys/kernel/pid_max").read()); parent=open("/host/sys/fs/cgroup/system.slice/pids.max").read().strip(); raise SystemExit(not (d.get("ok") is True and d.get("dstack_socket_present") is True and threads >= 114688 and pids > 114688 and (parent == "max" or (parent.isascii() and parent.isdigit() and int(parent) >= 114688))))' &&
           test "$$(docker info --format '{{.NCPU}}')" = 8 &&
           test "$$(docker info --format '{{.CgroupVersion}}/{{.CgroupDriver}}')" = 2/systemd &&
           xfs_quota -x -c 'state -p' "$${SANDBOX_DISK_ROOT}" |
@@ -141,7 +141,7 @@ services:
       SANDBOX_NETWORK_POOL: 10.192.0.0/10
       SANDBOX_NETWORK_PREFIXLEN: "29"
       SANDBOXD_REQUIRE_NETWORK_FIREWALL: "1"
-      SANDBOXD_FIREWALL_HELPER_IMAGE: ghcr.io/dmvt/confidential-sandboxes@sha256:7ce355e2ea70b1e6a88770bd88839e3e38585817b4198223baf433857caf40c8
+      SANDBOXD_FIREWALL_HELPER_IMAGE: ghcr.io/dmvt/confidential-sandboxes@sha256:572e315b596da38c051a99f68e2fc2de8f5a5279a0f7abf277c6f34176775040
       SANDBOXD_FIREWALL_WATCHDOG_INTERVAL_SECONDS: "15"
       # Production app traffic is host-only. Every sandbox receives a stable sibling hostname; it is
       # routing metadata, while the independent per-sandbox bearer enforces access. The shared
@@ -159,14 +159,16 @@ services:
       SANDBOXD_MIN_RUNSC_PIDS: "128"
       SANDBOXD_MIN_RUNSC_DISK_MB: "16"
       # Fixed admission budgets for BOX_VCPU=8 / BOX_MEM=16384 / BOX_DISK=300. Tenant plus trusted
-      # service maxima total 7 vCPU / 12.5 GiB, leaving host dockerd/OS/ZFS headroom. Tenant PIDs
-      # are hard-capped at 16,384. The 251 GiB XFS zvol sells 232 GiB, preserves 18 GiB of usable
-      # reserve, and absorbs its own filesystem metadata in the remaining space.
+      # service maxima total 7 vCPU / 12.5 GiB, leaving host dockerd/OS/ZFS headroom. Exact guest
+      # tasks are capped at 4,096 across at most 32 sandboxes. Pre-launch separately proves the
+      # pinned runsc host-thread envelope (18*N+512 each) plus a fixed 24,576-task OS reserve. The
+      # 251 GiB XFS zvol sells 232 GiB, preserves 18 GiB of usable reserve, and absorbs its own
+      # filesystem metadata in the remaining space.
       HOST_VCPU_MILLIS: "5000"
       HOST_MEMORY_MB: "10240"
       HOST_DISK_MB: "237568"
-      HOST_PIDS: "16384"
-      HOST_MAX_SANDBOXES: "50"
+      HOST_PIDS: "4096"
+      HOST_MAX_SANDBOXES: "32"
       HOST_CPU_OVERCOMMIT: "1.0"
       HOST_MEMORY_OVERCOMMIT: "1.0"
       HOST_DISK_OVERCOMMIT: "1.0"

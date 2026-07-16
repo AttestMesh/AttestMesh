@@ -117,12 +117,27 @@ QUOTA_ZVOL_BYTES=$((251 * 1024 * 1024 * 1024))
 QUOTA_SOLD_MIB=237568
 QUOTA_FS_HEADROOM_MIB=18432
 QUOTA_POOL_HEADROOM_MIB=28672
-QUOTA_TOOLS_IMAGE="ghcr.io/dmvt/confidential-sandboxes@sha256:7ce355e2ea70b1e6a88770bd88839e3e38585817b4198223baf433857caf40c8"
+QUOTA_TOOLS_IMAGE="ghcr.io/dmvt/confidential-sandboxes@sha256:572e315b596da38c051a99f68e2fc2de8f5a5279a0f7abf277c6f34176775040"
 EXPECTED_HOST_VCPUS=8
 # The VMM resource readback must still be exactly 16,384 MiB. Inside this TDX image that allocation
 # exposes about 15,034 MiB after confidential-guest firmware/kernel reservations, so retain a
 # conservative 14.5 GiB guest-visible floor while still rejecting every old 8 GiB node.
 MIN_HOST_MEMORY_MIB=14848
+
+# Fixed, reviewed task-capacity profile for the pinned eight-vCPU systrap runtime. Tenant admission
+# accounts exact guest tasks; each container's separate host cgroup uses 18*N+512. Prove the entire
+# worst-case admitted envelope plus a non-tenant reserve before starting the service. These values
+# are never derived from current load and never auto-expand on a larger machine.
+HOST_GUEST_PIDS_BUDGET=4096
+HOST_MAX_SANDBOXES=32
+RUNSC_HOST_PIDS_PER_GUEST_TASK=18
+RUNSC_FIXED_HOST_PID_OVERHEAD=512
+HOST_TASK_RESERVE=24576
+HOST_RUNTIME_TASK_BUDGET=$((
+  RUNSC_HOST_PIDS_PER_GUEST_TASK * HOST_GUEST_PIDS_BUDGET
+  + RUNSC_FIXED_HOST_PID_OVERHEAD * HOST_MAX_SANDBOXES
+))
+REQUIRED_HOST_TASK_CAPACITY=$((HOST_RUNTIME_TASK_BUDGET + HOST_TASK_RESERVE))
 
 # Registry credentials are sealed into the CVM but need not persist on its host filesystem.
 DOCKER_CONFIG="/run/sandboxd-prelaunch-docker-auth"
@@ -158,6 +173,43 @@ esac
 }
 [ "$actual_memory_kib" -ge $((MIN_HOST_MEMORY_MIB * 1024)) ] || {
   echo "sandboxd guest has $((actual_memory_kib / 1024)) MiB RAM; need at least $MIN_HOST_MEMORY_MIB MiB visible" >&2
+  exit 1
+}
+
+threads_max=$(sysctl -n kernel.threads-max)
+pid_max=$(sysctl -n kernel.pid_max)
+[ -r /sys/fs/cgroup/system.slice/pids.max ] \
+  && [ -r /sys/fs/cgroup/system.slice/pids.current ] || {
+  echo "system.slice PID controller files are unavailable" >&2
+  exit 1
+}
+root_control_group=$(systemctl show --property ControlGroup --value -- -.slice)
+system_slice_control_group=$(systemctl show --property ControlGroup --value -- system.slice)
+[ "$root_control_group" = / ] && [ "$system_slice_control_group" = /system.slice ] || {
+  echo "unexpected systemd control groups: root=$root_control_group system.slice=$system_slice_control_group" >&2
+  exit 1
+}
+system_slice_pids_max=$(awk '{print $1}' /sys/fs/cgroup/system.slice/pids.max)
+for value in "$threads_max" "$pid_max"; do
+  case "$value" in
+    ''|*[!0-9]*) echo "invalid host task-capacity readback: $value" >&2; exit 1 ;;
+  esac
+done
+case "$system_slice_pids_max" in
+  max) ;;
+  ''|*[!0-9]*) echo "invalid parent pids.max readback: $system_slice_pids_max" >&2; exit 1 ;;
+esac
+[ "$threads_max" -ge "$REQUIRED_HOST_TASK_CAPACITY" ] || {
+  echo "kernel.threads-max=$threads_max; fixed sandboxd task profile requires $REQUIRED_HOST_TASK_CAPACITY" >&2
+  exit 1
+}
+[ "$pid_max" -gt "$REQUIRED_HOST_TASK_CAPACITY" ] || {
+  echo "kernel.pid_max=$pid_max; fixed sandboxd task profile requires $REQUIRED_HOST_TASK_CAPACITY" >&2
+  exit 1
+}
+[ "$system_slice_pids_max" = max ] \
+  || [ "$system_slice_pids_max" -ge "$REQUIRED_HOST_TASK_CAPACITY" ] || {
+  echo "system.slice pids.max=$system_slice_pids_max; fixed sandboxd task profile requires $REQUIRED_HOST_TASK_CAPACITY" >&2
   exit 1
 }
 
@@ -324,6 +376,33 @@ for container_id in $quiesce_ids; do
     exit 1
   }
 done
+
+# Measure non-tenant baseline task use only after all retained tenants and the prior daemon have
+# been stopped. This keeps a legitimate admitted workload from being mistaken for OS overhead while
+# still refusing an update whose trusted baseline has consumed the fixed reserve.
+system_slice_pids_current=$(awk '{print $1}' /sys/fs/cgroup/system.slice/pids.current)
+loadavg_tasks=$(awk 'NR == 1 {print $4}' /proc/loadavg)
+loadavg_running=${loadavg_tasks%/*}
+global_tasks_current=${loadavg_tasks#*/}
+for value in "$loadavg_running" "$global_tasks_current" "$system_slice_pids_current"; do
+  case "$value" in
+    ''|*[!0-9]*) echo "invalid host task-usage readback: $value" >&2; exit 1 ;;
+  esac
+done
+[ "$loadavg_tasks" = "$loadavg_running/$global_tasks_current" ] || {
+  echo "malformed /proc/loadavg task readback: $loadavg_tasks" >&2
+  exit 1
+}
+[ "$global_tasks_current" -gt 0 ] || {
+  echo "global task readback is empty" >&2
+  exit 1
+}
+[ "$global_tasks_current" -le "$HOST_TASK_RESERVE" ] \
+  && [ "$system_slice_pids_current" -le "$HOST_TASK_RESERVE" ] || {
+  echo "host baseline tasks exceed fixed reserve: global=$global_tasks_current system.slice=$system_slice_pids_current reserve=$HOST_TASK_RESERVE" >&2
+  exit 1
+}
+echo "[prelaunch] fixed task capacity: guest-budget=$HOST_GUEST_PIDS_BUDGET sandboxes=$HOST_MAX_SANDBOXES runtime-budget=$HOST_RUNTIME_TASK_BUDGET reserve=$HOST_TASK_RESERVE required=$REQUIRED_HOST_TASK_CAPACITY threads-max=$threads_max pid-max=$pid_max system.slice-pids-max=$system_slice_pids_max global-current=$global_tasks_current system.slice-current=$system_slice_pids_current"
 
 mkdir -p /etc/docker
 DOCKER_DAEMON_CONFIG=/etc/docker/daemon.json
@@ -1189,7 +1268,8 @@ def start_vm(vm_id: str) -> dict[str, object]:
 def main() -> None:
     mode = sys.argv[1] if len(sys.argv) > 1 else "hash"
 
-    # The measured compose admits up to 5 vCPU / 10 GiB / 232 GiB / 16,384 PIDs of tenant resources.
+    # The measured compose admits up to 5 vCPU / 10 GiB / 232 GiB / 4,096 guest tasks across 32
+    # sandboxes. Pre-launch separately proves their fixed derived host-runtime task envelope.
     # This release has one exact measured machine profile. An explicit future upsize must update
     # these values, the guest preflight/affinity, and any intended admission-budget change together.
     mismatched = []

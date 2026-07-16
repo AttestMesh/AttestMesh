@@ -2,7 +2,10 @@
 
 This release has one exact machine profile: **8 vCPU, 16,384 MiB RAM, and 300 GiB disk**.
 The measured tenant budget remains independently fixed at 5,000 CPU millis, 10,240 MiB memory,
-16,384 PIDs, 237,568 MiB of quota-backed disk, and 50 concurrent sandboxes, all at 1.0 overcommit.
+4,096 exact guest tasks, 237,568 MiB of quota-backed disk, and 32 concurrent sandboxes, all at 1.0
+overcommit. The separate runsc host-task ceilings are fixed at `18*N+512` per tenant; measured
+pre-launch proves their full aggregate plus a reserved OS margin against the kernel and parent
+cgroup and refuses to start when that profile does not fit.
 Hardware discovery never changes those admission limits.
 
 The measured create policy keeps the 100-mCPU runsc floor only for isolated workloads. A runsc
@@ -112,6 +115,9 @@ daemon resumes durable rows, and fails closed unless all of these are true:
 - Docker uses the managed 28 GiB ZFS data root and the pinned runsc runtime;
 - Docker uses unified cgroup v2 with the systemd driver, and sandboxd's read-only host hierarchy
   readback matches every running tenant's exact CPU, memory, zero-swap, and host-PID ceiling;
+- `kernel.threads-max`, `kernel.pid_max`, and `system.slice/pids.max` cover the fixed worst-case
+  `18*4096 + 512*32` runtime envelope plus the configured host-task reserve, while measured
+  baseline task use remains inside that reserve;
 - the trusted daemon's host PID namespace makes Docker's init PID directly comparable to the exact
   leaf's `cgroup.procs`; tenant containers remain in private PID and cgroup namespaces;
 - XFS project block and inode quota enforcement is active;
@@ -154,7 +160,8 @@ no-go unless it proves:
 - an actual runsc workload launches at 4,900 CPU millis, Docker records
   `NanoCpus=4900000000`, and a multi-worker burn is bounded near 4.9 CPUs;
 - memory, guest-task PID (`RLIMIT_NPROC`/`EAGAIN`), XFS block, and XFS inode limits fail at their
-  declared boundaries, while the separate host runsc-process PID cgroup remains exact;
+  declared boundaries, while the separate host runsc-process PID cgroup remains at the reviewed
+  derived `18*N+512` safety ceiling without recording a `pids.events:max` hit;
 - explicit upsize succeeds, every downsize is rejected, and restart preserves the exact size;
 - two untrusted tenants have distinct private `/29` networks, cannot reach each other, the host,
   Docker, the control network, or link-local metadata directly, while public egress and canonical
@@ -164,9 +171,11 @@ no-go unless it proves:
 - quote verification binds the sandbox identity and manifest to the allowlisted app and compose;
 - cleanup returns sandbox count plus all committed and pending resources to zero.
 
-Do not consume 50 permanent allocation-ledger entries merely to retest the concurrent-count branch;
-that path is covered by unit/concurrency recovery tests. Use two live probe identities for the
-aggregate saturation test.
+The full release-candidate acceptance deliberately reaches 32 concurrent identities and therefore
+consumes at least 32 permanent allocation-ledger entries even after cleanup. Run that destructive
+count-saturation branch once per candidate, only after its preflight proves the required lifetime
+headroom; do not use it as a routine health check. Subsequent operational smoke should use two live
+probe identities, while the count branch remains covered by unit/concurrency recovery tests.
 
 ## Incident checks
 
