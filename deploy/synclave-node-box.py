@@ -285,6 +285,7 @@ if docker inspect "$app_name" >/dev/null 2>&1; then
     docker create --name "$diagnostic_name" \
         --network "$app_network" \
         --env-file "$diagnostic_env" \
+        --env SANDBOX_DEFAULT_IMAGE="$SANDBOX_DEFAULT_IMAGE" \
         --init \
         --cap-drop ALL \
         --security-opt no-new-privileges \

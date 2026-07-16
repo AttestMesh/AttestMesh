@@ -67,6 +67,7 @@ class SynclaveNodeContractTests(unittest.TestCase):
         self.assertIn("diagnostic_deadline=$((SECONDS + 45))", box)
         self.assertIn("[ \"$SECONDS\" -lt \"$diagnostic_deadline\" ]", box)
         self.assertIn('--network "$app_network"', box)
+        self.assertIn('--env SANDBOX_DEFAULT_IMAGE="$SANDBOX_DEFAULT_IMAGE"', box)
         self.assertIn('--memory 4g', box)
         self.assertIn('--cpus 1.0', box)
         self.assertIn('--pids-limit 1024', box)
