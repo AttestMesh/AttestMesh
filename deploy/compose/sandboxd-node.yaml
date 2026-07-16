@@ -128,7 +128,9 @@ services:
       SANDBOXD_MAX_ATTESTATION_EVENTS_PER_SANDBOX: "17"
       SANDBOXD_MAX_LIFETIME_ATTESTATION_EVENTS: "512"
       SANDBOXD_MAX_LIFETIME_ATTESTATION_EVENT_BYTES: "2097152"
-      SANDBOXD_ALLOWED_IMAGE_REPOSITORIES: "ghcr.io/dmvt/cs-sandbox-base"
+      # Fleet accepts only exact reviewed preset digests from these public upstream repositories,
+      # plus digest-pinned operator builds from the Synclave workload repository.
+      SANDBOXD_ALLOWED_IMAGE_REPOSITORIES: "docker.io/library/alpine,docker.io/nousresearch/hermes-agent,ghcr.io/openclaw/openclaw,docker.io/nearaidev/ironclaw,ghcr.io/attestmesh/synclave-workloads"
       DOCKER_CONFIG: /run/sandboxd-docker
       SANDBOXD_HOST: 10.191.255.250
       SANDBOXD_PORT: "8088"
@@ -301,8 +303,12 @@ services:
     depends_on:
       sandboxd:
         condition: service_healthy
+    # Pin the proxy as well as sandboxd. On a CVM reboot Docker restores restart-enabled services
+    # before Compose can honor depends_on; a dynamically assigned proxy can otherwise claim
+    # sandboxd's fixed .250 address and make the whole measured app fail with EADDRINUSE.
     networks:
-      - cs-ingress
+      cs-ingress:
+        ipv4_address: 10.191.255.251
     cap_drop:
       - ALL
     security_opt:
