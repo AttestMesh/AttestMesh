@@ -50,7 +50,7 @@ services:
       - /dev/net/tun
 
   sandboxd:
-    image: ghcr.io/dmvt/confidential-sandboxes@sha256:3bd7c80c2dda9f09866266deca9c763902361e750eddacca2d7217d667bcf00a
+    image: ghcr.io/dmvt/confidential-sandboxes@sha256:987d34b8dd445a9bcf175fcf245bc573d4d4659694871c3d63d7ea088ca64ab2
     # The dstack compose runner starts this service only after pre_launch_script has mounted and
     # verified the XFS quota filesystem. Dockerd must never restore it early against the underlying
     # directory during host boot; pre-launch recovery remains the sole restart authority.
@@ -80,8 +80,7 @@ services:
       test:
         - CMD-SHELL
         - >-
-          curl -fsS --max-time 3 http://10.191.255.250:8088/healthz |
-          grep -Eq '"ok":[[:space:]]*true.*"dstack_socket_present":[[:space:]]*true' &&
+          python -c 'import json,urllib.request; r=urllib.request.urlopen("http://10.191.255.250:8088/healthz",timeout=3); d=json.load(r); r.close(); raise SystemExit(not (d.get("ok") is True and d.get("dstack_socket_present") is True))' &&
           test "$$(docker info --format '{{.NCPU}}')" = 8 &&
           xfs_quota -x -c 'state -p' "$${SANDBOX_DISK_ROOT}" |
           grep -q 'Enforcement: ON'
@@ -129,7 +128,7 @@ services:
       SANDBOX_NETWORK_POOL: 10.192.0.0/10
       SANDBOX_NETWORK_PREFIXLEN: "29"
       SANDBOXD_REQUIRE_NETWORK_FIREWALL: "1"
-      SANDBOXD_FIREWALL_HELPER_IMAGE: ghcr.io/dmvt/confidential-sandboxes@sha256:3bd7c80c2dda9f09866266deca9c763902361e750eddacca2d7217d667bcf00a
+      SANDBOXD_FIREWALL_HELPER_IMAGE: ghcr.io/dmvt/confidential-sandboxes@sha256:987d34b8dd445a9bcf175fcf245bc573d4d4659694871c3d63d7ea088ca64ab2
       SANDBOXD_FIREWALL_WATCHDOG_INTERVAL_SECONDS: "15"
       # Preview URLs (/app/{id}/…) are capability URLs reachable without the daemon bearer; /_api/*
       # stays bearer-gated.
