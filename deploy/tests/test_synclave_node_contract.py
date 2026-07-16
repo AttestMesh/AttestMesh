@@ -40,7 +40,7 @@ class SynclaveNodeContractTests(unittest.TestCase):
         self.assertIn('app_restarting" = true', box)
         self.assertIn('app_health" != healthy', box)
         self.assertIn('app_network="${app_networks[0]}"', box)
-        self.assertIn("| sed '/^$/d'", box)
+        self.assertIn("| tr -d '\\r' | sed '/^[[:space:]]*$/d'", box)
         self.assertIn('[ -z "$network_id" ] || [ -z "$endpoint_id" ]', box)
         self.assertIn('network_actual_id" != "$network_id', box)
         self.assertIn('network_project" != dstack', box)
@@ -100,6 +100,22 @@ class SynclaveNodeContractTests(unittest.TestCase):
         self.assertIn("[REDACTED]", result.stdout)
         self.assertIn("migration failed", result.stdout)
         self.assertIn("safe-context", result.stdout)
+
+    def test_network_parser_drops_cr_and_whitespace_only_records(self) -> None:
+        result = subprocess.run(
+            [
+                "bash",
+                "-c",
+                "mapfile -t networks < <(tr -d '\\r' | sed '/^[[:space:]]*$/d'); "
+                "printf '%s:%s\\n' \"${#networks[@]}\" \"${networks[0]}\"",
+            ],
+            input="dstack_default\r\n \t\r\n\r\n",
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+
+        self.assertEqual(result.stdout, "1:dstack_default\n")
 
 
 if __name__ == "__main__":

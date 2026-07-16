@@ -254,7 +254,7 @@ if docker inspect "$app_name" >/dev/null 2>&1; then
       exit 1
     fi
 
-    mapfile -t app_networks < <(docker inspect -f '{{range $name, $_ := .NetworkSettings.Networks}}{{println $name}}{{end}}' "$app_name" | sed '/^$/d')
+    mapfile -t app_networks < <(docker inspect -f '{{range $name, $_ := .NetworkSettings.Networks}}{{println $name}}{{end}}' "$app_name" | tr -d '\r' | sed '/^[[:space:]]*$/d')
     if [ "${#app_networks[@]}" -ne 1 ]; then
       echo "app diagnostic requires one authoritative network attachment; found: ${app_networks[*]:-none}" >&2
       exit 1
