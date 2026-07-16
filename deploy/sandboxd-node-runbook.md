@@ -115,6 +115,9 @@ daemon resumes durable rows, and fails closed unless all of these are true:
 - Docker uses the managed 28 GiB ZFS data root and the pinned runsc runtime;
 - Docker uses unified cgroup v2 with the systemd driver, and sandboxd's read-only host hierarchy
   readback matches every running tenant's exact CPU, memory, zero-swap, and host-PID ceiling;
+- the bounded PID probe finishes inside sandboxd's 60-second upstream-read deadline, the outer TLS
+  proxy waits 70 seconds, and the acceptance client waits 75 seconds, so infrastructure timeouts do
+  not mask a workload result;
 - `kernel.threads-max`, `kernel.pid_max`, and `system.slice/pids.max` cover the fixed worst-case
   `18*4096 + 512*32` runtime envelope plus the configured host-task reserve, while measured
   baseline task use remains inside that reserve;

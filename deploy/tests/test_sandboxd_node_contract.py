@@ -124,6 +124,8 @@ class SandboxdNodeContractTests(unittest.TestCase):
         self.assertRegex(compose, r'HOST_MAX_SANDBOXES:\s*"32"')
         self.assertIn('threads >= 114688 and pids > 114688', compose)
         self.assertIn('/host/sys/fs/cgroup/system.slice/pids.max', compose)
+        self.assertIn('response_header_timeout 70s', compose)
+        self.assertNotIn('response_header_timeout 30s', compose)
 
         def shell_integer(name: str) -> int:
             match = re.search(rf"(?m)^{re.escape(name)}=([0-9]+)$", SOURCE)

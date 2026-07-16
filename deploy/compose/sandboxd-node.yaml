@@ -279,7 +279,10 @@ services:
               header_up X-Forwarded-Proto https
               transport http {
                 dial_timeout 5s
-                response_header_timeout 30s
+                # Preserve ordered failure ownership for bounded acceptance probes: the workload
+                # worker returns before sandboxd's 60s upstream-read deadline, sandboxd returns a
+                # controlled response before this outer TLS proxy, and the operator client uses 75s.
+                response_header_timeout 70s
                 keepalive_idle_conns_per_host 16
               }
             }
