@@ -46,7 +46,7 @@ CUSTOM_DOMAIN_CF_SECRETS_FILE="${CUSTOM_DOMAIN_CF_SECRETS_FILE:-$HOME/.attestmes
 # confidential-sandboxes (sandboxd) wiring for the "Provision sandbox" button. URL/image/plan are
 # non-secret config; the token is the sandboxd daemon secret (reused from its own secrets file).
 SANDBOX_DAEMON_URL="${SANDBOX_DAEMON_URL:-https://2105a8086e4700e611092aaa3efd37e1e302ffd6-8080.gateway.attestmesh.xyz}"
-SANDBOX_DEFAULT_IMAGE="${SANDBOX_DEFAULT_IMAGE:-ghcr.io/dmvt/cs-sandbox-base@sha256:8ccfb22336a73e28b7fd8bef024d355ec5673d70d09a6099ad5094836f65e9d3}"
+SANDBOX_DEFAULT_IMAGE="${SANDBOX_DEFAULT_IMAGE:-ghcr.io/attestmesh/synclave-workloads@sha256:eeeab97469edf54f2d5b9582a0a1c6b49866af931573324919a3dcc6b23a0b4e}"
 SANDBOX_DEFAULT_PLAN="${SANDBOX_DEFAULT_PLAN:-std-1-4-128}"
 SANDBOX_DAEMON_TOKEN="${SANDBOX_DAEMON_TOKEN:-$(sed -nE 's/^SANDBOX_DAEMON_TOKEN=//p' "$HOME/.attestmesh/sandboxd.env" 2>/dev/null)}"
 
