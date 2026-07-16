@@ -46,7 +46,7 @@ PORTS = json.loads(os.environ.get("BOX_PORTS", "[]"))
 # backend + the dstack gateway reach tlsproxy:443 at the CVM's bridge IP. In bridge
 # mode KMS is the SLIRP alias 10.0.2.2 (RA-TLS cert SAN), reached via the host DNAT.
 NET_MODE = (os.environ.get("BOX_NET_MODE", "bridge").strip().lower() or "bridge")
-# Gateway ON: tenant apps at *.app.s.n route through the dstack gateway,
+# Gateway ON: tenant apps at *.app.synclave.net route through the dstack gateway,
 # and the CVM is reachable at <app_id>-<port>s.gateway.attestmesh.xyz. Measured into
 # compose_hash (gateway_enabled).
 GATEWAY_ENABLED = os.environ.get("BOX_GATEWAY_ENABLED", "true").strip().lower() in {
@@ -74,6 +74,8 @@ ENV_KEYS = [
     "NEXTAUTH_URL",
     "APP_DOMAIN",
     "DIRECTORY_HOST",
+    "WEBHOST_ADMIN_HOST",
+    "ACME_EMAIL",
     "CONSOLE_HOST",
     "REDPILL_API_KEY",
     "REDPILL_BASE_URL",
@@ -193,6 +195,48 @@ fi
 "$RUNSC_BIN" --version
 docker info 2>/dev/null | grep -iE "runtime" || true
 docker info 2>/dev/null | grep -qi "runsc"
+
+# Compose can leave its temporary <container-id>_<project>-<service> rename
+# behind when a recreate is interrupted. Recover only the documented sidecar
+# tombstone, and only after Docker proves it is stopped and has the expected
+# Compose identity. Never force-remove or broad-match live services.
+tombstone_ids=()
+while read -r container_id container_name; do
+  case "$container_name" in
+    ????????????_dstack-sidecar-1)
+      prefix="${container_name%%_*}"
+      case "$prefix" in
+        *[!0-9a-f]*) ;;
+        *) tombstone_ids+=("$container_id") ;;
+      esac
+      ;;
+  esac
+done < <(docker ps -a --format '{{.ID}} {{.Names}}')
+if [ "${#tombstone_ids[@]}" -gt 1 ]; then
+  echo "multiple dstack sidecar tombstones found; refusing recovery" >&2
+  exit 1
+fi
+if [ "${#tombstone_ids[@]}" -eq 1 ]; then
+  tombstone_id="${tombstone_ids[0]}"
+  tombstone_name="$(docker inspect -f '{{.Name}}' "$tombstone_id")"
+  tombstone_name="${tombstone_name#/}"
+  tombstone_running="$(docker inspect -f '{{.State.Running}}' "$tombstone_id")"
+  tombstone_project="$(docker inspect -f '{{index .Config.Labels "com.docker.compose.project"}}' "$tombstone_id")"
+  tombstone_service="$(docker inspect -f '{{index .Config.Labels "com.docker.compose.service"}}' "$tombstone_id")"
+  case "$tombstone_name" in
+    ????????????_dstack-sidecar-1) ;;
+    *) echo "sidecar recovery target name changed; refusing" >&2; exit 1 ;;
+  esac
+  if [ "$tombstone_running" != false ] \
+    || [ "$tombstone_project" != dstack ] \
+    || [ "$tombstone_service" != sidecar ] \
+    || [ "$tombstone_name" = dstack-sidecar-1 ]; then
+    echo "sidecar recovery target is not a stopped Compose tombstone; refusing" >&2
+    exit 1
+  fi
+  echo "[prelaunch] removing stopped Compose tombstone $tombstone_name"
+  docker rm "$tombstone_id" >/dev/null
+fi
 
 # dstack's minimal guest /dev does not populate loop device nodes. The kernel
 # loop driver is built in, so create the standard control and block-device nodes

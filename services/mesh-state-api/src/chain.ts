@@ -1,7 +1,7 @@
 // On-chain reader (spec §6). Produces output-shaped snapshots pinned to a single
 // block so members are never torn across block boundaries.
 
-import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rename, stat, writeFile } from "node:fs/promises";
 import { dirname } from "node:path";
 import { createPublicClient, http, keccak256, type PublicClient } from "viem";
 import { base } from "viem/chains";
@@ -223,6 +223,7 @@ export interface MeshIndexState {
   clusterFactoryAddr: `0x${string}`;
   scannedToBlock: number;
   clusters: IndexedCluster[];
+  updatedAt: string | null;
 }
 
 export function makeClient(cfg: Config): PublicClient {
@@ -279,6 +280,7 @@ function emptyIndexState(cfg: Config): MeshIndexState {
     clusterFactoryAddr: cfg.clusterFactoryAddr,
     scannedToBlock: Number(cfg.clusterFactoryStartBlock - 1n),
     clusters: [],
+    updatedAt: null,
   };
 }
 
@@ -295,7 +297,11 @@ async function readIndexState(cfg: Config): Promise<MeshIndexState> {
     ) {
       return emptyIndexState(cfg);
     }
-    return state;
+    const persistedAt =
+      typeof state.updatedAt === "string" && Number.isFinite(Date.parse(state.updatedAt))
+        ? state.updatedAt
+        : (await stat(cfg.indexStatePath)).mtime.toISOString();
+    return { ...state, updatedAt: persistedAt };
   } catch {
     return emptyIndexState(cfg);
   }
@@ -308,8 +314,22 @@ export async function readMeshIndex(cfg: Config): Promise<MeshIndexState> {
 async function writeIndexState(cfg: Config, state: MeshIndexState): Promise<void> {
   await mkdir(dirname(cfg.indexStatePath), { recursive: true });
   const tmp = `${cfg.indexStatePath}.${process.pid}.tmp`;
+  state.updatedAt = new Date().toISOString();
   await writeFile(tmp, `${JSON.stringify(state, null, 2)}\n`, { mode: 0o600 });
   await rename(tmp, cfg.indexStatePath);
+}
+
+export function meshIndexProgress(state: MeshIndexState): {
+  atBlock: number;
+  headBlock: number;
+  blockLag: number;
+} {
+  const headBlock = state.scannedToBlock;
+  const atBlock = state.clusters.reduce(
+    (oldest, cluster) => Math.min(oldest, cluster.scannedToBlock),
+    headBlock,
+  );
+  return { atBlock, headBlock, blockLag: Math.max(0, headBlock - atBlock) };
 }
 
 async function blockTimestamp(

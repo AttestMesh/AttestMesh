@@ -22,7 +22,9 @@
 # No secrets are committed here; all ${VAR} values are sealed into the CVM by
 # deploy/synclave-node.sh (key NAMES are measured into the compose_hash, VALUES
 # are sealed to the app's X25519 key).
-name: attestmesh-synclave
+# Keep the runner's established `dstack` project identity: persistent production
+# containers and their published sidecar ports are owned by that project.
+name: dstack
 
 x-logging: &production-logging
   driver: json-file
@@ -193,9 +195,8 @@ services:
     # v21 = user-visible orchestrator failure details in enclave deploys;
     # v20 = CLUSTER_NETWORKS-only live mesh config + structured orchestrator errors;
     # v19 = Apps → Sandboxes rename (labels only, wire stays app).
-    # v44 = fleet-control main 1cb4ebb — sandbox-first Stripe billing foundation;
-    #       production stays keyless/inert until separately approved credentials and switches arrive.
-    image: ghcr.io/attestmesh/synclave-app:sha-c4494d6e69d6c59d0cd8d70dc4b0f34487ae2355@sha256:bf90e172bd5f821631a0d3dd50afda7b2efc0bd6133d7c3b12acd297223e9540
+    # Synclave main a0545a2 — deterministic repository compatibility analyzer.
+    image: ghcr.io/attestmesh/synclave-app:sha-a0545a207ba51c1757a3c5303cc1e5c8e609428c@sha256:cfcb54cfdee391d59d7cddb84f2d0f3cdcc37d5f5405d1a27546512a04c5fd98
     environment:
       API_HOST: 0.0.0.0
       API_PORT: 80
@@ -269,7 +270,7 @@ services:
     security_opt:
       - no-new-privileges:true
     mem_limit: 4g
-    cpus: 2.0
+    cpus: 1.0
     pids_limit: 1024
     logging: *production-logging
     healthcheck:

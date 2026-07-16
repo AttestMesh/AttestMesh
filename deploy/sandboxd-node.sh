@@ -1071,19 +1071,28 @@ import hashlib, json, os, subprocess, sys, time
 
 tok = os.environ["TOK"]
 gw = os.environ["GW"].rstrip("/")
-image = "ghcr.io/dmvt/cs-sandbox-base@sha256:5479cfaa62a9e553b85122ddd133724e3f737990d16c1f27e6b35a740a54cd13"
+image = "ghcr.io/attestmesh/synclave-workloads@sha256:eeeab97469edf54f2d5b9582a0a1c6b49866af931573324919a3dcc6b23a0b4e"
+request_suffix = f"{int(time.time())}-{os.getpid()}"
+idempotency_key = f"release-smoke-{request_suffix}"
 payload = {
     "owner": "ops:release-smoke",
     "org_id": "ops",
-    "sandbox_handle": f"release-{int(time.time())}-{os.getpid()}",
-    "runtime": {"kind": "runsc", "image": image},
-    "resources": {"cpu_millis": 100, "memory_mb": 128, "pids": 128, "disk_mb": 16},
+    "sandbox_handle": f"release-{request_suffix}",
+    "runtime": {
+        "kind": "runsc",
+        "image": image,
+        "command": "/bin/sh",
+        "args": ["-c", "sleep 3600"],
+    },
+    "resources": {"cpu_millis": 1000, "memory_mb": 1024, "pids": 256, "disk_mb": 10240},
 }
 
-def request(method, url, body=None, *, auth=False):
+def request(method, url, body=None, *, auth=False, headers=None):
     args = ["curl", "-sS", "--max-time", "45", "-X", method, "-w", "\n%{http_code}"]
     if auth:
         args += ["-H", f"Authorization: Bearer {tok}"]
+    for name, value in (headers or {}).items():
+        args += ["-H", f"{name}: {value}"]
     if body is not None:
         args += ["-H", "Content-Type: application/json", "--data-binary", json.dumps(body)]
     proc = subprocess.run([*args, url], text=True, capture_output=True, timeout=50)
@@ -1093,14 +1102,47 @@ def request(method, url, body=None, *, auth=False):
     return int(code), response
 
 sid = None
+capacity_before = None
 try:
-    code, raw = request("POST", f"{gw}/_api/sandboxes", payload, auth=True)
+    code, raw = request("GET", f"{gw}/_api/capacity", auth=True)
+    if code != 200:
+        raise RuntimeError(f"capacity preflight returned HTTP {code}")
+    capacity_before = json.loads(raw)
+
+    create_headers = {"Idempotency-Key": idempotency_key}
+    code, raw = request(
+        "POST", f"{gw}/_api/sandboxes", payload, auth=True, headers=create_headers
+    )
     if code != 201:
         raise RuntimeError(f"create returned HTTP {code}: {raw[:500]}")
     created = json.loads(raw)
     sid = created.get("id")
     if not sid or created.get("status") != "running":
         raise RuntimeError("create did not return a running sandbox identity")
+
+    code, raw = request(
+        "POST", f"{gw}/_api/sandboxes", payload, auth=True, headers=create_headers
+    )
+    if code != 201:
+        raise RuntimeError(f"idempotent replay returned HTTP {code}: {raw[:500]}")
+    replayed = json.loads(raw)
+    if replayed.get("id") != sid:
+        raise RuntimeError("idempotent replay returned a different sandbox identity")
+
+    code, raw = request("GET", f"{gw}/_api/capacity", auth=True)
+    if code != 200:
+        raise RuntimeError(f"capacity readback returned HTTP {code}")
+    capacity_during = json.loads(raw)
+    expected_resources = payload["resources"]
+    before_committed = capacity_before["committed"]
+    during_committed = capacity_during["committed"]
+    single_capacity_commit = (
+        capacity_during["sandbox_count"] == capacity_before["sandbox_count"] + 1
+        and all(
+            during_committed[name] == before_committed[name] + value
+            for name, value in expected_resources.items()
+        )
+    )
 
     code, raw = request("GET", f"{gw}/s/{sid}/attestation")
     if code != 200:
@@ -1121,6 +1163,8 @@ try:
             for event in events
         ),
         "image_pinned": (att.get("manifest", {}).get("runtime", {}).get("image") == image),
+        "idempotent_replay": replayed.get("id") == sid,
+        "single_capacity_commit": single_capacity_commit,
     }
     print("smoke", json.dumps({"sandbox_id": sid[:12] + "…", "checks": checks}, indent=2))
     if not all(checks.values()):
@@ -1143,6 +1187,15 @@ finally:
             code, _ = request("DELETE", f"{gw}/_api/sandboxes/{sid}", auth=True)
             if code != 200:
                 raise RuntimeError(f"cleanup returned HTTP {code}")
+            code, raw = request("GET", f"{gw}/_api/capacity", auth=True)
+            if code != 200:
+                raise RuntimeError(f"cleanup capacity readback returned HTTP {code}")
+            capacity_after = json.loads(raw)
+            if capacity_before is None or (
+                capacity_after["sandbox_count"] != capacity_before["sandbox_count"]
+                or capacity_after["committed"] != capacity_before["committed"]
+            ):
+                raise RuntimeError("cleanup did not restore the original capacity commitment")
         except Exception as cleanup_error:
             print(f"smoke cleanup failed: {cleanup_error}", file=sys.stderr)
             sys.exit_code = 1
