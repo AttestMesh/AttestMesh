@@ -193,9 +193,8 @@ services:
     # v21 = user-visible orchestrator failure details in enclave deploys;
     # v20 = CLUSTER_NETWORKS-only live mesh config + structured orchestrator errors;
     # v19 = Apps → Sandboxes rename (labels only, wire stays app).
-    # v46 = fleet-control main 3536566 — full app.synclave.net hosted-app domain;
-    #       includes the v45 test-catalog controls and v44 sandbox-first billing foundation.
-    image: ghcr.io/dmvt/synclave-app:full-domain-3536566@sha256:466758dbb249703c805048a6b9ba43fe0fd2bfa1d0a00a97efaac3a95aef04a4
+    # Synclave main a0545a2 — deterministic repository compatibility analyzer.
+    image: ghcr.io/attestmesh/synclave-app:sha-a0545a207ba51c1757a3c5303cc1e5c8e609428c@sha256:cfcb54cfdee391d59d7cddb84f2d0f3cdcc37d5f5405d1a27546512a04c5fd98
     environment:
       API_HOST: 0.0.0.0
       API_PORT: 80
