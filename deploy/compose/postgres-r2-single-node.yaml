@@ -62,7 +62,7 @@ services:
       - POSTGRES_DB=postgres
       - POSTGRES_INITDB_ARGS=--encoding=UTF8 --locale=C
       - BACKUP_ENABLED=true
-      - BACKUP_PREFIX=openkey-shared/backups
+      - BACKUP_PREFIX=shared-postgres/backups
       - AGENT_GRPC_SOCKET=/var/run/attestmesh/agent.sock
       - WALG_KEY_FILE=/run/walg/key
       - WALG_STATUS_FILE=/walg-status/state
