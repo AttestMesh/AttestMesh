@@ -2,7 +2,7 @@
 # PGlite identity store and uses the dstack guest socket for TEE key operations.
 services:
   sidecar:
-    image: ghcr.io/attestmesh/cluster-mesh-agent@sha256:e3d53442aa6e52d47227fb3528c1141302ad4fc63c4b3fb6dc38df7ce907d486
+    image: ghcr.io/attestmesh/cluster-mesh-agent@sha256:edb20df54414c2c668cd557e2250b834590a3ef308c86965e4ef70f82ed5c36d
     restart: unless-stopped
     environment:
       - CHAIN_ID=${CHAIN_ID}
