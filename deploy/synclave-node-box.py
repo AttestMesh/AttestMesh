@@ -282,9 +282,7 @@ if docker inspect "$app_name" >/dev/null 2>&1; then
     docker stop -t 10 "$app_name" >/dev/null
 
     echo "[prelaunch] running bounded app migration/start diagnostic; stdout suppressed" >&2
-    set +e
-    timeout --foreground --signal=TERM --kill-after=5s 45s \
-      docker run --rm --name "$diagnostic_name" \
+    docker create --name "$diagnostic_name" \
         --network "$app_network" \
         --env-file "$diagnostic_env" \
         --init \
@@ -293,19 +291,31 @@ if docker inspect "$app_name" >/dev/null 2>&1; then
         --memory 4g \
         --cpus 1.0 \
         --pids-limit 1024 \
-        "$diagnostic_image" \
-        >/dev/null 2> >(redact_diagnostic_stderr "$diagnostic_env" >&2)
-    diagnostic_rc=$?
-    set -e
+        "$diagnostic_image" >/dev/null
+    docker start "$diagnostic_name" >/dev/null
+    docker logs --follow "$diagnostic_name" \
+      >/dev/null 2> >(redact_diagnostic_stderr "$diagnostic_env" >&2) &
+    diagnostic_logs_pid=$!
+    diagnostic_deadline=$((SECONDS + 45))
+    while [ "$(docker inspect -f '{{.State.Running}}' "$diagnostic_name")" = true ] \
+      && [ "$SECONDS" -lt "$diagnostic_deadline" ]; do
+      sleep 1
+    done
 
-    if docker inspect "$diagnostic_name" >/dev/null 2>&1; then
-      docker stop -t 5 "$diagnostic_name" >/dev/null 2>&1 || true
-      docker rm "$diagnostic_name" >/dev/null 2>&1 || true
+    diagnostic_timed_out=false
+    if [ "$(docker inspect -f '{{.State.Running}}' "$diagnostic_name")" = true ]; then
+      diagnostic_timed_out=true
+      docker rm --force "$diagnostic_name" >/dev/null
+      wait "$diagnostic_logs_pid" 2>/dev/null || true
+    else
+      diagnostic_rc="$(docker inspect -f '{{.State.ExitCode}}' "$diagnostic_name")"
+      wait "$diagnostic_logs_pid" 2>/dev/null || true
+      docker rm "$diagnostic_name" >/dev/null
     fi
     rm -f "$diagnostic_env"
     trap - EXIT
 
-    if [ "$diagnostic_rc" -eq 124 ] || [ "$diagnostic_rc" -eq 143 ]; then
+    if [ "$diagnostic_timed_out" = true ]; then
       echo "[prelaunch] app migration/start diagnostic remained healthy for 45 seconds" >&2
     elif [ "$diagnostic_rc" -ne 0 ]; then
       echo "[prelaunch] app migration/start diagnostic exited rc=$diagnostic_rc" >&2

@@ -48,19 +48,24 @@ class SynclaveNodeContractTests(unittest.TestCase):
         self.assertIn("mktemp /run/dstack-app-diagnostic.env.", box)
         self.assertIn('chmod 600 "$diagnostic_env"', box)
         self.assertIn("PASSWORD|SECRET|TOKEN|AUTHORIZATION|API_KEY|DATABASE_URL", box)
-        self.assertIn("timeout --foreground --signal=TERM --kill-after=5s 45s", box)
+        self.assertNotIn("timeout ", box)
+        self.assertIn('docker create --name "$diagnostic_name"', box)
+        self.assertIn('docker start "$diagnostic_name"', box)
+        self.assertIn('docker logs --follow "$diagnostic_name"', box)
+        self.assertIn("diagnostic_deadline=$((SECONDS + 45))", box)
+        self.assertIn("[ \"$SECONDS\" -lt \"$diagnostic_deadline\" ]", box)
         self.assertIn('--network "$app_network"', box)
         self.assertIn('--memory 4g', box)
         self.assertIn('--cpus 1.0', box)
         self.assertIn('--pids-limit 1024', box)
         self.assertIn('>/dev/null 2> >(redact_diagnostic_stderr', box)
-        self.assertNotIn('docker rm -f "$diagnostic_name"', box)
+        self.assertIn('docker rm --force "$diagnostic_name"', box)
 
-        diagnostic_run = box.split("docker run --rm --name", 1)[1].split(
-            '>/dev/null 2> >(redact_diagnostic_stderr', 1
+        diagnostic_create = box.split("docker create --name", 1)[1].split(
+            '"$diagnostic_image" >/dev/null', 1
         )[0]
-        self.assertNotIn("--volume", diagnostic_run)
-        self.assertNotIn(" -v ", diagnostic_run)
+        self.assertNotIn("--volume", diagnostic_create)
+        self.assertNotIn(" -v ", diagnostic_create)
 
     def test_failed_app_diagnostic_redactor_removes_secret_markers(self) -> None:
         box = (ROOT / "deploy/synclave-node-box.py").read_text(encoding="utf-8")
