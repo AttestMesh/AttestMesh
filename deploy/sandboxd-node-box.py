@@ -69,8 +69,20 @@ def app_compose_and_hash(env_keys: list[str]) -> tuple[str, str]:
         "gateway_enabled": GATEWAY_ENABLED,
         "local_key_provider_enabled": False,
         "key_provider_id": "",
-        "public_logs": True,
-        "public_sysinfo": True,
+        # The guest-agent dashboard otherwise exposes service/container inventory and, when logs are
+        # enabled, request metadata to unauthenticated port 8090 clients.
+        "public_logs": False,
+        "public_sysinfo": False,
+        # The gateway must never expose the guest-agent dashboard (8090), sidecar health (9090), or
+        # one-shot registration helper (9092). Keep only audited product ingress and mesh transport.
+        "port_policy": {
+            "restrict_mode": True,
+            "ports": [
+                {"port": 443, "pp": False},
+                {"port": 8080, "pp": False},
+                {"port": 51900, "pp": False},
+            ],
+        },
         "allowed_envs": sorted(set(env_keys) | {"APP_ID"}),
         "no_instance_id": False,
         "secure_time": False,
@@ -100,7 +112,7 @@ QUOTA_ZVOL_BYTES=$((251 * 1024 * 1024 * 1024))
 QUOTA_SOLD_MIB=237568
 QUOTA_FS_HEADROOM_MIB=18432
 QUOTA_POOL_HEADROOM_MIB=28672
-QUOTA_TOOLS_IMAGE="ghcr.io/dmvt/confidential-sandboxes@sha256:96619929983e0cd33c2b018e0500f629b1db6181d4dba11cc4ba115efa3a69b4"
+QUOTA_TOOLS_IMAGE="ghcr.io/dmvt/confidential-sandboxes@sha256:ab4a6a5059662e52cdc408ac8abb3456f4b4ea612595f4d8b8d42c4c6db1e98f"
 EXPECTED_HOST_VCPUS=8
 # The VMM resource readback must still be exactly 16,384 MiB. Inside this TDX image that allocation
 # exposes about 15,034 MiB after confidential-guest firmware/kernel reservations, so retain a
@@ -116,7 +128,7 @@ mkdir -p "$DOCKER_CONFIG"
 chmod 0700 "$DOCKER_CONFIG"
 trap 'rm -rf "$DOCKER_CONFIG"; rm -f "$DOCKER_AFFINITY_TMP"' EXIT
 
-for tool in awk curl df docker find grep head jq mount rm sed systemctl zfs zpool; do
+for tool in awk curl df docker find grep head jq mount rm sed sysctl systemctl zfs zpool; do
   command -v "$tool" >/dev/null 2>&1 || {
     echo "missing required sandboxd host tool: $tool" >&2
     exit 1
@@ -397,30 +409,55 @@ fi
 # namespace after dockerd has created DOCKER-USER. INPUT blocks tenants from reaching host and
 # published ports directly. The custom forwarding chain permits true layer-2 traffic on the same
 # private bridge (tenant <-> sandboxd proxy), rejects private/special destinations, and returns only
-# public internet traffic to Docker's normal forwarding/NAT path.
+# public internet traffic to Docker's normal forwarding/NAT path. The daemon installs exact
+# source-and-destination /29 returns for validated labeled tenant networks before resuming them; the
+# pre-launch base chain deliberately starts with no private allow and is therefore fail-closed.
+sysctl -w net.ipv4.ip_forward=1 >/dev/null
+sysctl -w net.bridge.bridge-nf-call-iptables=1 >/dev/null
+[ "$(sysctl -n net.ipv4.ip_forward)" = "1" ] || {
+  echo "IPv4 forwarding is disabled" >&2
+  exit 1
+}
+[ "$(sysctl -n net.bridge.bridge-nf-call-iptables)" = "1" ] || {
+  echo "bridge IPv4 packets do not traverse the host firewall" >&2
+  exit 1
+}
+# A helper container shares the host network namespace but not its mount namespace. Bind the exact
+# host xtables lock inode so every save/restore serializes with dockerd's own firewall updates.
+touch /run/xtables.lock
+chmod 0600 /run/xtables.lock
 docker run --rm --privileged --network host \
+  --mount type=bind,src=/run/xtables.lock,dst=/run/xtables.lock \
   --entrypoint sh "$QUOTA_TOOLS_IMAGE" -ceu '
     IPT=
+    IPTR=
     for backend in iptables-legacy iptables-nft iptables; do
+      restore="${backend}-restore"
       command -v "$backend" >/dev/null 2>&1 || continue
+      command -v "$restore" >/dev/null 2>&1 || continue
       if "$backend" -w 5 -nL DOCKER-USER >/dev/null 2>&1; then
         IPT="$backend"
+        IPTR="$restore"
         break
       fi
     done
     [ -n "$IPT" ] || { echo "no iptables backend owns DOCKER-USER" >&2; exit 1; }
     ipt() { "$IPT" -w 5 "$@"; }
     ipt -N SANDBOXD-TENANT 2>/dev/null || true
-    ipt -F SANDBOXD-TENANT
-    ipt -A SANDBOXD-TENANT -d 10.192.0.0/10 -m physdev --physdev-is-bridged -j RETURN
+    restore_file=/tmp/sandboxd-firewall-base
+    cat > "$restore_file" <<EOF
+*filter
+-F SANDBOXD-TENANT
+EOF
     for cidr in \
       0.0.0.0/8 10.0.0.0/8 100.64.0.0/10 127.0.0.0/8 \
       169.254.0.0/16 172.16.0.0/12 192.0.0.0/24 192.0.2.0/24 \
       192.168.0.0/16 198.18.0.0/15 198.51.100.0/24 203.0.113.0/24 \
       224.0.0.0/4 240.0.0.0/4; do
-      ipt -A SANDBOXD-TENANT -d "$cidr" -j REJECT
+      printf "%s\n" "-A SANDBOXD-TENANT -d $cidr -j REJECT" >> "$restore_file"
     done
-    ipt -A SANDBOXD-TENANT -j RETURN
+    printf "%s\n" "-A SANDBOXD-TENANT -j RETURN" COMMIT >> "$restore_file"
+    "$IPTR" -w 5 --noflush < "$restore_file"
     # A correctly populated DOCKER-USER chain is inert if the Docker FORWARD hook was removed or
     # reordered. Canonicalize the hook as the first forwarding rule and verify it explicitly.
     while ipt -C FORWARD -j DOCKER-USER 2>/dev/null; do
@@ -439,9 +476,13 @@ docker run --rm --privileged --network host \
     [ "$first_forward" = "-A FORWARD -j DOCKER-USER" ]
     ipt -C DOCKER-USER -i "csb+" -j SANDBOXD-TENANT
     ipt -C INPUT -i "csb+" -j REJECT
-    ipt -C SANDBOXD-TENANT -d 10.192.0.0/10 -m physdev --physdev-is-bridged -j RETURN
     ipt -C SANDBOXD-TENANT -d 10.0.0.0/8 -j REJECT
     ipt -C SANDBOXD-TENANT -d 169.254.0.0/16 -j REJECT
+    expected="$(sed -n "/^-A SANDBOXD-TENANT /p" "$restore_file")"
+    "$IPT" -w 5 -t filter -S > /tmp/sandboxd-firewall-rules
+    actual="$(sed -n "/^-A SANDBOXD-TENANT /p" /tmp/sandboxd-firewall-rules \
+      | sed "s/ --reject-with icmp-port-unreachable$//")"
+    [ "$actual" = "$expected" ]
   '
 
 # Persistent sandbox storage is a separate XFS filesystem with project-quota enforcement. A sparse

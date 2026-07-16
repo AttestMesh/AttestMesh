@@ -21,6 +21,29 @@ class SandboxdBootOrder(unittest.TestCase):
         self.assertLess(neutralize, restart)
         self.assertLess(restart, mount)
 
+    def test_host_firewall_uses_shared_lock_and_atomic_chain_restore(self):
+        helper = (ROOT / "deploy/sandboxd-node-box.py").read_text()
+        self.assertIn("touch /run/xtables.lock", helper)
+        self.assertIn(
+            "--mount type=bind,src=/run/xtables.lock,dst=/run/xtables.lock", helper
+        )
+        self.assertIn('"$IPTR" -w 5 --noflush < "$restore_file"', helper)
+        self.assertIn("net.bridge.bridge-nf-call-iptables=1", helper)
+        self.assertNotIn("--physdev-is-bridged", helper)
+
+    def test_guest_dashboard_is_closed_by_measured_port_policy(self):
+        helper = (ROOT / "deploy/sandboxd-node-box.py").read_text()
+        self.assertIn('"public_logs": False', helper)
+        self.assertIn('"public_sysinfo": False', helper)
+        self.assertIn('"restrict_mode": True', helper)
+        for port in (443, 8080, 51900):
+            self.assertIn(f'{{"port": {port}, "pp": False}}', helper)
+        for forbidden in (8090, 9090, 9092):
+            self.assertNotIn(f'{{"port": {forbidden}, "pp": False}}', helper)
+
+        compose = (ROOT / "deploy/compose/sandboxd-node.yaml").read_text()
+        self.assertNotRegex(compose, r"(?m)^\s+log:\s*$")
+
 
 if __name__ == "__main__":
     unittest.main()

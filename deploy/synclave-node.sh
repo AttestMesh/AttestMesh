@@ -46,8 +46,9 @@ CUSTOM_DOMAIN_CF_SECRETS_FILE="${CUSTOM_DOMAIN_CF_SECRETS_FILE:-$HOME/.attestmes
 # confidential-sandboxes (sandboxd) wiring for the "Provision sandbox" button. URL/image/plan are
 # non-secret config; the token is the sandboxd daemon secret (reused from its own secrets file).
 SANDBOX_DAEMON_URL="${SANDBOX_DAEMON_URL:-https://2105a8086e4700e611092aaa3efd37e1e302ffd6-8080.gateway.attestmesh.xyz}"
-SANDBOX_DEFAULT_IMAGE="${SANDBOX_DEFAULT_IMAGE:-ghcr.io/dmvt/cs-sandbox-base@sha256:8ccfb22336a73e28b7fd8bef024d355ec5673d70d09a6099ad5094836f65e9d3}"
+SANDBOX_DEFAULT_IMAGE="${SANDBOX_DEFAULT_IMAGE:-ghcr.io/dmvt/cs-sandbox-base@sha256:5479cfaa62a9e553b85122ddd133724e3f737990d16c1f27e6b35a740a54cd13}"
 SANDBOX_DEFAULT_PLAN="${SANDBOX_DEFAULT_PLAN:-std-1-4-128}"
+SANDBOX_APPS_DOMAIN="${SANDBOX_APPS_DOMAIN:-sandbox.synclave.net}"
 SANDBOX_DAEMON_TOKEN="${SANDBOX_DAEMON_TOKEN:-$(sed -nE 's/^SANDBOX_DAEMON_TOKEN=//p' "$HOME/.attestmesh/sandboxd.env" 2>/dev/null)}"
 
 # Non-secret config (overridable), sealed alongside the secrets for one measured surface.
@@ -142,6 +143,8 @@ _require_env() {
     [ -n "${!k:-}" ] || die "secret $k not set in $SECRETS_FILE"
   done
   [ -n "${SANDBOX_DAEMON_TOKEN:-}" ] || die "SANDBOX_DAEMON_TOKEN empty (expected in \$HOME/.attestmesh/sandboxd.env); required for the Provision button"
+  [ "$SANDBOX_APPS_DOMAIN" = "sandbox.synclave.net" ] \
+    || die "SANDBOX_APPS_DOMAIN must be the dedicated sandbox.synclave.net zone"
   # Synclave's DB defaults to the C3 pg-ha cluster. The compose exposes pg-ha via
   # sidecar-netns forwarders because the app container is not itself in the WG netns.
   DATABASE_URL="${DATABASE_URL:-postgresql://synclave:${POSTGRES_PASSWORD}@sidecar:15431/synclave}"
@@ -223,6 +226,7 @@ _box_run() {
     printf 'E_SANDBOX_DAEMON_TOKEN=%q\n'     "$SANDBOX_DAEMON_TOKEN"
     printf 'E_SANDBOX_DEFAULT_IMAGE=%q\n'    "$SANDBOX_DEFAULT_IMAGE"
     printf 'E_SANDBOX_DEFAULT_PLAN=%q\n'     "$SANDBOX_DEFAULT_PLAN"
+    printf 'E_SANDBOX_APPS_DOMAIN=%q\n'      "$SANDBOX_APPS_DOMAIN"
     printf 'E_DSTACK_DOCKER_USERNAME=%q\n'   "${guser:-dmvt}"
     printf 'E_DSTACK_DOCKER_PASSWORD=%q\n'   "$gtok"
     printf 'E_DSTACK_DOCKER_REGISTRY=%q\n'   "ghcr.io"

@@ -61,6 +61,36 @@ class SandboxdNodeContractTests(unittest.TestCase):
         self.assertRegex(compose, r'HOST_CPU_OVERCOMMIT:\s*"1[.]0"')
         self.assertIn("test \"$$(docker info --format '{{.NCPU}}')\" = 8", compose)
 
+    def test_lifetime_ledgers_have_measured_hard_caps(self) -> None:
+        compose = (ROOT / "deploy" / "compose" / "sandboxd-node.yaml").read_text()
+        expected = {
+            "SANDBOXD_MAX_LIFETIME_ALLOCATIONS": "512",
+            "SANDBOXD_MAX_ATTESTATION_EVENTS_PER_SANDBOX": "17",
+            "SANDBOXD_MAX_LIFETIME_ATTESTATION_EVENTS": "512",
+            "SANDBOXD_MAX_LIFETIME_ATTESTATION_EVENT_BYTES": "2097152",
+        }
+        for name, value in expected.items():
+            self.assertRegex(compose, rf'{name}:\s*"{value}"')
+
+    def test_synclave_receives_the_measured_sandbox_app_domain(self) -> None:
+        deploy_script = (ROOT / "deploy" / "synclave-node.sh").read_text()
+        box_helper = (ROOT / "deploy" / "synclave-node-box.py").read_text()
+        compose = (ROOT / "deploy" / "compose" / "synclave-node.yaml").read_text()
+
+        self.assertIn(
+            'SANDBOX_APPS_DOMAIN="${SANDBOX_APPS_DOMAIN:-sandbox.synclave.net}"',
+            deploy_script,
+        )
+        self.assertIn("E_SANDBOX_APPS_DOMAIN=%q", deploy_script)
+        self.assertIn(
+            'SANDBOX_APPS_DOMAIN must be the dedicated sandbox.synclave.net zone',
+            deploy_script,
+        )
+        self.assertIn('"SANDBOX_APPS_DOMAIN"', box_helper)
+        self.assertIn("SANDBOX_APPS_DOMAIN: ${SANDBOX_APPS_DOMAIN}", compose)
+        # Adding the sandbox origin must not displace the existing application session secret.
+        self.assertIn("SESSION_SECRET: ${SESSION_SECRET}", compose)
+
     def test_update_commits_hash_only_after_target_health(self) -> None:
         deploy_script = (ROOT / "deploy" / "sandboxd-node.sh").read_text()
         readback_gate = deploy_script.index("VMM did not read back target compose")

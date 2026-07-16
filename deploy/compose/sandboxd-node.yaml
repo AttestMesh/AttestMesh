@@ -50,7 +50,7 @@ services:
       - /dev/net/tun
 
   sandboxd:
-    image: ghcr.io/dmvt/confidential-sandboxes@sha256:96619929983e0cd33c2b018e0500f629b1db6181d4dba11cc4ba115efa3a69b4
+    image: ghcr.io/dmvt/confidential-sandboxes@sha256:ab4a6a5059662e52cdc408ac8abb3456f4b4ea612595f4d8b8d42c4c6db1e98f
     # The dstack compose runner starts this service only after pre_launch_script has mounted and
     # verified the XFS quota filesystem. Dockerd must never restore it early against the underlying
     # directory during host boot; pre-launch recovery remains the sole restart authority.
@@ -111,10 +111,16 @@ services:
       SANDBOXD_MAX_PROXY_CONNECTIONS_PER_SANDBOX: "4"
       SANDBOXD_PROXY_TOTAL_TIMEOUT_SECONDS: "300"
       SANDBOXD_PROXY_READ_TIMEOUT_SECONDS: "60"
+      # Do not report a networked sandbox running until the daemon can complete a real TCP connect
+      # over its exact private bridge. This includes cold-start allowance for runsc workloads.
+      SANDBOXD_INGRESS_READY_TIMEOUT_SECONDS: "90"
       SANDBOXD_RECOVERY_TIMEOUT_SECONDS: "300"
       # Initial production guardrail for the permanent handle ledger and append-only RTMR3 history.
       # Raising this is an explicit measured deployment change after quote-size monitoring.
-      SANDBOXD_MAX_LIFETIME_ALLOCATIONS: "1000"
+      SANDBOXD_MAX_LIFETIME_ALLOCATIONS: "512"
+      SANDBOXD_MAX_ATTESTATION_EVENTS_PER_SANDBOX: "17"
+      SANDBOXD_MAX_LIFETIME_ATTESTATION_EVENTS: "512"
+      SANDBOXD_MAX_LIFETIME_ATTESTATION_EVENT_BYTES: "2097152"
       SANDBOXD_ALLOWED_IMAGE_REPOSITORIES: "ghcr.io/dmvt/cs-sandbox-base"
       DOCKER_CONFIG: /run/sandboxd-docker
       SANDBOXD_HOST: 10.191.255.250
@@ -128,13 +134,11 @@ services:
       SANDBOX_NETWORK_POOL: 10.192.0.0/10
       SANDBOX_NETWORK_PREFIXLEN: "29"
       SANDBOXD_REQUIRE_NETWORK_FIREWALL: "1"
-      SANDBOXD_FIREWALL_HELPER_IMAGE: ghcr.io/dmvt/confidential-sandboxes@sha256:96619929983e0cd33c2b018e0500f629b1db6181d4dba11cc4ba115efa3a69b4
+      SANDBOXD_FIREWALL_HELPER_IMAGE: ghcr.io/dmvt/confidential-sandboxes@sha256:ab4a6a5059662e52cdc408ac8abb3456f4b4ea612595f4d8b8d42c4c6db1e98f
       SANDBOXD_FIREWALL_WATCHDOG_INTERVAL_SECONDS: "15"
-      # Preview URLs (/app/{id}/…) are capability URLs reachable without the daemon bearer; /_api/*
-      # stays bearer-gated.
-      SANDBOX_APP_PUBLIC: "1"
-      # Production app traffic is host-only. Every sandbox receives a high-entropy sibling hostname;
-      # the shared /app/{id} route is disabled so tenants cannot share a browser origin.
+      # Production app traffic is host-only. Every sandbox receives a stable sibling hostname; it is
+      # routing metadata, while the independent per-sandbox bearer enforces access. The shared
+      # /app/{id} route is disabled so tenants cannot share a browser origin.
       SANDBOXD_REQUIRE_UNIQUE_APP_ORIGINS: "1"
       SANDBOX_APPS_DOMAIN: ${APP_DOMAIN:?set to the dedicated sandbox wildcard domain}
       # One-shot image to chown a fresh per-sandbox /data volume to the tenant uid (65534) so the
@@ -243,10 +247,6 @@ services:
           }
         }
         *.{$$SANDBOX_APPS_DOMAIN} {
-          log {
-            output stdout
-            format json
-          }
           @sandbox_host header_regexp Host ^sbx-[0-9a-f]{52}\.sandbox\.synclave\.net$
           handle @sandbox_host {
             reverse_proxy frontproxy:8088 {

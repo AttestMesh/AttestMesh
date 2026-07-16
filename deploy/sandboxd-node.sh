@@ -638,7 +638,7 @@ import hashlib, json, os, subprocess, sys, time
 
 tok = os.environ["TOK"]
 gw = os.environ["GW"].rstrip("/")
-image = "ghcr.io/dmvt/cs-sandbox-base@sha256:8ccfb22336a73e28b7fd8bef024d355ec5673d70d09a6099ad5094836f65e9d3"
+image = "ghcr.io/dmvt/cs-sandbox-base@sha256:5479cfaa62a9e553b85122ddd133724e3f737990d16c1f27e6b35a740a54cd13"
 payload = {
     "owner": "ops:release-smoke",
     "org_id": "ops",

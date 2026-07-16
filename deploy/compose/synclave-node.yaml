@@ -216,6 +216,7 @@ services:
       SANDBOX_DAEMON_TOKEN: ${SANDBOX_DAEMON_TOKEN}
       SANDBOX_DEFAULT_IMAGE: ${SANDBOX_DEFAULT_IMAGE}
       SANDBOX_DEFAULT_PLAN: ${SANDBOX_DEFAULT_PLAN}
+      SANDBOX_APPS_DOMAIN: ${SANDBOX_APPS_DOMAIN}
       # Webhost admin panel operators (comma-separated emails).
       PLATFORM_ADMIN_EMAILS: ${PLATFORM_ADMIN_EMAILS:-}
       # Waitlist + concierge feedback → Telegram bot. All optional (unset ⇒ the send is a
