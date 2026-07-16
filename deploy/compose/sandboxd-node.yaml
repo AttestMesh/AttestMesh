@@ -50,7 +50,7 @@ services:
       - /dev/net/tun
 
   sandboxd:
-    image: ghcr.io/dmvt/confidential-sandboxes@sha256:3bd7c80c2dda9f09866266deca9c763902361e750eddacca2d7217d667bcf00a
+    image: ghcr.io/dmvt/confidential-sandboxes@sha256:572e315b596da38c051a99f68e2fc2de8f5a5279a0f7abf277c6f34176775040
     # The dstack compose runner starts this service only after pre_launch_script has mounted and
     # verified the XFS quota filesystem. Dockerd must never restore it early against the underlying
     # directory during host boot; pre-launch recovery remains the sole restart authority.
@@ -60,6 +60,12 @@ services:
     cpus: "1.0"
     mem_limit: 1536m
     pids_limit: 1024
+    # Read-only host cgroup-v2 evidence for exact physical tenant ceiling verification. Tenants do
+    # not share this cgroup namespace or mount.
+    cgroup: host
+    # Docker reports host init PIDs. Sharing the host PID namespace lets the trusted daemon bind
+    # that exact PID to cgroup.procs; tenant containers are required to remain private.
+    pid: host
     sysctls:
       net.ipv4.ip_forward: "0"
       net.ipv6.conf.all.forwarding: "0"
@@ -80,9 +86,9 @@ services:
       test:
         - CMD-SHELL
         - >-
-          curl -fsS --max-time 3 http://10.191.255.250:8088/healthz |
-          grep -Eq '"ok":[[:space:]]*true.*"dstack_socket_present":[[:space:]]*true' &&
-          docker info --format '{{.ServerVersion}}' >/dev/null &&
+          python -c 'import json,urllib.request; r=urllib.request.urlopen("http://10.191.255.250:8088/healthz",timeout=3); d=json.load(r); r.close(); threads=int(open("/proc/sys/kernel/threads-max").read()); pids=int(open("/proc/sys/kernel/pid_max").read()); parent=open("/host/sys/fs/cgroup/system.slice/pids.max").read().strip(); raise SystemExit(not (d.get("ok") is True and d.get("dstack_socket_present") is True and threads >= 114688 and pids > 114688 and (parent == "max" or (parent.isascii() and parent.isdigit() and int(parent) >= 114688))))' &&
+          test "$$(docker info --format '{{.NCPU}}')" = 8 &&
+          test "$$(docker info --format '{{.CgroupVersion}}/{{.CgroupDriver}}')" = 2/systemd &&
           xfs_quota -x -c 'state -p' "$${SANDBOX_DISK_ROOT}" |
           grep -q 'Enforcement: ON'
       interval: 30s
@@ -112,11 +118,19 @@ services:
       SANDBOXD_MAX_PROXY_CONNECTIONS_PER_SANDBOX: "4"
       SANDBOXD_PROXY_TOTAL_TIMEOUT_SECONDS: "300"
       SANDBOXD_PROXY_READ_TIMEOUT_SECONDS: "60"
+      # Do not report a networked sandbox running until the daemon can complete a real TCP connect
+      # over its exact private bridge. This includes cold-start allowance for runsc workloads.
+      SANDBOXD_INGRESS_READY_TIMEOUT_SECONDS: "90"
       SANDBOXD_RECOVERY_TIMEOUT_SECONDS: "300"
       # Initial production guardrail for the permanent handle ledger and append-only RTMR3 history.
       # Raising this is an explicit measured deployment change after quote-size monitoring.
-      SANDBOXD_MAX_LIFETIME_ALLOCATIONS: "1000"
-      SANDBOXD_ALLOWED_IMAGE_REPOSITORIES: "ghcr.io/attestmesh/synclave-workloads"
+      SANDBOXD_MAX_LIFETIME_ALLOCATIONS: "512"
+      SANDBOXD_MAX_ATTESTATION_EVENTS_PER_SANDBOX: "17"
+      SANDBOXD_MAX_LIFETIME_ATTESTATION_EVENTS: "512"
+      SANDBOXD_MAX_LIFETIME_ATTESTATION_EVENT_BYTES: "2097152"
+      # Fleet accepts only exact reviewed preset digests from these public upstream repositories,
+      # plus digest-pinned operator builds from the Synclave workload repository.
+      SANDBOXD_ALLOWED_IMAGE_REPOSITORIES: "docker.io/library/alpine,docker.io/nousresearch/hermes-agent,ghcr.io/openclaw/openclaw,docker.io/nearaidev/ironclaw,ghcr.io/attestmesh/synclave-workloads"
       DOCKER_CONFIG: /run/sandboxd-docker
       SANDBOXD_HOST: 10.191.255.250
       SANDBOXD_PORT: "8088"
@@ -129,13 +143,11 @@ services:
       SANDBOX_NETWORK_POOL: 10.192.0.0/10
       SANDBOX_NETWORK_PREFIXLEN: "29"
       SANDBOXD_REQUIRE_NETWORK_FIREWALL: "1"
-      SANDBOXD_FIREWALL_HELPER_IMAGE: ghcr.io/dmvt/confidential-sandboxes@sha256:3bd7c80c2dda9f09866266deca9c763902361e750eddacca2d7217d667bcf00a
+      SANDBOXD_FIREWALL_HELPER_IMAGE: ghcr.io/dmvt/confidential-sandboxes@sha256:572e315b596da38c051a99f68e2fc2de8f5a5279a0f7abf277c6f34176775040
       SANDBOXD_FIREWALL_WATCHDOG_INTERVAL_SECONDS: "15"
-      # Preview URLs (/app/{id}/…) are capability URLs reachable without the daemon bearer; /_api/*
-      # stays bearer-gated.
-      SANDBOX_APP_PUBLIC: "1"
-      # Production app traffic is host-only. Every sandbox receives a high-entropy sibling hostname;
-      # the shared /app/{id} route is disabled so tenants cannot share a browser origin.
+      # Production app traffic is host-only. Every sandbox receives a stable sibling hostname; it is
+      # routing metadata, while the independent per-sandbox bearer enforces access. The shared
+      # /app/{id} route is disabled so tenants cannot share a browser origin.
       SANDBOXD_REQUIRE_UNIQUE_APP_ORIGINS: "1"
       SANDBOX_APPS_DOMAIN: ${APP_DOMAIN:?set to the dedicated sandbox wildcard domain}
       # One-shot image to chown a fresh per-sandbox /data volume to the tenant uid (65534) so the
@@ -144,22 +156,28 @@ services:
       SANDBOXD_ALLOWED_RUNTIMES: runsc
       SANDBOXD_RUNSC_DIGEST: sha512:9efeefada7b9a7bcc21dc3a1ad3531d11dfac267808cced45d047aab742f15ecb91b2bb635dea78a4ae36817f76e5ed223b7ad80f3165f15dd24de9b0c95726f
       SANDBOXD_MIN_RUNSC_CPU_MILLIS: "100"
+      SANDBOXD_MIN_NETWORKED_RUNSC_CPU_MILLIS: "1000"
       SANDBOXD_MIN_RUNSC_MEMORY_MB: "128"
       SANDBOXD_MIN_RUNSC_PIDS: "128"
       SANDBOXD_MIN_RUNSC_DISK_MB: "16"
       # Fixed admission budgets for BOX_VCPU=8 / BOX_MEM=16384 / BOX_DISK=300. Tenant plus trusted
-      # service maxima total 7 vCPU / 12.5 GiB, leaving host dockerd/OS/ZFS headroom. Tenant PIDs
-      # are hard-capped at 16,384. The 251 GiB XFS zvol sells 232 GiB, preserves 18 GiB of usable
-      # reserve, and absorbs its own filesystem metadata in the remaining space.
+      # service maxima total 7 vCPU / 12.5 GiB, leaving host dockerd/OS/ZFS headroom. Exact guest
+      # tasks are capped at 4,096 across at most 32 sandboxes. Pre-launch separately proves the
+      # pinned runsc host-thread envelope (18*N+512 each) plus a fixed 24,576-task OS reserve. The
+      # 251 GiB XFS zvol sells 232 GiB, preserves 18 GiB of usable reserve, and absorbs its own
+      # filesystem metadata in the remaining space.
       HOST_VCPU_MILLIS: "5000"
       HOST_MEMORY_MB: "10240"
       HOST_DISK_MB: "237568"
-      HOST_PIDS: "16384"
-      HOST_MAX_SANDBOXES: "50"
+      HOST_PIDS: "4096"
+      HOST_MAX_SANDBOXES: "32"
       HOST_CPU_OVERCOMMIT: "1.0"
       HOST_MEMORY_OVERCOMMIT: "1.0"
       HOST_DISK_OVERCOMMIT: "1.0"
       SANDBOXD_REQUIRE_CAPACITY: "1"  # fail closed if any production ceiling is invalid/missing
+      SANDBOXD_REQUIRE_HOST_CGROUP: "1"
+      SANDBOXD_HOST_CGROUP_ROOT: /host/sys/fs/cgroup
+      SANDBOXD_EXPECTED_CGROUP_DRIVER: systemd
       SANDBOX_DISK_ROOT: /var/lib/sandboxd-data
       SANDBOXD_REQUIRE_DISK_QUOTA: "1"  # fail closed unless XFS project quotas enforce /data
       # Registry creds (CVM-sealed) so the daemon can pull PRIVATE images for runsc workloads.
@@ -175,6 +193,12 @@ services:
     volumes:
       - /var/run/dstack.sock:/var/run/dstack.sock:ro
       - /var/run/docker.sock:/var/run/docker.sock
+      - type: bind
+        source: /sys/fs/cgroup
+        target: /host/sys/fs/cgroup
+        read_only: true
+        bind:
+          create_host_path: false
       # Pre-launch creates this as dstack/sandboxd-state with exact 2 GiB quota, refquota, and
       # refreservation. It remains writable even if the separate Docker data-root reaches its cap.
       - type: bind
@@ -244,10 +268,6 @@ services:
           }
         }
         *.{$$SANDBOX_APPS_DOMAIN} {
-          log {
-            output stdout
-            format json
-          }
           @sandbox_host header_regexp Host ^sbx-[0-9a-f]{52}\.sandbox\.synclave\.net$
           handle @sandbox_host {
             reverse_proxy frontproxy:8088 {
@@ -261,7 +281,10 @@ services:
               header_up X-Forwarded-Proto https
               transport http {
                 dial_timeout 5s
-                response_header_timeout 30s
+                # Preserve ordered failure ownership for bounded acceptance probes: the workload
+                # worker returns before sandboxd's 60s upstream-read deadline, sandboxd returns a
+                # controlled response before this outer TLS proxy, and the operator client uses 75s.
+                response_header_timeout 70s
                 keepalive_idle_conns_per_host 16
               }
             }
@@ -280,8 +303,12 @@ services:
     depends_on:
       sandboxd:
         condition: service_healthy
+    # Pin the proxy as well as sandboxd. On a CVM reboot Docker restores restart-enabled services
+    # before Compose can honor depends_on; a dynamically assigned proxy can otherwise claim
+    # sandboxd's fixed .250 address and make the whole measured app fail with EADDRINUSE.
     networks:
-      - cs-ingress
+      cs-ingress:
+        ipv4_address: 10.191.255.251
     cap_drop:
       - ALL
     security_opt:

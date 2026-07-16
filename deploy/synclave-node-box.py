@@ -123,6 +123,7 @@ ENV_KEYS = [
     "SANDBOX_DAEMON_TOKEN",
     "SANDBOX_DEFAULT_IMAGE",
     "SANDBOX_DEFAULT_PLAN",
+    "SANDBOX_APPS_DOMAIN",
     # --- private-registry pull creds (ghcr.io/dmvt/* + attestmesh sidecar) ---
     "DSTACK_DOCKER_USERNAME",
     "DSTACK_DOCKER_PASSWORD",
