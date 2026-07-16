@@ -28,8 +28,9 @@ services:
       - /dev/net/tun
 
   openkey:
-    image: ghcr.io/attestmesh/openkey-api@sha256:cac7885e86da2c4533c9cb37c884d5c711ca90626479d59b0f891f77e9815efa
+    image: ghcr.io/attestmesh/openkey-api@sha256:4a0fe36f606dd5f2d8357313a9f19828fd2865a5a3aec26d736accea98cd9cd3
     restart: unless-stopped
+    depends_on: [postgres-mesh-proxy]
     env_file:
       - /tmp/attestmesh-workload.env
     volumes:
@@ -37,6 +38,24 @@ services:
       - openkey-data:/data
     ports:
       - "3001:3001"
+    healthcheck:
+      test: [CMD, bun, -e, "await fetch('http://127.0.0.1:3001/health').then(r=>{if(!r.ok)process.exit(1)})"]
+      interval: 10s
+      timeout: 5s
+      retries: 18
+
+  postgres-mesh-proxy:
+    image: alpine/socat:1.8.0.0
+    restart: unless-stopped
+    network_mode: service:sidecar
+    depends_on: [sidecar]
+    env_file: [/tmp/attestmesh-workload.env]
+    entrypoint: [/bin/sh, -ec]
+    command:
+      - exec socat TCP-LISTEN:15432,fork,reuseaddr,bind=0.0.0.0 TCP:"$$PG_MESH_IP":5432
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
 
   registration-calldata:
     image: ghcr.io/attestmesh/attestmesh-indexer@sha256:14e9e3f6869ada585642c14e4e2e43bee197978ffc68d146dd6d3cddbc49d2bb

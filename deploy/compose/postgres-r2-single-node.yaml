@@ -62,7 +62,7 @@ services:
       - POSTGRES_DB=postgres
       - POSTGRES_INITDB_ARGS=--encoding=UTF8 --locale=C
       - BACKUP_ENABLED=true
-      - BACKUP_PREFIX=postgres-r2-single/backups
+      - BACKUP_PREFIX=openkey-shared/backups
       - AGENT_GRPC_SOCKET=/var/run/attestmesh/agent.sock
       - WALG_KEY_FILE=/run/walg/key
       - WALG_STATUS_FILE=/walg-status/state
@@ -73,6 +73,9 @@ services:
       - pgdata:/var/lib/postgresql/data
       - agent-sock:/var/run/attestmesh
       - walg-status:/walg-status
+    # Required for peer CVMs while this node's CSK-backed mesh sidecar is pending.
+    # The dstack host bridge is private; no public gateway route targets this port.
+    ports: ["5432:5432"]
     healthcheck:
       test: [CMD-SHELL, "pg_isready -h 127.0.0.1 -U postgres -d postgres"]
       interval: 10s
