@@ -196,6 +196,115 @@ fi
 
 if [ -n "${DSTACK_DOCKER_PASSWORD:-}" ]; then
   echo "$DSTACK_DOCKER_PASSWORD" | docker login "${DSTACK_DOCKER_REGISTRY:-ghcr.io}" -u "$DSTACK_DOCKER_USERNAME" --password-stdin
+fi
+
+# A deliberately narrow, measured diagnostic for the exact failed Synclave
+# analyzer roll. The dstack sidecar's :51900 listener is its WireGuard-over-TLS
+# data plane, not a container-management API, so capture the app's real stderr
+# inside the guest without granting a remote Docker surface. This runs only for
+# the pinned image while the existing Compose app is unhealthy/restarting. It
+# mounts no volumes; the image's unchanged CMD performs the normal migration
+# (and its normal advisory lock) before starting the API.
+diagnostic_image='ghcr.io/attestmesh/synclave-app:sha-a0545a207ba51c1757a3c5303cc1e5c8e609428c@sha256:cfcb54cfdee391d59d7cddb84f2d0f3cdcc37d5f5405d1a27546512a04c5fd98'
+diagnostic_name='dstack-app-diagnostic'
+app_name='dstack-app-1'
+
+redact_diagnostic_stderr() {
+  local env_file="$1"
+  awk -v env_file="$env_file" '
+    BEGIN {
+      while ((getline item < env_file) > 0) {
+        separator = index(item, "=")
+        if (!separator) continue
+        key = toupper(substr(item, 1, separator - 1))
+        value = substr(item, separator + 1)
+        if (key ~ /(PASSWORD|SECRET|TOKEN|AUTHORIZATION|API_KEY|DATABASE_URL)/ && length(value) >= 4) {
+          secrets[++secret_count] = value
+        }
+      }
+      close(env_file)
+    }
+    {
+      output = $0
+      for (i = 1; i <= secret_count; i++) {
+        while ((position = index(output, secrets[i])) > 0) {
+          output = substr(output, 1, position - 1) "[REDACTED]" substr(output, position + length(secrets[i]))
+        }
+      }
+      print output
+    }
+  ' | sed -E \
+    -e 's#((postgres(ql)?|mysql|redis|https?)://)[^/@[:space:]]+@#\1[REDACTED]@#g' \
+    -e 's#((password|secret|token|authorization|api[_-]?key)[[:space:]]*[=:][[:space:]]*)[^[:space:],;]+#\1[REDACTED]#Ig'
+}
+
+if docker inspect "$app_name" >/dev/null 2>&1; then
+  app_project="$(docker inspect -f '{{index .Config.Labels "com.docker.compose.project"}}' "$app_name")"
+  app_service="$(docker inspect -f '{{index .Config.Labels "com.docker.compose.service"}}' "$app_name")"
+  app_image="$(docker inspect -f '{{.Config.Image}}' "$app_name")"
+  app_restarting="$(docker inspect -f '{{.State.Restarting}}' "$app_name")"
+  app_health="$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "$app_name")"
+
+  if [ "$app_project" = dstack ] \
+    && [ "$app_service" = app ] \
+    && [ "$app_image" = "$diagnostic_image" ] \
+    && { [ "$app_restarting" = true ] || [ "$app_health" != healthy ]; }; then
+    if docker inspect "$diagnostic_name" >/dev/null 2>&1; then
+      echo "diagnostic container already exists; refusing to replace it" >&2
+      exit 1
+    fi
+
+    mapfile -t app_networks < <(docker inspect -f '{{range $name, $_ := .NetworkSettings.Networks}}{{println $name}}{{end}}' "$app_name")
+    if [ "${#app_networks[@]}" -ne 1 ] || [ "${app_networks[0]}" != dstack_default ]; then
+      echo "app diagnostic requires the sole dstack_default attachment" >&2
+      exit 1
+    fi
+    read -r network_id endpoint_id < <(docker inspect -f '{{with index .NetworkSettings.Networks "dstack_default"}}{{.NetworkID}} {{.EndpointID}}{{end}}' "$app_name")
+    if [ -z "$network_id" ] || [ -z "$endpoint_id" ]; then
+      echo "app diagnostic requires an active dstack_default endpoint" >&2
+      exit 1
+    fi
+
+    diagnostic_env="$(mktemp /run/dstack-app-diagnostic.env.XXXXXX)"
+    chmod 600 "$diagnostic_env"
+    trap 'rm -f "$diagnostic_env"' EXIT
+    docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$app_name" >"$diagnostic_env"
+    docker stop -t 10 "$app_name" >/dev/null
+
+    echo "[prelaunch] running bounded app migration/start diagnostic; stdout suppressed" >&2
+    set +e
+    timeout --foreground --signal=TERM --kill-after=5s 45s \
+      docker run --rm --name "$diagnostic_name" \
+        --network dstack_default \
+        --env-file "$diagnostic_env" \
+        --init \
+        --cap-drop ALL \
+        --security-opt no-new-privileges \
+        --memory 4g \
+        --cpus 1.0 \
+        --pids-limit 1024 \
+        "$diagnostic_image" \
+        >/dev/null 2> >(redact_diagnostic_stderr "$diagnostic_env" >&2)
+    diagnostic_rc=$?
+    set -e
+
+    if docker inspect "$diagnostic_name" >/dev/null 2>&1; then
+      docker stop -t 5 "$diagnostic_name" >/dev/null 2>&1 || true
+      docker rm "$diagnostic_name" >/dev/null 2>&1 || true
+    fi
+    rm -f "$diagnostic_env"
+    trap - EXIT
+
+    if [ "$diagnostic_rc" -eq 124 ] || [ "$diagnostic_rc" -eq 143 ]; then
+      echo "[prelaunch] app migration/start diagnostic remained healthy for 45 seconds" >&2
+    elif [ "$diagnostic_rc" -ne 0 ]; then
+      echo "[prelaunch] app migration/start diagnostic exited rc=$diagnostic_rc" >&2
+      exit "$diagnostic_rc"
+    else
+      echo "[prelaunch] app migration/start diagnostic exited before the observation window" >&2
+      exit 1
+    fi
+  fi
 fi"""
     rendered = json.dumps(app_compose, indent=4, ensure_ascii=False)
     return rendered, hashlib.sha256(rendered.encode()).hexdigest()
