@@ -40,6 +40,7 @@ class SynclaveNodeContractTests(unittest.TestCase):
         self.assertIn('app_restarting" = true', box)
         self.assertIn('app_health" != healthy', box)
         self.assertIn('app_network="${app_networks[0]}"', box)
+        self.assertIn("| sed '/^$/d'", box)
         self.assertIn('[ -z "$network_id" ] || [ -z "$endpoint_id" ]', box)
         self.assertIn('network_actual_id" != "$network_id', box)
         self.assertIn('network_project" != dstack', box)
