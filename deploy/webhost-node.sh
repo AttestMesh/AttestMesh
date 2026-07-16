@@ -345,11 +345,13 @@ verify_daemon() {
   # cannot prove daemon reachability. Resolve the running CVM's bridge address
   # from its QEMU MAC and the box DHCP lease, then probe frontproxy over the
   # private bridge with an app-domain Host header.
-  if [ -z "$cvm_ip" ] && [ -n "${VM_ID:-}" ]; then
-    cvm_ip=$(ssh_box "mac=\$(pgrep -af qemu-system | grep '/${VM_ID}/' | sed -nE 's/.*mac=([0-9a-f:]{17}).*/\\1/p' | head -1); [ -n \"\$mac\" ] && sudo awk -v mac=\"\$mac\" '\$2 == mac { print \$3 }' /var/lib/misc/dnsmasq-dstack-br0.leases | tail -1" 2>/dev/null || true)
-  fi
-  [ -n "$cvm_ip" ] || die "could not resolve Webhost CVM bridge IP; set WEBHOST_CVM_IP"
   for i in $(seq 1 30); do
+    [ -n "$cvm_ip" ] || cvm_ip=$(_cvm_ip)
+    if [ -z "$cvm_ip" ]; then
+      log "… Webhost CVM bridge lease not ready ($i/30)"
+      sleep 10
+      continue
+    fi
     code=$(ssh_box "curl -sS -o /dev/null -w '%{http_code}' --max-time 10 -H 'Host: ${probe_host}' http://${cvm_ip}/_api/projects" 2>/dev/null || true)
     if [ "$code" = 401 ] || [ "$code" = 200 ]; then
       log "✔ tee-daemon reachable: ${probe_host} via ${cvm_ip}/_api/projects -> $code"
