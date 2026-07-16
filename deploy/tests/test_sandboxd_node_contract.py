@@ -48,7 +48,9 @@ class SandboxdNodeContractTests(unittest.TestCase):
         )
 
     def test_prelaunch_fails_closed_on_docker_cpu_mismatch(self) -> None:
-        self.assertIn("systemctl show docker.service --property MainPID --value", SOURCE)
+        self.assertIn(
+            "systemctl show docker.service --property MainPID --value", SOURCE
+        )
         self.assertIn('docker_cpu_affinity" = "0-7"', SOURCE)
         self.assertIn("docker info --format '{{.NCPU}}'", SOURCE)
         self.assertIn(
@@ -83,7 +85,7 @@ class SandboxdNodeContractTests(unittest.TestCase):
         )
         self.assertIn("E_SANDBOX_APPS_DOMAIN=%q", deploy_script)
         self.assertIn(
-            'SANDBOX_APPS_DOMAIN must be the dedicated sandbox.synclave.net zone',
+            "SANDBOX_APPS_DOMAIN must be the dedicated sandbox.synclave.net zone",
             deploy_script,
         )
         self.assertIn('"SANDBOX_APPS_DOMAIN"', box_helper)
@@ -123,9 +125,47 @@ class SandboxdNodeContractTests(unittest.TestCase):
         self.assertLess(mutating_save, mutation)
         self.assertIn("SANDBOXD_UPDATE_RECOVERY_FROM_HASH", deploy_script)
         self.assertIn(
+            "SANDBOXD_UPDATE_FAILED_TARGET_REBASE_FROM_HASH",
+            deploy_script,
+        )
+        self.assertIn(
             "is neither previous 0x$UPDATE_PREVIOUS_H nor target 0x$UPDATE_H",
             deploy_script,
         )
+
+    def test_failed_target_rebase_preserves_last_good_hash_and_journals_first(
+        self,
+    ) -> None:
+        deploy_script = (ROOT / "deploy" / "sandboxd-node.sh").read_text()
+        opt_in = deploy_script.index(
+            'failed_target_rebase_h="${SANDBOXD_UPDATE_FAILED_TARGET_REBASE_FROM_HASH:-}"'
+        )
+        unhealthy = deploy_script.index('_wait_health 3 2 "$UPDATE_H"', opt_in)
+        reread = deploy_script.index(
+            'current=$(_box_run describe "" "$VM_ID")', unhealthy
+        )
+        inventory = deploy_script.index('_inventory_matches "$VM_ID"', reread)
+        previous = deploy_script.index('UPDATE_PREVIOUS_H="$UPDATE_H"', inventory)
+        target = deploy_script.index('UPDATE_H="$nh"', previous)
+        prepared = deploy_script.index("UPDATE_PHASE=prepared", target)
+        rebase_save = deploy_script.index("      _save", prepared)
+        allowlist = deploy_script.index(
+            '_allowlist_compose_hash "$UPDATE_H"', rebase_save
+        )
+        mutation = deploy_script.index('_box_run update "$X" "$VM_ID"', allowlist)
+        final_health = deploy_script.index('_wait_health 45 10 "$UPDATE_H"', mutation)
+        commit = deploy_script.index('H="$UPDATE_H"', final_health)
+        self.assertLess(opt_in, unhealthy)
+        self.assertLess(unhealthy, reread)
+        self.assertLess(reread, inventory)
+        self.assertLess(inventory, previous)
+        self.assertLess(previous, target)
+        self.assertLess(target, prepared)
+        self.assertLess(prepared, rebase_save)
+        self.assertLess(rebase_save, allowlist)
+        self.assertLess(allowlist, mutation)
+        self.assertLess(mutation, final_health)
+        self.assertLess(final_health, commit)
 
 
 if __name__ == "__main__":

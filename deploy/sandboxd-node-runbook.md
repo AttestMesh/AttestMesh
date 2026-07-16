@@ -46,6 +46,26 @@ resources, app identity, and same-app inventory. Only then may one invocation se
 reconciliation value, not a boolean bypass; the script persists it as the previous hash before the
 next mutation.
 
+If a journaled update reached `UPDATE_PHASE=upgraded` but failed the target health gate, keep the
+journal intact. Prepare the reviewed hotfix compose, inspect the state journal and VMM, and confirm
+that the same recorded VM still has the exact journaled `UPDATE_H`, 8-vCPU/16,384-MiB/300-GiB
+profile, app id, and same-app inventory. Then authorize that one transition with the full failed
+hash (not the new hash):
+
+```sh
+SANDBOXD_UPDATE_FAILED_TARGET_REBASE_FROM_HASH=<64-hex-failed-UPDATE_H> \
+  deploy/sandboxd-node.sh sandboxd update
+```
+
+This is accepted only from `upgraded`, only when the newly measured compose differs, and only after
+the failed target cannot prove healthy on three fresh checks. The updater then re-reads the exact VM,
+resources, app, failed hash, status, and inventory before atomically changing the journal to
+`prepared` with the failed hash as `UPDATE_PREVIOUS_H` and the hotfix as `UPDATE_H`. The
+last-known-good `H` is deliberately preserved until the hotfix proves exact health and unique
+inventory. A missing/wrong opt-in, healthy old target, different VM, resource drift, app drift,
+third compose hash, or ambiguous inventory fails before allowlisting or VMM mutation. Do not use
+the legacy `SANDBOXD_UPDATE_RECOVERY_FROM_HASH` path for a journaled failed target.
+
 Pre-launch stops managed workloads before restarting Docker, restores the host firewall before the
 daemon resumes durable rows, and fails closed unless all of these are true:
 

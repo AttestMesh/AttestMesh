@@ -295,11 +295,19 @@ update_member() {
   [ -n "${X:-}" ] && [ -n "${VM_ID:-}" ] && [ -n "${CLUSTER:-}" ] || die "need X/VM_ID/CLUSTER in $STATE"
   [ -z "${REPLACEMENT_PHASE:-}" ] || die "cannot update during replacement phase $REPLACEMENT_PHASE"
   local nh out j current current_h current_status target_h recovery_h recorded_h
+  local failed_target_rebase_h
+  recorded_h="${H:-}"
+  recorded_h="${recorded_h#0x}"
+  recorded_h="${recorded_h#0X}"
+  [[ "$recorded_h" =~ ^[0-9a-fA-F]{64}$ ]] \
+    || die "recorded compose hash is invalid: ${H:-<missing>}"
   current=$(_box_run describe "" "$VM_ID") || die "could not read current VM resources"
   j=$(echo "$current" | grep '"vm_id"' | tail -1)
   echo "$j" | jq -e \
-    --arg vcpu "$BOX_VCPU" --arg memory "$BOX_MEM" --arg disk "$BOX_DISK" --arg app "$X" \
+    --arg vm "$VM_ID" --arg vcpu "$BOX_VCPU" --arg memory "$BOX_MEM" \
+    --arg disk "$BOX_DISK" --arg app "$X" \
     '.found == true and
+     .vm_id == $vm and
      (.vcpu | tonumber) == ($vcpu | tonumber) and
      (.memory | tonumber) == ($memory | tonumber) and
      (.disk_size | tonumber) == ($disk | tonumber) and
@@ -324,9 +332,6 @@ update_member() {
   log "new compose_hash=0x$nh"
 
   if [ -z "${UPDATE_PHASE:-}" ]; then
-    recorded_h="${H#0x}"
-    recorded_h="${recorded_h#0X}"
-    [[ "$recorded_h" =~ ^[0-9a-fA-F]{64}$ ]] || die "recorded compose hash is invalid: $H"
     if [ "${current_h,,}" != "${recorded_h,,}" ]; then
       recovery_h="${SANDBOXD_UPDATE_RECOVERY_FROM_HASH:-}"
       recovery_h="${recovery_h#0x}"
@@ -354,8 +359,64 @@ update_member() {
       || die "in-place update journal contains an invalid compose hash"
     [ "$UPDATE_VM_ID" = "$VM_ID" ] \
       || die "in-place update journal names VM $UPDATE_VM_ID, not recorded VM $VM_ID"
-    [ "${UPDATE_H,,}" = "${nh,,}" ] \
-      || die "measured compose changed during unfinished update (journal=0x$UPDATE_H current=0x$nh)"
+    if [ "$UPDATE_PHASE" = upgraded ] && [ "${UPDATE_H,,}" != "${nh,,}" ]; then
+      # A target that reached UpgradeApp but failed its health gate may need a second measured
+      # release. Rebase only from the exact journaled/read-back failed hash, and only after proving
+      # that hash is not currently healthy. H remains the last-known-good hash throughout; the
+      # failed target becomes UPDATE_PREVIOUS_H so normal update recovery can still distinguish
+      # not-started, applied, and ambiguous outcomes after the rebase is durably recorded.
+      failed_target_rebase_h="${SANDBOXD_UPDATE_FAILED_TARGET_REBASE_FROM_HASH:-}"
+      failed_target_rebase_h="${failed_target_rebase_h#0x}"
+      failed_target_rebase_h="${failed_target_rebase_h#0X}"
+      [[ "$failed_target_rebase_h" =~ ^[0-9a-fA-F]{64}$ ]] \
+        && [ "${failed_target_rebase_h,,}" = "${UPDATE_H,,}" ] \
+        && [ "${failed_target_rebase_h,,}" = "${current_h,,}" ] \
+        || die "unfinished update target changed; to rebase an unhealthy upgraded target, set SANDBOXD_UPDATE_FAILED_TARGET_REBASE_FROM_HASH to exact journaled/read-back hash 0x$UPDATE_H"
+      if _wait_health 3 2 "$UPDATE_H"; then
+        die "journaled update target 0x$UPDATE_H currently proves healthy; refusing failed-target rebase"
+      fi
+
+      # Health probing can take ten seconds. Re-read every VMM invariant and the same-app inventory
+      # immediately before the atomic journal transition so a concurrent VM/inventory change
+      # cannot be authorized by stale evidence.
+      current=$(_box_run describe "" "$VM_ID") \
+        || die "could not re-inspect failed update target before rebase"
+      j=$(echo "$current" | grep '"vm_id"' | tail -1)
+      echo "$j" | jq -e \
+        --arg vm "$VM_ID" --arg target "$UPDATE_H" --arg vcpu "$BOX_VCPU" \
+        --arg memory "$BOX_MEM" --arg disk "$BOX_DISK" --arg app "$X" \
+        '.found == true and
+         .vm_id == $vm and
+         (((.compose_hash // "") | ascii_downcase | ltrimstr("0x")) ==
+          ($target | ascii_downcase | ltrimstr("0x"))) and
+         (.vcpu | tonumber) == ($vcpu | tonumber) and
+         (.memory | tonumber) == ($memory | tonumber) and
+         (.disk_size | tonumber) == ($disk | tonumber) and
+         (((.app_id // "") | ascii_downcase | ltrimstr("0x")) ==
+          ($app | ascii_downcase | ltrimstr("0x")))' >/dev/null \
+        || die "failed update target identity/resource/hash changed before rebase"
+      current_status=$(echo "$j" | jq -er '(.status // "") | ascii_downcase') \
+        || die "failed update target has no status before rebase"
+      if [ "$current_status" = stopped ] || [ "$current_status" = exited ]; then
+        _inventory_matches none \
+          || die "failed update target is stopped but another same-app VM is active; refusing rebase"
+      else
+        _inventory_matches "$VM_ID" \
+          || die "failed update target is not the only active same-app VM; refusing rebase"
+      fi
+
+      UPDATE_PREVIOUS_H="$UPDATE_H"
+      UPDATE_H="$nh"
+      UPDATE_PHASE=prepared
+      # This is the authorization boundary: persist the exact failed and hotfix hashes before
+      # allowlisting or performing any VMM mutation. H deliberately remains last-known-good.
+      _save
+      current_h="$UPDATE_PREVIOUS_H"
+      log "⚠ durably rebased unhealthy update target 0x$UPDATE_PREVIOUS_H onto hotfix 0x$UPDATE_H"
+    else
+      [ "${UPDATE_H,,}" = "${nh,,}" ] \
+        || die "measured compose changed during unfinished update (journal=0x$UPDATE_H current=0x$nh)"
+    fi
   fi
 
   # Verify the KMS gate before any StopVm/UpgradeApp or recovery start. An unallowlisted hash
@@ -406,9 +467,10 @@ update_member() {
     || die "could not inspect upgraded VM; update journal retained"
   j=$(echo "$current" | grep '"vm_id"' | tail -1)
   echo "$j" | jq -e \
-    --arg target "$UPDATE_H" --arg vcpu "$BOX_VCPU" --arg memory "$BOX_MEM" \
-    --arg disk "$BOX_DISK" --arg app "$X" \
+    --arg vm "$VM_ID" --arg target "$UPDATE_H" --arg vcpu "$BOX_VCPU" \
+    --arg memory "$BOX_MEM" --arg disk "$BOX_DISK" --arg app "$X" \
     '.found == true and
+     .vm_id == $vm and
      (((.compose_hash // "") | ascii_downcase | ltrimstr("0x")) ==
       ($target | ascii_downcase | ltrimstr("0x"))) and
      (.vcpu | tonumber) == ($vcpu | tonumber) and
