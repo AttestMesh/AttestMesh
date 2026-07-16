@@ -50,7 +50,7 @@ services:
       - /dev/net/tun
 
   sandboxd:
-    image: ghcr.io/dmvt/confidential-sandboxes@sha256:e5d97740f30282faa4a3c6c144126269739ea5d39f311000ab95efa5d4678a74
+    image: ghcr.io/dmvt/confidential-sandboxes@sha256:1d333c0b8a3861bc99c31ee3b7ab619989a3b817abdfc6858bb72460135d1611
     # The dstack compose runner starts this service only after pre_launch_script has mounted and
     # verified the XFS quota filesystem. Dockerd must never restore it early against the underlying
     # directory during host boot; pre-launch recovery remains the sole restart authority.
@@ -134,7 +134,7 @@ services:
       SANDBOX_NETWORK_POOL: 10.192.0.0/10
       SANDBOX_NETWORK_PREFIXLEN: "29"
       SANDBOXD_REQUIRE_NETWORK_FIREWALL: "1"
-      SANDBOXD_FIREWALL_HELPER_IMAGE: ghcr.io/dmvt/confidential-sandboxes@sha256:e5d97740f30282faa4a3c6c144126269739ea5d39f311000ab95efa5d4678a74
+      SANDBOXD_FIREWALL_HELPER_IMAGE: ghcr.io/dmvt/confidential-sandboxes@sha256:1d333c0b8a3861bc99c31ee3b7ab619989a3b817abdfc6858bb72460135d1611
       SANDBOXD_FIREWALL_WATCHDOG_INTERVAL_SECONDS: "15"
       # Production app traffic is host-only. Every sandbox receives a stable sibling hostname; it is
       # routing metadata, while the independent per-sandbox bearer enforces access. The shared
@@ -147,6 +147,7 @@ services:
       SANDBOXD_ALLOWED_RUNTIMES: runsc
       SANDBOXD_RUNSC_DIGEST: sha512:9efeefada7b9a7bcc21dc3a1ad3531d11dfac267808cced45d047aab742f15ecb91b2bb635dea78a4ae36817f76e5ed223b7ad80f3165f15dd24de9b0c95726f
       SANDBOXD_MIN_RUNSC_CPU_MILLIS: "100"
+      SANDBOXD_MIN_NETWORKED_RUNSC_CPU_MILLIS: "1000"
       SANDBOXD_MIN_RUNSC_MEMORY_MB: "128"
       SANDBOXD_MIN_RUNSC_PIDS: "128"
       SANDBOXD_MIN_RUNSC_DISK_MB: "16"

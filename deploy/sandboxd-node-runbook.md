@@ -5,6 +5,18 @@ The measured tenant budget remains independently fixed at 5,000 CPU millis, 10,2
 16,384 PIDs, 237,568 MiB of quota-backed disk, and 50 concurrent sandboxes, all at 1.0 overcommit.
 Hardware discovery never changes those admission limits.
 
+The measured create policy keeps the 100-mCPU runsc floor only for isolated workloads. A runsc
+sandbox declaring an ingress port must explicitly request at least 1,000 mCPU; smaller requests are
+rejected before reservation and are never silently upsized. This matches Fleet's smallest published
+plan and keeps gVisor cold start inside the bounded ingress-readiness transaction.
+
+Treat any future increase of that networked floor as a drain-or-upsize migration. While the old
+compose is still running, explicitly PATCH every retained networked sandbox to the new minimum (or
+destroy/recreate it) and verify the ledger before deploying the new compose. Recovery rejects a
+retained serving row below the configured floor instead of rewriting its measured size. If one was
+missed, roll back to the previous measured compose, remediate it explicitly, and retry; rows already
+being destroyed or deleted are exempt only so cleanup can complete.
+
 An explicit future machine upsize requires one reviewed release changing the VMM profile,
 `EXPECTED_HOST_VCPUS`, the explicit Docker CPU-affinity list, and any separately approved tenant
 budget. An out-of-band resize fails the exact profile check. Tenant resources likewise change only
