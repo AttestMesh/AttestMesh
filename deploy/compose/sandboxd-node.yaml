@@ -116,7 +116,7 @@ services:
       # Initial production guardrail for the permanent handle ledger and append-only RTMR3 history.
       # Raising this is an explicit measured deployment change after quote-size monitoring.
       SANDBOXD_MAX_LIFETIME_ALLOCATIONS: "1000"
-      SANDBOXD_ALLOWED_IMAGE_REPOSITORIES: "ghcr.io/dmvt/cs-sandbox-base"
+      SANDBOXD_ALLOWED_IMAGE_REPOSITORIES: "ghcr.io/attestmesh/synclave-workloads"
       DOCKER_CONFIG: /run/sandboxd-docker
       SANDBOXD_HOST: 10.191.255.250
       SANDBOXD_PORT: "8088"
