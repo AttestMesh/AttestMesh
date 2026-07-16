@@ -39,6 +39,10 @@ X=${X:-}
 H=${H:-}
 VM_ID=${VM_ID:-}
 DEPLOY_PHASE=${DEPLOY_PHASE:-}
+UPDATE_PHASE=${UPDATE_PHASE:-}
+UPDATE_VM_ID=${UPDATE_VM_ID:-}
+UPDATE_H=${UPDATE_H:-}
+UPDATE_PREVIOUS_H=${UPDATE_PREVIOUS_H:-}
 PREVIOUS_VM_ID=${PREVIOUS_VM_ID:-}
 REPLACEMENT_VM_ID=${REPLACEMENT_VM_ID:-}
 REPLACEMENT_OLD_VM_ID=${REPLACEMENT_OLD_VM_ID:-}
@@ -290,42 +294,148 @@ update_member() {
   _load; _require_env
   [ -n "${X:-}" ] && [ -n "${VM_ID:-}" ] && [ -n "${CLUSTER:-}" ] || die "need X/VM_ID/CLUSTER in $STATE"
   [ -z "${REPLACEMENT_PHASE:-}" ] || die "cannot update during replacement phase $REPLACEMENT_PHASE"
-  local nh out j current target_h
+  local nh out j current current_h current_status target_h recovery_h recorded_h
   current=$(_box_run describe "" "$VM_ID") || die "could not read current VM resources"
   j=$(echo "$current" | grep '"vm_id"' | tail -1)
   echo "$j" | jq -e \
-    --arg vcpu "$BOX_VCPU" --arg memory "$BOX_MEM" --arg disk "$BOX_DISK" \
+    --arg vcpu "$BOX_VCPU" --arg memory "$BOX_MEM" --arg disk "$BOX_DISK" --arg app "$X" \
     '.found == true and
      (.vcpu | tonumber) == ($vcpu | tonumber) and
      (.memory | tonumber) == ($memory | tonumber) and
-     (.disk_size | tonumber) == ($disk | tonumber)' >/dev/null \
+     (.disk_size | tonumber) == ($disk | tonumber) and
+     (((.app_id // "") | ascii_downcase | ltrimstr("0x")) ==
+      ($app | ascii_downcase | ltrimstr("0x")))' >/dev/null \
     || die "current VM differs from the exact measured profile; use a reviewed replacement (never in-place autoscale)"
+  current_h=$(echo "$j" | jq -er '.compose_hash | ascii_downcase | ltrimstr("0x")') \
+    || die "current VM has no measured compose hash"
+  current_status=$(echo "$j" | jq -er '(.status // "") | ascii_downcase') \
+    || die "current VM has no status"
+  if [ -z "${UPDATE_PHASE:-}" ]; then
+    _inventory_matches "$VM_ID" \
+      || die "recorded VM is not the only active same-app VM before update"
+  else
+    # A crash after StopVm may leave no active copy. Resume only when this exact VM is active or
+    # the app inventory is quiescent; any different active copy remains an ambiguity.
+    _inventory_matches "$VM_ID" || _inventory_matches none \
+      || die "same-app inventory is ambiguous during in-place update recovery"
+  fi
   nh=$(_box_run hash | grep -oE '^[0-9a-f]{64}$' | tail -1)
   [ -n "$nh" ] || die "could not compute new compose_hash"
   log "new compose_hash=0x$nh"
-  # Verify the KMS gate before StopVm/UpgradeApp. An unallowlisted hash cannot unseal at boot.
-  _allowlist_compose_hash "$nh" "sandboxd-update-addHash-${NODE}"
-  out=$(_box_run update "$X" "$VM_ID") || die "in-place update failed"
-  echo "$out"
-  j=$(echo "$out" | grep '"app_id"' | tail -1)
-  target_h=$(echo "$j" | jq -er .compose_hash) \
-    || die "in-place update returned no compose hash; recorded hash remains $H"
-  [ "${target_h,,}" = "${nh,,}" ] \
-    || die "in-place update returned unexpected compose hash $target_h (expected $nh); recorded hash remains $H"
+
+  if [ -z "${UPDATE_PHASE:-}" ]; then
+    recorded_h="${H#0x}"
+    recorded_h="${recorded_h#0X}"
+    [[ "$recorded_h" =~ ^[0-9a-fA-F]{64}$ ]] || die "recorded compose hash is invalid: $H"
+    if [ "${current_h,,}" != "${recorded_h,,}" ]; then
+      recovery_h="${SANDBOXD_UPDATE_RECOVERY_FROM_HASH:-}"
+      recovery_h="${recovery_h#0x}"
+      [[ "$recovery_h" =~ ^[0-9a-fA-F]{64}$ ]] \
+        && [ "${recovery_h,,}" = "${current_h,,}" ] \
+        || die "VM compose 0x$current_h differs from recorded 0x${H#0x}; set SANDBOXD_UPDATE_RECOVERY_FROM_HASH to that exact inspected hash only after reviewing the interrupted update"
+      log "⚠ explicitly recovering the inspected unjournaled compose 0x$current_h"
+    fi
+    UPDATE_VM_ID="$VM_ID"
+    UPDATE_PREVIOUS_H="$current_h"
+    UPDATE_H="$nh"
+    UPDATE_PHASE=prepared
+    # Persist both hashes before StopVm/UpgradeApp. A retry can now distinguish not-started,
+    # applied, and ambiguous outcomes without blindly mutating the VM a second time.
+    _save
+  else
+    [ "$UPDATE_PHASE" = prepared ] || [ "$UPDATE_PHASE" = mutating ] \
+      || [ "$UPDATE_PHASE" = upgraded ] \
+      || die "unknown in-place update phase $UPDATE_PHASE"
+    [ -n "${UPDATE_VM_ID:-}" ] && [ -n "${UPDATE_H:-}" ] \
+      && [ -n "${UPDATE_PREVIOUS_H:-}" ] \
+      || die "in-place update journal is incomplete"
+    [[ "$UPDATE_H" =~ ^[0-9a-fA-F]{64}$ ]] \
+      && [[ "$UPDATE_PREVIOUS_H" =~ ^[0-9a-fA-F]{64}$ ]] \
+      || die "in-place update journal contains an invalid compose hash"
+    [ "$UPDATE_VM_ID" = "$VM_ID" ] \
+      || die "in-place update journal names VM $UPDATE_VM_ID, not recorded VM $VM_ID"
+    [ "${UPDATE_H,,}" = "${nh,,}" ] \
+      || die "measured compose changed during unfinished update (journal=0x$UPDATE_H current=0x$nh)"
+  fi
+
+  # Verify the KMS gate before any StopVm/UpgradeApp or recovery start. An unallowlisted hash
+  # cannot unseal at boot.
+  _allowlist_compose_hash "$UPDATE_H" "sandboxd-update-addHash-${NODE}"
+
+  if [ "$UPDATE_PHASE" = prepared ]; then
+    UPDATE_PHASE=mutating
+    _save
+  fi
+
+  if [ "$UPDATE_PHASE" = mutating ]; then
+    if [ "${current_h,,}" = "${UPDATE_PREVIOUS_H,,}" ]; then
+      out=$(_box_run update "$X" "$VM_ID") \
+        || die "in-place update failed; durable update journal retained for exact readback recovery"
+      echo "$out"
+      j=$(echo "$out" | grep '"app_id"' | tail -1)
+      target_h=$(echo "$j" | jq -er '.compose_hash | ascii_downcase | ltrimstr("0x")') \
+        || die "in-place update returned no compose hash; durable update journal retained"
+      [ "${target_h,,}" = "${UPDATE_H,,}" ] \
+        || die "in-place update returned unexpected compose hash $target_h (expected $UPDATE_H); durable update journal retained"
+    elif [ "${current_h,,}" = "${UPDATE_H,,}" ]; then
+      log "in-place update already reached its target before journal completion"
+      if [ "$current_status" = stopped ] || [ "$current_status" = exited ]; then
+        _inventory_matches none \
+          || die "target VM is stopped but another same-app VM is active; refusing recovery start"
+        _box_run start "" "$VM_ID" >/dev/null \
+          || die "target VM is stopped and recovery start failed"
+      fi
+    else
+      die "in-place update outcome is ambiguous: VM hash 0x$current_h is neither previous 0x$UPDATE_PREVIOUS_H nor target 0x$UPDATE_H"
+    fi
+
+    current=$(_box_run describe "" "$VM_ID") \
+      || die "could not read back updated VM; update journal retained"
+    j=$(echo "$current" | grep '"vm_id"' | tail -1)
+    echo "$j" | jq -e --arg target "$UPDATE_H" \
+      '.found == true and
+       (((.compose_hash // "") | ascii_downcase | ltrimstr("0x")) ==
+        ($target | ascii_downcase | ltrimstr("0x")))' >/dev/null \
+      || die "VMM did not read back target compose; update journal retained"
+    UPDATE_PHASE=upgraded
+    _save
+  fi
+
+  [ "$UPDATE_PHASE" = upgraded ] || die "in-place update did not reach upgraded phase"
   current=$(_box_run describe "" "$VM_ID") \
-    || die "could not read back updated VM; target=$target_h recorded=$H"
+    || die "could not inspect upgraded VM; update journal retained"
   j=$(echo "$current" | grep '"vm_id"' | tail -1)
-  echo "$j" | jq -e --arg target "$target_h" \
+  echo "$j" | jq -e \
+    --arg target "$UPDATE_H" --arg vcpu "$BOX_VCPU" --arg memory "$BOX_MEM" \
+    --arg disk "$BOX_DISK" --arg app "$X" \
     '.found == true and
-     (((.compose_hash // "") | ascii_downcase) == ($target | ascii_downcase))' >/dev/null \
-    || die "VMM did not read back target compose; target=$target_h recorded=$H"
-  # UpgradeApp/start is asynchronous. Do not commit the target hash to the durable journal until
-  # the gateway proves that exact measured app is healthy and no second same-app VM is active.
-  _wait_health 45 10 "$target_h" \
-    || die "updated VM did not prove target health; target=$target_h recorded=$H (restore the recorded measured compose before retrying)"
+     (((.compose_hash // "") | ascii_downcase | ltrimstr("0x")) ==
+      ($target | ascii_downcase | ltrimstr("0x"))) and
+     (.vcpu | tonumber) == ($vcpu | tonumber) and
+     (.memory | tonumber) == ($memory | tonumber) and
+     (.disk_size | tonumber) == ($disk | tonumber) and
+     (((.app_id // "") | ascii_downcase | ltrimstr("0x")) ==
+      ($app | ascii_downcase | ltrimstr("0x")))' >/dev/null \
+    || die "upgraded VM identity/resource/hash readback failed; update journal retained"
+  current_status=$(echo "$j" | jq -er '(.status // "") | ascii_downcase')
+  if [ "$current_status" = stopped ] || [ "$current_status" = exited ]; then
+    _inventory_matches none \
+      || die "upgraded VM is stopped but another same-app VM is active; refusing recovery start"
+    _box_run start "" "$VM_ID" >/dev/null \
+      || die "upgraded VM recovery start failed; update journal retained"
+  fi
+  _wait_inventory "$VM_ID" 30 2 \
+    || die "updated VM is not the only active same-app VM; update journal retained"
+  # Do not commit the target hash until the exact measured app is healthy and unique.
+  _wait_health 45 10 "$UPDATE_H" \
+    || die "updated VM did not prove target health; update journal retained"
   _inventory_matches "$VM_ID" \
-    || die "same-app inventory changed during update health gate; recorded hash remains $H"
-  H="$target_h"
+    || die "same-app inventory changed during update health gate; update journal retained"
+  H="$UPDATE_H"
+  UPDATE_PHASE=
+  UPDATE_VM_ID=
+  UPDATE_H=
+  UPDATE_PREVIOUS_H=
   _save
   log "✔ sandboxd update complete and healthy vm=$VM_ID compose_hash=$H"
 }

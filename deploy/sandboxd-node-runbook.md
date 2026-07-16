@@ -22,6 +22,18 @@ deploy/sandboxd-node.sh sandboxd verify-health
 deploy/sandboxd-node.sh sandboxd smoke
 ```
 
+An in-place update writes its VM id, previous compose hash, target compose hash, and phase to the
+state journal before stopping the VM. If the command is interrupted, leave the compose and journal
+unchanged and rerun `update`; recovery accepts only the recorded previous or target hash, resumes the
+same VM, and commits `H` only after exact target health plus one-active-VM inventory. A third hash
+fails closed. Never delete or hand-edit the journal to get past that check.
+
+For a legacy interrupted update that predates this journal, first inspect the exact VMM hash,
+resources, app identity, and same-app inventory. Only then may one invocation set
+`SANDBOXD_UPDATE_RECOVERY_FROM_HASH` to that full 64-hex inspected hash. This is an exact incident
+reconciliation value, not a boolean bypass; the script persists it as the previous hash before the
+next mutation.
+
 Pre-launch stops managed workloads before restarting Docker, restores the host firewall before the
 daemon resumes durable rows, and fails closed unless all of these are true:
 

@@ -94,14 +94,38 @@ class SandboxdNodeContractTests(unittest.TestCase):
     def test_update_commits_hash_only_after_target_health(self) -> None:
         deploy_script = (ROOT / "deploy" / "sandboxd-node.sh").read_text()
         readback_gate = deploy_script.index("VMM did not read back target compose")
-        health_gate = deploy_script.index('_wait_health 45 10 "$target_h"')
+        health_gate = deploy_script.index('_wait_health 45 10 "$UPDATE_H"')
         inventory_gate = deploy_script.index('_inventory_matches "$VM_ID"', health_gate)
-        commit_hash = deploy_script.index('H="$target_h"', inventory_gate)
+        commit_hash = deploy_script.index('H="$UPDATE_H"', inventory_gate)
         save_state = deploy_script.index("  _save", commit_hash)
         self.assertLess(readback_gate, health_gate)
         self.assertLess(health_gate, inventory_gate)
         self.assertLess(inventory_gate, commit_hash)
         self.assertLess(commit_hash, save_state)
+
+    def test_update_is_durably_reconcilable_and_rejects_a_third_hash(self) -> None:
+        deploy_script = (ROOT / "deploy" / "sandboxd-node.sh").read_text()
+        for field in (
+            "UPDATE_PHASE",
+            "UPDATE_VM_ID",
+            "UPDATE_H",
+            "UPDATE_PREVIOUS_H",
+        ):
+            self.assertIn(f"{field}=${{{field}:-}}", deploy_script)
+        prepared = deploy_script.index("UPDATE_PHASE=prepared")
+        prepared_save = deploy_script.index("    _save", prepared)
+        mutating = deploy_script.index("UPDATE_PHASE=mutating", prepared_save)
+        mutating_save = deploy_script.index("    _save", mutating)
+        mutation = deploy_script.index('_box_run update "$X" "$VM_ID"', mutating_save)
+        self.assertLess(prepared, prepared_save)
+        self.assertLess(prepared_save, mutating)
+        self.assertLess(mutating, mutating_save)
+        self.assertLess(mutating_save, mutation)
+        self.assertIn("SANDBOXD_UPDATE_RECOVERY_FROM_HASH", deploy_script)
+        self.assertIn(
+            "is neither previous 0x$UPDATE_PREVIOUS_H nor target 0x$UPDATE_H",
+            deploy_script,
+        )
 
 
 if __name__ == "__main__":
