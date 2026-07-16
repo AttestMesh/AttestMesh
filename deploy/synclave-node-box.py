@@ -152,13 +152,51 @@ def app_compose_and_hash(env_keys: list[str]) -> tuple[str, str]:
         "no_instance_id": False,  # stable per-instance disk (app_id||instance_id)
         "secure_time": True,
     }
-    # Log in to the private registry inside the guest so ghcr.io/dmvt/* +
-    # ghcr.io/attestmesh/* images pull. Creds arrive sealed as DSTACK_DOCKER_*.
-    app_compose["pre_launch_script"] = (
-        'if [ -n "$DSTACK_DOCKER_PASSWORD" ]; then '
-        'echo "$DSTACK_DOCKER_PASSWORD" | docker login "${DSTACK_DOCKER_REGISTRY:-ghcr.io}" '
-        '-u "$DSTACK_DOCKER_USERNAME" --password-stdin; fi'
-    )
+    # Remove only the documented stopped Compose sidecar tombstone left by an
+    # interrupted recreate, then log in to the private registry. Never
+    # force-remove or broad-match live services.
+    app_compose["pre_launch_script"] = r"""set -euo pipefail
+tombstone_ids=()
+while read -r container_id container_name; do
+  case "$container_name" in
+    ????????????_dstack-sidecar-1)
+      prefix="${container_name%%_*}"
+      case "$prefix" in
+        *[!0-9a-f]*) ;;
+        *) tombstone_ids+=("$container_id") ;;
+      esac
+      ;;
+  esac
+done < <(docker ps -a --format '{{.ID}} {{.Names}}')
+if [ "${#tombstone_ids[@]}" -gt 1 ]; then
+  echo "multiple dstack sidecar tombstones found; refusing recovery" >&2
+  exit 1
+fi
+if [ "${#tombstone_ids[@]}" -eq 1 ]; then
+  tombstone_id="${tombstone_ids[0]}"
+  tombstone_name="$(docker inspect -f '{{.Name}}' "$tombstone_id")"
+  tombstone_name="${tombstone_name#/}"
+  tombstone_running="$(docker inspect -f '{{.State.Running}}' "$tombstone_id")"
+  tombstone_project="$(docker inspect -f '{{index .Config.Labels "com.docker.compose.project"}}' "$tombstone_id")"
+  tombstone_service="$(docker inspect -f '{{index .Config.Labels "com.docker.compose.service"}}' "$tombstone_id")"
+  case "$tombstone_name" in
+    ????????????_dstack-sidecar-1) ;;
+    *) echo "sidecar recovery target name changed; refusing" >&2; exit 1 ;;
+  esac
+  if [ "$tombstone_running" != false ] \
+    || [ "$tombstone_project" != dstack ] \
+    || [ "$tombstone_service" != sidecar ] \
+    || [ "$tombstone_name" = dstack-sidecar-1 ]; then
+    echo "sidecar recovery target is not a stopped Compose tombstone; refusing" >&2
+    exit 1
+  fi
+  echo "[prelaunch] removing stopped Compose tombstone $tombstone_name"
+  docker rm "$tombstone_id" >/dev/null
+fi
+
+if [ -n "${DSTACK_DOCKER_PASSWORD:-}" ]; then
+  echo "$DSTACK_DOCKER_PASSWORD" | docker login "${DSTACK_DOCKER_REGISTRY:-ghcr.io}" -u "$DSTACK_DOCKER_USERNAME" --password-stdin
+fi"""
     rendered = json.dumps(app_compose, indent=4, ensure_ascii=False)
     return rendered, hashlib.sha256(rendered.encode()).hexdigest()
 
