@@ -196,7 +196,7 @@ services:
     # v20 = CLUSTER_NETWORKS-only live mesh config + structured orchestrator errors;
     # v19 = Apps → Sandboxes rename (labels only, wire stays app).
     # Synclave main a0545a2 — deterministic repository compatibility analyzer.
-    image: ghcr.io/attestmesh/synclave-app:sha-a0545a207ba51c1757a3c5303cc1e5c8e609428c@sha256:cfcb54cfdee391d59d7cddb84f2d0f3cdcc37d5f5405d1a27546512a04c5fd98
+    image: ghcr.io/attestmesh/synclave-app:sha-91f85769a1e2d9b2787cbdf6cf345aa3ea13e418@sha256:201894e1d8e50421b10155863ce13c8f7aa691bea17ac17665f6ed0395c545ae
     environment:
       API_HOST: 0.0.0.0
       API_PORT: 80
