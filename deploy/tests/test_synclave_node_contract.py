@@ -41,7 +41,7 @@ class SynclaveNodeContractTests(unittest.TestCase):
         self.assertIn('app_health" != healthy', box)
         self.assertIn('app_network="${app_networks[0]}"', box)
         self.assertIn("| tr -d '\\r' | sed '/^[[:space:]]*$/d'", box)
-        self.assertIn('[ -z "$network_id" ] || [ -z "$endpoint_id" ]', box)
+        self.assertIn('[ -z "$network_id" ]', box)
         self.assertIn('network_actual_id" != "$network_id', box)
         self.assertIn('network_project" != dstack', box)
         self.assertIn('network_role" != default', box)
@@ -66,6 +66,14 @@ class SynclaveNodeContractTests(unittest.TestCase):
         )[0]
         self.assertNotIn("--volume", diagnostic_create)
         self.assertNotIn(" -v ", diagnostic_create)
+
+    def test_stopped_app_attachment_does_not_require_endpoint_id(self) -> None:
+        box = (ROOT / "deploy/synclave-node-box.py").read_text(encoding="utf-8")
+
+        self.assertIn("{{.NetworkID}} {{.EndpointID}}", box)
+        self.assertIn("read -r network_id _", box)
+        self.assertIn('if [ -z "$network_id" ]; then', box)
+        self.assertNotIn('[ -z "$endpoint_id" ]', box)
 
     def test_failed_app_diagnostic_redactor_removes_secret_markers(self) -> None:
         box = (ROOT / "deploy/synclave-node-box.py").read_text(encoding="utf-8")

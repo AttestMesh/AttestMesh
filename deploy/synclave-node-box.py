@@ -260,9 +260,9 @@ if docker inspect "$app_name" >/dev/null 2>&1; then
       exit 1
     fi
     app_network="${app_networks[0]}"
-    read -r network_id endpoint_id < <(docker inspect -f "{{with index .NetworkSettings.Networks \"$app_network\"}}{{.NetworkID}} {{.EndpointID}}{{end}}" "$app_name")
-    if [ -z "$network_id" ] || [ -z "$endpoint_id" ]; then
-      echo "app diagnostic requires an active endpoint on $app_network" >&2
+    read -r network_id _ < <(docker inspect -f "{{with index .NetworkSettings.Networks \"$app_network\"}}{{.NetworkID}} {{.EndpointID}}{{end}}" "$app_name")
+    if [ -z "$network_id" ]; then
+      echo "app diagnostic requires a declared NetworkID on $app_network" >&2
       exit 1
     fi
     network_actual_id="$(docker network inspect -f '{{.Id}}' "$app_network")"
