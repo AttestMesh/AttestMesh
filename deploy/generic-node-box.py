@@ -81,7 +81,7 @@ def app_compose_and_hash(env_keys: list[str]) -> tuple[str, str]:
         'echo "$DSTACK_DOCKER_PASSWORD" | docker login "${DSTACK_DOCKER_REGISTRY:-ghcr.io}" '
         '-u "$DSTACK_DOCKER_USERNAME" --password-stdin; fi; '
         'rm -f /tmp/attestmesh-workload.env; '
-        'if [ -n "$APP_ENV_B64" ]; then echo "$APP_ENV_B64" | base64 -d > /tmp/attestmesh-workload.env; '
+        'if [ -n "$APP_ENV_B64" ]; then printf %s "$APP_ENV_B64" | openssl enc -base64 -d -A > /tmp/attestmesh-workload.env; '
         'else : > /tmp/attestmesh-workload.env; fi; chmod 0600 /tmp/attestmesh-workload.env'
     )
     rendered = json.dumps(app_compose, indent=4, ensure_ascii=False)
@@ -222,7 +222,53 @@ def main() -> None:
         )
         return
 
-    raise SystemExit("usage: generic-node-box.py [deploy|hash|stop <vm_id>|update <app_id> <vm_id>]")
+    if mode == "recreate":
+        app_id = sys.argv[2] if len(sys.argv) > 2 else ""
+        vm_id = sys.argv[3] if len(sys.argv) > 3 else ""
+        if not app_id or not vm_id:
+            raise SystemExit("usage: generic-node-box.py recreate <app_id> <vm_id>")
+        env = build_env()
+        compose_file, compose_hash = app_compose_and_hash(list(env.keys()))
+        sealed = dict(env)
+        sealed["APP_ID"] = app_id
+        try:
+            m.vmm("StopVm", {"id": vm_id})
+        except Exception:
+            pass
+        for _ in range(40):
+            info = m.vmm("GetInfo", {"id": vm_id})
+            status = str((info.get("info") or {}).get("status") or "").lower()
+            if not info.get("found", True) or status.startswith(("stop", "exit")):
+                break
+            time.sleep(2)
+        m.vmm("RemoveVm", {"id": vm_id})
+        result = m.vmm(
+            "CreateVm",
+            {
+                "name": NAME,
+                "image": "dstack-0.5.11",
+                "compose_file": compose_file,
+                "vcpu": VCPU,
+                "memory": MEM,
+                "disk_size": DISK,
+                "app_id": app_id,
+                "user_config": "",
+                "ports": [m._parse_port(port) for port in PORTS],
+                "hugepages": False,
+                "pin_numa": False,
+                "stopped": False,
+                "no_tee": False,
+                "kms_urls": kms_urls(),
+                "networking": {"mode": NET_MODE},
+                "gateway_urls": [m.GATEWAY_RPC] if GATEWAY_ENABLED else [],
+                "encrypted_env": m._seal_env(sealed, m._app_env_encrypt_pubkey(app_id)),
+            },
+        )
+        print(json.dumps({"app_id": app_id, "compose_hash": compose_hash,
+                          "vm_id": result.get("id"), "mode": "recreate"}))
+        return
+
+    raise SystemExit("usage: generic-node-box.py [deploy|hash|stop <vm_id>|update|recreate <app_id> <vm_id>]")
 
 
 if __name__ == "__main__":
