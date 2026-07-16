@@ -22,7 +22,9 @@
 # No secrets are committed here; all ${VAR} values are sealed into the CVM by
 # deploy/synclave-node.sh (key NAMES are measured into the compose_hash, VALUES
 # are sealed to the app's X25519 key).
-name: attestmesh-synclave
+# Keep the runner's established `dstack` project identity: persistent production
+# containers and their published sidecar ports are owned by that project.
+name: dstack
 
 x-logging: &production-logging
   driver: json-file

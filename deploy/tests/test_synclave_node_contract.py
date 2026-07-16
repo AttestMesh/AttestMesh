@@ -8,6 +8,14 @@ ROOT = Path(__file__).resolve().parents[2]
 
 
 class SynclaveNodeContractTests(unittest.TestCase):
+    def test_compose_preserves_the_existing_dstack_project_identity(self) -> None:
+        compose = (ROOT / "deploy/compose/synclave-node.yaml").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn("\nname: dstack\n", compose)
+        self.assertNotIn("\nname: attestmesh-synclave\n", compose)
+
     def test_prelaunch_removes_only_the_stopped_compose_sidecar_tombstone(self) -> None:
         box = (ROOT / "deploy/synclave-node-box.py").read_text(encoding="utf-8")
 
