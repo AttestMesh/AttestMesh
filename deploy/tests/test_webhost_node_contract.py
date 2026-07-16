@@ -108,6 +108,7 @@ class WebhostNodeContractTests(unittest.TestCase):
         self.assertEqual(env["DAEMON_CONTAINER_RUNTIME"], "runsc")
         self.assertEqual(env["DAEMON_ENFORCE_EGRESS"], "1")
         self.assertEqual(env["INGRESS_PORT"], "8088")
+        self.assertEqual(services["frontproxy"]["cpus"], 1.0)
         self.assertFalse(
             any(key.startswith("RUNYARD_") for key in env),
             "the unified Webhost must not consume the legacy HTTP Runyard handoff",
@@ -181,6 +182,13 @@ class WebhostNodeContractTests(unittest.TestCase):
         )
         self.assertIn('"WEBHOST_ADMIN_HOST"', box)
         self.assertIn('"ACME_EMAIL"', box)
+        self.assertIn("????????????_dstack-sidecar-1", box)
+        self.assertIn('tombstone_running" != false', box)
+        self.assertIn('tombstone_project" != dstack', box)
+        self.assertIn('tombstone_service" != sidecar', box)
+        self.assertIn('docker rm "$tombstone_id"', box)
+        self.assertNotIn('docker rm -f "$tombstone_id"', box)
+        self.assertIn("Webhost CVM bridge lease not ready", driver)
 
     def test_snapshot_and_restore_commands_round_trip(self) -> None:
         backup_service = self.candidate["services"]["migration-backup"]
