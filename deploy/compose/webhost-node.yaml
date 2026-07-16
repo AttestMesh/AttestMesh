@@ -78,7 +78,7 @@ services:
         condition: service_completed_successfully
 
   storage-helper:
-    image: ghcr.io/dmvt/webhost-control-storage-helper@sha256:e710fd41f4fac83380c42b5276ed776433e5e7e0fd316490a4a59f70b3e47ba6
+    image: ghcr.io/dmvt/webhost-control-storage-helper@sha256:91ee79f2b553266336a393d6e7b484ed23d9735f4dc27eaff858658b5bc87cf0
     pull_policy: always
     restart: unless-stopped
     init: true
@@ -122,11 +122,11 @@ services:
       migration-backup:
         condition: service_completed_successfully
 
-  # Webhost v1.1.4 unifies the control API, admin UI, public directory, tenant
+  # Webhost v1.1.5 unifies the control API, admin UI, public directory, tenant
   # ingress, and runtime orchestration. These settings mirror its released
   # production Compose contract while retaining the live dstack volume names.
   frontproxy:
-    image: ghcr.io/dmvt/webhost-control-control-plane@sha256:47f9a25c8145074b94bbcd21af808988637b2027bfad003e4aadfd9c8d19d802
+    image: ghcr.io/dmvt/webhost-control-control-plane@sha256:9faee0607e7d40df9af9e8a2c6f754ff5e10ef36568ddb072542a9b7b70c437f
     pull_policy: always
     restart: unless-stopped
     init: true
@@ -139,8 +139,8 @@ services:
     logging: *production-logging
     environment:
       WEBHOST_ENV: production
-      WEBHOST_VERSION: v1.1.4
-      WEBHOST_BUILD_COMMIT: 483d6d3585a4e551eaa2d38a09a47b29b1e1b234
+      WEBHOST_VERSION: v1.1.5
+      WEBHOST_BUILD_COMMIT: 11d25aea81233d9c62acfd1941ff0b2c0263b9ae
       WEBHOST_LOG_FORMAT: json
       WEBHOST_ADMIN_HOST: ${WEBHOST_ADMIN_HOST:-daemon.synclave.net}
       TEE_DAEMON_TOKEN: ${TEE_DAEMON_TOKEN:?set a 32-byte-or-longer control token}
@@ -288,7 +288,7 @@ services:
         condition: service_healthy
 
   tlsproxy:
-    image: ghcr.io/dmvt/webhost-control-tlsproxy@sha256:58acbf1252724407da69bc6a7313001dc5685e61c6ed5dd4d185cf8739802e3d
+    image: ghcr.io/dmvt/webhost-control-tlsproxy@sha256:06c17f112eebc792639c9990191b8d306c206ad4e9329732114c2c36a1966720
     pull_policy: always
     restart: unless-stopped
     init: true
