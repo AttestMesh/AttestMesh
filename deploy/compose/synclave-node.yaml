@@ -267,7 +267,7 @@ services:
     security_opt:
       - no-new-privileges:true
     mem_limit: 4g
-    cpus: 2.0
+    cpus: 1.0
     pids_limit: 1024
     logging: *production-logging
     healthcheck:
