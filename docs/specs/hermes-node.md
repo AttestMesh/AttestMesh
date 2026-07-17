@@ -35,10 +35,10 @@ The reference for the node shape is the hand-built agent on the ssh node ("Verit
 bash deploy/hermes-node.sh <agent> init          # writes ~/.attestmesh/agents/<agent>.env template
 # create Fastmail mailbox + GitHub machine account; fill env file
 # optional persona: ~/.attestmesh/agents/<agent>.soul.md
-bash deploy/hermes-node.sh <agent> all           # provision-matrix → deploy → prime → bind → verify → verify-ssh → verify-hermes
+bash deploy/hermes-node.sh <agent> all           # provision-matrix → deploy → prime → bind → verify → verify-ssh → verify-hermes → verify-paseo
 ```
 
-Day-2: `update` (in-place roll, disk preserved), `verify-hermes` (reads the gateway's self-reported `gateway_state.json` over ssh; expects `matrix: connected`).
+Day-2: `update` (in-place roll, disk preserved), `verify-hermes` (reads the gateway's self-reported `gateway_state.json` over ssh; expects `matrix: connected`), and `verify-paseo` (requires both fugu-ultra and GLM router model IDs through ACP).
 
 ## 4. Trust & caveats
 
@@ -46,3 +46,4 @@ Day-2: `update` (in-place roll, disk preserved), `verify-hermes` (reads the gate
 - Secrets ride to the box helper via a 0600 tmpfs env file, not argv.
 - `provision-matrix` drives an LLM channel (best-effort, bounded confirms). The deterministic upgrade is the **on-chain command channel**: seal `MATRIX_ADMIN_SENDERS` (an authorized member id) on the matrix node and speak `attestmesh.matrix-admin.command.v1` — see matrix-admin-agent spec §7/§8.1. Adopt at the next planned matrix-node roll.
 - Agent egress is currently **unrestricted** (workbench semantics). If an agent should be locked down, add the `agent-egress-fw` pattern from the matrix node as a follow-up.
+- SSH is break-glass operator access, not a runtime dependency. Both listeners are gateway-exposed root shells over the shared volume; :1023 additionally reaches the private mesh. The target design replaces permanent SSH with authenticated administration endpoints and short-lived audited recovery access.

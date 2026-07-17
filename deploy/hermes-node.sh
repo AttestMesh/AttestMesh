@@ -31,7 +31,7 @@ source "$HERE/lib.sh"
 : "${RPC_URL:?source deploy/env.sh first}"
 require PRIVATE_KEY RPC_URL CHAIN_ID DEPLOYER_ADDR
 
-NODE="${1:?usage: hermes-node.sh <node-name> [init|provision-matrix|deploy|prime|bind|register-direct|verify|verify-ssh|verify-hermes|update|all|setup]}"
+NODE="${1:?usage: hermes-node.sh <node-name> [init|provision-matrix|deploy|prime|bind|register-direct|verify|verify-ssh|verify-hermes|verify-paseo|update|all|setup]}"
 ACTION="${2:-all}"
 BOX_HOST="${BOX_HOST:-ubuntu@173.231.234.133}"
 BOX_PY="${BOX_PY:-/opt/dstack-mcp/venv/bin/python}"
@@ -221,13 +221,17 @@ _gw_host() {
   printf '%s-%s.%s' "$(printf '%s' "$xb" | tr 'A-Z' 'a-z')" "$port" "$GATEWAY_DOMAIN"
 }
 
-_node_ssh() {
-  local host; host="$(_gw_host 1022)"
+_node_ssh_port() {
+  local port="${1:?port required}" host
+  shift
+  host="$(_gw_host "$port")"
   ssh -o BatchMode=yes -o ConnectTimeout=20 -o StrictHostKeyChecking=accept-new \
     -o UserKnownHostsFile="$LOGDIR/hermes-node-${NODE}.known_hosts" \
     -o ProxyCommand="openssl s_client -quiet -connect ${host}:443 -servername ${host}" \
     "root@${host}" "$@"
 }
+
+_node_ssh() { _node_ssh_port 1022 "$@"; }
 
 init_env() {
   install -d -m 700 "$AGENT_DIR"
@@ -447,6 +451,28 @@ verify_hermes() {
   die "hermes gateway never reported matrix connected (check: ssh to $(_gw_host 1022))"
 }
 
+# Paseo and Hermes ACP run in the sidecar network namespace. Verify through the
+# :1023 mesh shell: the :1022 bridge shell's localhost is a different netns and
+# produces a misleading DAEMON_NOT_RUNNING result. This also catches stale
+# workbench images missing the stable ACP config-options model selector.
+verify_paseo() {
+  _load
+  [ -n "${X:-}" ] || die "need X (run deploy first)"
+  local i models
+  for i in $(seq 1 30); do
+    models=$(_node_ssh_port 1023 'paseo provider models hermes --json 2>/dev/null' 2>/dev/null || true)
+    if printf '%s' "$models" | jq -e \
+      '([.[].id] | index("custom:fugu-ultra")) != null and
+       ([.[].id] | index("custom:glm-5.2")) != null' >/dev/null 2>&1; then
+      log "✔ paseo Hermes provider exposes fugu-ultra + glm-5.2 model switching"
+      return 0
+    fi
+    log "… paseo model selector not ready ($i/30)"
+    sleep 10
+  done
+  die "paseo never exposed required Hermes models (check via the :1023 mesh shell)"
+}
+
 update_member() {
   _load; _default_cluster_env; _load_agent_env; _require_env
   [ -n "${X:-}" ] && [ -n "${VM_ID:-}" ] && [ -n "${CLUSTER:-}" ] || die "need X/VM_ID/CLUSTER in $STATE"
@@ -471,6 +497,7 @@ update_member() {
   log "✔ hermes node update complete mode=$mode vm=$VM_ID"
   verify
   verify_ssh_gateway
+  verify_paseo
 }
 
 log "=== Hermes agent AttestMesh node: $NODE ==="
@@ -483,9 +510,10 @@ case "$ACTION" in
   verify) verify ;;
   verify-ssh) verify_ssh_gateway ;;
   verify-hermes) verify_hermes ;;
+  verify-paseo) verify_paseo ;;
   update) update_member ;;
   register-direct) register_direct ;;
   setup) provision_matrix; deploy_cvm; prime_gate; bind_member; register_direct ;;
-  all) provision_matrix; deploy_cvm; prime_gate; bind_member; register_direct; verify; verify_ssh_gateway; verify_hermes ;;
-  *) die "usage: hermes-node.sh <node-name> [init|provision-matrix|deploy|prime|bind|register-direct|verify|verify-ssh|verify-hermes|update|all|setup]" ;;
+  all) provision_matrix; deploy_cvm; prime_gate; bind_member; register_direct; verify; verify_ssh_gateway; verify_hermes; verify_paseo ;;
+  *) die "usage: hermes-node.sh <node-name> [init|provision-matrix|deploy|prime|bind|register-direct|verify|verify-ssh|verify-hermes|verify-paseo|update|all|setup]" ;;
 esac
