@@ -45,6 +45,26 @@ printf '%s' "$SUPW" > "$SECRETS_DIR/pg-superuser"
 printf '%s' "$APIPW" > "$SECRETS_DIR/patroni-api"
 chmod 644 "$SECRETS_DIR/pg-superuser" "$SECRETS_DIR/patroni-api"
 
+# Explicit former-primary recovery mode. Patroni normally performs this same
+# single-user crash replay, but a stuck inherited stdin can leave it waiting
+# forever. A recovery boot feeds EOF deliberately, disables archiving, records
+# control-state evidence, and never starts the HA daemon. The operator must then
+# roll the node normally; no WAL reset or data rewrite is performed here.
+if [ "${PGHA_CRASH_RECOVERY_ONLY:-false}" = true ]; then
+  RLOG="$(dirname "$STAT")/crash-recovery-$NODE.log"
+  _st "explicit crash recovery: starting single-user replay with archive_command=false"
+  set +e
+  timeout 900 gosu postgres /usr/lib/postgresql/16/bin/postgres \
+    --single -D "$PGDATA_DIR" -c archive_mode=on -c archive_command=false template1 \
+    </dev/null >>"$RLOG" 2>&1
+  rc=$?
+  set -e
+  /usr/lib/postgresql/16/bin/pg_controldata "$PGDATA_DIR" >>"$RLOG" 2>&1 || true
+  _st "explicit crash recovery: finished rc=$rc; see $RLOG"
+  [ "$rc" -eq 0 ] || exit "$rc"
+  exec sleep infinity
+fi
+
 ARCHIVE_CMD=/bin/true
 if [ "${BACKUP_ENABLED:-false}" = "true" ]; then
   export WALG_KEY_FILE="${WALG_KEY_FILE:-$RUN_DIR/walg.key}"
@@ -52,9 +72,10 @@ if [ "${BACKUP_ENABLED:-false}" = "true" ]; then
   csk_derive attestmesh.pgha.walg.v1 > "$WALG_KEY_FILE" || _die "WAL-G key derivation failed"
   [ -s "$WALG_KEY_FILE" ] || _die "WAL-G key file empty after derivation"
   chmod 600 "$WALG_KEY_FILE"; chown postgres:postgres "$WALG_KEY_FILE"
-  ARCHIVE_CMD="/usr/local/bin/walg-archive %p"
+  ARCHIVE_CMD="/usr/local/bin/pgha-walg-archive %p"
   _st "backups enabled: prefix=${BACKUP_PREFIX:-pg-ha} bucket=${R2_BUCKET:-?}"
   /usr/local/bin/pgha-backup-loop.sh &
+  /opt/patroni/bin/python /usr/local/bin/pgha-logical-backups.py &
 fi
 
 ETCD_HOSTS=""

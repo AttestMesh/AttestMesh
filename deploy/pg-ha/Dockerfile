@@ -13,7 +13,7 @@ RUN set -eux; \
     apt-get install -y --no-install-recommends \
         python3-venv haproxy jq iproute2 curl ca-certificates postgresql-16-pgvector; \
     python3 -m venv /opt/patroni; \
-    /opt/patroni/bin/pip install --no-cache-dir "${PATRONI_SPEC}" "psycopg[binary]"; \
+    /opt/patroni/bin/pip install --no-cache-dir "${PATRONI_SPEC}" "psycopg[binary]" boto3; \
     ln -s /opt/patroni/bin/patroni /usr/local/bin/patroni; \
     ln -s /opt/patroni/bin/patronictl /usr/local/bin/patronictl; \
     curl -fsSL -o /tmp/etcd.tar.gz \
@@ -25,5 +25,6 @@ RUN set -eux; \
     etcd --version; patroni --version; haproxy -v
 
 COPY pgha-common.sh pgha-etcd-entrypoint.sh pgha-patroni-entrypoint.sh pgha-haproxy-entrypoint.sh \
-     pgha-backup-loop.sh pgha-post-init.sh pgha-walg-bootstrap.sh /usr/local/bin/
+     pgha-backup-loop.sh pgha-logical-backups.py pgha-post-init.sh pgha-walg-bootstrap.sh \
+     pgha-walg-archive /usr/local/bin/
 RUN chmod +x /usr/local/bin/pgha-*.sh

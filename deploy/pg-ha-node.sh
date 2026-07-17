@@ -23,10 +23,11 @@ BOX_PY="${BOX_PY:-/opt/dstack-mcp/venv/bin/python}"
 BOX_DEPLOYER_KEY="${BOX_DEPLOYER_KEY:-/root/.attestmesh/base-deployer.json}"
 BOX_RPC="${BOX_RPC:-https://base-rpc.publicnode.com}"
 COMPOSE="${COMPOSE:-$ROOT/deploy/compose/pg-ha-node.yaml}"
-MATRIX_STATE="${MATRIX_STATE:-$LOGDIR/matrix-node-matrix-node.state}"
-SSH_STATE="${SSH_STATE:-$LOGDIR/ssh-node-ssh-node.state}"
 SECRETS_FILE="${SECRETS_FILE:-$HOME/.attestmesh/pg-ha.env}"
 [ -f "$SECRETS_FILE" ] && source "$SECRETS_FILE"
+# Direct upstream credentials used only by the node-local encrypting gateways.
+# The R2_* values above remain the loopback gateway's client credentials.
+R2_UPSTREAM_CREDS="${R2_UPSTREAM_CREDS:-$HOME/.attestmesh/r2-host-r2.toml}"
 export BOX_VCPU="${BOX_VCPU:-8}" BOX_MEM="${BOX_MEM:-65536}" BOX_DISK="${BOX_DISK:-256}"
 export BOX_PORTS="${BOX_PORTS:-[]}" BOX_GATEWAY_ENABLED="${BOX_GATEWAY_ENABLED:-true}" BOX_NET_MODE="${BOX_NET_MODE:-bridge}"
 GATEWAY_DOMAIN="${GATEWAY_DOMAIN:-gateway.attestmesh.xyz}"
@@ -35,6 +36,22 @@ PGHA_COUNT="${PGHA_COUNT:-3}"
 BACKUP_ENABLED="${BACKUP_ENABLED:-true}"
 BACKUP_PREFIX="${BACKUP_PREFIX:-pg-ha}"
 BACKUP_RESTORE="${BACKUP_RESTORE:-}"
+BACKUP_DUMP_INTERVAL_SECONDS="${BACKUP_DUMP_INTERVAL_SECONDS:-21600}"
+PGHA_CLUSTER_NAME="${PGHA_CLUSTER_NAME:-andrew-xyn-pg}"
+PGHA_SAFE_ADDRESS="${PGHA_SAFE_ADDRESS:-}"
+# This driver targets the self-hosted dstack box, whose KMS signer is distinct from
+# deploy/env.sh's Phala production root. An incorrect root fails as InvalidSigChain().
+PGHA_KMS_ROOT="${PGHA_KMS_ROOT:-0x7fa63d99495be2129cf28eee54e2ef2724e3aa2e}"
+# Keep the Pimlico endpoint bundler-only. Operators should set PGHA_CVM_RPC_URL to
+# the node's dedicated box-proxyd route; it deliberately overrides env.sh's default.
+CVM_RPC_URL="${PGHA_CVM_RPC_URL:-${CVM_RPC_URL:-$RPC_URL}}"
+
+_assert_chain_only_control_plane() {
+  local forbidden
+  forbidden=$(grep -Ein 'tailscale|matrix|sshd|openssh' "$COMPOSE" || true)
+  [ -z "$forbidden" ] || die "chain-only control-plane invariant failed; forbidden service/config in $COMPOSE: $forbidden"
+  [ "${BOX_PORTS:-[]}" = "[]" ] || die "host application ports forbidden (BOX_PORTS must be [])"
+}
 
 CSTATE="$LOGDIR/pg-ha-${NODE}.state"
 ZERO32=0x0000000000000000000000000000000000000000000000000000000000000000
@@ -48,16 +65,12 @@ _save_cluster() {
   cat > "$CSTATE" <<EOF
 CLUSTER=${CLUSTER:-}
 MEMBER_IMPL=${MEMBER_IMPL:-}
-MATRIX_X=${MATRIX_X:-}
-MATRIX_MESH_IP=${MATRIX_MESH_IP:-}
-MATRIX_ROOM_ID=${MATRIX_ROOM_ID:-}
-MATRIX_ADMIN_MXIDS=${MATRIX_ADMIN_MXIDS:-}
+PGHA_SAFE_ADDRESS=${PGHA_SAFE_ADDRESS:-}
 CIDR_IP=${CIDR_IP:-}
 CIDR_PREFIX=${CIDR_PREFIX:-}
 MESH_CIDR_STR=${MESH_CIDR_STR:-}
 PGHA_PEERS=${PGHA_PEERS:-}
 PGHA_VERIFY_PASSWORD=${PGHA_VERIFY_PASSWORD:-}
-BOTPASSWORD=${BOTPASSWORD:-}
 PGHA_INITIALIZED=${PGHA_INITIALIZED:-}
 EOF
 }
@@ -86,33 +99,9 @@ _ipv4_from_u32() {
   printf '%d.%d.%d.%d' "$(( (n >> 24) & 255 ))" "$(( (n >> 16) & 255 ))" "$(( (n >> 8) & 255 ))" "$(( n & 255 ))"
 }
 
-_matrix_server_name() {
-  printf '%s.gateway.attestmesh.xyz' "$(printf '%s' "${MATRIX_X#0x}" | tr A-Z a-z)"
-}
-
-_bot_user_id() { printf '@pgha-%s:%s' "$1" "$(_matrix_server_name)"; }
-
-_default_matrix_env() {
-  [ -f "$MATRIX_STATE" ] || die "missing Matrix state: $MATRIX_STATE"
-  local m_x m_cluster m_impl
-  m_x=$(grep '^X=' "$MATRIX_STATE" | cut -d= -f2-)
-  m_cluster=$(grep '^CLUSTER=' "$MATRIX_STATE" | cut -d= -f2-)
-  m_impl=$(grep '^MEMBER_IMPL=' "$MATRIX_STATE" | cut -d= -f2-)
-  [ -n "$m_x" ] && [ -n "$m_cluster" ] && [ -n "$m_impl" ] || die "Matrix state lacks X/CLUSTER/MEMBER_IMPL"
-
-  MATRIX_X="${MATRIX_X:-$m_x}"
-  CLUSTER="${CLUSTER:-$m_cluster}"
-  MEMBER_IMPL="${MEMBER_IMPL:-$m_impl}"
-  local matrix_member_id mesh_u32
-  matrix_member_id=$(cast call "$CLUSTER" 'memberIdOf(address)(bytes32)' "$MATRIX_X" --rpc-url "$RPC_URL" 2>/dev/null)
-  [ -n "$matrix_member_id" ] && [ "$matrix_member_id" != "$ZERO32" ] || die "Matrix app is not registered in cluster $CLUSTER"
-  mesh_u32=$(cast call "$CLUSTER" 'meshIpOf(bytes32)(uint32)' "$matrix_member_id" --rpc-url "$RPC_URL" 2>/dev/null | awk '{print int($1)}')
-  [ -n "$mesh_u32" ] && [ "$mesh_u32" != 0 ] || die "could not resolve Matrix mesh IP"
-  MATRIX_MESH_IP="${MATRIX_MESH_IP:-$(_ipv4_from_u32 "$mesh_u32")}"
-
-  local server_name; server_name="$(_matrix_server_name)"
-  MATRIX_ROOM_ID="${MATRIX_ROOM_ID:-!QlbJvhWoxMNcJvVwCr:${server_name}}"
-  MATRIX_ADMIN_MXIDS="${MATRIX_ADMIN_MXIDS:-@lsdan:${server_name}}"
+_default_cluster_env() {
+  [ -n "${CLUSTER:-}" ] && [ -n "${MEMBER_IMPL:-}" ] \
+    || die "new-mesh state lacks CLUSTER/MEMBER_IMPL: $CSTATE"
 }
 
 _require_env() {
@@ -130,8 +119,18 @@ _require_env() {
     for v in R2_ACCESS_KEY_ID R2_SECRET_ACCESS_KEY R2_ENDPOINT R2_BUCKET; do
       [ -n "${!v:-}" ] || missing="$missing $v"
     done
+    if [ -f "$R2_UPSTREAM_CREDS" ]; then
+      R2_UPSTREAM_ENDPOINT="$(sed -nE 's/^endpoint *= *"?([^" ]+)"?.*/\1/p' "$R2_UPSTREAM_CREDS")"
+      R2_UPSTREAM_BUCKET="$(sed -nE 's/^bucket *= *"?([^" ]+)"?.*/\1/p' "$R2_UPSTREAM_CREDS")"
+      R2_UPSTREAM_REGION="$(sed -nE 's/^region *= *"?([^" ]+)"?.*/\1/p' "$R2_UPSTREAM_CREDS")"; : "${R2_UPSTREAM_REGION:=auto}"
+      R2_UPSTREAM_ACCESS_KEY_ID="$(sed -nE 's/^access_key_id *= *"?([^" ]+)"?.*/\1/p' "$R2_UPSTREAM_CREDS")"
+      R2_UPSTREAM_SECRET_ACCESS_KEY="$(sed -nE 's/^secret_access_key *= *"?([^" ]+)"?.*/\1/p' "$R2_UPSTREAM_CREDS")"
+    fi
+    for v in R2_UPSTREAM_ENDPOINT R2_UPSTREAM_BUCKET R2_UPSTREAM_ACCESS_KEY_ID R2_UPSTREAM_SECRET_ACCESS_KEY; do
+      [ -n "${!v:-}" ] || missing="$missing $v"
+    done
   fi
-  [ -z "$missing" ] || die "missing required env:$missing (put R2_*/BOTPASSWORD in $SECRETS_FILE)"
+  [ -z "$missing" ] || die "missing required env:$missing (put R2_* in $SECRETS_FILE)"
 }
 
 send_seq() {
@@ -176,11 +175,6 @@ _box_run() {
   gtok=$(grep  -E '^\s*token\s*='    "$HOME/.teesql/ghcr-pull.toml" 2>/dev/null | head -1 | sed -E 's/.*=\s*//' | tr -d "\"' ")
   [ -n "$gtok" ] || die "no ghcr token in ~/.teesql/ghcr-pull.toml"
   bootstrap="${NODE_BOOTSTRAP:-new}"
-  # Per-node mention alias so `@pgha-pgN` addresses exactly one bot. Only pg1 also answers to
-  # the friendly shared "pg-ha" alias — giving it to every node would make one `pg-ha: …`
-  # message activate all N agents in the shared room (N staged switchovers, N LLM runs).
-  local aliases="pgha-${node}"
-  [ "$node" = pg1 ] && aliases="${aliases},pg-ha"
   scp -o BatchMode=yes -q "$COMPOSE" "$BOX_HOST:/tmp/${NODE}.yaml"
   scp -o BatchMode=yes -q "$HERE/pg-ha-node-box.py" "$BOX_HOST:/tmp/pg-ha-node-box.py"
   {
@@ -195,34 +189,39 @@ _box_run() {
     printf 'E_PGHA_BOOTSTRAP=%q\n'        "$bootstrap"
     printf 'E_PGHA_MESH_CIDR=%q\n'        "${MESH_CIDR_STR:-}"
     printf 'E_PGHA_VERIFY_PASSWORD=%q\n'  "${PGHA_VERIFY_PASSWORD:-}"
+    printf 'E_PGHA_CLUSTER_NAME=%q\n'     "$PGHA_CLUSTER_NAME"
+    printf 'E_PGHA_SAFE_ADDRESS=%q\n'      "$PGHA_SAFE_ADDRESS"
+    printf 'E_PGHA_RECOVERY_CANDIDATE=%q\n' "${PGHA_RECOVERY_CANDIDATE:-}"
+    printf 'E_PGHA_CRASH_RECOVERY_ONLY=%q\n' "${PGHA_CRASH_RECOVERY_ONLY:-false}"
     printf 'E_BACKUP_ENABLED=%q\n'        "$BACKUP_ENABLED"
     printf 'E_BACKUP_PREFIX=%q\n'         "$BACKUP_PREFIX"
     printf 'E_BACKUP_RESTORE=%q\n'        "$BACKUP_RESTORE"
+    printf 'E_BACKUP_DUMP_INTERVAL_SECONDS=%q\n' "$BACKUP_DUMP_INTERVAL_SECONDS"
     printf 'E_R2_ACCESS_KEY_ID=%q\n'      "${R2_ACCESS_KEY_ID:-}"
     printf 'E_R2_SECRET_ACCESS_KEY=%q\n'  "${R2_SECRET_ACCESS_KEY:-}"
     printf 'E_R2_ENDPOINT=%q\n'           "${R2_ENDPOINT:-}"
     printf 'E_R2_BUCKET=%q\n'             "${R2_BUCKET:-}"
     printf 'E_R2_REGION=%q\n'             "${R2_REGION:-us-east-1}"
-    printf 'E_MATRIX_MESH_IP=%q\n'        "${MATRIX_MESH_IP:-}"
-    printf 'E_MATRIX_USER_ID=%q\n'        "$(_bot_user_id "$node")"
-    printf 'E_MATRIX_PASSWORD=%q\n'       "${BOTPASSWORD:-}"
-    printf 'E_MATRIX_ROOM_ID=%q\n'        "${MATRIX_ROOM_ID:-}"
-    printf 'E_MATRIX_ADMIN_MXIDS=%q\n'    "${MATRIX_ADMIN_MXIDS:-}"
-    printf 'E_MATRIX_MENTION_ALIASES=%q\n' "$aliases"
+    printf 'E_R2_UPSTREAM_ENDPOINT=%q\n'  "${R2_UPSTREAM_ENDPOINT:-}"
+    printf 'E_R2_UPSTREAM_BUCKET=%q\n'    "${R2_UPSTREAM_BUCKET:-}"
+    printf 'E_R2_UPSTREAM_REGION=%q\n'    "${R2_UPSTREAM_REGION:-auto}"
+    printf 'E_R2_UPSTREAM_ACCESS_KEY_ID=%q\n' "${R2_UPSTREAM_ACCESS_KEY_ID:-}"
+    printf 'E_R2_UPSTREAM_SECRET_ACCESS_KEY=%q\n' "${R2_UPSTREAM_SECRET_ACCESS_KEY:-}"
     printf 'E_LLM_BASE_URL=%q\n'          "${LLM_BASE_URL:-}"
     printf 'E_LLM_MODEL=%q\n'             "${LLM_MODEL:-}"
     printf 'E_LLM_API_KEY=%q\n'           "${LLM_API_KEY:-}"
     printf 'E_DSTACK_DOCKER_USERNAME=%q\n' "${guser:-dmvt}"
     printf 'E_DSTACK_DOCKER_PASSWORD=%q\n' "$gtok"
     printf 'E_DSTACK_DOCKER_REGISTRY=%q\n' "ghcr.io"
-  } | ssh_box "sudo BOX_APP_NAME='${NODE}' BOX_NAME='${NODE}-${node}' BOX_COMPOSE='/tmp/${NODE}.yaml' BOX_VCPU=$BOX_VCPU BOX_MEM=$BOX_MEM BOX_DISK=$BOX_DISK BOX_PORTS='$BOX_PORTS' BOX_GATEWAY_ENABLED='$BOX_GATEWAY_ENABLED' BOX_NET_MODE='$BOX_NET_MODE' BOX_FRESH_DISK='${BOX_FRESH_DISK:-}' \
+  } | ssh_box "sudo BOX_RPC='$BOX_RPC' BOX_APP_NAME='${NODE}' BOX_NAME='${NODE}-${node}' BOX_COMPOSE='/tmp/${NODE}.yaml' BOX_VCPU=$BOX_VCPU BOX_MEM=$BOX_MEM BOX_DISK=$BOX_DISK BOX_PORTS='$BOX_PORTS' BOX_GATEWAY_ENABLED='$BOX_GATEWAY_ENABLED' BOX_NET_MODE='$BOX_NET_MODE' BOX_FRESH_DISK='${BOX_FRESH_DISK:-}' \
     bash -c 'set -a; . /dev/stdin; set +a; exec $BOX_PY /tmp/pg-ha-node-box.py $mode $app_id $vm_id'"
 }
 
 # ── pipeline: register-all -> compute-peers -> create-all ───────────────────────────────
 
 register_all() {
-  _load_cluster; _default_matrix_env; _require_env
+  _assert_chain_only_control_plane
+  _load_cluster; _default_cluster_env; _require_env
   _save_cluster
   local n out j
   for n in $(_nodes); do
@@ -240,7 +239,7 @@ register_all() {
 }
 
 compute_peers() {
-  _load_cluster; _default_matrix_env; _mesh_math_init
+  _load_cluster; _default_cluster_env; _mesh_math_init
   local used=" " n mid ip attempts out j existing id
   # Our own nodes' member IDs — so a RE-RUN (resume) doesn't treat a node we already
   # registered as an external collision and needlessly register a throwaway app_id.
@@ -292,9 +291,8 @@ compute_peers() {
 }
 
 create_all() {
-  _load_cluster; _default_matrix_env; _require_env; _mesh_math_init
+  _load_cluster; _default_cluster_env; _require_env; _mesh_math_init
   [ -n "${PGHA_PEERS:-}" ] || die "no PGHA_PEERS — run compute-peers first"
-  [ -n "${BOTPASSWORD:-}" ] || die "missing BOTPASSWORD (shared password of the @pgha-pgN bot users; put it in $SECRETS_FILE)"
   PGHA_VERIFY_PASSWORD="${PGHA_VERIFY_PASSWORD:-$(openssl rand -hex 24)}"
   _save_cluster
   local n out j bootstrap
@@ -318,8 +316,14 @@ create_all() {
 deploy_all() { register_all; compute_peers; create_all; }
 
 prime_all() {
-  _load_cluster; _default_matrix_env
+  _load_cluster; _default_cluster_env
   local n h="" allowed
+  allowed=$(cast call "$CLUSTER" 'allowedKmsRoots(address)(bool)' "$PGHA_KMS_ROOT" --rpc-url "$RPC_URL" 2>/dev/null)
+  if [ "$allowed" = true ]; then
+    log "self-hosted box KMS root already allowlisted"
+  else
+    send_seq "pgha-addKmsRoot-${NODE}" "$CLUSTER" "addAllowedKmsRoot(address)" "$PGHA_KMS_ROOT"
+  fi
   for n in $(_nodes); do
     _nload "$n"
     [ -n "$H" ] || die "$n has no compose hash — run register-all first"
@@ -344,7 +348,7 @@ prime_all() {
 }
 
 bind_all() {
-  _load_cluster; _default_matrix_env
+  _load_cluster; _default_cluster_env
   [ -n "${MEMBER_IMPL:-}" ] || die "need MEMBER_IMPL"
   local n reinit c
   reinit=$(cast calldata "reinitializeFromDstackApp(address)" "$CLUSTER")
@@ -372,7 +376,7 @@ SCRIPT
 }
 
 verify_all() {
-  _load_cluster; _default_matrix_env; _mesh_math_init
+  _load_cluster; _default_cluster_env; _mesh_math_init
   local n i id count onchain_u32 onchain_ip
   for n in $(_nodes); do
     _nload "$n"
@@ -625,7 +629,7 @@ _matrix_fqdn() {
 
 _matrix_verify_credentials() {
   _load_cluster
-  _default_matrix_env
+  _default_cluster_env
   MATRIX_VERIFY_LOCALPART="${MATRIX_VERIFY_USER:-${INITIAL_ADMIN:-}}"
   case "$MATRIX_VERIFY_LOCALPART" in
     @*:*) MATRIX_VERIFY_LOCALPART="$(printf '%s' "$MATRIX_VERIFY_LOCALPART" | sed -nE 's/^@([^:]+):.*/\1/p')" ;;
@@ -660,7 +664,7 @@ _matrix_expect_reply() {
 }
 
 verify_agent() {
-  _load_cluster; _default_matrix_env
+  _load_cluster; _default_cluster_env
   local bot
   bot="$(_bot_user_id pg1)"
   _matrix_expect_reply "pgha-admin-agent status" "$bot" "$bot !pgha status" "HA cluster"
@@ -668,7 +672,7 @@ verify_agent() {
 
 switchover() {
   local candidate="${1:?usage: pg-ha-node.sh <name> switchover <pgN>}" bot fqdn
-  _load_cluster; _default_matrix_env; _matrix_verify_credentials
+  _load_cluster; _default_cluster_env; _matrix_verify_credentials
   case " $(_nodes | tr '\n' ' ') " in
     *" $candidate "*) ;;
     *) die "unknown switchover candidate: $candidate" ;;
@@ -738,12 +742,14 @@ cycle_replica() {
 
 update_member() {
   local n="${1:?usage: pg-ha-node.sh <name> update <pgN>}"
-  _load_cluster; _default_matrix_env; _require_env; _mesh_math_init
-  [ -n "${PGHA_PEERS:-}" ] && [ -n "${BOTPASSWORD:-}" ] || die "need PGHA_PEERS/BOTPASSWORD in $CSTATE / $SECRETS_FILE"
+  _load_cluster; _default_cluster_env; _require_env; _mesh_math_init
+  [ -n "${PGHA_PEERS:-}" ] || die "need PGHA_PEERS in $CSTATE"
   _nload "$n"
   [ -n "$X" ] && [ -n "$VM_ID" ] || die "need X/VM_ID for $n"
   local nh allowed out j
-  nh=$(NODE_BOOTSTRAP=join _box_run hash "$n" | grep -oE '^[0-9a-f]{64}$' | tail -1)
+  local roll_bootstrap=new
+  [ -n "${PGHA_INITIALIZED:-}" ] && roll_bootstrap=join
+  nh=$(NODE_BOOTSTRAP="$roll_bootstrap" _box_run hash "$n" | grep -oE '^[0-9a-f]{64}$' | tail -1)
   [ -n "$nh" ] || die "could not compute new compose_hash"
   log "new compose_hash=0x$nh"
   allowed=$(cast call "$CLUSTER" 'allowedComposeHashes(bytes32)(bool)' "0x$nh" --rpc-url "$RPC_URL" 2>/dev/null)
@@ -754,7 +760,7 @@ update_member() {
   fi
   # BOOTSTRAP=join is safe on every roll: a preserved data dir short-circuits it, and a
   # fresh disk (BOX_FRESH_DISK=1) must re-join the established quorum anyway.
-  out=$(NODE_BOOTSTRAP=join _box_run update "$n" "$X" "$VM_ID") || die "in-place update failed for $n"
+  out=$(NODE_BOOTSTRAP="$roll_bootstrap" _box_run update "$n" "$X" "$VM_ID") || die "in-place update failed for $n"
   echo "$out"
   j=$(echo "$out" | grep '"app_id"' | tail -1)
   H=$(echo "$j" | jq -r .compose_hash)
@@ -779,6 +785,64 @@ update_all() {
     verify_ha
   done
   log "✔ rolled all $PGHA_COUNT nodes"
+}
+
+verify_backup() {
+  _load_cluster
+  local n serial line stamp epoch now gateway_ok=0 base_epoch=0 dump_epoch=0
+  now=$(date -u +%s)
+  for n in $(_nodes); do
+    _nload "$n"
+    [ -n "$VM_ID" ] || die "no VM_ID for $n"
+    serial=$(_box_run logs "$n" "$VM_ID" 2>/dev/null) || die "could not read $n serial log"
+    line=$(grep 's3gw: ready: serving S3 on :19000' <<<"$serial" | tail -1)
+    [ -n "$line" ] || die "$n has no local encrypted-gateway ready evidence"
+    gateway_ok=$((gateway_ok + 1))
+    while IFS= read -r line; do
+      stamp=$(grep -oE '^20[0-9]{2}-[0-9]{2}-[0-9]{2}T[0-9:.+-]+Z?' <<<"$line" | head -1)
+      [ -n "$stamp" ] || continue
+      epoch=$(date -u -d "$stamp" +%s 2>/dev/null || echo 0)
+      case "$line" in
+        *'base: backup-push OK'*) [ "$epoch" -le "$base_epoch" ] || base_epoch=$epoch ;;
+        *'logical: uploaded '*) [ "$epoch" -le "$dump_epoch" ] || dump_epoch=$epoch ;;
+      esac
+    done <<<"$serial"
+  done
+  [ "$gateway_ok" -eq "$PGHA_COUNT" ] || die "not every node reported a ready local gateway"
+  [ "$base_epoch" -gt 0 ] || die "no successful base backup observed"
+  [ "$dump_epoch" -gt 0 ] || die "no successful logical dump observed"
+  [ $((now - base_epoch)) -le "${BACKUP_VERIFY_MAX_AGE_SECONDS:-25200}" ] \
+    || die "latest base backup is older than 7h"
+  [ $((now - dump_epoch)) -le "${BACKUP_VERIFY_MAX_AGE_SECONDS:-25200}" ] \
+    || die "latest logical dump is older than 7h"
+  log "✔ backup verification passed: $PGHA_COUNT local gateways ready; base + logical successes are fresh"
+}
+
+verify_runtime() {
+  _load_cluster
+  local n info serial recent peers lock owner="" lock_observers=0
+  for n in $(_nodes); do
+    _nload "$n"
+    info=$(_box_run info "$n" "$VM_ID" 2>/dev/null | grep -E '^\{.*"vm_id"' | tail -1)
+    [ "$(jq -r '.status // ""' <<<"$info")" = running ] \
+      && [ -z "$(jq -r '.boot_error // empty' <<<"$info")" ] \
+      || die "$n is not running cleanly"
+    serial=$(_box_run logs "$n" "$VM_ID" 2>/dev/null) || die "could not read $n serial log"
+    recent=$(tail -1000 <<<"$serial")
+    peers=$(grep 'wg diagnostic.*live=true' <<<"$recent" \
+      | sed -nE 's/.* peer=([0-9a-f]+).*/\1/p' | sort -u | wc -l)
+    [ "$peers" -ge $((PGHA_COUNT - 1)) ] || die "$n lacks live evidence for every mesh peer"
+    lock=$(grep 'Lock owner:' <<<"$recent" | tail -1 | sed -nE 's/.*Lock owner: ([^; ]+).*/\1/p')
+    if [ -n "$lock" ]; then
+      [ "$lock" != None ] || die "$n most recently observed no Patroni leader"
+      [ -z "$owner" ] && owner="$lock"
+      [ "$lock" = "$owner" ] || die "Patroni leader disagreement: expected $owner, $n observes $lock"
+      lock_observers=$((lock_observers + 1))
+    fi
+  done
+  [ "$lock_observers" -ge $((PGHA_COUNT / 2 + 1)) ] \
+    || die "fewer than a quorum of serial logs contain current leader evidence"
+  log "✔ runtime verification passed: all nodes running, mesh-live, quorum observes leader=$owner"
 }
 
 host_storage_guard() {
@@ -911,8 +975,14 @@ case "$ACTION" in
   resize) resize_member "$ARG3" ;;
   resize-all) resize_all ;;
   update) update_member "$ARG3"; verify_ha ;;
-  update-only) update_member "$ARG3" ;;   # diagnostic roll without the verify-ha gate
+  update-only)
+    [ "${PGHA_ALLOW_UNVERIFIED_ROLL:-0}" = 1 ] \
+      || die "update-only bypasses HA verification; set PGHA_ALLOW_UNVERIFIED_ROLL=1 for a deliberate single-node diagnostic/recovery roll"
+    update_member "$ARG3"
+    ;;
   update-all) update_all ;;
+  verify-backup) verify_backup ;;
+  verify-runtime) verify_runtime ;;
   all) deploy_all; prime_all; bind_all; verify_all; verify_ha; verify_isolation_all; verify_agent ;;
   *) die "unknown action: $ACTION" ;;
 esac

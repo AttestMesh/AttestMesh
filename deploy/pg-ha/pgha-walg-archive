@@ -1,0 +1,19 @@
+#!/bin/sh
+# WAL archive wrapper with bounded serial/status evidence. PostgreSQL retains and
+# retries a segment whenever this returns non-zero.
+set -u
+. /usr/local/bin/walg-env.sh
+STAT="${WALG_STATUS_FILE:-/pgha-status/walg}"
+seg="$(basename "$1")"
+if [ -z "${WALG_LIBSODIUM_KEY:-}" ]; then
+  echo "$(date -u +%FT%TZ) wal: deferred $seg (CSK key unavailable)" >>"$STAT"
+  exit 1
+fi
+if wal-g wal-push "$1" >>"$STAT" 2>&1; then
+  echo "$(date -u +%FT%TZ) wal: archived $seg" >>"$STAT"
+  exit 0
+else
+  rc=$?
+fi
+echo "$(date -u +%FT%TZ) wal: FAILED rc=$rc $seg" >>"$STAT"
+exit "$rc"

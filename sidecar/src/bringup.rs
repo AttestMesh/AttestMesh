@@ -290,6 +290,13 @@ pub async fn launch(
         tokio::spawn(async move { reconcile_loop(ctx, gw, wake_rx).await });
     }
 
+    // Serial-console diagnostics for mesh bring-up. This exposes only public peer
+    // identifiers/keys and kernel counters; no secrets or application payloads.
+    {
+        let ctx = ctx.clone();
+        tokio::spawn(async move { wg_diagnostic_loop(ctx).await });
+    }
+
     // 3b. Indexer subscription (sidecar spec §9): discover via IndexerRegistry,
     // verify every push, dispatch, Ack, and reconnect with backoff.
     {
@@ -325,6 +332,47 @@ pub async fn launch(
     }
 
     Ok(())
+}
+
+async fn wg_diagnostic_loop(ctx: Arc<Ctx>) {
+    loop {
+        tokio::time::sleep(Duration::from_secs(15)).await;
+        let peers: Vec<_> = {
+            let table = ctx.shared.peers.lock().await;
+            table
+                .all()
+                .map(|p| (p.member_id, p.mesh_ip, p.wg_pub, p.configured, p.live, p.transport))
+                .collect()
+        };
+        if peers.is_empty() {
+            let phase = ctx.shared.current_phase().await;
+            tracing::info!(phase = phase.as_str(),
+                "wg diagnostic: no peers discovered");
+            continue;
+        }
+        for (member_id, mesh_ip, wg_pub, configured, live, transport) in peers {
+            match ctx.wg.peer_status(&wg_pub).await {
+                Ok(Some(status)) => {
+                    let phase = ctx.shared.current_phase().await;
+                    tracing::info!(
+                        peer = %hex::encode(member_id),
+                        mesh_ip = %cidr::fmt_ipv4(mesh_ip),
+                        configured,
+                        live,
+                        transport = transport.as_str(),
+                        endpoint = ?status.endpoint,
+                        handshake_unix = status.last_handshake_unix,
+                        phase = phase.as_str(),
+                        "wg diagnostic"
+                    )
+                }
+                Ok(None) => tracing::warn!(peer = %hex::encode(member_id), configured,
+                    "wg diagnostic: peer absent from kernel interface"),
+                Err(error) => tracing::warn!(peer = %hex::encode(member_id), error = ?error,
+                    "wg diagnostic: status read failed"),
+            }
+        }
+    }
 }
 
 /// One pass + steady-state loop: enumerate members from current chain views,

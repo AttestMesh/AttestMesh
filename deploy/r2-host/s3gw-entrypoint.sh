@@ -85,6 +85,20 @@ export RCLONE_CONFIG_CRYPT_PASSWORD="$(rclone obscure "$pw_hex")"
 export RCLONE_CONFIG_CRYPT_PASSWORD2="$(rclone obscure "$salt_hex")"
 unset pw_hex salt_hex
 
+# rclone serve-s3 maps S3 buckets to directories at the served remote root.
+# WAL-G correctly assumes its bucket already exists, so create the encrypted
+# directory before accepting requests. This is idempotent and the name is
+# encrypted by crypt before it reaches upstream R2.
+if [ -n "${S3GW_DEFAULT_BUCKET:-}" ]; then
+  _st "ensuring encrypted S3 bucket ${S3GW_DEFAULT_BUCKET}"
+  # S3 has no durable empty directories: mkdir alone is a no-op. A harmless
+  # encrypted marker makes the top-level directory discoverable as a bucket by
+  # rclone serve-s3 on every subsequent restart.
+  printf 'attestmesh encrypted bucket\n' \
+    | rclone rcat "crypt:${S3GW_DEFAULT_BUCKET}/.attestmesh-bucket" \
+    || _die "could not create encrypted S3 bucket ${S3GW_DEFAULT_BUCKET}"
+fi
+
 _st "ready: serving S3 on :${S3GW_LISTEN_PORT:-19000} -> crypt over r2:${R2_BUCKET}"
 # 0.0.0.0 is safe: the port is never compose-published; the only route in is the
 # mesh-IP-bound socat proxy in the sidecar netns. NOTICE-level log to the status
