@@ -150,6 +150,7 @@ services:
       - haproxy
     environment:
       - FUGU_LB_ADMIN_KEY=${FUGU_LB_ADMIN_KEY}
+      - FUGU_LB_UPSTREAM_KEY=${FUGU_LB_UPSTREAM_KEY}
     volumes:
       - haproxy-run:/fugu-lb-run
       - fugu-lb-state:/fugu-lb-state
@@ -167,6 +168,7 @@ services:
         from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
         ADMIN_KEY = os.environ.get("FUGU_LB_ADMIN_KEY", "")
+        UPSTREAM_KEY = os.environ.get("FUGU_LB_UPSTREAM_KEY", "")
         SOCKET_PATH = "/fugu-lb-run/admin.sock"
         STATE_PATH = "/fugu-lb-state/active_backend"
 
@@ -231,7 +233,7 @@ services:
                     }
                 ).encode("utf-8"),
                 headers={
-                    "authorization": f"Bearer {ADMIN_KEY}",
+                    "authorization": f"Bearer {UPSTREAM_KEY}",
                     "content-type": "application/json",
                 },
                 method="POST",

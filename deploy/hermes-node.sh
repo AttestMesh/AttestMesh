@@ -458,19 +458,22 @@ verify_hermes() {
 verify_paseo() {
   _load
   [ -n "${X:-}" ] || die "need X (run deploy first)"
-  local i models
+  local i models last_models=""
   for i in $(seq 1 30); do
-    models=$(_node_ssh_port 1023 'paseo provider models hermes --json 2>/dev/null' 2>/dev/null || true)
+    models=$(_node_ssh_port 1023 'paseo provider models hermes --json 2>&1' 2>&1 || true)
+    last_models="$models"
     if printf '%s' "$models" | jq -e \
-      '([.[].id] | index("custom:fugu-ultra")) != null and
-       ([.[].id] | index("custom:glm-5.2")) != null' >/dev/null 2>&1; then
+      '[.. | .id? // empty] as $ids
+       | (($ids | index("custom:fugu-ultra")) != null)
+         and (($ids | index("custom:glm-5.2")) != null)' >/dev/null 2>&1; then
       log "✔ paseo Hermes provider exposes fugu-ultra + glm-5.2 model switching"
       return 0
     fi
     log "… paseo model selector not ready ($i/30)"
     sleep 10
   done
-  die "paseo never exposed required Hermes models (check via the :1023 mesh shell)"
+  log "final paseo provider payload: $(printf '%s' "$last_models" | head -c 2000)"
+  die "paseo never exposed required Hermes models (see payload above; check via the :1023 mesh shell)"
 }
 
 update_member() {

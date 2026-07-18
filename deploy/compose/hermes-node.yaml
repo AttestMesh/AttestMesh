@@ -87,8 +87,6 @@ services:
   # WireGuard mesh interface lives. NET_ADMIN is for `wg show` (peer discovery).
   sshd-mesh:
     image: ghcr.io/attestmesh/hermes-workbench@sha256:856568473706c0db44ce2685f9058b364598946082112fb146a3950e2a68d3b6
-    # This shell can reach AttestMesh-only services; distinguish it from :1022.
-    hostname: ${AGENT_NAME:-hermes}-mesh
     restart: unless-stopped
     network_mode: service:sidecar
     depends_on:
