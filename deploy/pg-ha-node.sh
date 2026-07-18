@@ -28,7 +28,7 @@ SECRETS_FILE="${SECRETS_FILE:-$HOME/.attestmesh/pg-ha.env}"
 # Direct upstream credentials used only by the node-local encrypting gateways.
 # The R2_* values above remain the loopback gateway's client credentials.
 R2_UPSTREAM_CREDS="${R2_UPSTREAM_CREDS:-$HOME/.attestmesh/r2-host-r2.toml}"
-export BOX_VCPU="${BOX_VCPU:-8}" BOX_MEM="${BOX_MEM:-65536}" BOX_DISK="${BOX_DISK:-256}"
+export BOX_VCPU="${BOX_VCPU:-2}" BOX_MEM="${BOX_MEM:-4096}" BOX_DISK="${BOX_DISK:-80}"
 export BOX_PORTS="${BOX_PORTS:-[]}" BOX_GATEWAY_ENABLED="${BOX_GATEWAY_ENABLED:-true}" BOX_NET_MODE="${BOX_NET_MODE:-bridge}"
 GATEWAY_DOMAIN="${GATEWAY_DOMAIN:-gateway.attestmesh.xyz}"
 TS_SUFFIX="${TS_SUFFIX:-tail39cb2e.ts.net}"
@@ -756,7 +756,8 @@ update_member() {
   if [ "$allowed" = true ]; then
     log "compose hash already allowlisted"
   else
-    send_seq "pgha-update-addHash-${NODE}" "$CLUSTER" "addComposeHash(bytes32)" "0x$nh"
+    send_seq "pgha-update-addHash-${NODE}" "$CLUSTER" "addComposeHash(bytes32)" "0x$nh" \
+      || die "compose hash admission failed; refusing to stop or update $n"
   fi
   # BOOTSTRAP=join is safe on every roll: a preserved data dir short-circuits it, and a
   # fresh disk (BOX_FRESH_DISK=1) must re-join the established quorum anyway.
@@ -833,6 +834,10 @@ verify_runtime() {
       | sed -nE 's/.* peer=([0-9a-f]+).*/\1/p' | sort -u | wc -l)
     [ "$peers" -ge $((PGHA_COUNT - 1)) ] || die "$n lacks live evidence for every mesh peer"
     lock=$(grep 'Lock owner:' <<<"$recent" | tail -1 | sed -nE 's/.*Lock owner: ([^; ]+).*/\1/p')
+    # Quiet replicas usually emit this steady-state form after bootstrap; a transient
+    # "Lock owner" line should not have to remain in the bounded serial-log tail.
+    [ -n "$lock" ] || lock=$(grep 'following a leader (' <<<"$recent" | tail -1 \
+      | sed -nE 's/.*following a leader \(([^)]+)\).*/\1/p')
     if [ -n "$lock" ]; then
       [ "$lock" != None ] || die "$n most recently observed no Patroni leader"
       [ -z "$owner" ] && owner="$lock"
@@ -872,6 +877,9 @@ resize_member() {
 
   before="$(vm_info_json "$target" "$VM_ID")"
   [ -n "$before" ] || die "could not read VMM resources for $target"
+  if [ "$(jq -r .disk_size <<<"$before")" -gt "$BOX_DISK" ]; then
+    die "$target disk cannot shrink in place; use BOX_FRESH_DISK=1 update $target to recreate and re-seed it"
+  fi
   if [ "$(jq -r .vcpu <<<"$before")" = "$BOX_VCPU" ] \
     && [ "$(jq -r .memory <<<"$before")" = "$BOX_MEM" ] \
     && [ "$(jq -r .disk_size <<<"$before")" = "$BOX_DISK" ]; then

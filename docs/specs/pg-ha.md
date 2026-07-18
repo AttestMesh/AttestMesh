@@ -180,7 +180,7 @@ State: per-node `$LOGDIR/pg-ha-node-<name>-pg<i>.state` (X/H/VM_ID/MESH_IP) + cl
 CLUSTER/MEMBER_IMPL come from this deployment's newly created Safe-owned mesh. Provisioning
 secrets go to the dstack box **via SSH stdin** (`%q`-quoted payload) — never argv. This is
 box control, not an SSH service or access path inside any member CVM. Box knobs
-per node: `no_instance_id:false`, gateway ON, bridge, no host ports, ~2vcpu/4GB/40GB.
+per node: `no_instance_id:false`, gateway ON, bridge, no host ports, 2 vCPU/4 GB/80 GB.
 
 The self-hosted box KMS root is
 `0x7fa63d99495be2129cf28eee54e2ef2724e3aa2e`; it is not the Phala production
@@ -217,6 +217,11 @@ through encrypted Safe-owner blockchain commands and node-local runtime probes:
    verify its command ID is committed to the node-local replay/audit ledger.
 
 Day-2:
+- **Disk downsize**: virtual disks cannot shrink in place. Set `BOX_FRESH_DISK=1` and
+  run `update <replica>` to recreate that member at the target size under the same app
+  identity; require mesh, etcd, Patroni streaming, isolation, and backup gates before
+  advancing. Fail over the leader only after both replicas have completed. Remove the
+  stopped predecessor VMs after the final fleet verification.
 - **Roll (disk-preserving `update <i>` / `update-all`)**: allowlist the new hash, then
   StopVm→UpgradeApp→StartVm one node at a time, gating on `verify-ha` between nodes.
   etcd member ID and pgdata survive; a rolled ex-primary rejoins via pg_rewind/stream.
