@@ -201,7 +201,10 @@ proves callback → worker → ClickHouse → S3 end-to-end).
 - **Deploy the LB once:** `deploy/fugu-router-lb-node.sh fugu-router-lb all`.
   The default `all` path binds the LB and switches it to the existing
   `fugu-router` backend. The control API is mesh-only on `:18411` and uses
-  `FUGU_LB_ADMIN_KEY`, defaulting to `LITELLM_MASTER_KEY`.
+  `FUGU_LB_ADMIN_KEY`, defaulting to `LITELLM_MASTER_KEY`. Backend cutover
+  probes use the separate `FUGU_LB_UPSTREAM_KEY`, which also defaults to
+  `LITELLM_MASTER_KEY`; set it explicitly when the controller admin credential
+  is rotated into a separate trust domain.
 - **Roll a compose/env change:** `<driver> <name> update [<node>]` — computes
   the new hash, allowlists it FIRST, then in-place StopVm→UpgradeApp→StartVm.
   HA clusters: `update-all` serializes node-by-node with a `verify-ha` gate

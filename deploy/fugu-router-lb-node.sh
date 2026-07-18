@@ -139,7 +139,9 @@ _ensure_lb_secrets() {
     source "$FUGU_RPC_FILE"
   fi
   FUGU_LB_ADMIN_KEY="${FUGU_LB_ADMIN_KEY:-${LITELLM_MASTER_KEY:-}}"
+  FUGU_LB_UPSTREAM_KEY="${FUGU_LB_UPSTREAM_KEY:-${LITELLM_MASTER_KEY:-}}"
   [ -n "${FUGU_LB_ADMIN_KEY:-}" ] || die "missing FUGU_LB_ADMIN_KEY (or LITELLM_MASTER_KEY in $SECRETS_FILE)"
+  [ -n "${FUGU_LB_UPSTREAM_KEY:-}" ] || die "missing FUGU_LB_UPSTREAM_KEY (or LITELLM_MASTER_KEY in $SECRETS_FILE)"
 }
 
 _require_litellm_key() {
@@ -180,6 +182,7 @@ _box_run() {
     printf 'E_INDEXER_REGISTRY_ADDR=%q\n' "$INDEXER_REGISTRY_ADDR"
     printf 'E_GATEWAY_DOMAIN=%q\n' "$GATEWAY_DOMAIN"
     printf 'E_FUGU_LB_ADMIN_KEY=%q\n' "${FUGU_LB_ADMIN_KEY:-}"
+    printf 'E_FUGU_LB_UPSTREAM_KEY=%q\n' "${FUGU_LB_UPSTREAM_KEY:-}"
     printf 'E_FUGU_LB_INITIAL_BACKEND=%q\n' "${FUGU_LB_INITIAL_BACKEND:-}"
     printf 'E_DSTACK_DOCKER_USERNAME=%q\n' "${guser:-dmvt}"
     printf 'E_DSTACK_DOCKER_PASSWORD=%q\n' "$gtok"

@@ -51,7 +51,7 @@ source deploy/env.sh
 bash deploy/hermes-node.sh <agent> all
 ```
 
-`all` = `provision-matrix → deploy → prime → bind → verify → verify-ssh → verify-hermes`:
+`all` = `provision-matrix → deploy → prime → bind → verify → verify-ssh → verify-hermes → verify-paseo`:
 
 | step | what happens | what "good" looks like |
 |---|---|---|
@@ -63,6 +63,7 @@ bash deploy/hermes-node.sh <agent> all
 | verify-ssh | SSH banner through `<app_id>-1022.<gw>:443` | `✔ ssh gateway is reachable` |
 | register-direct | no live 4337 bundler (Alchemy dead): fetches the sidecar helper's calldata (HTTP :9092 via gateway, serial-log fallback) and the deployer sends it, paying gas | `✔` + tx status 1 |
 | verify-hermes | reads `/root/.hermes/gateway_state.json` over ssh | `✔ hermes gateway up, matrix connected` |
+| verify-paseo | queries Hermes through the :1023 mesh shell | lists `custom:fugu-ultra` and `custom:glm-5.2` |
 
 ⚠️ **Membership is permanent** (no `removeMember` on C3 yet — see PR #3 /
 `docs/specs/csk-rotation.md` for the eviction/rotation story). Deploy deliberately.
@@ -71,8 +72,12 @@ bash deploy/hermes-node.sh <agent> all
 
 - **Say hello**: from Element (lsdan), DM `@<agent>:<server>` — the gateway
   auto-handles invites; allowed users default to `@lsdan` + `@fran`.
-- **Paseo pairing** (to drive it from app.paseo.sh):
-  `ssh` to the node (below) → `paseo daemon pair` → scan/open the link.
+- **Paseo pairing** (to drive it from app.paseo.sh): use the **:1023 mesh
+  shell** (below) → `paseo daemon pair` → scan/open the link. The :1022 shell
+  has a different network namespace and cannot reach Paseo on localhost:6767.
+- **Model switching**: run `bash deploy/hermes-node.sh <agent> verify-paseo`.
+  Do not sign off a node that only lists its default model. Keep Hermes
+  `model.provider: custom`; `custom:<name>` hides the router model catalog.
 - **Shell access**: add to `~/.ssh/config`, mirroring the ssh-node entries:
   `<app_id>-1022.gateway.attestmesh.xyz` (bridge) and `-1023` (mesh netns),
   `User root`, `Port 443`,
@@ -98,6 +103,11 @@ bash deploy/hermes-node.sh <agent> all
 ## 5. Troubleshooting
 
 Maiden-deploy (tessera, 2026-07-09) lessons baked into the trio — for awareness:
+
+- **Selected model resets to fugu-ultra** — Paseo cached an ACP snapshot that
+  lacked stable model config options. Confirm the image contains the
+  `hermes-acp-model-config-selector.patch`, restart the **Paseo daemon** (agent
+  reload is insufficient), and run `verify-paseo` again.
 
 - **Model keys**: the fugu-router LB (`10.18.133.81:18410`) only accepts LiteLLM
   `sk-…` virtual keys; the `LITELLM_MASTER_KEY` in `~/.attestmesh/fugu-router.env`
@@ -134,3 +144,26 @@ Maiden-deploy (tessera, 2026-07-09) lessons baked into the trio — for awarenes
 - **Host key changed after fresh-disk roll**:
   `ssh-keygen -R '[<host>]:443'` (in-place rolls keep host keys — they live on
   the volume).
+
+## 6. SSH security posture
+
+SSH is an operator/recovery facility, not an agent-runtime dependency. Today
+both gateway listeners are key-only **root** shells over the complete persistent
+`/root`; :1023 also reaches the private mesh and can be used as a SOCKS
+foothold. An authorized key therefore controls the agent identity, repository
+credentials, Paseo state, and a path toward mesh-only services.
+
+Keep this only as a temporary break-glass mechanism while TEE service logs and
+sealed-volume administration have no safer channel:
+
+- restrict `~/.attestmesh/ssh-node-authorized-keys` to named operators and
+  rotate it immediately when access changes;
+- use :1022 for filesystem/log recovery and :1023 only when the mesh namespace
+  is required (Paseo and mesh-only health checks);
+- never present either shell as an application capability.
+
+The target architecture removes permanent gateway SSH after bootstrap and
+replaces it with authenticated health/configuration APIs plus short-lived,
+audited break-glass access. Removing SSH before those exist would also remove
+the only reliable recovery path for TEE-hidden logs and persisted config, so
+constrained break-glass access is the safer immediate posture.

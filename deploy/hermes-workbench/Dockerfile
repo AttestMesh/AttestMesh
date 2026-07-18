@@ -80,6 +80,8 @@ RUN git clone https://github.com/NousResearch/hermes-agent.git /usr/local/lib/he
 COPY patches/hermes-acp-model-config-selector.patch /tmp/hermes-acp-model-config-selector.patch
 RUN cd /usr/local/lib/hermes-agent \
   && patch -p1 < /tmp/hermes-acp-model-config-selector.patch \
+  && grep -q '_build_model_config_options' acp_adapter/server.py \
+  && grep -q 'config_options=self._build_model_config_options' acp_adapter/server.py \
   && rm /tmp/hermes-acp-model-config-selector.patch
 
 COPY plugins/model-providers/fugu-router /usr/local/lib/hermes-agent/plugins/model-providers/fugu-router

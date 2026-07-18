@@ -60,6 +60,8 @@ services:
 
   sshd:
     image: ghcr.io/attestmesh/hermes-workbench@sha256:856568473706c0db44ce2685f9058b364598946082112fb146a3950e2a68d3b6
+    # Make the recovery/bridge shell unmistakable in its prompt and terminal title.
+    hostname: ${AGENT_NAME:-hermes}-bridge
     restart: unless-stopped
     environment:
       - SSH_AUTHORIZED_KEYS_B64=${SSH_AUTHORIZED_KEYS_B64}
