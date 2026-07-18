@@ -4,6 +4,7 @@
 
 use alloy::primitives::Address;
 use anyhow::{Context, Result};
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 #[derive(Debug, Clone)]
@@ -22,6 +23,8 @@ pub struct Config {
     /// ingress hostnames are `<app_id>-<port>s.<domain>`. Unset → mesh bring-up
     /// is skipped (registration-only mode).
     pub gateway_domain: Option<String>,
+    /// Per-app gateway domains for mixed providers, as `app=domain,...`.
+    pub gateway_domain_overrides: HashMap<Address, String>,
     /// Send the sponsored PeerEndpoint envelope to a peer whose Ed25519 key is not
     /// yet on chain (ed25519-onchain-key transitional fallback). Default OFF: mesh
     /// key distribution is pure chain reads (peers publish `publishEd25519Key`), so
@@ -81,6 +84,10 @@ impl Config {
                 Ok(s) if !s.trim().is_empty() => Some(s.trim().to_string()),
                 _ => None,
             },
+            gateway_domain_overrides: parse_gateway_domain_overrides(&opt(
+                "GATEWAY_DOMAIN_OVERRIDES",
+                "",
+            ))?,
             peer_envelope_fallback: opt("PEER_ENVELOPE_FALLBACK", "false")
                 .trim()
                 .eq_ignore_ascii_case("true"),
@@ -120,6 +127,22 @@ impl Config {
     }
 }
 
+fn parse_gateway_domain_overrides(raw: &str) -> Result<HashMap<Address, String>> {
+    let mut out = HashMap::new();
+    for item in raw.split(',').map(str::trim).filter(|item| !item.is_empty()) {
+        let (app, domain) = item.split_once('=').with_context(|| {
+            format!("GATEWAY_DOMAIN_OVERRIDES entry must be app=domain: {item}")
+        })?;
+        let app = app.trim().parse().context("GATEWAY_DOMAIN_OVERRIDES app id")?;
+        let domain = domain.trim().trim_end_matches('.');
+        if domain.is_empty() || domain.contains('/') || domain.contains(':') {
+            anyhow::bail!("invalid gateway domain override for {app}: {domain}");
+        }
+        out.insert(app, domain.to_string());
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -143,6 +166,7 @@ mod tests {
             "MEMBER_CONTRACT",
             "GAS_POLICY_ID",
             "GATEWAY_DOMAIN",
+            "GATEWAY_DOMAIN_OVERRIDES",
             "WG_TCP_PORT",
             "WG_LISTEN_PORT",
             "WG_UDP_PUNCH",

@@ -116,6 +116,14 @@ fn sni_for(member_contract: Address, tcp_port: u16, gw_domain: &str) -> String {
     )
 }
 
+fn gateway_domain_for<'a>(config: &'a Config, member: &Address, fallback: &'a str) -> &'a str {
+    config
+        .gateway_domain_overrides
+        .get(member)
+        .map(String::as_str)
+        .unwrap_or(fallback)
+}
+
 impl Ctx {
     /// Wrap an inner cluster call as `ClusterMember.execute` and submit it as a
     /// sponsored UserOp signed by the registration-derived owner key.
@@ -494,7 +502,8 @@ async fn reconcile_once(ctx: &Ctx, gw_domain: &str) -> Result<()> {
                 .chain
                 .mesh_ip_of(cluster, B256::from(*member_id))
                 .await?;
-            let sni = sni_for(rec.member_contract, ctx.config.wg_tcp_port, gw_domain);
+            let peer_domain = gateway_domain_for(&ctx.config, &rec.member_contract, gw_domain);
+            let sni = sni_for(rec.member_contract, ctx.config.wg_tcp_port, peer_domain);
             let endpoint =
                 transport::spawn_peer_bridge(sni.clone(), 443, ctx.shared.wg_listen_port)
                     .await
@@ -1387,6 +1396,7 @@ mod tests {
                 gas_policy_id: String::new(),
                 indexer_registry_addr: Address::repeat_byte(0x22),
                 gateway_domain: Some("gateway.invalid".into()),
+                gateway_domain_overrides: HashMap::new(),
                 peer_envelope_fallback: false,
                 wg_tcp_port: 51900,
                 wg_listen_port: 51821,

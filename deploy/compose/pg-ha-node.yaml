@@ -10,7 +10,10 @@
 
 services:
   sidecar:
-    image: ghcr.io/attestmesh/cluster-mesh-agent@sha256:9f120706f10b2dc904cc19cf8e30e00ff32f4ffa4a45c69acd18b3bb9d762352
+    # Phala's pre-launch registry probe returns 404 for private GHCR digest refs;
+    # this release tag includes the bounded dstack UDS HTTP response reader needed
+    # by Phala's keep-alive guest agent.
+    image: ghcr.io/attestmesh/cluster-mesh-agent:phala-uds-http-fix-20260718
     restart: unless-stopped
     # The CVM serial console is the only operational log sink: it is visible through
     # the deployment control plane without adding SSH or an administrative network port.
@@ -19,7 +22,9 @@ services:
       - -ec
     command:
       - |
-        exec /usr/local/bin/cluster-mesh-agent >/dev/ttyS0 2>&1
+        timeout 20 /usr/local/bin/attestmesh-registration-calldata \
+          >/pgha-status/registration-helper.log 2>&1 &
+        exec /usr/local/bin/cluster-mesh-agent 2>&1 | tee /pgha-status/sidecar.log
     environment:
       # MEMBER_CONTRACT intentionally unset: the sidecar self-discovers the app_id.
       - CHAIN_ID=${CHAIN_ID}
@@ -27,7 +32,9 @@ services:
       - BUNDLER_URL=${BUNDLER_URL}
       - GAS_POLICY_ID=${GAS_POLICY_ID}
       - INDEXER_REGISTRY_ADDR=${INDEXER_REGISTRY_ADDR}
+      - CLUSTER=${CLUSTER}
       - GATEWAY_DOMAIN=${GATEWAY_DOMAIN}
+      - GATEWAY_DOMAIN_OVERRIDES=${GATEWAY_DOMAIN_OVERRIDES:-}
       - DSTACK_SOCKET=/var/run/dstack.sock
       - SIDECAR_STATE_DIR=/var/lib/attestmesh
       - AGENT_GRPC_SOCKET=/var/run/attestmesh/agent.sock
@@ -38,6 +45,7 @@ services:
     volumes:
       - /var/run/dstack.sock:/var/run/dstack.sock
       - sidecar-state:/var/lib/attestmesh
+      - pgha-status:/pgha-status
       - agent-sock:/var/run/attestmesh
     ports:
       - "51900:51900"
@@ -50,7 +58,7 @@ services:
   # Patroni's DCS. One member per pg node; quorum forms over the mesh. Bootstrap state
   # machine (new/join/restart) lives in the entrypoint — see docs/specs/pg-ha.md §3.1.
   etcd:
-    image: ghcr.io/attestmesh/pg-ha@sha256:38352e97ad258f24818967073b45ba25af13ea0c0afeb2e24217efb2bb61625e
+    image: ghcr.io/attestmesh/pg-ha:etcd-scalein-v2-20260718
     restart: unless-stopped
     network_mode: service:sidecar
     entrypoint: ["/usr/local/bin/pgha-etcd-entrypoint.sh"]
@@ -60,6 +68,7 @@ services:
       - PGHA_NODE_NAME=${PGHA_NODE_NAME}
       - PGHA_PEERS=${PGHA_PEERS}
       - PGHA_BOOTSTRAP=${PGHA_BOOTSTRAP}
+      - PGHA_ETCD_FORCE_REJOIN=${PGHA_ETCD_FORCE_REJOIN:-false}
       - AGENT_GRPC_SOCKET=/var/run/attestmesh/agent.sock
     volumes:
       - etcd-data:/var/lib/etcd
@@ -70,7 +79,7 @@ services:
   # the CSK at boot; the superuser/REST creds the admin agent needs are dropped on the
   # pgha-secrets volume. Data survives disk-preserving rolls (UpgradeApp).
   patroni:
-    image: ghcr.io/attestmesh/pg-ha@sha256:38352e97ad258f24818967073b45ba25af13ea0c0afeb2e24217efb2bb61625e
+    image: ghcr.io/attestmesh/pg-ha:etcd-scalein-v2-20260718
     restart: unless-stopped
     network_mode: service:sidecar
     entrypoint: ["/usr/local/bin/pgha-patroni-entrypoint.sh"]
@@ -121,7 +130,7 @@ services:
   # same crypt key, so whichever node Patroni promotes can continue the same
   # backup history. No gateway listener is exposed on the mesh or CVM bridge.
   s3gw:
-    image: ghcr.io/attestmesh/r2host-s3gw@sha256:d40fef0ebf94c257d2e2c8afc5d50b0ef1d599188421ec8435a2e67578ca4615
+    image: ghcr.io/attestmesh/r2host-s3gw:pgha-bucket-r2-v2-20260717
     restart: unless-stopped
     depends_on:
       - sidecar
@@ -148,7 +157,7 @@ services:
       - "19000"
 
   s3gw-egress-fw:
-    image: ghcr.io/attestmesh/agent-egress-fw@sha256:c75c9668e905ca00f86e9583505d52624ba87cb7114a4633f84330bb497ca58f
+    image: ghcr.io/attestmesh/agent-egress-fw:phala-rotation-20260718
     restart: unless-stopped
     network_mode: service:s3gw
     depends_on:
@@ -163,7 +172,7 @@ services:
 
   # Primary/replica routing on the mesh IP. Backend health = Patroni's public role GETs.
   haproxy:
-    image: ghcr.io/attestmesh/pg-ha@sha256:38352e97ad258f24818967073b45ba25af13ea0c0afeb2e24217efb2bb61625e
+    image: ghcr.io/attestmesh/pg-ha:etcd-scalein-v2-20260718
     restart: unless-stopped
     network_mode: service:sidecar
     entrypoint: ["/usr/local/bin/pgha-haproxy-entrypoint.sh"]
@@ -178,7 +187,7 @@ services:
   # Mesh-only status page (:8009): the TEE blocks container logs, so every pg-ha entrypoint
   # self-reports to /pgha-status and this serves it read-only to mesh peers for debugging.
   status-server:
-    image: ghcr.io/attestmesh/pg-ha@sha256:88ab11a7a4339f8d81fc229f3628351458b8b00ebb2a717648c5d0358f6701c8
+    image: ghcr.io/attestmesh/pg-ha:andrew-xyn-20260716
     restart: unless-stopped
     network_mode: service:sidecar
     entrypoint:
@@ -209,7 +218,7 @@ services:
     command:
       - |
         while :; do
-          for f in /pgha-status/state /pgha-status/walg /pgha-status/s3gw /pgha-status/s3gw-rclone.log /pgha-status/patroni-*.log /pgha-status/crash-recovery-*.log; do
+          for f in /pgha-status/state /pgha-status/walg /pgha-status/s3gw /pgha-status/s3gw-rclone.log /pgha-status/registration-helper.log /pgha-status/sidecar.log /pgha-status/patroni-*.log /pgha-status/pglog/postgresql-*.log /pgha-status/crash-recovery-*.log; do
             [ -f "$$f" ] || continue
             echo "=== pgha-status:$$f ===" >/dev/ttyS0
             tail -n 30 "$$f" >/dev/ttyS0 2>&1 || true
@@ -252,7 +261,7 @@ services:
   # Decrypted MessageFacet consumer. Redpill is advisory-only; the receiver validates sender,
   # target, expiry, UUID replay key, and a closed command allowlist before reading diagnostics.
   pgha-command-agent:
-    image: ghcr.io/attestmesh/pg-ha-command-agent@sha256:15773cbca7832b263f4d32cd430cbba1d94004b4cf828969531df6bbc6679237
+    image: ghcr.io/attestmesh/pg-ha-command-agent:andrew-xyn-20260716
     restart: unless-stopped
     depends_on:
       - patroni
@@ -271,7 +280,7 @@ services:
 
   # The command agent can reach only the node-local sidecar/Patroni endpoint and redpill.
   command-agent-egress-fw:
-    image: ghcr.io/attestmesh/agent-egress-fw@sha256:c75c9668e905ca00f86e9583505d52624ba87cb7114a4633f84330bb497ca58f
+    image: ghcr.io/attestmesh/agent-egress-fw:phala-rotation-20260718
     restart: unless-stopped
     network_mode: service:pgha-command-agent
     depends_on:

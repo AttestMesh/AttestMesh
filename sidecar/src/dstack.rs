@@ -240,19 +240,53 @@ impl DstackRuntime for UnixSocketDstack {
 impl UnixSocketDstack {
     async fn request(&self, path: &str, body: &serde_json::Value) -> Result<serde_json::Value> {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        let mut stream = tokio::net::UnixStream::connect(&self.socket_path)
+        let exchange = async {
+            let mut stream = tokio::net::UnixStream::connect(&self.socket_path)
+                .await
+                .with_context(|| format!("connect dstack socket {}", self.socket_path))?;
+            let payload = serde_json::to_vec(body)?;
+            let req = format!(
+                "POST {} HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                path,
+                payload.len()
+            );
+            stream.write_all(req.as_bytes()).await?;
+            stream.write_all(&payload).await?;
+
+            // Some dstack 0.5.x guest agents keep the UDS HTTP connection alive even
+            // when the request says `Connection: close`. Waiting for EOF therefore
+            // wedges first-boot key derivation forever. Read until Content-Length is
+            // satisfied (or EOF for older agents) and bound the whole exchange.
+            let mut resp = Vec::new();
+            let mut buf = [0u8; 4096];
+            let mut expected_total = None;
+            loop {
+                let n = stream.read(&mut buf).await?;
+                if n == 0 {
+                    break;
+                }
+                resp.extend_from_slice(&buf[..n]);
+                if expected_total.is_none() {
+                    if let Some(header_end) = resp.windows(4).position(|w| w == b"\r\n\r\n") {
+                        let headers = std::str::from_utf8(&resp[..header_end])?;
+                        let content_length = headers.lines().find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            name.eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse::<usize>().ok())
+                                .flatten()
+                        });
+                        expected_total = content_length.map(|len| header_end + 4 + len);
+                    }
+                }
+                if expected_total.is_some_and(|total| resp.len() >= total) {
+                    break;
+                }
+            }
+            Ok::<Vec<u8>, anyhow::Error>(resp)
+        };
+        let resp = tokio::time::timeout(std::time::Duration::from_secs(20), exchange)
             .await
-            .with_context(|| format!("connect dstack socket {}", self.socket_path))?;
-        let payload = serde_json::to_vec(body)?;
-        let req = format!(
-            "POST {} HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-            path,
-            payload.len()
-        );
-        stream.write_all(req.as_bytes()).await?;
-        stream.write_all(&payload).await?;
-        let mut resp = Vec::new();
-        stream.read_to_end(&mut resp).await?;
+            .with_context(|| format!("dstack request {path} timed out"))??;
         let body_start = resp
             .windows(4)
             .position(|w| w == b"\r\n\r\n")

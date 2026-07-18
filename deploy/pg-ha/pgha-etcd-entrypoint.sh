@@ -20,6 +20,13 @@ assert_self_ip "$MY_IP"
 _st "mesh ip $MY_IP confirmed for $NODE; deriving etcd root credential"
 ROOT_PW="$(csk_derive attestmesh.pgha.etcd.v1)" || exit 1
 
+# Recovery for a member that was explicitly removed from quorum while its CVM disk survived.
+# This deletes only the node-local etcd state; PostgreSQL data is on a separate volume.
+if [ "${PGHA_ETCD_FORCE_REJOIN:-false}" = true ] && [ -d "$DATA/member" ]; then
+  _st "forced etcd rejoin requested; clearing retired local etcd member state"
+  rm -rf "$DATA/member"
+fi
+
 # etcdctl wrapper: try without creds first (pre-auth cluster), fall back to root creds.
 _ectl() {
   local out
@@ -95,6 +102,25 @@ else
     --initial-cluster-state existing &
 fi
 ETCD_PID=$!
+
+# Reconcile retired voters after the local member is healthy. Initial-cluster is ignored when a
+# data directory already exists, so a scale-in expressed by a smaller sealed PGHA_PEERS map would
+# otherwise leave a permanently dead etcd voter behind. Removal is idempotent across members and
+# deliberately never removes this node.
+(
+  while ! curl -fsS --max-time 2 http://127.0.0.1:2379/health 2>/dev/null | grep -q '"true"'; do
+    sleep 5
+  done
+  expected=" $(peer_names | tr '\n' ' ') "
+  while IFS=',' read -r member_id _status member_name _peer _rest; do
+    member_name="$(printf '%s' "$member_name" | tr -d ' ')"
+    [ -n "$member_name" ] || continue
+    [ "$member_name" = "$NODE" ] && continue
+    case "$expected" in *" $member_name "*) continue;; esac
+    _st "removing retired member $member_name ($member_id); absent from sealed peer map"
+    _ectl --endpoints=http://127.0.0.1:2379 member remove "$member_id" >/dev/null 2>&1 || true
+  done < <(_ectl --endpoints=http://127.0.0.1:2379 member list -w simple 2>/dev/null || true)
+) &
 
 # Converge client auth in the BACKGROUND: keep retrying until `auth status` reports enabled.
 # Quorum can take longer than any fixed window to form (peers register on-chain at their own

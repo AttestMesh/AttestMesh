@@ -163,7 +163,7 @@ postgresql:
   pg_hba:
     - local all all trust
     - host all all 127.0.0.1/32 trust
-    # Replication connections match ONLY lines whose db field is `replication` — the
+    # Replication connections match ONLY lines whose db field is replication; the
     # localhost entries above do NOT cover them, and Patroni checks the replication
     # credential against the local postgres (and pg_rewind needs it after failovers).
     - local replication all trust

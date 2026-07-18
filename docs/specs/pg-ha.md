@@ -110,7 +110,7 @@ Runtime guards (both hard-fail before any data is written):
 
 | Data dir | `PGHA_BOOTSTRAP` | Action |
 |---|---|---|
-| non-empty | (any) | plain start — etcd ignores `--initial-cluster*` after init (covers disk-preserving rolls) |
+| non-empty | (any) | start from preserved state, then remove etcd members absent from the sealed `PGHA_PEERS` map (covers disk-preserving rolls and scale-in) |
 | empty | `new` | static bootstrap: `ETCD_INITIAL_CLUSTER` from `PGHA_PEERS`, `initial-cluster-state=new`, token `attestmesh-pg-ha`. Quorum forms when ⌈(N+1)/2⌉ arrive; no ordering constraints. |
 | empty | `join` | poll peers' `:2379` until one answers; `etcdctl member list`; if a stale member holds **my** peer URL (fresh-disk re-provision: same app_id ⇒ same mesh IP) → `member remove` it; `member add pg<i> --peer-urls=http://<my_ip>:2380`; start with `initial-cluster-state=existing`. |
 
@@ -289,6 +289,17 @@ without verified backup/restore evidence.
 - Verification requires fresh evidence: all local gateways ready, a base-backup success and a
   logical-dump upload no older than seven hours, plus WAL archive status. Historical success is
   insufficient.
+- A provider rotation is scale-out followed by scale-in: prove the new replica is streaming,
+  reseal the final odd-sized peer map on a surviving member, observe the retired etcd voter being
+  removed, and only then stop the old CVM. `PGHA_PEERS_OVERRIDE` must reach both box and Phala
+  sealed environments; a deployment-time override that only affects one provider is unsafe.
+- If an etcd voter is removed accidentally while its PostgreSQL disk remains valid, set
+  `PGHA_ETCD_FORCE_REJOIN=true` for one roll of that node. It clears only local etcd state and
+  rejoins through live peers. Immediately reseal it to `false`; never delete PostgreSQL data for
+  an etcd-only membership repair.
+- Serial diagnostics include bounded PostgreSQL collector logs. `could not locate a valid
+  checkpoint record` is local PGDATA corruption: with quorum and two verified copies, replace that
+  replica's disk and let Patroni base-backup it. Do not use `pg_resetwal`.
 
 ## 8. Accepted v1 deviations (hardening follow-ups)
 

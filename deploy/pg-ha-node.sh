@@ -18,6 +18,7 @@ require PRIVATE_KEY RPC_URL CHAIN_ID DEPLOYER_ADDR
 NODE="${1:?usage: pg-ha-node.sh <name> [deploy-all|prime-all|bind-all|verify-all|verify-ha|verify-failover|verify-isolation-all|verify-agent|switchover <pgN>|cycle-replica <pgN>|resize <pgN>|resize-all|update <pgN>|update-all|all|register-all|compute-peers|create-all|deploy|prime|bind|verify <pgN>]}"
 ACTION="${2:-all}"
 ARG3="${3:-}"
+ARG4="${4:-}"
 BOX_HOST="${BOX_HOST:-ubuntu@173.231.234.133}"
 BOX_PY="${BOX_PY:-/opt/dstack-mcp/venv/bin/python}"
 BOX_DEPLOYER_KEY="${BOX_DEPLOYER_KEY:-/root/.attestmesh/base-deployer.json}"
@@ -184,8 +185,10 @@ _box_run() {
     printf 'E_GAS_POLICY_ID=%q\n'         "${GAS_POLICY_ID:-}"
     printf 'E_INDEXER_REGISTRY_ADDR=%q\n' "${INDEXER_REGISTRY_ADDR:-}"
     printf 'E_GATEWAY_DOMAIN=%q\n'        "$GATEWAY_DOMAIN"
+    printf 'E_GATEWAY_DOMAIN_OVERRIDES=%q\n' "${GATEWAY_DOMAIN_OVERRIDES:-}"
     printf 'E_PGHA_NODE_NAME=%q\n'        "$node"
-    printf 'E_PGHA_PEERS=%q\n'            "${PGHA_PEERS:-}"
+    printf 'E_PGHA_PEERS=%q\n'            "${PGHA_PEERS_OVERRIDE:-${PGHA_PEERS:-}}"
+    printf 'E_PGHA_ETCD_FORCE_REJOIN=%q\n' "${PGHA_ETCD_FORCE_REJOIN:-false}"
     printf 'E_PGHA_BOOTSTRAP=%q\n'        "$bootstrap"
     printf 'E_PGHA_MESH_CIDR=%q\n'        "${MESH_CIDR_STR:-}"
     printf 'E_PGHA_VERIFY_PASSWORD=%q\n'  "${PGHA_VERIFY_PASSWORD:-}"
@@ -215,6 +218,32 @@ _box_run() {
     printf 'E_DSTACK_DOCKER_REGISTRY=%q\n' "ghcr.io"
   } | ssh_box "sudo BOX_RPC='$BOX_RPC' BOX_APP_NAME='${NODE}' BOX_NAME='${NODE}-${node}' BOX_COMPOSE='/tmp/${NODE}.yaml' BOX_VCPU=$BOX_VCPU BOX_MEM=$BOX_MEM BOX_DISK=$BOX_DISK BOX_PORTS='$BOX_PORTS' BOX_GATEWAY_ENABLED='$BOX_GATEWAY_ENABLED' BOX_NET_MODE='$BOX_NET_MODE' BOX_FRESH_DISK='${BOX_FRESH_DISK:-}' \
     bash -c 'set -a; . /dev/stdin; set +a; exec $BOX_PY /tmp/pg-ha-node-box.py $mode $app_id $vm_id'"
+}
+
+# Build a Phala-sealed environment without putting secrets in CLI arguments. The caller
+# supplies the provider-local gateway domain/overrides and passes the resulting file to
+# `phala deploy -e`; the file is always mode 0600 and must be removed after deployment.
+build_phala_env() {
+  local node="${1:?phala-env requires pgN}" out="${2:?phala-env requires output path}" guser gtok peers
+  _load_cluster; _default_cluster_env; _require_env; _mesh_math_init; _nload "$node"
+  [ -n "${PGHA_PEERS:-}" ] || die "need PGHA_PEERS"
+  peers="${PGHA_PEERS_OVERRIDE:-$PGHA_PEERS}"
+  guser=$(grep -E '^\s*username\s*=' "$HOME/.teesql/ghcr-pull.toml" | head -1 | sed -E 's/.*=\s*//' | tr -d "\"' ")
+  gtok=$(grep -E '^\s*token\s*=' "$HOME/.teesql/ghcr-pull.toml" | head -1 | sed -E 's/.*=\s*//' | tr -d "\"' ")
+  [ -n "$gtok" ] || die "no ghcr token"
+  umask 077
+  {
+    printf 'CHAIN_ID=%s\nRPC_URL=%s\nBUNDLER_URL=%s\nGAS_POLICY_ID=%s\nCLUSTER=%s\n' "$CHAIN_ID" "${CVM_RPC_URL:-$RPC_URL}" "${CVM_BUNDLER_URL:-${BUNDLER_URL:-$RPC_URL}}" "${GAS_POLICY_ID:-}" "$CLUSTER"
+    printf 'INDEXER_REGISTRY_ADDR=%s\nGATEWAY_DOMAIN=%s\nGATEWAY_DOMAIN_OVERRIDES=%s\n' "$INDEXER_REGISTRY_ADDR" "$GATEWAY_DOMAIN" "${GATEWAY_DOMAIN_OVERRIDES:-}"
+    printf 'PGHA_NODE_NAME=%s\nPGHA_PEERS=%s\nPGHA_BOOTSTRAP=join\nPGHA_MESH_CIDR=%s\nPGHA_ETCD_FORCE_REJOIN=%s\n' "$node" "$peers" "$MESH_CIDR_STR" "${PGHA_ETCD_FORCE_REJOIN:-false}"
+    printf 'PGHA_VERIFY_PASSWORD=%s\nPGHA_CLUSTER_NAME=%s\nPGHA_SAFE_ADDRESS=%s\nPGHA_CRASH_RECOVERY_ONLY=false\n' "$PGHA_VERIFY_PASSWORD" "$PGHA_CLUSTER_NAME" "$PGHA_SAFE_ADDRESS"
+    printf 'BACKUP_ENABLED=%s\nBACKUP_PREFIX=%s\nBACKUP_RESTORE=%s\nBACKUP_DUMP_INTERVAL_SECONDS=%s\n' "$BACKUP_ENABLED" "$BACKUP_PREFIX" "$BACKUP_RESTORE" "$BACKUP_DUMP_INTERVAL_SECONDS"
+    printf 'R2_ACCESS_KEY_ID=%s\nR2_SECRET_ACCESS_KEY=%s\nR2_ENDPOINT=%s\nR2_BUCKET=%s\nR2_REGION=%s\n' "$R2_ACCESS_KEY_ID" "$R2_SECRET_ACCESS_KEY" "$R2_ENDPOINT" "$R2_BUCKET" "${R2_REGION:-us-east-1}"
+    printf 'R2_UPSTREAM_ENDPOINT=%s\nR2_UPSTREAM_BUCKET=%s\nR2_UPSTREAM_REGION=%s\nR2_UPSTREAM_ACCESS_KEY_ID=%s\nR2_UPSTREAM_SECRET_ACCESS_KEY=%s\n' "$R2_UPSTREAM_ENDPOINT" "$R2_UPSTREAM_BUCKET" "$R2_UPSTREAM_REGION" "$R2_UPSTREAM_ACCESS_KEY_ID" "$R2_UPSTREAM_SECRET_ACCESS_KEY"
+    printf 'LLM_BASE_URL=%s\nLLM_MODEL=%s\nLLM_API_KEY=%s\n' "$LLM_BASE_URL" "$LLM_MODEL" "$LLM_API_KEY"
+    printf 'DSTACK_DOCKER_REGISTRY=ghcr.io\nDSTACK_DOCKER_USERNAME=%s\nDSTACK_DOCKER_PASSWORD=%s\n' "$guser" "$gtok"
+  } >"$out"
+  log "✔ built Phala sealed env for $node at $out (mode $(stat -c %a "$out"))"
 }
 
 # ── pipeline: register-all -> compute-peers -> create-all ───────────────────────────────
@@ -982,6 +1011,7 @@ case "$ACTION" in
   cycle-replica) cycle_replica "$ARG3" ;;
   resize) resize_member "$ARG3" ;;
   resize-all) resize_all ;;
+  phala-env) build_phala_env "$ARG3" "$ARG4" ;;
   update) update_member "$ARG3"; verify_ha ;;
   update-only)
     [ "${PGHA_ALLOW_UNVERIFIED_ROLL:-0}" = 1 ] \
