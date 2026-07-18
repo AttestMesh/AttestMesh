@@ -48,9 +48,12 @@ COMMON_ARGS=(
   --advertise-client-urls "http://$MY_IP:2379"
 )
 
-if [ -d "$DATA/member" ]; then
+if [ -d "$DATA/member" ] && { [ "${PGHA_ETCD_FORCE_NEW_CLUSTER:-false}" = true ] || [ "${PGHA_RECOVERY_CANDIDATE:-}" = "$NODE" ] || [ "${PGHA_IMAGE_FORCE_NEW_NODE:-}" = "$NODE" ]; }; then
+  _st "disaster recovery requested; preserving DCS data and forcing a one-member cluster"
+  etcd "${COMMON_ARGS[@]}" --force-new-cluster >>"$STAT" 2>&1 &
+elif [ -d "$DATA/member" ]; then
   _st "existing data dir -> plain restart"
-  etcd "${COMMON_ARGS[@]}" &
+  etcd "${COMMON_ARGS[@]}" >>"$STAT" 2>&1 &
 elif [ "${PGHA_BOOTSTRAP:-new}" = "new" ]; then
   initial=""
   for n in $(peer_names); do
@@ -60,21 +63,30 @@ elif [ "${PGHA_BOOTSTRAP:-new}" = "new" ]; then
   etcd "${COMMON_ARGS[@]}" \
     --initial-cluster "$initial" \
     --initial-cluster-state new \
-    --initial-cluster-token attestmesh-pg-ha &
+    --initial-cluster-token attestmesh-pg-ha >>"$STAT" 2>&1 &
 else
   # Fresh disk on an established cluster (re-provision or scale-out). Same app_id ⇒ same mesh
   # IP, so a stale member may still hold my peer URL — remove it, then add myself.
   _st "empty data dir + bootstrap=join -> runtime member add via peers"
-  ep=""
+  # A replacement must never fall through to an arbitrary healthy peer. During a
+  # partition, a retired node can still answer /health from a different etcd
+  # cluster and would then admit this node into the stale partition. The first
+  # non-self entry is the operator-selected authoritative seed; retry it until it
+  # is healthy. Peer-map ordering is therefore a recovery safety boundary.
+  ep="" seed_ip=""
+  for n in $(peer_names); do
+    [ "$n" = "$NODE" ] && continue
+    seed_ip="$(peer_ip "$n")"
+    break
+  done
+  [ -n "$seed_ip" ] || _die "join requires at least one authoritative non-self peer"
   while [ -z "$ep" ]; do
-    for n in $(peer_names); do
-      [ "$n" = "$NODE" ] && continue
-      ip="$(peer_ip "$n")"
-      if curl -fsS --max-time 3 "http://$ip:2379/health" 2>/dev/null | grep -q '"true"'; then
-        ep="http://$ip:2379"; break
-      fi
-    done
-    [ -z "$ep" ] && { _st "no healthy peer client endpoint yet; retrying"; sleep 5; }
+    if curl -fsS --max-time 3 "http://$seed_ip:2379/health" 2>/dev/null | grep -q '"true"'; then
+      ep="http://$seed_ip:2379"
+    else
+      _st "authoritative seed $seed_ip is not healthy yet; refusing stale-peer fallback"
+      sleep 5
+    fi
   done
   _st "using peer endpoint $ep"
   # Parse the SIMPLE (CSV) output, not JSON: etcd member IDs are uint64 and jq (IEEE-754
@@ -87,19 +99,24 @@ else
     _st "removing stale member $stale_hex (held my peer URL)"
     _ectl --endpoints="$ep" member remove "$stale_hex" || _die "stale member remove failed"
   fi
+  # Snapshot membership BEFORE adding the voter. Adding a voter to a one-member cluster
+  # immediately requires two votes, so any member-list read after the add deadlocks on the
+  # quorum that this process is responsible for restoring.
+  pre_add_members="$(_ectl --endpoints="$ep" member list -w simple 2>/dev/null)" \
+    || _die "pre-add member snapshot failed"
   _ectl --endpoints="$ep" member add "$NODE" --peer-urls="http://$MY_IP:2380" >/dev/null \
     || _die "member add failed"
-  # Initial cluster = every started member (name=peerURL, from simple output) + self.
+  # Initial cluster = every pre-existing member (name=peerURL) + self.
   initial=""
   while IFS=',' read -r _id _status _name _peer _rest; do
     _name="$(printf '%s' "$_name" | tr -d ' ')"; _peer="$(printf '%s' "$_peer" | tr -d ' ')"
     [ -n "$_name" ] && [ "$_name" != "$NODE" ] && initial="${initial:+$initial,}$_name=$_peer"
-  done < <(_ectl --endpoints="$ep" member list -w simple 2>/dev/null)
+  done <<<"$pre_add_members"
   initial="${initial:+$initial,}$NODE=http://$MY_IP:2380"
   _st "joining with initial-cluster=$initial"
   etcd "${COMMON_ARGS[@]}" \
     --initial-cluster "$initial" \
-    --initial-cluster-state existing &
+    --initial-cluster-state existing >>"$STAT" 2>&1 &
 fi
 ETCD_PID=$!
 

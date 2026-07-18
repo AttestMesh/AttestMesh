@@ -184,17 +184,20 @@ _box_run() {
     printf 'E_BUNDLER_URL=%q\n'           "${CVM_BUNDLER_URL:-${BUNDLER_URL:-$RPC_URL}}"
     printf 'E_GAS_POLICY_ID=%q\n'         "${GAS_POLICY_ID:-}"
     printf 'E_INDEXER_REGISTRY_ADDR=%q\n' "${INDEXER_REGISTRY_ADDR:-}"
+    printf 'E_CLUSTER=%q\n'               "${CLUSTER:-}"
     printf 'E_GATEWAY_DOMAIN=%q\n'        "$GATEWAY_DOMAIN"
     printf 'E_GATEWAY_DOMAIN_OVERRIDES=%q\n' "${GATEWAY_DOMAIN_OVERRIDES:-}"
     printf 'E_PGHA_NODE_NAME=%q\n'        "$node"
     printf 'E_PGHA_PEERS=%q\n'            "${PGHA_PEERS_OVERRIDE:-${PGHA_PEERS:-}}"
     printf 'E_PGHA_ETCD_FORCE_REJOIN=%q\n' "${PGHA_ETCD_FORCE_REJOIN:-false}"
+    printf 'E_PGHA_ETCD_FORCE_NEW_CLUSTER=%q\n' "${PGHA_ETCD_FORCE_NEW_CLUSTER:-false}"
     printf 'E_PGHA_BOOTSTRAP=%q\n'        "$bootstrap"
     printf 'E_PGHA_MESH_CIDR=%q\n'        "${MESH_CIDR_STR:-}"
     printf 'E_PGHA_VERIFY_PASSWORD=%q\n'  "${PGHA_VERIFY_PASSWORD:-}"
     printf 'E_PGHA_CLUSTER_NAME=%q\n'     "$PGHA_CLUSTER_NAME"
     printf 'E_PGHA_SAFE_ADDRESS=%q\n'      "$PGHA_SAFE_ADDRESS"
     printf 'E_PGHA_RECOVERY_CANDIDATE=%q\n' "${PGHA_RECOVERY_CANDIDATE:-}"
+    printf 'E_PGHA_REINIT_NODE=%q\n'        "${PGHA_REINIT_NODE:-}"
     printf 'E_PGHA_CRASH_RECOVERY_ONLY=%q\n' "${PGHA_CRASH_RECOVERY_ONLY:-false}"
     printf 'E_BACKUP_ENABLED=%q\n'        "$BACKUP_ENABLED"
     printf 'E_BACKUP_PREFIX=%q\n'         "$BACKUP_PREFIX"
@@ -235,7 +238,7 @@ build_phala_env() {
   {
     printf 'CHAIN_ID=%s\nRPC_URL=%s\nBUNDLER_URL=%s\nGAS_POLICY_ID=%s\nCLUSTER=%s\n' "$CHAIN_ID" "${CVM_RPC_URL:-$RPC_URL}" "${CVM_BUNDLER_URL:-${BUNDLER_URL:-$RPC_URL}}" "${GAS_POLICY_ID:-}" "$CLUSTER"
     printf 'INDEXER_REGISTRY_ADDR=%s\nGATEWAY_DOMAIN=%s\nGATEWAY_DOMAIN_OVERRIDES=%s\n' "$INDEXER_REGISTRY_ADDR" "$GATEWAY_DOMAIN" "${GATEWAY_DOMAIN_OVERRIDES:-}"
-    printf 'PGHA_NODE_NAME=%s\nPGHA_PEERS=%s\nPGHA_BOOTSTRAP=join\nPGHA_MESH_CIDR=%s\nPGHA_ETCD_FORCE_REJOIN=%s\n' "$node" "$peers" "$MESH_CIDR_STR" "${PGHA_ETCD_FORCE_REJOIN:-false}"
+    printf 'PGHA_NODE_NAME=%s\nPGHA_PEERS=%s\nPGHA_BOOTSTRAP=join\nPGHA_MESH_CIDR=%s\nPGHA_ETCD_FORCE_REJOIN=%s\nPGHA_ETCD_FORCE_NEW_CLUSTER=%s\n' "$node" "$peers" "$MESH_CIDR_STR" "${PGHA_ETCD_FORCE_REJOIN:-false}" "${PGHA_ETCD_FORCE_NEW_CLUSTER:-false}"
     printf 'PGHA_VERIFY_PASSWORD=%s\nPGHA_CLUSTER_NAME=%s\nPGHA_SAFE_ADDRESS=%s\nPGHA_CRASH_RECOVERY_ONLY=false\n' "$PGHA_VERIFY_PASSWORD" "$PGHA_CLUSTER_NAME" "$PGHA_SAFE_ADDRESS"
     printf 'BACKUP_ENABLED=%s\nBACKUP_PREFIX=%s\nBACKUP_RESTORE=%s\nBACKUP_DUMP_INTERVAL_SECONDS=%s\n' "$BACKUP_ENABLED" "$BACKUP_PREFIX" "$BACKUP_RESTORE" "$BACKUP_DUMP_INTERVAL_SECONDS"
     printf 'R2_ACCESS_KEY_ID=%s\nR2_SECRET_ACCESS_KEY=%s\nR2_ENDPOINT=%s\nR2_BUCKET=%s\nR2_REGION=%s\n' "$R2_ACCESS_KEY_ID" "$R2_SECRET_ACCESS_KEY" "$R2_ENDPOINT" "$R2_BUCKET" "${R2_REGION:-us-east-1}"
@@ -1044,28 +1047,35 @@ rotation_preflight() {
 
 rotation_survivor_gate() {
   _rotation_env
-  local n="${1:?rotation-survivor-gate requires pgN}" serial
+  local n="${1:?rotation-survivor-gate requires pgN}" serial i
   _nload "$n"; [ -n "$VM_ID" ] || die "no VM for survivor $n"
-  serial=$(_box_run logs "$n" "$VM_ID") || die "cannot read survivor serial"
-  grep -Fq "backends: ${PGHA_ROTATION_FINAL_PEERS}" <<<"$serial" \
-    || die "$n has not sealed the final peer map"
-  grep -Eq "I am \($n\), (the leader with the lock|a secondary, and following a leader)" <<<"$serial" \
-    || die "$n has no healthy Patroni role evidence"
-  grep -Eq 'PANIC:|could not locate a valid checkpoint record' <<<"$(tail -n 500 <<<"$serial")" \
-    && die "$n has a recent PostgreSQL panic"
-  log "✔ survivor $n has final map and a healthy Patroni role"
+  for i in $(seq 1 40); do
+    serial=$(_box_run logs "$n" "$VM_ID") || die "cannot read survivor serial"
+    if grep -Fq "backends: ${PGHA_ROTATION_FINAL_PEERS}" <<<"$serial" \
+      && grep -Eq "I am \($n\), (the leader with the lock|a secondary, and following a leader)" <<<"$serial"; then
+      grep -Eq 'PANIC:|could not locate a valid checkpoint record' <<<"$(tail -n 500 <<<"$serial")" \
+        && die "$n has a recent PostgreSQL panic"
+      log "✔ survivor $n has final map and a healthy Patroni role"
+      return 0
+    fi
+    log "… waiting for $n final-map/Patroni evidence ($i/40); observed=$(grep -F 'backends:' <<<"$serial" | tail -1 | tr -s ' ' | cut -c1-220); role=$(grep -E "I am \($n\)" <<<"$serial" | tail -1 | tr -s ' ' | cut -c1-160)"
+    sleep 5
+  done
+  die "$n did not seal the final peer map with healthy Patroni evidence"
 }
 
 rotation_candidate_gate() {
-  _rotation_env
-  local logs
-  logs=$(phala logs dstack-patroni-1 --cvm-id "$PGHA_ROTATION_PHALA_CVM_ID" --stderr -n 1200 2>&1) \
-    || die "cannot read authenticated candidate Patroni logs"
-  grep -Eq "I am \(${PGHA_ROTATION_CANDIDATE}\), a secondary, and following a leader|started streaming WAL" <<<"$logs" \
-    || die "candidate has no streaming-replica evidence"
-  grep -Eq 'PANIC:|could not locate a valid checkpoint record' <<<"$logs" \
-    && die "candidate logs contain a PostgreSQL panic"
-  log "✔ candidate is a streaming replica"
+  _rotation_env; _load_cluster
+  local info member_id serial
+  info=$(phala cvms get "$PGHA_ROTATION_PHALA_CVM_ID" --json) || die "cannot read Phala candidate"
+  [ "$(jq -r '.status' <<<"$info")" = running ] || die "candidate CVM is not running"
+  member_id=$(cast call "$CLUSTER" 'memberIdOf(address)(bytes32)' "$(jq -r '.app_id' <<<"$info")" --rpc-url "$RPC_URL" 2>/dev/null)
+  [ -n "$member_id" ] && [ "$member_id" != "$ZERO32" ] || die "candidate is not registered in the mesh"
+  _nload "$PGHA_ROTATION_EVIDENCE_NODE"; [ -n "$VM_ID" ] || die "no evidence-node VM"
+  serial=$(_box_run logs "$PGHA_ROTATION_EVIDENCE_NODE" "$VM_ID") || die "cannot read survivor serial"
+  grep -Eiq "PATRONI_CLUSTER_EVIDENCE.*(\"name\"[[:space:]]*:[[:space:]]*\"${PGHA_ROTATION_CANDIDATE}\".*\"state\"[[:space:]]*:[[:space:]]*\"streaming\"|\"state\"[[:space:]]*:[[:space:]]*\"streaming\".*\"name\"[[:space:]]*:[[:space:]]*\"${PGHA_ROTATION_CANDIDATE}\")" <<<"$serial" \
+    || die "survivor has no streaming-replica evidence for ${PGHA_ROTATION_CANDIDATE}"
+  log "✔ survivor observes registered candidate as a streaming replica"
 }
 
 rotation_backup_gate() {

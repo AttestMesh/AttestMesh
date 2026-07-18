@@ -184,4 +184,13 @@ _st "starting patroni (etcd3=$ETCD_HOSTS, connect=$MY_IP:5434, bootstrap=$BOOTST
 # mesh-readable status volume instead.
 PLOG="$(dirname "$STAT")/patroni-$NODE.log"
 touch "$PLOG"; chown postgres:postgres "$PLOG"
+# Serial-only, read-only evidence for fail-closed provider rotation. Patroni binds
+# this API inside the shared node netns; no listener or credential is added here.
+(
+  while :; do
+    body=$(curl -fsS --max-time 5 http://127.0.0.1:8008/cluster 2>/dev/null || true)
+    [ -z "$body" ] || printf 'PATRONI_CLUSTER_EVIDENCE %s\n' "$body" >/dev/ttyS0
+    sleep 15
+  done
+) &
 exec gosu postgres bash -c "exec patroni '$CONF' >> '$PLOG' 2>&1"

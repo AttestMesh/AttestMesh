@@ -26,10 +26,10 @@ const Input = z.object({
   boxComposeHash: Hash,
   phalaComposeHash: Hash,
   confirmation: z.string(),
-  temporaryEnvFile: z.string().optional(),
+  temporaryEnvFile: z.string().nullish(),
 }).passthrough();
 
-const Step = z.object({ ok: z.literal(true), step: z.string(), at: z.string() });
+const Step = z.object({ ok: z.literal("true"), step: z.string(), at: z.string() });
 const { Workflow, smithers, outputs } = createSmithers({
   input: Input,
   preflight: Step,
@@ -67,7 +67,7 @@ function pgha(input: z.infer<typeof Input>, action: string, node?: string): void
 }
 
 function done(step: string) {
-  return { ok: true as const, step, at: new Date().toISOString() };
+  return { ok: "true" as const, step, at: new Date().toISOString() };
 }
 
 export default smithers((ctx) => {
@@ -86,9 +86,6 @@ export default smithers((ctx) => {
         <Task id="rotationPreflight" output={outputs.preflight}>
           {() => { pgha(input, "rotation-preflight"); return done("preflight"); }}
         </Task>
-        <Task id="candidateStreaming" output={outputs.candidate}>
-          {() => { pgha(input, "rotation-candidate-gate"); return done("candidate-streaming"); }}
-        </Task>
         <Task id="freshBackups" output={outputs.backup}>
           {() => { pgha(input, "rotation-backup-gate"); return done("fresh-backups"); }}
         </Task>
@@ -100,6 +97,9 @@ export default smithers((ctx) => {
             }
             return done("survivors-converged");
           }}
+        </Task>
+        <Task id="candidateStreaming" output={outputs.candidate}>
+          {() => { pgha(input, "rotation-candidate-gate"); return done("candidate-streaming"); }}
         </Task>
         <Task id="retireOldSecondary" output={outputs.retire}>
           {() => { pgha(input, "rotation-retire"); return done("retired-secondary-stopped"); }}

@@ -58,7 +58,7 @@ services:
   # Patroni's DCS. One member per pg node; quorum forms over the mesh. Bootstrap state
   # machine (new/join/restart) lives in the entrypoint — see docs/specs/pg-ha.md §3.1.
   etcd:
-    image: ghcr.io/attestmesh/pg-ha:etcd-scalein-v2-20260718
+    image: ghcr.io/attestmesh/pg-ha:quorum-recovery-v7-20260718
     restart: unless-stopped
     network_mode: service:sidecar
     entrypoint: ["/usr/local/bin/pgha-etcd-entrypoint.sh"]
@@ -69,6 +69,8 @@ services:
       - PGHA_PEERS=${PGHA_PEERS}
       - PGHA_BOOTSTRAP=${PGHA_BOOTSTRAP}
       - PGHA_ETCD_FORCE_REJOIN=${PGHA_ETCD_FORCE_REJOIN:-false}
+      - PGHA_ETCD_FORCE_NEW_CLUSTER=${PGHA_ETCD_FORCE_NEW_CLUSTER:-false}
+      - PGHA_RECOVERY_CANDIDATE=${PGHA_RECOVERY_CANDIDATE:-}
       - AGENT_GRPC_SOCKET=/var/run/attestmesh/agent.sock
     volumes:
       - etcd-data:/var/lib/etcd
@@ -79,7 +81,7 @@ services:
   # the CSK at boot; the superuser/REST creds the admin agent needs are dropped on the
   # pgha-secrets volume. Data survives disk-preserving rolls (UpgradeApp).
   patroni:
-    image: ghcr.io/attestmesh/pg-ha:etcd-scalein-v2-20260718
+    image: ghcr.io/attestmesh/pg-ha:quorum-recovery-v7-20260718
     restart: unless-stopped
     network_mode: service:sidecar
     entrypoint: ["/usr/local/bin/pgha-patroni-entrypoint.sh"]
@@ -172,7 +174,7 @@ services:
 
   # Primary/replica routing on the mesh IP. Backend health = Patroni's public role GETs.
   haproxy:
-    image: ghcr.io/attestmesh/pg-ha:etcd-scalein-v2-20260718
+    image: ghcr.io/attestmesh/pg-ha:quorum-recovery-v7-20260718
     restart: unless-stopped
     network_mode: service:sidecar
     entrypoint: ["/usr/local/bin/pgha-haproxy-entrypoint.sh"]
@@ -218,7 +220,10 @@ services:
     command:
       - |
         while :; do
-          for f in /pgha-status/state /pgha-status/walg /pgha-status/s3gw /pgha-status/s3gw-rclone.log /pgha-status/registration-helper.log /pgha-status/sidecar.log /pgha-status/patroni-*.log /pgha-status/pglog/postgresql-*.log /pgha-status/crash-recovery-*.log; do
+          echo "=== pgha-status:patroni-cluster ===" >/dev/ttyS0
+          wget -qO- --timeout=5 http://sidecar:8008/cluster >/dev/ttyS0 2>&1 || true
+          echo >/dev/ttyS0
+          for f in /pgha-status/walg /pgha-status/s3gw /pgha-status/s3gw-rclone.log /pgha-status/registration-helper.log /pgha-status/sidecar.log /pgha-status/patroni-*.log /pgha-status/pglog/postgresql-*.log /pgha-status/crash-recovery-*.log /pgha-status/state; do
             [ -f "$$f" ] || continue
             echo "=== pgha-status:$$f ===" >/dev/ttyS0
             tail -n 30 "$$f" >/dev/ttyS0 2>&1 || true
@@ -227,6 +232,45 @@ services:
         done
     volumes:
       - pgha-status:/pgha-status:ro
+    devices:
+      - /dev/ttyS0:/dev/ttyS0
+
+  # Dedicated fail-closed rotation evidence. This opens no listener: it reads Patroni's
+  # existing loopback API from the shared sidecar netns and mirrors bounded cluster JSON
+  # to the serial console consumed by Smithers.
+  patroni-evidence-console:
+    image: alpine:3.20
+    restart: unless-stopped
+    network_mode: service:sidecar
+    depends_on:
+      - patroni
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - |
+        while :; do
+          body="$$(wget -qO- --timeout=5 http://127.0.0.1:8008/cluster 2>/dev/null || true)"
+          if [ -n "$$body" ]; then
+            echo "PATRONI_CLUSTER_EVIDENCE $$body" >/dev/ttyS0
+          fi
+          sleep 15
+        done
+    devices:
+      - /dev/ttyS0:/dev/ttyS0
+
+  etcd-evidence-console:
+    image: alpine:3.20
+    restart: unless-stopped
+    network_mode: service:sidecar
+    depends_on:
+      - etcd
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - |
+        while :; do
+          body="$$(wget -qO- --timeout=3 http://127.0.0.1:2379/health 2>/dev/null || true)"
+          echo "ETCD_HEALTH_EVIDENCE $${body:-unreachable}" >/dev/ttyS0
+          sleep 15
+        done
     devices:
       - /dev/ttyS0:/dev/ttyS0
 
@@ -255,6 +299,25 @@ services:
         done
     environment:
       - PGHA_RECOVERY_CANDIDATE=${PGHA_RECOVERY_CANDIDATE}
+    volumes:
+      - pgha-secrets:/pgha-secrets:ro
+
+  patroni-reinitialize:
+    image: curlimages/curl:8.12.1
+    restart: "no"
+    network_mode: service:sidecar
+    depends_on:
+      - patroni
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - |
+        [ "$${PGHA_REINIT_NODE:-}" = "$${PGHA_NODE_NAME}" ] || exit 0
+        pw="$$(cat /pgha-secrets/patroni-api)"
+        until curl -fsS --max-time 10 -u "patroni:$$pw" -H 'content-type: application/json' \
+          -d '{"force":true}' http://127.0.0.1:8008/reinitialize; do sleep 5; done
+    environment:
+      - PGHA_NODE_NAME=${PGHA_NODE_NAME}
+      - PGHA_REINIT_NODE=${PGHA_REINIT_NODE:-}
     volumes:
       - pgha-secrets:/pgha-secrets:ro
 

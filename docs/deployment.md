@@ -307,6 +307,17 @@ Generated state is intentionally local:
   state file `pg-ha-<name>.state` (Safe, cluster, member implementation, PGHA_PEERS, verify
   credential, initialized flag) plus
   per-node `pg-ha-node-<name>-pg<i>.state` files (app id, compose hash, VM id, mesh IP).
+
+  Recovery joins are fail-closed: the first non-self member in `PGHA_PEERS` is the
+  authoritative etcd seed. A joining node retries that seed and never falls through
+  to another healthy endpoint, because a retired node may still report healthy from
+  a stale etcd cluster. Put the verified newest-timeline survivor first, stop stale
+  members, and require matching etcd cluster ID plus Patroni timeline/streaming
+  evidence before joining the next node.
+
+  Path-A rotations also verify that `clusterMemberImpl` contains
+  `reinitializeFromDstackApp(address)` before upgrading the stock app proxy. Stale
+  deployment metadata is a hard failure.
 - `deploy/.smithers/` and `deploy/smithers.db*` are Smithers execution state.
 - `deploy/node_modules/`, temporary env files, and Python `__pycache__/` directories are not
   deployment source.
