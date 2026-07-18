@@ -293,6 +293,16 @@ without verified backup/restore evidence.
   reseal the final odd-sized peer map on a surviving member, observe the retired etcd voter being
   removed, and only then stop the old CVM. `PGHA_PEERS_OVERRIDE` must reach both box and Phala
   sealed environments; a deployment-time override that only affects one provider is unsafe.
+  Run the cutover through `deploy/workflows/pg-ha-rotate-provider.tsx` (`cd deploy && bun run
+  graph:pg-ha-rotate -- --input '<json>'`, then `bun run up:pg-ha-rotate -- --input '<json>'`).
+  Its input names the candidate and retired members, surviving box members, evidence member,
+  exact final peer map, Phala CVM ID, and both Safe-admitted compose hashes. The explicit
+  confirmation is `retire:<old>:for:<new>`. The routine refuses retirement unless Phala reports
+  exactly 2 vCPU/4 GB/80 GB, no SSH key or public diagnostics, the candidate is streaming,
+  encrypted base/logical backups are fresh, each survivor has sealed the same odd peer map, and
+  etcd removal is visible. Its final gate also proves the retired VM is stopped. Candidate
+  provisioning and Safe signatures remain separate approval boundaries; never put secrets in
+  Smithers input.
 - If an etcd voter is removed accidentally while its PostgreSQL disk remains valid, set
   `PGHA_ETCD_FORCE_REJOIN=true` for one roll of that node. It clears only local etcd state and
   rejoins through live peers. Immediately reseal it to `false`; never delete PostgreSQL data for

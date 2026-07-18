@@ -15,7 +15,7 @@ source "$HERE/lib.sh"
 : "${RPC_URL:?source deploy/env.sh first}"
 require PRIVATE_KEY RPC_URL CHAIN_ID DEPLOYER_ADDR
 
-NODE="${1:?usage: pg-ha-node.sh <name> [deploy-all|prime-all|bind-all|verify-all|verify-ha|verify-failover|verify-isolation-all|verify-agent|switchover <pgN>|cycle-replica <pgN>|resize <pgN>|resize-all|update <pgN>|update-all|all|register-all|compute-peers|create-all|deploy|prime|bind|verify <pgN>]}"
+NODE="${1:?usage: pg-ha-node.sh <name> [deploy-all|prime-all|bind-all|verify-all|verify-ha|verify-failover|verify-isolation-all|verify-agent|rotation-preflight|rotation-candidate-gate|rotation-survivor-gate <pgN>|rotation-backup-gate|rotation-retire|rotation-final|switchover <pgN>|cycle-replica <pgN>|resize <pgN>|resize-all|update <pgN>|update-all|all|register-all|compute-peers|create-all|deploy|prime|bind|verify <pgN>]}"
 ACTION="${2:-all}"
 ARG3="${3:-}"
 ARG4="${4:-}"
@@ -995,6 +995,144 @@ resize_all() {
   log "✔ pg-ha fleet resize complete; leader=$candidate targets=${BOX_VCPU}/${BOX_MEM}/${BOX_DISK}"
 }
 
+# ── mixed-provider rotation gates (Smithers primitives) ───────────────────────────────
+
+_rotation_env() {
+  : "${PGHA_ROTATION_CANDIDATE:?set PGHA_ROTATION_CANDIDATE (for example pg4)}"
+  : "${PGHA_ROTATION_RETIRED:?set PGHA_ROTATION_RETIRED (for example pg2)}"
+  : "${PGHA_ROTATION_FINAL_PEERS:?set PGHA_ROTATION_FINAL_PEERS}"
+  : "${PGHA_ROTATION_PHALA_CVM_ID:?set PGHA_ROTATION_PHALA_CVM_ID}"
+  : "${PGHA_ROTATION_EVIDENCE_NODE:?set PGHA_ROTATION_EVIDENCE_NODE (surviving box node)}"
+  : "${PGHA_ROTATION_BOX_COMPOSE_HASH:?set PGHA_ROTATION_BOX_COMPOSE_HASH}"
+  : "${PGHA_ROTATION_PHALA_COMPOSE_HASH:?set PGHA_ROTATION_PHALA_COMPOSE_HASH}"
+  case ",${PGHA_ROTATION_FINAL_PEERS}," in
+    *",${PGHA_ROTATION_CANDIDATE}="*) ;;
+    *) die "final peer map does not contain candidate ${PGHA_ROTATION_CANDIDATE}" ;;
+  esac
+  case ",${PGHA_ROTATION_FINAL_PEERS}," in
+    *",${PGHA_ROTATION_RETIRED}="*) die "final peer map still contains retired node ${PGHA_ROTATION_RETIRED}" ;;
+  esac
+  local count
+  count=$(printf '%s' "$PGHA_ROTATION_FINAL_PEERS" | awk -F, '{print NF}')
+  [ $((count % 2)) -eq 1 ] || die "final peer map must have an odd member count (got $count)"
+}
+
+rotation_preflight() {
+  _rotation_env; _load_cluster
+  command -v phala >/dev/null || die "phala CLI unavailable"
+  local j
+  j=$(phala cvms get "$PGHA_ROTATION_PHALA_CVM_ID" --json) || die "cannot read Phala candidate"
+  [ "$(jq -r '.status' <<<"$j")" = running ] || die "Phala candidate is not running"
+  [ "$(jq -r '.resource.vcpu' <<<"$j")" = 2 ] || die "Phala candidate must have 2 vCPU"
+  [ "$(jq -r '.resource.memory_in_gb' <<<"$j")" = 4 ] || die "Phala candidate must have 4GB RAM"
+  [ "$(jq -r '.resource.disk_in_gb' <<<"$j")" = 80 ] || die "Phala candidate must have 80GB disk"
+  [ "$(jq -r '.public_logs' <<<"$j")" = false ] || die "Phala public logs must be disabled"
+  [ "$(jq -r '.public_sysinfo' <<<"$j")" = false ] || die "Phala public sysinfo must be disabled"
+  [ "$(jq -r '.listed' <<<"$j")" = false ] || die "Phala CVM must not be listed"
+  [ "$(jq -r '.ssh_pubkey // ""' <<<"$j")" = "" ] || die "Phala candidate has an SSH key"
+  [ "$(cast call "$CLUSTER" 'allowedComposeHashes(bytes32)(bool)' "$PGHA_ROTATION_BOX_COMPOSE_HASH" --rpc-url "$RPC_URL")" = true ] \
+    || die "box compose hash is not Safe-admitted"
+  [ "$(cast call "$CLUSTER" 'allowedComposeHashes(bytes32)(bool)' "$PGHA_ROTATION_PHALA_COMPOSE_HASH" --rpc-url "$RPC_URL")" = true ] \
+    || die "Phala compose hash is not Safe-admitted"
+  _nload "$PGHA_ROTATION_RETIRED"
+  [ -n "$VM_ID" ] || die "no recorded VM for retired node"
+  j=$(_box_run info "$PGHA_ROTATION_RETIRED" "$VM_ID") || die "cannot read retired VM"
+  [ "$(jq -r '.vcpu' <<<"$j")" = 2 ] && [ "$(jq -r '.memory' <<<"$j")" = 4096 ] \
+    && [ "$(jq -r '.disk_size' <<<"$j")" = 80 ] || die "retired VM has unexpected resources"
+  log "✔ rotation preflight: exact resources, no SSH, no public Phala diagnostics, odd final map"
+}
+
+rotation_survivor_gate() {
+  _rotation_env
+  local n="${1:?rotation-survivor-gate requires pgN}" serial
+  _nload "$n"; [ -n "$VM_ID" ] || die "no VM for survivor $n"
+  serial=$(_box_run logs "$n" "$VM_ID") || die "cannot read survivor serial"
+  grep -Fq "backends: ${PGHA_ROTATION_FINAL_PEERS}" <<<"$serial" \
+    || die "$n has not sealed the final peer map"
+  grep -Eq "I am \($n\), (the leader with the lock|a secondary, and following a leader)" <<<"$serial" \
+    || die "$n has no healthy Patroni role evidence"
+  grep -Eq 'PANIC:|could not locate a valid checkpoint record' <<<"$(tail -n 500 <<<"$serial")" \
+    && die "$n has a recent PostgreSQL panic"
+  log "✔ survivor $n has final map and a healthy Patroni role"
+}
+
+rotation_candidate_gate() {
+  _rotation_env
+  local logs
+  logs=$(phala logs dstack-patroni-1 --cvm-id "$PGHA_ROTATION_PHALA_CVM_ID" --stderr -n 1200 2>&1) \
+    || die "cannot read authenticated candidate Patroni logs"
+  grep -Eq "I am \(${PGHA_ROTATION_CANDIDATE}\), a secondary, and following a leader|started streaming WAL" <<<"$logs" \
+    || die "candidate has no streaming-replica evidence"
+  grep -Eq 'PANIC:|could not locate a valid checkpoint record' <<<"$logs" \
+    && die "candidate logs contain a PostgreSQL panic"
+  log "✔ candidate is a streaming replica"
+}
+
+rotation_backup_gate() {
+  _rotation_env
+  local n="$PGHA_ROTATION_EVIDENCE_NODE" serial base dump now stamp epoch
+  _nload "$n"; [ -n "$VM_ID" ] || die "no VM for evidence node $n"
+  serial=$(_box_run logs "$n" "$VM_ID") || die "cannot read evidence-node serial"
+  grep -q 's3gw: ready: serving S3 on :19000' <<<"$serial" || die "local encrypted R2 gateway not ready"
+  base=$(grep 'base: backup-push OK' <<<"$serial" | tail -1)
+  dump=$(grep 'logical: uploaded ' <<<"$serial" | tail -1)
+  [ -n "$base" ] && [ -n "$dump" ] || die "fresh base/logical backup evidence missing"
+  now=$(date -u +%s)
+  for line in "$base" "$dump"; do
+    stamp=$(grep -oE '^20[0-9]{2}-[0-9]{2}-[0-9]{2}T[0-9:.+-]+Z?' <<<"$line" | head -1)
+    epoch=$(date -u -d "$stamp" +%s 2>/dev/null || echo 0)
+    [ "$epoch" -gt 0 ] && [ $((now - epoch)) -le "${BACKUP_VERIFY_MAX_AGE_SECONDS:-25200}" ] \
+      || die "backup evidence is missing or older than seven hours"
+  done
+  log "✔ fresh encrypted base + logical backup evidence"
+}
+
+rotation_retire() {
+  _rotation_env
+  local survivor_serial retired_serial j
+  _nload "$PGHA_ROTATION_EVIDENCE_NODE"; [ -n "$VM_ID" ] || die "no evidence-node VM"
+  survivor_serial=$(_box_run logs "$PGHA_ROTATION_EVIDENCE_NODE" "$VM_ID")
+  grep -q "removing retired member ${PGHA_ROTATION_RETIRED}" <<<"$survivor_serial" \
+    || die "no evidence that etcd removed ${PGHA_ROTATION_RETIRED}"
+  grep -Fq "backends: ${PGHA_ROTATION_FINAL_PEERS}" <<<"$survivor_serial" \
+    || die "survivor has not sealed the final HAProxy peer map"
+  _nload "$PGHA_ROTATION_RETIRED"; [ -n "$VM_ID" ] || die "no retired-node VM"
+  retired_serial=$(_box_run logs "$PGHA_ROTATION_RETIRED" "$VM_ID")
+  grep -Eq "I am \(${PGHA_ROTATION_RETIRED}\), a secondary, and following a leader" <<<"$retired_serial" \
+    || die "retired node is not proven to be a secondary"
+  _box_run stop "$PGHA_ROTATION_RETIRED" "$VM_ID" >/dev/null || die "failed to stop retired VM"
+  for _ in $(seq 1 40); do
+    j=$(_box_run info "$PGHA_ROTATION_RETIRED" "$VM_ID" 2>/dev/null || true)
+    case "$(jq -r '.status // ""' <<<"$j" 2>/dev/null)" in stopped|exited*)
+      log "✔ retired node stopped after etcd removal"; return 0;;
+    esac
+    sleep 2
+  done
+  die "retired VM did not stop"
+}
+
+rotation_final() {
+  rotation_preflight
+  rotation_backup_gate
+  local n="$PGHA_ROTATION_EVIDENCE_NODE" serial
+  _nload "$n"; serial=$(_box_run logs "$n" "$VM_ID")
+  grep -Eq 'the leader with the lock|a secondary, and following a leader' <<<"$serial" \
+    || die "no final Patroni health evidence"
+  _nload "$PGHA_ROTATION_RETIRED"
+  [ -n "$VM_ID" ] || die "no retired-node VM recorded"
+  local retired_info retired_status
+  retired_info=$(_box_run info "$PGHA_ROTATION_RETIRED" "$VM_ID" 2>/dev/null || true)
+  retired_status=$(jq -r '.status // ""' <<<"$retired_info" 2>/dev/null)
+  case "$retired_status" in
+    stopped|exited*) ;;
+    *) die "retired VM is not stopped (status=${retired_status:-unknown})" ;;
+  esac
+  if [ -n "${PGHA_ROTATION_ENV_FILE:-}" ] && [ -e "$PGHA_ROTATION_ENV_FILE" ]; then
+    die "temporary Phala sealed env still exists: $PGHA_ROTATION_ENV_FILE"
+  fi
+  log "✔ rotation final gate passed"
+}
+
 case "$ACTION" in
   register-all) register_all ;;
   compute-peers) compute_peers ;;
@@ -1021,6 +1159,12 @@ case "$ACTION" in
   update-all) update_all ;;
   verify-backup) verify_backup ;;
   verify-runtime) verify_runtime ;;
+  rotation-preflight) rotation_preflight ;;
+  rotation-candidate-gate) rotation_candidate_gate ;;
+  rotation-survivor-gate) rotation_survivor_gate "$ARG3" ;;
+  rotation-backup-gate) rotation_backup_gate ;;
+  rotation-retire) rotation_retire ;;
+  rotation-final) rotation_final ;;
   all) deploy_all; prime_all; bind_all; verify_all; verify_ha; verify_isolation_all; verify_agent ;;
   *) die "unknown action: $ACTION" ;;
 esac
