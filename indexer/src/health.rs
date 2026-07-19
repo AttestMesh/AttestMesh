@@ -6,7 +6,7 @@
 
 use crate::metrics::Metrics;
 use crate::query::{build_health, build_topology, ReadModel};
-use alloy::primitives::B256;
+use alloy::primitives::{Address, B256};
 use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
@@ -20,6 +20,26 @@ use std::sync::Arc;
 
 /// Max acceptable head lag before `/healthz` flips to 503 (spec §12).
 pub const MAX_HEAD_LAG_BLOCKS: u64 = 10;
+
+/// Immutable boot facts used by the LB/deployer to reject a heterogeneous or
+/// accidentally non-dedicated shared-mode candidate.
+#[derive(Debug, Clone)]
+pub struct AdmissionMetadata {
+    pub code_id: B256,
+    pub identity_mode: &'static str,
+    pub indexer_cluster: Option<Address>,
+    pub serving_member_id: Option<B256>,
+    pub serving_member_contract: Option<Address>,
+    pub serving_mesh_ip: Option<u32>,
+}
+
+#[derive(Debug, Clone)]
+pub struct StatusMetadata {
+    pub chain_id: u64,
+    pub gateway_domain: Option<String>,
+    pub identity_pubkey: B256,
+    pub admission: AdmissionMetadata,
+}
 
 /// Liveness signals updated by the runtime loops.
 pub struct Health {
@@ -76,6 +96,7 @@ struct HttpState {
     chain_id: u64,
     gateway_domain: Option<String>,
     identity_pubkey: B256,
+    admission: AdmissionMetadata,
 }
 
 /// Serve `/healthz` + `/metrics` until the process exits or the future is dropped.
@@ -84,17 +105,16 @@ pub async fn serve(
     health: Arc<Health>,
     metrics: Arc<Metrics>,
     read_model: Arc<ReadModel>,
-    chain_id: u64,
-    gateway_domain: Option<String>,
-    identity_pubkey: B256,
+    metadata: StatusMetadata,
 ) -> anyhow::Result<()> {
     let state = HttpState {
         health,
         metrics,
         read_model,
-        chain_id,
-        gateway_domain,
-        identity_pubkey,
+        chain_id: metadata.chain_id,
+        gateway_domain: metadata.gateway_domain,
+        identity_pubkey: metadata.identity_pubkey,
+        admission: metadata.admission,
     };
     let app = Router::new()
         .route("/healthz", get(healthz))
@@ -134,11 +154,22 @@ async fn status(State(s): State<HttpState>) -> Response {
         .snapshots(s.chain_id, s.gateway_domain.as_deref())
         .await;
     let member_count: usize = snapshots.iter().map(|s| s.member_count).sum();
+    let admission = admission_json(&s.admission);
+    let status_admission = status_admission_json(&s.admission);
+    let code_id = status_admission["codeId"].clone();
+    let identity_mode = status_admission["identityMode"].clone();
+    let indexer_cluster = status_admission["indexerCluster"].clone();
+    let serving_member_id = status_admission["servingMemberId"].clone();
     (
         StatusCode::OK,
         Json(json!({
             "chainId": s.chain_id,
             "pubKey": format!("{:#x}", s.identity_pubkey),
+            "codeId": code_id,
+            "identityMode": identity_mode,
+            "indexerCluster": indexer_cluster,
+            "servingMemberId": serving_member_id,
+            "admission": admission,
             "health": {
                 "ok": health_reason.is_none(),
                 "reason": health_reason,
@@ -154,6 +185,28 @@ async fn status(State(s): State<HttpState>) -> Response {
         })),
     )
         .into_response()
+}
+
+fn admission_json(metadata: &AdmissionMetadata) -> serde_json::Value {
+    json!({
+        "codeId": format!("{:#x}", metadata.code_id),
+        "identityMode": metadata.identity_mode,
+        "indexerCluster": metadata.indexer_cluster.map(|value| format!("{value:#x}")),
+        "servingMemberId": metadata.serving_member_id.map(|value| format!("{value:#x}")),
+        "servingMemberContract": metadata
+            .serving_member_contract
+            .map(|value| format!("{value:#x}")),
+        "servingMeshIp": metadata.serving_mesh_ip,
+    })
+}
+
+fn status_admission_json(metadata: &AdmissionMetadata) -> serde_json::Value {
+    json!({
+        "codeId": format!("{:#x}", metadata.code_id),
+        "identityMode": metadata.identity_mode,
+        "indexerCluster": metadata.indexer_cluster.map(|value| format!("{value:#x}")),
+        "servingMemberId": metadata.serving_member_id.map(|value| format!("{value:#x}")),
+    })
 }
 
 async fn metrics_handler(State(s): State<HttpState>) -> Response {
@@ -296,5 +349,37 @@ mod tests {
         // Head lag past threshold flips back to unhealthy.
         h.set_head_lag(MAX_HEAD_LAG_BLOCKS);
         assert!(h.evaluate().is_err());
+    }
+
+    #[test]
+    fn admission_metadata_is_machine_readable() {
+        let metadata = AdmissionMetadata {
+            code_id: B256::repeat_byte(0x11),
+            identity_mode: "cluster-shared",
+            indexer_cluster: Some(Address::repeat_byte(0x22)),
+            serving_member_id: Some(B256::repeat_byte(0x33)),
+            serving_member_contract: Some(Address::repeat_byte(0x44)),
+            serving_mesh_ip: Some(0x0a0d0001),
+        };
+        let fields = admission_json(&metadata);
+        assert_eq!(fields["identityMode"], "cluster-shared");
+        assert_eq!(fields["codeId"], format!("{:#x}", B256::repeat_byte(0x11)));
+        assert_eq!(
+            fields["indexerCluster"],
+            format!("{:#x}", Address::repeat_byte(0x22))
+        );
+        assert_eq!(
+            fields["servingMemberId"],
+            format!("{:#x}", B256::repeat_byte(0x33))
+        );
+
+        // These four fields are the stable top-level /status admission contract
+        // consumed by the LB preflight.
+        let status = status_admission_json(&metadata);
+        assert_eq!(status["identityMode"], "cluster-shared");
+        assert_eq!(status["codeId"], fields["codeId"]);
+        assert_eq!(status["indexerCluster"], fields["indexerCluster"]);
+        assert_eq!(status["servingMemberId"], fields["servingMemberId"]);
+        assert_eq!(status.as_object().unwrap().len(), 4);
     }
 }

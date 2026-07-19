@@ -269,6 +269,7 @@ pub async fn launch(
         &shared.self_member_id,
     )
     .await
+    .context("load durable Indexer cursor")?
     {
         shared.set_indexer_progress(block, log_index, false).await;
         tracing::info!(block, log_index, "loaded durable Indexer replay checkpoint");
@@ -691,19 +692,20 @@ async fn handle_indexed_message(
         }
         None => {
             let bytes = plaintext.len();
-            if ctx
-                .shared
+            ctx.shared
                 .incoming_tx
                 .send(crate::state::AppIncoming {
                     sender_member_id: sender,
                     payload: plaintext,
                     block_number,
                 })
-                .is_ok()
-            {
-                tracing::debug!(sender = %hex::encode(sender), block = block_number, bytes,
-                    "app message forwarded to SubscribeMessages");
-            }
+                .map_err(|_| {
+                    anyhow::anyhow!(
+                        "no active SubscribeMessages consumer; refusing to acknowledge app message"
+                    )
+                })?;
+            tracing::debug!(sender = %hex::encode(sender), block = block_number, bytes,
+                "app message forwarded to SubscribeMessages");
         }
     }
     Ok(())
@@ -1187,6 +1189,17 @@ async fn serve_agent_grpc(
             return;
         }
     };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Err(error) =
+            std::fs::set_permissions(&socket_path, std::fs::Permissions::from_mode(0o600))
+        {
+            tracing::error!(%error, path = %socket_path, "agent gRPC UDS chmod failed");
+            let _ = std::fs::remove_file(&socket_path);
+            return;
+        }
+    }
     tracing::info!(path = %socket_path, "agent gRPC listening");
     let svc = crate::agent_grpc::AgentService::new(shared, chain, bundler);
     if let Err(e) = tonic::transport::Server::builder()

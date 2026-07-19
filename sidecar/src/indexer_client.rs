@@ -4,7 +4,9 @@
 //! down and re-discovered (treated as adversarial).
 
 use crate::proto::indexer::indexer_client::IndexerClient;
-use crate::proto::indexer::{subscribe_message, Ack, Hello, PushEnvelope, SubscribeMessage};
+use crate::proto::indexer::{
+    subscribe_message, Ack, DeliveryCursor, Hello, PushEnvelope, SubscribeMessage,
+};
 use crate::state::Shared;
 use alloy::sol_types::SolEvent;
 use alloy_rlp::Decodable;
@@ -17,43 +19,53 @@ use tokio::sync::{mpsc, oneshot};
 use tokio_stream::wrappers::ReceiverStream;
 
 pub const ENVELOPE_DOMAIN: &[u8] = b"attestmesh.indexer.envelope.v1";
-pub const PROTOCOL_VERSION: u32 = 2;
+pub const PROTOCOL_VERSION: u32 = 3;
 pub const CHECKPOINT_LOG_INDEX: u64 = u64::MAX;
 const CURSOR_FILE: &str = "indexer-cursor.v1";
 const CURSOR_BYTES: u64 = 69;
 
-/// Load the last durably handled checkpoint. Corruption degrades to a replay from
-/// the normal fresh-subscription policy; cursor state is an optimization, not a
-/// boot requirement.
+/// Keep the boundary-block fallback useful for pre-v3 Indexers. An exact `(0, 0)`
+/// is a real v3 cursor, but legacy servers interpret `from_block = 0` as a fresh
+/// subscription and initialize at head. Block 1 is therefore the safe legacy
+/// sentinel; the server will still clamp it to the member's registration block.
+fn legacy_from_block(resume: Option<(u64, u64)>) -> u64 {
+    resume.map_or(0, |(block, _)| block.max(1))
+}
+
+/// Load the last durably handled cursor. A missing file is a genuinely fresh
+/// subscription. Existing but unreadable, malformed, or mis-bound state fails
+/// closed: treating it as fresh could skip events by initializing at chain head.
 pub async fn load_cursor(
     state_dir: Option<&Path>,
     cluster: alloy::primitives::Address,
     member_id: &[u8; 32],
-) -> Option<(u64, u64)> {
-    let bytes = match crate::storage::read_optional(state_dir, CURSOR_FILE, CURSOR_BYTES).await {
-        Ok(Some(bytes)) => bytes,
-        Ok(None) => return None,
-        Err(error) => {
-            tracing::warn!(error = ?error, "Indexer cursor cache read failed; replay baseline reset");
-            return None;
-        }
+) -> Result<Option<(u64, u64)>> {
+    let bytes = match crate::storage::read_optional(state_dir, CURSOR_FILE, CURSOR_BYTES)
+        .await
+        .context("read durable Indexer cursor")?
+    {
+        Some(bytes) => bytes,
+        None => return Ok(None),
     };
-    if bytes.len() != CURSOR_BYTES as usize || bytes[0] != 1 {
-        tracing::warn!("Indexer cursor cache has an unknown or truncated format; ignoring");
-        return None;
-    }
-    if bytes[1..21] != cluster.as_slice()[..] || bytes[21..53] != member_id[..] {
-        tracing::warn!("Indexer cursor cache belongs to another cluster/member; ignoring");
-        return None;
-    }
+    anyhow::ensure!(
+        bytes.len() == CURSOR_BYTES as usize && bytes[0] == 1,
+        "durable Indexer cursor has an unknown or truncated format"
+    );
+    anyhow::ensure!(
+        bytes[1..21] == cluster.as_slice()[..] && bytes[21..53] == member_id[..],
+        "durable Indexer cursor belongs to another cluster/member"
+    );
     let mut block = [0u8; 8];
     let mut log_index = [0u8; 8];
     block.copy_from_slice(&bytes[53..61]);
     log_index.copy_from_slice(&bytes[61..69]);
-    Some((u64::from_be_bytes(block), u64::from_be_bytes(log_index)))
+    Ok(Some((
+        u64::from_be_bytes(block),
+        u64::from_be_bytes(log_index),
+    )))
 }
 
-async fn store_checkpoint(
+async fn store_cursor(
     state_dir: Option<&Path>,
     cluster: alloy::primitives::Address,
     member_id: &[u8; 32],
@@ -207,6 +219,8 @@ pub async fn connect_and_run(
     dispatch: mpsc::Sender<DispatchRequest>,
     state_dir: Option<PathBuf>,
 ) -> Result<()> {
+    let state_dir = state_dir
+        .context("SIDECAR_STATE_DIR is required for protocol-v3 durable delivery cursors")?;
     // Explicit TLS config for https endpoints (the gateway-terminated route).
     // assume_http2: the dstack gateway serves gRPC/h2 but may answer ALPN with
     // http/1.1 — gRPC requires h2, so trust the verified reality over ALPN.
@@ -222,10 +236,10 @@ pub async fn connect_and_run(
     let mut client = IndexerClient::new(channel);
 
     let (tx, rx) = mpsc::channel::<SubscribeMessage>(64);
-    // A different Indexer deployment has no server-side cursor for this member.
-    // Supplying the last handled block makes it replay that block (duplicates are
-    // safe) instead of treating the subscription as brand new and starting at head.
-    let from_block = shared.get_indexer_status().await.cursor_block;
+    // The exact sidecar cursor is authoritative across independent Indexer replicas.
+    // Keep `from_block` populated as a boundary-block fallback for a pre-v3 server.
+    let resume = shared.indexer_resume_cursor().await;
+    let from_block = legacy_from_block(resume);
     let hello = SubscribeMessage {
         inner: Some(subscribe_message::Inner::Hello(Hello {
             cluster_addr: shared.cluster.as_slice().to_vec(),
@@ -233,6 +247,10 @@ pub async fn connect_and_run(
             attestation: Vec::new(),
             from_block,
             protocol_version: PROTOCOL_VERSION,
+            resume_cursor: resume.map(|(block_number, log_index)| DeliveryCursor {
+                block_number,
+                log_index,
+            }),
         })),
     };
     tx.send(hello).await.context("send indexer Hello")?;
@@ -245,7 +263,7 @@ pub async fn connect_and_run(
 
     tracing::info!(cluster = %shared.cluster, "indexer subscription open");
     shared.set_indexer_connected(true).await;
-    let mut last_handled: Option<(u64, u64)> = None;
+    let mut last_handled = resume;
     while let Some(env) = inbound.message().await.context("indexer stream")? {
         if !verify_envelope(&env, &indexer_pubkey) {
             anyhow::bail!("indexer signature mismatch — tearing down subscription");
@@ -291,6 +309,25 @@ pub async fn connect_and_run(
                 .map_err(anyhow::Error::msg)?;
         }
 
+        let advances = last_handled.map_or(true, |last| position > last);
+        if advances {
+            // Make the handled position crash-durable before telling any replica it
+            // may advance its local cursor. If this write fails, tear down without
+            // Ack so the position is replayed on reconnect.
+            store_cursor(
+                Some(state_dir.as_path()),
+                shared.cluster,
+                &shared.self_member_id,
+                position.0,
+                position.1,
+            )
+            .await
+            .context("persist Indexer cursor before Ack")?;
+            last_handled = Some(position);
+        }
+        shared
+            .set_indexer_progress(env.block_number, env.log_index, checkpoint)
+            .await;
         let ack = SubscribeMessage {
             inner: Some(subscribe_message::Inner::Ack(Ack {
                 block_number: env.block_number,
@@ -298,26 +335,6 @@ pub async fn connect_and_run(
             })),
         };
         tx.send(ack).await.context("send indexer Ack")?;
-        if last_handled.map_or(true, |last| position > last) {
-            last_handled = Some(position);
-        }
-        shared
-            .set_indexer_progress(env.block_number, env.log_index, checkpoint)
-            .await;
-        if checkpoint {
-            let progress = shared.get_indexer_status().await;
-            if let Err(error) = store_checkpoint(
-                state_dir.as_deref(),
-                shared.cluster,
-                &shared.self_member_id,
-                progress.cursor_block,
-                progress.cursor_log_index,
-            )
-            .await
-            {
-                tracing::warn!(error = ?error, "Indexer checkpoint cursor persist failed");
-            }
-        }
         tracing::debug!(
             block = env.block_number,
             log_index = env.log_index,
@@ -489,12 +506,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn checkpoint_cursor_round_trips_and_corruption_is_ignored() {
+    async fn checkpoint_cursor_round_trips_and_corruption_fail_closed() {
         let temp = tempfile::tempdir().unwrap();
         let cluster = Address::repeat_byte(0xc1);
         let member = [0xa1; 32];
-        assert_eq!(load_cursor(Some(temp.path()), cluster, &member).await, None);
-        store_checkpoint(
+        assert_eq!(
+            load_cursor(Some(temp.path()), cluster, &member)
+                .await
+                .unwrap(),
+            None
+        );
+        store_cursor(
             Some(temp.path()),
             cluster,
             &member,
@@ -504,16 +526,28 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(
-            load_cursor(Some(temp.path()), cluster, &member).await,
+            load_cursor(Some(temp.path()), cluster, &member)
+                .await
+                .unwrap(),
             Some((123, CHECKPOINT_LOG_INDEX))
         );
-        assert_eq!(
-            load_cursor(Some(temp.path()), Address::repeat_byte(0xc2), &member).await,
-            None
+        assert!(
+            load_cursor(Some(temp.path()), Address::repeat_byte(0xc2), &member)
+                .await
+                .is_err()
         );
         tokio::fs::write(temp.path().join(CURSOR_FILE), b"bad")
             .await
             .unwrap();
-        assert_eq!(load_cursor(Some(temp.path()), cluster, &member).await, None);
+        assert!(load_cursor(Some(temp.path()), cluster, &member)
+            .await
+            .is_err());
+    }
+
+    #[test]
+    fn exact_zero_cursor_does_not_look_fresh_to_a_legacy_indexer() {
+        assert_eq!(legacy_from_block(None), 0);
+        assert_eq!(legacy_from_block(Some((0, 0))), 1);
+        assert_eq!(legacy_from_block(Some((42, 7))), 42);
     }
 }

@@ -62,8 +62,10 @@ struct FakeIndexer {
     signing_key: SigningKey,
     cluster: Address,
     acks: mpsc::UnboundedSender<(u64, u64)>,
-    hellos: mpsc::UnboundedSender<(u32, u64)>,
+    hellos: mpsc::UnboundedSender<HelloRecord>,
 }
+
+type HelloRecord = (u32, u64, Option<(u64, u64)>);
 
 #[tonic::async_trait]
 impl Indexer for FakeIndexer {
@@ -84,7 +86,12 @@ impl Indexer for FakeIndexer {
         if hello.protocol_version != indexer_client::PROTOCOL_VERSION {
             return Err(Status::failed_precondition("wrong protocol version"));
         }
-        let _ = self.hellos.send((hello.protocol_version, hello.from_block));
+        let exact = hello
+            .resume_cursor
+            .map(|cursor| (cursor.block_number, cursor.log_index));
+        let _ = self
+            .hellos
+            .send((hello.protocol_version, hello.from_block, exact));
 
         let sender = B256::repeat_byte(0x33);
         let recipient = B256::from_slice(&hello.member_id);
@@ -135,7 +142,6 @@ impl Indexer for FakeIndexer {
 
         let (out_tx, out_rx) = mpsc::channel(2);
         out_tx.send(event).await.unwrap();
-        out_tx.send(checkpoint).await.unwrap();
         let acks = self.acks.clone();
         tokio::spawn(async move {
             let mut received = 0;
@@ -143,6 +149,13 @@ impl Indexer for FakeIndexer {
                 if let Some(subscribe_message::Inner::Ack(ack)) = message.inner {
                     let _ = acks.send((ack.block_number, ack.log_index));
                     received += 1;
+                    if received == 1 {
+                        // Keep the checkpoint behind the event Ack so the test can
+                        // inspect the durable event cursor at that exact boundary.
+                        if out_tx.send(checkpoint.clone()).await.is_err() {
+                            break;
+                        }
+                    }
                     if received == 2 {
                         break;
                     }
@@ -201,7 +214,7 @@ async fn signed_indexer_message_delivery_acks_only_after_dispatch_and_checkpoint
 
     assert_eq!(
         hello_rx.recv().await.unwrap(),
-        (indexer_client::PROTOCOL_VERSION, 0)
+        (indexer_client::PROTOCOL_VERSION, 0, None)
     );
 
     let request = dispatch_rx.recv().await.unwrap();
@@ -228,6 +241,17 @@ async fn signed_indexer_message_delivery_acks_only_after_dispatch_and_checkpoint
     request.completion.send(Ok(())).unwrap();
 
     assert_eq!(ack_rx.recv().await.unwrap(), (77, 3));
+    assert_eq!(
+        indexer_client::load_cursor(
+            Some(cursor_dir.path()),
+            shared.cluster,
+            &shared.self_member_id,
+        )
+        .await
+        .unwrap(),
+        Some((77, 3)),
+        "the exact event cursor must be durable before its Ack reaches the server"
+    );
     assert_eq!(ack_rx.recv().await.unwrap(), (78, u64::MAX));
     client.await.unwrap().unwrap();
     let status = shared.get_indexer_status().await;
@@ -240,7 +264,8 @@ async fn signed_indexer_message_delivery_acks_only_after_dispatch_and_checkpoint
             shared.cluster,
             &shared.self_member_id,
         )
-        .await,
+        .await
+        .unwrap(),
         Some((78, u64::MAX))
     );
 
@@ -253,9 +278,8 @@ async fn signed_indexer_message_delivery_acks_only_after_dispatch_and_checkpoint
     assert!(!shared.get_indexer_status().await.connected);
 
     // A reconnect through a newly selected LB backend carries the last handled
-    // block, including across a sidecar process restart. A backend with no cursor
-    // replays that block instead of skipping to its indexed head; same-block
-    // duplicates remain part of at-least-once delivery.
+    // exact cursor, including across a sidecar process restart. `from_block` stays
+    // populated for old servers, while a v3 server can skip the handled log index.
     let restarted = Shared::new(shared.keys.clone(), member, cluster, 0x0a0d0000, 16, 51821);
     let (saved_block, saved_log_index) = indexer_client::load_cursor(
         Some(cursor_dir.path()),
@@ -263,6 +287,7 @@ async fn signed_indexer_message_delivery_acks_only_after_dispatch_and_checkpoint
         &restarted.self_member_id,
     )
     .await
+    .unwrap()
     .unwrap();
     restarted
         .set_indexer_progress(saved_block, saved_log_index, false)
@@ -279,11 +304,17 @@ async fn signed_indexer_message_delivery_acks_only_after_dispatch_and_checkpoint
     });
     assert_eq!(
         hello_rx.recv().await.unwrap(),
-        (indexer_client::PROTOCOL_VERSION, 78)
+        (indexer_client::PROTOCOL_VERSION, 78, Some((78, u64::MAX)))
     );
-    let replay = dispatch_rx.recv().await.unwrap();
-    replay.completion.send(Ok(())).unwrap();
+    // The fake server deliberately repeats an older event. The client validates it
+    // but uses its exact in-memory/durable cursor to avoid redispatch.
     assert_eq!(ack_rx.recv().await.unwrap(), (77, 3));
     assert_eq!(ack_rx.recv().await.unwrap(), (78, u64::MAX));
+    let unexpected =
+        tokio::time::timeout(std::time::Duration::from_millis(50), dispatch_rx.recv()).await;
+    assert!(
+        !matches!(unexpected, Ok(Some(_))),
+        "events at or below the exact resume cursor must not be redispatched"
+    );
     reconnect.await.unwrap().unwrap();
 }

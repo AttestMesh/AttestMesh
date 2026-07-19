@@ -26,6 +26,10 @@ pub const ENVELOPE_DOMAIN: &[u8] = b"attestmesh.indexer.envelope.v1";
 /// Sidecar protocol version that understands signed catch-up checkpoints.
 pub const CHECKPOINT_PROTOCOL_VERSION: u32 = 2;
 
+/// Sidecar protocol version that supplies an exact subscriber-authoritative
+/// `(blockNumber, logIndex)` resume cursor in `Hello`.
+pub const EXACT_CURSOR_PROTOCOL_VERSION: u32 = 3;
+
 /// Checkpoints use the existing signed envelope wire shape so rolling the Indexer
 /// does not change the Subscribe response type. Empty event/tx/repro fields plus a
 /// maximal log index cannot collide with a real EVM log.

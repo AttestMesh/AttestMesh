@@ -1,19 +1,23 @@
-# Stable public front door for AttestMesh Indexer blue/green cutovers.
+# Stable public front door for AttestMesh Indexer blue/green cutovers and
+# Stage A shared-identity worker pools.
 #
 # The LB is itself a C3 member. HAProxy exposes the stable gateway ports:
 #   :50052  gRPC Subscribe stream (TCP/h2c to the active Indexer)
 #   :9090   Indexer HTTP health/status/read model
 # Its authenticated control API binds only to the mesh interface on :50053.
 #
-# A switch is deliberately two-phase. `prepare` probes the candidate and stops
-# accepting new frontend connections while existing gRPC streams continue. The
-# deploy driver then updates IndexerRegistry with the candidate signing key and
-# calls `commit`, which changes both HAProxy backends, closes old streams, and
+# A switch is deliberately two-phase. `prepare` probes the candidate or every
+# member of a shared-identity worker pool, then stops accepting new frontend
+# connections while existing gRPC streams continue. The deploy driver then
+# updates IndexerRegistry with the candidate/pool signing key
+# and calls `commit`, which changes both HAProxy backends, closes old streams, and
 # re-enables the frontends. Sidecars reconnect through the stable endpoint.
+# The Sidecar and registration-helper OCI index below was published by CI from
+# source commit 1cbb85cc5bb71d12102417d18e2cc6c352e6021c.
 
 services:
   sidecar:
-    image: ghcr.io/attestmesh/cluster-mesh-agent@sha256:e3d53442aa6e52d47227fb3528c1141302ad4fc63c4b3fb6dc38df7ce907d486
+    image: ghcr.io/attestmesh/cluster-mesh-agent@sha256:87d7ee2b1a85e903d80791551e813001cfdd7b2cecf131c8d7e407d2c7d7ecfb
     restart: unless-stopped
     environment:
       - CHAIN_ID=${CHAIN_ID}
@@ -37,7 +41,6 @@ services:
       - "51900:51900"
       - "50051:50051"
       - "50052:50052"
-      - "50053:50053"
       - "9090:9090"
       - "9091:9091"
     cap_add:
@@ -46,7 +49,7 @@ services:
       - /dev/net/tun
 
   registration-calldata:
-    image: ghcr.io/attestmesh/cluster-mesh-agent@sha256:e3d53442aa6e52d47227fb3528c1141302ad4fc63c4b3fb6dc38df7ce907d486
+    image: ghcr.io/attestmesh/cluster-mesh-agent@sha256:87d7ee2b1a85e903d80791551e813001cfdd7b2cecf131c8d7e407d2c7d7ecfb
     restart: "no"
     depends_on:
       - sidecar
@@ -61,38 +64,20 @@ services:
       - /var/run/dstack.sock:/var/run/dstack.sock
 
   haproxy:
-    image: haproxy:3.0-alpine
+    image: haproxy@sha256:dee54db8b27cd6c21519ea4f0ba0604f3742e8e7369bc16fb5b69133dec3f47f
     restart: unless-stopped
     user: "0:0"
     network_mode: service:sidecar
     depends_on:
       - sidecar
-    environment:
-      - APP_ENV_B64=${APP_ENV_B64}
     volumes:
       - haproxy-run:/indexer-lb-run
-      - indexer-lb-state:/indexer-lb-state
     entrypoint: ["/bin/sh", "-ec"]
     command:
       - |
         set -u
-        printf '%s' "$${APP_ENV_B64:-}" | base64 -d > /tmp/indexer-lb.env
-        set -a
-        . /tmp/indexer-lb.env
-        set +a
-        mkdir -p /indexer-lb-run /indexer-lb-state
+        mkdir -p /indexer-lb-run
         rm -f /indexer-lb-run/admin.sock
-        active="$${INDEXER_LB_INITIAL_BACKEND:-}"
-        if [ -s /indexer-lb-state/active_backend ]; then
-          active="$$(cat /indexer-lb-state/active_backend)"
-        fi
-        if echo "$$active" | grep -Eq '^([0-9]{1,3}\.){3}[0-9]{1,3}$$'; then
-          grpc_server="server active $${active}:50052 check"
-          http_server="server active $${active}:9090 check"
-        else
-          grpc_server="server active 127.0.0.1:1 check disabled"
-          http_server="server active 127.0.0.1:1 check disabled"
-        fi
         cat >/tmp/indexer-lb-haproxy.cfg <<CFG
         global
           maxconn 4096
@@ -113,9 +98,14 @@ services:
 
         backend indexer_grpc_active
           mode tcp
-          option tcp-check
+          balance roundrobin
+          # Forward gRPC to :50052, but use the Indexer's readiness endpoint on
+          # :9090 as the native health signal. This keeps an RPC-dead or lagging
+          # worker out of the gRPC pool even if its TCP listener is still open.
+          option httpchk GET /healthz
+          http-check expect status 200
           default-server inter 3s fall 2 rise 2 on-marked-down shutdown-sessions
-          $$grpc_server
+          server-template worker 1-8 127.0.0.1:1 check port 9090 disabled
 
         frontend indexer_http
           mode http
@@ -125,15 +115,16 @@ services:
 
         backend indexer_http_active
           mode http
+          balance roundrobin
           option httpchk GET /healthz
           http-check expect status 200
           default-server inter 3s fall 2 rise 2 on-marked-down shutdown-sessions
-          $$http_server
+          server-template worker 1-8 127.0.0.1:1 check disabled
         CFG
         exec haproxy -f /tmp/indexer-lb-haproxy.cfg -db
 
   controller:
-    image: python:3.11-alpine
+    image: python@sha256:25976e9d34a0fab1f278cae931f34c8303d97bf0c0d7f85b6b4dcf641d7702a4
     restart: unless-stopped
     network_mode: service:sidecar
     depends_on:
@@ -147,32 +138,94 @@ services:
     entrypoint: ["/bin/sh", "-ec"]
     command:
       - |
+        umask 077
         printf '%s' "$${APP_ENV_B64:-}" | base64 -d > /tmp/indexer-lb.env
+        chmod 0600 /tmp/indexer-lb.env
         set -a
         . /tmp/indexer-lb.env
         set +a
         cat >/tmp/indexer_lb_controller.py <<'PY'
+        import csv
         import fcntl
         import hmac
         import ipaddress
+        import io
         import json
         import os
         import re
+        import secrets
         import socket
         import struct
+        import threading
         import time
+        import urllib.error
         import urllib.request
+        from concurrent.futures import ThreadPoolExecutor
         from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+        from urllib.parse import parse_qs, urlparse
 
         ADMIN_KEY = os.environ.get("INDEXER_LB_ADMIN_KEY", "")
+        INITIAL_BACKENDS = os.environ.get("INDEXER_LB_INITIAL_BACKEND", "")
+        LB_CLUSTER = os.environ.get("INDEXER_LB_CLUSTER", "").strip().lower()
+        PINNED_SHARED_PUBKEY = os.environ.get(
+            "INDEXER_LB_PINNED_PUBKEY", ""
+        ).strip().lower()
+        PROTOCOL_V3_FLEET_CONFIRMED = (
+            os.environ.get("INDEXER_PROTOCOL_V3_FLEET_CONFIRMED", "") == "1"
+        )
         SOCKET_PATH = "/indexer-lb-run/admin.sock"
         ACTIVE_BACKEND_PATH = "/indexer-lb-state/active_backend"
         ACTIVE_PUBKEY_PATH = "/indexer-lb-state/active_pubkey"
+        ACTIVE_CODE_ID_PATH = "/indexer-lb-state/active_code_id"
+        ACTIVE_CLUSTER_PATH = "/indexer-lb-state/active_cluster"
+        ACTIVE_MEMBERS_PATH = "/indexer-lb-state/active_members"
+        ACTIVE_OPERATION_PATH = "/indexer-lb-state/active_operation"
+        ACTIVE_STATE_PATH = "/indexer-lb-state/active.json"
         PREPARED_PATH = "/indexer-lb-state/prepared.json"
-        PUBKEY_RE = re.compile(r"^0x[0-9a-fA-F]{64}$")
+        DRAIN_RESERVATIONS_PATH = "/indexer-lb-state/drain-reservations.json"
+        HEX32_RE = re.compile(r"^0x[0-9a-fA-F]{64}$")
+        ADDRESS_RE = re.compile(r"^0x[0-9a-fA-F]{40}$")
+        OPERATION_RE = re.compile(r"^[0-9a-f]{64}$")
+        ZERO32 = "0x" + ("0" * 64)
+        ZERO_ADDRESS = "0x" + ("0" * 40)
+        MAX_BACKENDS = 8
+        MAX_DRAIN_RESERVATIONS = 128
+        PRIVATE_BACKEND_NETS = tuple(
+            ipaddress.IPv4Network(value)
+            for value in ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16")
+        )
+        MAX_HEAD_LAG_BLOCKS = 10
+        SERVING_WAIT_SECONDS = 90
+        REQUEST_TIMEOUT_SECONDS = 15
+        MAX_CONTROL_THREADS = 16
+        MAX_BACKEND_HTTP_BYTES = 65536
+        MUTATION_LOCK = threading.RLock()
+
+        def local_ipv4_addresses() -> set[str]:
+            addresses = {"127.0.0.1"}
+            try:
+                interfaces = socket.if_nameindex()
+            except OSError:
+                interfaces = []
+            for _index, name in interfaces:
+                sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                try:
+                    packed = struct.pack("256s", name.encode("utf-8")[:15])
+                    addresses.add(
+                        socket.inet_ntoa(
+                            fcntl.ioctl(sock.fileno(), 0x8915, packed)[20:24]
+                        )
+                    )
+                except OSError:
+                    pass
+                finally:
+                    sock.close()
+            return addresses
 
         if not ADMIN_KEY:
             raise SystemExit("INDEXER_LB_ADMIN_KEY is required")
+        if not ADDRESS_RE.fullmatch(LB_CLUSTER) or LB_CLUSTER == ZERO_ADDRESS:
+            raise SystemExit("INDEXER_LB_CLUSTER must be a nonzero 20-byte address")
 
         def mesh_ip() -> str:
             while True:
@@ -194,122 +247,1228 @@ services:
             except FileNotFoundError:
                 return ""
 
+        def fsync_parent(path: str) -> None:
+            directory = os.path.dirname(path) or "."
+            fd = os.open(directory, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+            try:
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+
         def write_text(path: str, value: str) -> None:
             tmp = path + ".tmp"
             with open(tmp, "w", encoding="utf-8") as fh:
                 fh.write(value + "\n")
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.chmod(tmp, 0o600)
             os.replace(tmp, path)
+            fsync_parent(path)
+
+        def write_json_atomic(path: str, value: dict) -> None:
+            tmp = path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as fh:
+                json.dump(value, fh, sort_keys=True)
+                fh.write("\n")
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.chmod(tmp, 0o600)
+            os.replace(tmp, path)
+            fsync_parent(path)
+
+        def read_active_json() -> dict:
+            try:
+                with open(ACTIVE_STATE_PATH, "r", encoding="utf-8") as fh:
+                    value = json.load(fh)
+                if not isinstance(value, dict):
+                    raise RuntimeError("active.json must contain a JSON object")
+                return value
+            except FileNotFoundError:
+                return {}
+            except ValueError as exc:
+                raise RuntimeError("active.json is corrupt") from exc
 
         def read_prepared() -> dict:
             try:
                 with open(PREPARED_PATH, "r", encoding="utf-8") as fh:
                     value = json.load(fh)
-                    return value if isinstance(value, dict) else {}
-            except (FileNotFoundError, ValueError):
+                    if not isinstance(value, dict):
+                        raise RuntimeError("prepared journal must be a JSON object")
+                    return value
+            except FileNotFoundError:
                 return {}
+            except ValueError as exc:
+                raise RuntimeError("prepared journal is corrupt") from exc
 
         def write_prepared(value: dict) -> None:
-            tmp = PREPARED_PATH + ".tmp"
-            with open(tmp, "w", encoding="utf-8") as fh:
-                json.dump(value, fh, sort_keys=True)
-            os.replace(tmp, PREPARED_PATH)
+            write_json_atomic(PREPARED_PATH, value)
 
         def clear_prepared() -> None:
             try:
                 os.unlink(PREPARED_PATH)
+                fsync_parent(PREPARED_PATH)
             except FileNotFoundError:
                 pass
 
+        def read_drain_reservations() -> dict:
+            return read_drain_journal()["active"]
+
+        def _validate_drain_reservations(value: dict) -> dict:
+            if not isinstance(value, dict):
+                raise RuntimeError("drain reservations must be a JSON object")
+            if len(value) > MAX_DRAIN_RESERVATIONS:
+                raise RuntimeError("too many active drain reservations")
+            normalized = {}
+            for backend, reservation in value.items():
+                backend = validate_backend(str(backend))
+                if not isinstance(reservation, dict):
+                    raise RuntimeError("drain reservation entry must be an object")
+                if reservation.get("backend") != backend:
+                    raise RuntimeError("drain reservation backend key mismatch")
+                reservation_id = str(reservation.get("reservation_id", ""))
+                release_token = str(reservation.get("release_token", ""))
+                operation_id = str(reservation.get("reserved_at_operation_id", ""))
+                if not OPERATION_RE.fullmatch(reservation_id):
+                    raise RuntimeError("drain reservation_id is invalid")
+                if not OPERATION_RE.fullmatch(release_token):
+                    raise RuntimeError("drain release token is invalid")
+                normalize_operation_id(operation_id)
+                normalized[backend] = dict(reservation)
+            return normalized
+
+        def read_drain_journal() -> dict:
+            try:
+                with open(DRAIN_RESERVATIONS_PATH, "r", encoding="utf-8") as fh:
+                    value = json.load(fh)
+            except FileNotFoundError:
+                return {"schema": 1, "active": {}, "released": []}
+            except ValueError as exc:
+                raise RuntimeError("drain reservation journal is corrupt") from exc
+            if not isinstance(value, dict):
+                raise RuntimeError("drain reservation journal must be a JSON object")
+            if value.get("schema") == 1:
+                active = _validate_drain_reservations(value.get("active", {}))
+                released = value.get("released", [])
+                if not isinstance(released, list) or len(released) > 256:
+                    raise RuntimeError("drain release tombstones are invalid")
+                normalized_released = []
+                for tombstone in released:
+                    if not isinstance(tombstone, dict):
+                        raise RuntimeError("drain release tombstone must be an object")
+                    backend = validate_backend(
+                        str(tombstone.get("backend", "")), allow_local=True
+                    )
+                    reservation_id = str(tombstone.get("reservation_id", ""))
+                    release_token = str(tombstone.get("release_token", ""))
+                    if not OPERATION_RE.fullmatch(reservation_id) or not OPERATION_RE.fullmatch(
+                        release_token
+                    ):
+                        raise RuntimeError("drain release tombstone token is invalid")
+                    normalized_released.append({**tombstone, "backend": backend})
+                return {"schema": 1, "active": active, "released": normalized_released}
+            # Migrate the short-lived pre-tombstone format on its next mutation.
+            return {
+                "schema": 1,
+                "active": _validate_drain_reservations(value),
+                "released": [],
+            }
+
+        def write_drain_reservations(value: dict) -> None:
+            journal = read_drain_journal()
+            journal["active"] = _validate_drain_reservations(value)
+            write_json_atomic(DRAIN_RESERVATIONS_PATH, journal)
+
+        def write_drain_journal(value: dict) -> None:
+            write_json_atomic(DRAIN_RESERVATIONS_PATH, value)
+
+        def reject_reserved_backends(backends: list[str]) -> None:
+            reserved = read_drain_reservations()
+            overlap = sorted(set(backends) & set(reserved))
+            if overlap:
+                raise ValueError(
+                    "backend has an active drain reservation: " + ",".join(overlap)
+                )
+
         def haproxy_cmd(command: str) -> str:
             sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-            sock.settimeout(10)
-            sock.connect(SOCKET_PATH)
-            sock.sendall((command.rstrip() + "\n").encode("utf-8"))
-            sock.shutdown(socket.SHUT_WR)
-            chunks = []
-            while True:
-                chunk = sock.recv(4096)
-                if not chunk:
-                    break
-                chunks.append(chunk)
-            sock.close()
+            try:
+                sock.settimeout(10)
+                sock.connect(SOCKET_PATH)
+                sock.sendall((command.rstrip() + "\n").encode("utf-8"))
+                sock.shutdown(socket.SHUT_WR)
+                chunks = []
+                while True:
+                    chunk = sock.recv(4096)
+                    if not chunk:
+                        break
+                    chunks.append(chunk)
+            finally:
+                sock.close()
             output = b"".join(chunks).decode("utf-8", errors="replace")
-            if output.lstrip().startswith("Unknown command"):
+            lowered = output.strip().lower()
+            failure_markers = (
+                "unknown command",
+                "no such ",
+                "invalid ",
+                "can't ",
+                "cannot ",
+                "permission denied",
+                "error:",
+            )
+            if any(marker in lowered for marker in failure_markers):
                 raise RuntimeError(output.strip())
             return output
 
-        def validate_backend(value: str) -> str:
+        def validate_backend(value: str, *, allow_local: bool = False) -> str:
             try:
                 ip = ipaddress.IPv4Address(value)
             except Exception as exc:
                 raise ValueError("backend must be an IPv4 address") from exc
-            if not ip.is_private:
-                raise ValueError("backend must be a private bridge or mesh address")
+            if not any(ip in network for network in PRIVATE_BACKEND_NETS):
+                raise ValueError("backend must be an RFC1918 bridge or mesh address")
+            # attestmesh0 may appear after module import, so never cache this set.
+            if not allow_local and str(ip) in local_ipv4_addresses():
+                raise ValueError("backend must not be an address of the LB itself")
             return str(ip)
 
-        def normalize_pubkey(value: str) -> str:
+        def validate_backends(value, *, allow_empty: bool = False) -> list[str]:
+            if isinstance(value, str):
+                raw = [part.strip() for part in value.split(",") if part.strip()]
+            elif isinstance(value, list):
+                raw = [str(part).strip() for part in value]
+            else:
+                raise ValueError("backends must be an array or comma-separated string")
+            if not raw and not allow_empty:
+                raise ValueError("at least one backend is required")
+            if len(raw) > MAX_BACKENDS:
+                raise ValueError(f"at most {MAX_BACKENDS} backends are supported")
+            out = [validate_backend(part) for part in raw]
+            if len(set(out)) != len(out):
+                raise ValueError("backend addresses must be distinct")
+            return out
+
+        def normalize_hex32(value: str, field: str, *, nonzero: bool = False) -> str:
             value = value.strip().lower()
-            if not PUBKEY_RE.fullmatch(value):
-                raise ValueError("expected_pubkey must be a 32-byte 0x hex value")
+            if not HEX32_RE.fullmatch(value):
+                raise ValueError(f"{field} must be a 32-byte 0x hex value")
+            if nonzero and value == ZERO32:
+                raise ValueError(f"{field} must be nonzero")
             return value
 
-        def probe_backend(ip: str, expected_pubkey: str) -> dict:
-            with socket.create_connection((ip, 50052), timeout=10):
-                pass
-            with urllib.request.urlopen(f"http://{ip}:9090/healthz", timeout=10) as resp:
-                health_body = resp.read(2048).decode("utf-8", errors="replace")
-                if resp.status != 200:
-                    raise RuntimeError(
-                        f"health probe returned HTTP {resp.status}: {health_body[:200]}"
-                    )
-            with urllib.request.urlopen(f"http://{ip}:9090/status", timeout=10) as resp:
-                status = json.load(resp)
+        def normalize_pubkey(value: str) -> str:
+            return normalize_hex32(value, "expected_pubkey", nonzero=True)
+
+        def normalize_address(value: str, field: str) -> str:
+            value = value.strip().lower()
+            if not ADDRESS_RE.fullmatch(value) or value == ZERO_ADDRESS:
+                raise ValueError(f"{field} must be a nonzero 20-byte 0x address")
+            return value
+
+        def normalize_operation_id(value: str) -> str:
+            value = value.strip().lower()
+            if not OPERATION_RE.fullmatch(value):
+                raise ValueError("operation_id must be 32 bytes of lowercase hex")
+            return value
+
+        def require_operation(prepared: dict, supplied: str) -> str:
+            operation_id = normalize_operation_id(supplied)
+            expected = str(prepared.get("operation_id", ""))
+            if not expected or not hmac.compare_digest(operation_id, expected):
+                raise ValueError("operation_id does not match the prepared generation")
+            return operation_id
+
+        def read_active_backends() -> list[str]:
+            state = read_active_json()
+            if state:
+                return validate_backends(state.get("backends", []), allow_empty=True)
+            return validate_backends(read_text(ACTIVE_BACKEND_PATH), allow_empty=True)
+
+        class RejectRedirects(urllib.request.HTTPRedirectHandler):
+            def redirect_request(self, req, fp, code, msg, headers, newurl):
+                return None
+
+        BACKEND_HTTP = urllib.request.build_opener(
+            urllib.request.ProxyHandler({}), RejectRedirects()
+        )
+
+        def bounded_backend_get(ip: str, path: str) -> bytes:
+            url = f"http://{validate_backend(ip)}:9090{path}"
+            request = urllib.request.Request(url, method="GET")
+            with BACKEND_HTTP.open(request, timeout=10) as resp:
+                lengths = resp.headers.get_all("content-length", [])
+                if len(lengths) > 1:
+                    raise RuntimeError("backend returned multiple Content-Length headers")
+                if lengths:
+                    try:
+                        declared = int(lengths[0], 10)
+                    except ValueError as exc:
+                        raise RuntimeError(
+                            "backend returned an invalid Content-Length"
+                        ) from exc
+                    if declared < 0 or declared > MAX_BACKEND_HTTP_BYTES:
+                        raise RuntimeError("backend response Content-Length is too large")
+                data = resp.read(MAX_BACKEND_HTTP_BYTES + 1)
+                if len(data) > MAX_BACKEND_HTTP_BYTES:
+                    raise RuntimeError("backend response exceeded 64KiB")
+                return data
+
+        def bounded_backend_json(ip: str, path: str) -> dict:
+            try:
+                value = json.loads(bounded_backend_get(ip, path))
+            except json.JSONDecodeError as exc:
+                raise ValueError("backend returned invalid JSON") from exc
+            if not isinstance(value, dict):
+                raise ValueError("backend JSON response must be an object")
+            return value
+
+        class BackendIdentityError(RuntimeError):
+            pass
+
+        class BackendHealthError(RuntimeError):
+            pass
+
+        def probe_backend(
+            ip: str,
+            expected_pubkey: str,
+            *,
+            shared_ha: bool,
+            expected_code_id: str = "",
+            expected_cluster: str = "",
+            expected_member: str = "",
+            require_serving: bool,
+        ) -> dict:
+            health_body = ""
+            if require_serving or not shared_ha:
+                with socket.create_connection((ip, 50052), timeout=10):
+                    pass
+                health_body = bounded_backend_get(ip, "/healthz").decode(
+                    "utf-8", errors="replace"
+                )
+            status = bounded_backend_json(ip, "/status")
             actual_pubkey = normalize_pubkey(str(status.get("pubKey", "")))
             if actual_pubkey != expected_pubkey:
-                raise RuntimeError(
+                raise BackendIdentityError(
                     f"backend pubkey mismatch: expected {expected_pubkey}, got {actual_pubkey}"
                 )
             health = status.get("health") or {}
-            if health.get("ok") is not True:
-                raise RuntimeError(f"backend status is unhealthy: {health}")
+            if shared_ha:
+                actual_code_id = normalize_hex32(
+                    str(status.get("codeId", "")), "status.codeId", nonzero=True
+                )
+                actual_cluster = normalize_address(
+                    str(status.get("indexerCluster", "")), "status.indexerCluster"
+                )
+                actual_member = normalize_hex32(
+                    str(status.get("servingMemberId", "")),
+                    "status.servingMemberId",
+                    nonzero=True,
+                )
+                if status.get("identityMode") != "cluster-shared":
+                    raise BackendIdentityError("backend identityMode is not cluster-shared")
+                if actual_code_id != expected_code_id:
+                    raise BackendIdentityError(
+                        f"backend codeId mismatch: expected {expected_code_id}, got {actual_code_id}"
+                    )
+                if actual_cluster != expected_cluster:
+                    raise BackendIdentityError(
+                        f"backend indexerCluster mismatch: expected {expected_cluster}, got {actual_cluster}"
+                    )
+                if expected_member and actual_member != expected_member:
+                    raise BackendIdentityError(
+                        f"backend servingMemberId changed: expected {expected_member}, got {actual_member}"
+                    )
+                lag = health.get("chainHeadLagBlocks")
+                if health.get("rpcReachable") is not True:
+                    raise BackendHealthError(f"backend RPC is not reachable: {health}")
+                if type(lag) is not int or lag < 0 or lag >= MAX_HEAD_LAG_BLOCKS:
+                    raise BackendHealthError(
+                        f"backend chain head lag is not acceptable: {health}"
+                    )
+                read_model = status.get("readModel") or {}
+                if type(read_model.get("atBlock")) is not int:
+                    raise BackendHealthError(
+                        f"backend read model is not caught up: {read_model}"
+                    )
+                if type(read_model.get("clusterCount")) is not int or read_model["clusterCount"] < 1:
+                    raise BackendHealthError(f"backend read model is empty: {read_model}")
+                if require_serving and (
+                    health.get("grpcAccepting") is not True or health.get("ok") is not True
+                ):
+                    raise BackendHealthError(
+                        f"backend is not serving after registry update: {health}"
+                    )
+            else:
+                actual_code_id = ""
+                actual_cluster = ""
+                actual_member = ""
+                if status.get("identityMode") == "cluster-shared":
+                    raise BackendIdentityError(
+                        "cluster-shared backend requires a pool of at least two workers"
+                    )
+                if health.get("ok") is not True:
+                    raise BackendHealthError(f"backend status is unhealthy: {health}")
             return {
                 "health": health_body[:500],
                 "pubkey": actual_pubkey,
+                "code_id": actual_code_id,
+                "cluster": actual_cluster,
+                "member_id": actual_member,
                 "status": status,
             }
+
+        def probe_pool(
+            backends: list[str],
+            pubkey: str,
+            *,
+            shared_ha: bool,
+            code_id: str = "",
+            cluster: str = "",
+            expected_members: list[str] | None = None,
+            require_serving: bool,
+        ) -> list[dict]:
+            expected_members = expected_members or ([""] * len(backends))
+            if len(expected_members) != len(backends):
+                raise ValueError("expected member IDs must match the backend count")
+            if shared_ha and require_serving and not all(expected_members):
+                raise ValueError("serving commit requires every prepared member ID")
+            with ThreadPoolExecutor(max_workers=len(backends)) as executor:
+                futures = [
+                    executor.submit(
+                        probe_backend,
+                        backend,
+                        pubkey,
+                        shared_ha=shared_ha,
+                        expected_code_id=code_id,
+                        expected_cluster=cluster,
+                        expected_member=expected_members[index],
+                        require_serving=require_serving,
+                    )
+                    for index, backend in enumerate(backends)
+                ]
+                probes = [future.result() for future in futures]
+            if shared_ha:
+                members = [probe["member_id"] for probe in probes]
+                if len(set(members)) != len(members):
+                    raise RuntimeError("shared HA backends must have distinct servingMemberIds")
+            return probes
+
+        def probe_initial_shared_pool(backends: list[str]) -> dict:
+            # Initial pool recovery is allowed only when the registry already lets
+            # the workers serve. A first migration must go through prepare/commit.
+            if not PROTOCOL_V3_FLEET_CONFIRMED:
+                raise RuntimeError(
+                    "initial shared pool requires protocol-v3 fleet confirmation"
+                )
+            first = bounded_backend_json(backends[0], "/status")
+            if not PINNED_SHARED_PUBKEY:
+                raise RuntimeError(
+                    "initial shared pool requires an independently pinned pubkey"
+                )
+            pubkey = normalize_pubkey(PINNED_SHARED_PUBKEY)
+            code_id = normalize_hex32(
+                str(first.get("codeId", "")), "status.codeId", nonzero=True
+            )
+            cluster = normalize_address(
+                str(first.get("indexerCluster", "")), "status.indexerCluster"
+            )
+            if cluster == LB_CLUSTER:
+                raise RuntimeError(
+                    "initial shared pool uses the LB/C3 cluster instead of a dedicated cluster"
+                )
+            discovered = probe_pool(
+                backends,
+                pubkey,
+                shared_ha=True,
+                code_id=code_id,
+                cluster=cluster,
+                require_serving=False,
+            )
+            members = [probe["member_id"] for probe in discovered]
+            probe_pool(
+                backends,
+                pubkey,
+                shared_ha=True,
+                code_id=code_id,
+                cluster=cluster,
+                expected_members=members,
+                require_serving=True,
+            )
+            return {
+                "pubkey": pubkey,
+                "code_id": code_id,
+                "cluster": cluster,
+                "members": members,
+            }
+
+        def reject_singleton_shared_identity(backend: str) -> None:
+            status = bounded_backend_json(backend, "/status")
+            if status.get("identityMode") == "cluster-shared":
+                raise BackendIdentityError(
+                    "cluster-shared backend requires a pool of at least two workers"
+                )
+
+        def wait_until_serving(prepared: dict) -> list[dict]:
+            deadline = time.monotonic() + SERVING_WAIT_SECONDS
+            last_error = None
+            while time.monotonic() < deadline:
+                try:
+                    return probe_pool(
+                        prepared["backends"],
+                        prepared["pubkey"],
+                        shared_ha=prepared.get("shared_ha", False),
+                        code_id=prepared.get("code_id", ""),
+                        cluster=prepared.get("cluster", ""),
+                        expected_members=prepared.get("members", []),
+                        require_serving=True,
+                    )
+                except Exception as exc:
+                    last_error = exc
+                    time.sleep(3)
+            raise RuntimeError(
+                f"backends did not become serving within {SERVING_WAIT_SECONDS}s: {last_error}"
+            )
 
         def frontends(enabled: bool) -> None:
             verb = "enable" if enabled else "disable"
             haproxy_cmd(f"{verb} frontend indexer_grpc")
             haproxy_cmd(f"{verb} frontend indexer_http")
+            verify_frontends(enabled)
 
-        def set_backend(ip: str) -> dict:
-            outputs = {}
-            outputs["grpc_set"] = haproxy_cmd(
-                f"set server indexer_grpc_active/active addr {ip} port 50052"
-            )
-            outputs["http_set"] = haproxy_cmd(
-                f"set server indexer_http_active/active addr {ip} port 9090"
-            )
-            outputs["grpc_enable"] = haproxy_cmd(
-                "enable server indexer_grpc_active/active"
-            )
-            outputs["http_enable"] = haproxy_cmd(
-                "enable server indexer_http_active/active"
-            )
+        def verify_frontends(enabled: bool) -> None:
+            raw = haproxy_cmd("show stat")
+            if not raw.startswith("# "):
+                raise RuntimeError("HAProxy show stat returned no CSV header")
+            rows = list(csv.DictReader(io.StringIO(raw[2:])))
+            by_key = {
+                (row.get("pxname", ""), row.get("svname", "")): row
+                for row in rows
+            }
+            expected = "OPEN" if enabled else "PAUSED"
+            for name in ("indexer_grpc", "indexer_http"):
+                row = by_key.get((name, "FRONTEND"))
+                if not row or row.get("status") != expected:
+                    raise RuntimeError(
+                        f"HAProxy frontend {name} expected {expected}, "
+                        f"got {(row or {}).get('status', '<missing>')}"
+                    )
+
+        def set_pool(
+            backends: list[str], *, enabled_backends: list[str] | None = None
+        ) -> dict:
+            enabled = set(backends if enabled_backends is None else enabled_backends)
+            if not enabled.issubset(set(backends)):
+                raise ValueError("enabled backends must be members of the active pool")
+            outputs = {
+                "backends": list(backends),
+                "enabled_backends": [backend for backend in backends if backend in enabled],
+                "slots": [],
+            }
+            for index in range(1, MAX_BACKENDS + 1):
+                name = f"worker{index}"
+                if index <= len(backends):
+                    ip = backends[index - 1]
+                    haproxy_cmd(
+                        f"set server indexer_grpc_active/{name} addr {ip} port 50052"
+                    )
+                    haproxy_cmd(
+                        f"set server indexer_http_active/{name} addr {ip} port 9090"
+                    )
+                    verb = "enable" if ip in enabled else "disable"
+                    haproxy_cmd(f"{verb} server indexer_grpc_active/{name}")
+                    haproxy_cmd(f"{verb} server indexer_http_active/{name}")
+                    outputs["slots"].append(
+                        {"slot": name, "backend": ip, "enabled": ip in enabled}
+                    )
+                else:
+                    haproxy_cmd(f"disable server indexer_grpc_active/{name}")
+                    haproxy_cmd(f"disable server indexer_http_active/{name}")
+                    haproxy_cmd(
+                        f"set server indexer_grpc_active/{name} addr 127.0.0.1 port 1"
+                    )
+                    haproxy_cmd(
+                        f"set server indexer_http_active/{name} addr 127.0.0.1 port 1"
+                    )
+                    outputs["slots"].append({"slot": name, "enabled": False})
+            verify_runtime_pool(backends, enabled_backends=list(enabled))
             return outputs
 
+        def verify_runtime_pool(
+            backends: list[str], *, enabled_backends: list[str] | None = None,
+            permit_disabled_active: bool = False,
+        ) -> None:
+            enabled = set(backends if enabled_backends is None else enabled_backends)
+            if not enabled.issubset(set(backends)):
+                raise ValueError("enabled backends must be members of the active pool")
+            raw = haproxy_cmd("show stat")
+            if not raw.startswith("# "):
+                raise RuntimeError("HAProxy show stat returned no CSV header")
+            rows = list(csv.DictReader(io.StringIO(raw[2:])))
+            by_key = {
+                (row.get("pxname", ""), row.get("svname", "")): row
+                for row in rows
+            }
+            for index in range(1, MAX_BACKENDS + 1):
+                name = f"worker{index}"
+                for backend_name, port in (
+                    ("indexer_grpc_active", 50052),
+                    ("indexer_http_active", 9090),
+                ):
+                    row = by_key.get((backend_name, name))
+                    if not row:
+                        raise RuntimeError(
+                            f"HAProxy runtime slot is missing: {backend_name}/{name}"
+                        )
+                    status = row.get("status", "")
+                    if index <= len(backends):
+                        expected_addr = f"{backends[index - 1]}:{port}"
+                        if row.get("addr") != expected_addr:
+                            raise RuntimeError(
+                                f"HAProxy runtime address mismatch for {backend_name}/{name}: "
+                                f"expected {expected_addr}, got {row.get('addr')}"
+                            )
+                        if (
+                            not permit_disabled_active
+                            and backends[index - 1] in enabled
+                            and status.startswith("MAINT")
+                        ):
+                            raise RuntimeError(
+                                f"HAProxy runtime slot remained disabled: {backend_name}/{name}"
+                            )
+                        if (
+                            not permit_disabled_active
+                            and backends[index - 1] not in enabled
+                            and not status.startswith("MAINT")
+                        ):
+                            raise RuntimeError(
+                                f"unverified HAProxy runtime slot remained enabled: "
+                                f"{backend_name}/{name}"
+                            )
+                    else:
+                        if not status.startswith("MAINT"):
+                            raise RuntimeError(
+                                f"unused HAProxy runtime slot remained enabled: {backend_name}/{name}"
+                            )
+                        if row.get("addr") != "127.0.0.1:1":
+                            raise RuntimeError(
+                                f"unused HAProxy runtime slot retained an address: "
+                                f"{backend_name}/{name}={row.get('addr')}"
+                            )
+
         def close_sessions() -> dict:
+            outputs = {}
+            for index in range(1, MAX_BACKENDS + 1):
+                name = f"worker{index}"
+                outputs[name] = {
+                    "grpc": haproxy_cmd(
+                        f"shutdown sessions server indexer_grpc_active/{name}"
+                    ),
+                    "http": haproxy_cmd(
+                        f"shutdown sessions server indexer_http_active/{name}"
+                    ),
+                }
+            return outputs
+
+        def quarantine_runtime_pool() -> None:
+            # Preserve the durable active generation while making every runtime
+            # slot non-routable and evicting streams that may already point at a
+            # reused address. Each step is best-effort so one CLI failure cannot
+            # prevent the remaining fail-closed actions.
+            errors = []
+            actions = [lambda: frontends(False)]
+            for index in range(1, MAX_BACKENDS + 1):
+                name = f"worker{index}"
+                actions.extend(
+                    (
+                        lambda name=name: haproxy_cmd(
+                            f"disable server indexer_grpc_active/{name}"
+                        ),
+                        lambda name=name: haproxy_cmd(
+                            f"disable server indexer_http_active/{name}"
+                        ),
+                    )
+                )
+            actions.append(close_sessions)
+            for action in actions:
+                try:
+                    action()
+                except Exception as exc:
+                    errors.append(exc)
+            if errors:
+                raise RuntimeError(
+                    "failed to fully quarantine HAProxy runtime: "
+                    + "; ".join(str(error) for error in errors)
+                )
+
+        def persist_active(
+            backends: list[str],
+            pubkey: str,
+            *,
+            code_id: str = "",
+            cluster: str = "",
+            members: list[str] | None = None,
+            operation_id: str = "",
+        ) -> None:
+            state = {
+                "backends": list(backends),
+                "pubkey": pubkey,
+                "code_id": code_id,
+                "cluster": cluster,
+                "members": list(members or []),
+                "operation_id": operation_id,
+            }
+            # active.json is the sole crash-consistent authority. The individual
+            # files remain as a migration/debug compatibility view only.
+            write_json_atomic(ACTIVE_STATE_PATH, state)
+            write_text(ACTIVE_BACKEND_PATH, ",".join(backends))
+            write_text(ACTIVE_PUBKEY_PATH, pubkey)
+            write_text(ACTIVE_CODE_ID_PATH, code_id)
+            write_text(ACTIVE_CLUSTER_PATH, cluster)
+            write_text(ACTIVE_MEMBERS_PATH, ",".join(members or []))
+            write_text(ACTIVE_OPERATION_PATH, operation_id)
+
+        def active_state() -> dict:
+            state = read_active_json()
+            if state:
+                state["backends"] = validate_backends(
+                    state.get("backends", []), allow_empty=True
+                )
+                if not isinstance(state.get("members", []), list):
+                    raise RuntimeError("active.json members must be an array")
+                state["members"] = list(state.get("members", []))
+                operation_id = str(state.get("operation_id", ""))
+                if operation_id:
+                    state["operation_id"] = normalize_operation_id(operation_id)
+                return state
             return {
-                "grpc": haproxy_cmd(
-                    "shutdown sessions server indexer_grpc_active/active"
-                ),
-                "http": haproxy_cmd(
-                    "shutdown sessions server indexer_http_active/active"
-                ),
+                "backends": read_active_backends(),
+                "pubkey": read_text(ACTIVE_PUBKEY_PATH),
+                "code_id": read_text(ACTIVE_CODE_ID_PATH),
+                "cluster": read_text(ACTIVE_CLUSTER_PATH),
+                "members": [
+                    member
+                    for member in read_text(ACTIVE_MEMBERS_PATH).split(",")
+                    if member
+                ],
+                "operation_id": read_text(ACTIVE_OPERATION_PATH),
             }
 
+        ACTIVE_STATE_KEYS = {
+            "backends",
+            "pubkey",
+            "code_id",
+            "cluster",
+            "members",
+            "operation_id",
+        }
+
+        def canonical_active_state(value, field: str) -> dict:
+            if not isinstance(value, dict) or set(value) != ACTIVE_STATE_KEYS:
+                raise ValueError(f"{field} must contain the exact active-state fields")
+            members = value.get("members")
+            if not isinstance(members, list) or not all(
+                isinstance(member, str) for member in members
+            ):
+                raise ValueError(f"{field}.members must be an array of strings")
+            operation_id = str(value.get("operation_id", ""))
+            if operation_id:
+                operation_id = normalize_operation_id(operation_id)
+            return {
+                "backends": validate_backends(
+                    value.get("backends", []), allow_empty=True
+                ),
+                "pubkey": str(value.get("pubkey", "")),
+                "code_id": str(value.get("code_id", "")),
+                "cluster": str(value.get("cluster", "")),
+                "members": list(members),
+                "operation_id": operation_id,
+            }
+
+        def restore_state(
+            state: dict,
+            *,
+            close_existing: bool,
+            enabled_backends: list[str] | None = None,
+        ) -> dict:
+            backends = validate_backends(state.get("backends", []), allow_empty=True)
+            changed = set_pool(backends, enabled_backends=enabled_backends)
+            sessions = close_sessions() if close_existing else {}
+            persist_active(
+                backends,
+                str(state.get("pubkey", "")),
+                code_id=str(state.get("code_id", "")),
+                cluster=str(state.get("cluster", "")),
+                members=list(state.get("members", [])),
+                operation_id=str(state.get("operation_id", "")),
+            )
+            return {"haproxy": changed, "closed_sessions": sessions}
+
+        def validate_active_before_reopen(
+            state: dict, *, tolerate_unavailable: bool = False
+        ) -> list[str]:
+            backends = validate_backends(state.get("backends", []), allow_empty=True)
+            reject_reserved_backends(backends)
+            if not backends:
+                return []
+            pubkey_raw = str(state.get("pubkey", ""))
+            if len(backends) == 1:
+                # Bind the reachable address to its identity even for the
+                # migration-only state format that predates a persisted pubkey.
+                # A cluster-shared worker is never safe as a singleton.
+                reject_singleton_shared_identity(backends[0])
+                # Old direct/blue-green state predates active.json and may not have
+                # a persisted key. HAProxy's native /healthz check remains the
+                # fail-closed serving gate for that migration-only case.
+                if pubkey_raw:
+                    probe_pool(
+                        backends,
+                        normalize_pubkey(pubkey_raw),
+                        shared_ha=False,
+                        require_serving=True,
+                    )
+                return backends
+
+            pubkey = normalize_pubkey(pubkey_raw)
+            code_id = normalize_hex32(
+                str(state.get("code_id", "")), "active.code_id", nonzero=True
+            )
+            cluster = normalize_address(
+                str(state.get("cluster", "")), "active.cluster"
+            )
+            if cluster == LB_CLUSTER:
+                raise RuntimeError("persisted shared pool uses the LB/C3 cluster")
+            members = state.get("members", [])
+            if not isinstance(members, list) or len(members) != len(backends):
+                raise RuntimeError("persisted shared pool has invalid member IDs")
+            normalized_members = [
+                normalize_hex32(str(member), "active.members[]", nonzero=True)
+                for member in members
+            ]
+            if len(set(normalized_members)) != len(normalized_members):
+                raise RuntimeError("persisted shared pool repeats a member ID")
+            if not tolerate_unavailable:
+                probe_pool(
+                    backends,
+                    pubkey,
+                    shared_ha=True,
+                    code_id=code_id,
+                    cluster=cluster,
+                    expected_members=normalized_members,
+                    require_serving=True,
+                )
+                return backends
+
+            tolerated = (
+                BackendHealthError,
+                ConnectionError,
+                OSError,
+                TimeoutError,
+                urllib.error.URLError,
+            )
+
+            def steady_probe(index: int, backend: str):
+                try:
+                    # Read and bind identity before touching gRPC or /healthz.
+                    # A reachable address with the wrong enclave identity is a
+                    # fatal reuse/misrouting condition, never an unavailable
+                    # worker that HAProxy may later mark UP.
+                    identity = probe_backend(
+                        backend,
+                        pubkey,
+                        shared_ha=True,
+                        expected_code_id=code_id,
+                        expected_cluster=cluster,
+                        expected_member=normalized_members[index],
+                        require_serving=False,
+                    )
+                except urllib.error.HTTPError:
+                    # The peer was reachable but did not provide the bounded,
+                    # non-redirecting identity endpoint. Never let HAProxy later
+                    # route it solely because /healthz happens to return 200.
+                    raise
+                except tolerated:
+                    return None
+                try:
+                    # Identity is now bound. Serving failures are ordinary
+                    # degraded-pool conditions and keep only this slot in MAINT.
+                    with socket.create_connection((backend, 50052), timeout=10):
+                        pass
+                    bounded_backend_get(backend, "/healthz")
+                    health = identity["status"].get("health") or {}
+                    if health.get("grpcAccepting") is not True or health.get("ok") is not True:
+                        raise BackendHealthError(
+                            f"backend is not serving after identity validation: {health}"
+                        )
+                    return backend, identity
+                except (urllib.error.HTTPError, RuntimeError, *tolerated):
+                    return None
+
+            with ThreadPoolExecutor(max_workers=len(backends)) as executor:
+                futures = [
+                    executor.submit(steady_probe, index, backend)
+                    for index, backend in enumerate(backends)
+                ]
+                # Identity/malformed errors are intentionally not swallowed and
+                # make the whole reconciliation fail closed.
+                healthy = [
+                    result
+                    for result in (future.result() for future in futures)
+                    if result is not None
+                ]
+            if not healthy:
+                raise RuntimeError(
+                    "persisted shared pool has no healthy identity-matching backend"
+                )
+            return [backend for backend, _probe in healthy]
+
+        def reconcile_haproxy(reason: str) -> dict:
+            with MUTATION_LOCK:
+                frontends(False)
+                prepared = read_prepared()
+                if prepared:
+                    if prepared.get("commit_complete") is True:
+                        state = active_state()
+                        if state.get("operation_id") == prepared.get("operation_id"):
+                            verified = validate_active_before_reopen(
+                                state, tolerate_unavailable=True
+                            )
+                            changed = set_pool(
+                                state.get("backends", []), enabled_backends=verified
+                            )
+                            frontends(True)
+                            clear_prepared()
+                            return {
+                                "reason": reason,
+                                "paused": False,
+                                "completed_commit": True,
+                                "haproxy": changed,
+                            }
+                        # A marker write may have reached disk just before the
+                        # data-plane try block rolled back. Treat an active-state
+                        # mismatch as incomplete and recover journal.previous.
+                        prepared["commit_complete"] = False
+                        prepared.pop("commit_completed_at", None)
+                        write_prepared(prepared)
+                    previous = prepared.get("previous")
+                    if isinstance(previous, dict):
+                        restored = restore_state(
+                            previous,
+                            close_existing=(
+                                prepared.get("commit_started") is True
+                                or prepared.get("registry_intent") is True
+                            ),
+                        )
+                    else:
+                        state = active_state()
+                        restored = restore_state(state, close_existing=False)
+                    # A prepared generation is never reopened automatically. The
+                    # durable driver journal must explicitly commit or abort it.
+                    return {"reason": reason, "paused": True, **restored}
+
+                state = active_state()
+                verified = validate_active_before_reopen(
+                    state, tolerate_unavailable=True
+                )
+                changed = set_pool(
+                    state.get("backends", []), enabled_backends=verified
+                )
+                frontends(True)
+                return {"reason": reason, "paused": False, "haproxy": changed}
+
+        def socket_generation():
+            try:
+                stat = os.stat(SOCKET_PATH)
+                return (stat.st_dev, stat.st_ino, stat.st_mtime_ns)
+            except FileNotFoundError:
+                return None
+
+        def watch_haproxy(initial_generation) -> None:
+            generation = initial_generation
+            next_identity_refresh = time.monotonic() + 15
+            while True:
+                current = socket_generation()
+                if current is None:
+                    generation = None
+                elif current != generation:
+                    try:
+                        reconcile_haproxy("socket-generation-change")
+                    except Exception as exc:
+                        try:
+                            with MUTATION_LOCK:
+                                quarantine_runtime_pool()
+                        except Exception:
+                            pass
+                        print(
+                            "indexer-lb-controller: HAProxy reconciliation failed: "
+                            f"{type(exc).__name__}: {exc}",
+                            flush=True,
+                        )
+                    else:
+                        generation = current
+                elif time.monotonic() >= next_identity_refresh:
+                    try:
+                        state_snapshot = None
+                        with MUTATION_LOCK:
+                            prepared = read_prepared()
+                            state = active_state()
+                            if not prepared and len(state.get("backends", [])) >= 2:
+                                state_snapshot = json.loads(json.dumps(state))
+                        if state_snapshot is not None:
+                            # Network probes must not hold the control-plane
+                            # mutation lock. Reacquire it and compare the exact
+                            # generation before touching HAProxy runtime state.
+                            verified = validate_active_before_reopen(
+                                state_snapshot, tolerate_unavailable=True
+                            )
+                            with MUTATION_LOCK:
+                                unchanged = (
+                                    not read_prepared()
+                                    and active_state() == state_snapshot
+                                )
+                                if unchanged:
+                                    set_pool(
+                                        state_snapshot.get("backends", []),
+                                        enabled_backends=verified,
+                                    )
+                                    frontends(True)
+                    except Exception as exc:
+                        # A reachable identity mismatch or malformed /status is
+                        # fail-closed. The next refresh can reopen only after a
+                        # fresh identity-first validation succeeds.
+                        try:
+                            with MUTATION_LOCK:
+                                current_matches = state_snapshot is None
+                                if state_snapshot is not None:
+                                    try:
+                                        current_matches = (
+                                            active_state() == state_snapshot
+                                        )
+                                    except Exception:
+                                        current_matches = True
+                                if current_matches:
+                                    quarantine_runtime_pool()
+                        except Exception:
+                            pass
+                        print(
+                            "indexer-lb-controller: shared identity refresh failed: "
+                            f"{type(exc).__name__}: {exc}",
+                            flush=True,
+                        )
+                    finally:
+                        next_identity_refresh = time.monotonic() + 15
+                time.sleep(1)
+
+        def prepare_from_body(body: dict) -> tuple[dict, list[dict]]:
+            pubkey = normalize_pubkey(str(body.get("expected_pubkey", "")))
+            operation_id = normalize_operation_id(str(body.get("operation_id", "")))
+            if "backends" not in body:
+                # Backward-compatible single-backend blue/green request.
+                backends = [validate_backend(str(body.get("backend", "")).strip())]
+                reject_reserved_backends(backends)
+                raw_code_id = str(body.get("expected_code_id", "")).strip()
+                code_id = (
+                    normalize_hex32(raw_code_id, "expected_code_id")
+                    if raw_code_id
+                    else ""
+                )
+                probes = probe_pool(
+                    backends,
+                    pubkey,
+                    shared_ha=False,
+                    require_serving=True,
+                )
+                return (
+                    {
+                        "backend": backends[0],
+                        "backends": backends,
+                        "pubkey": pubkey,
+                        "code_id": code_id,
+                        "operation_id": operation_id,
+                        "shared_ha": False,
+                        "prepared_at": int(time.time()),
+                    },
+                    probes,
+                )
+
+            backends = validate_backends(body.get("backends"))
+            reject_reserved_backends(backends)
+            if len(backends) < 2:
+                raise ValueError("a shared HA pool requires at least two backends")
+            if (
+                not PROTOCOL_V3_FLEET_CONFIRMED
+                or body.get("protocol_v3_fleet_confirmed") is not True
+            ):
+                raise ValueError(
+                    "shared HA pool requires protocol-v3 fleet confirmation"
+                )
+            code_id = normalize_hex32(
+                str(body.get("expected_code_id", "")), "expected_code_id", nonzero=True
+            )
+            cluster = normalize_address(
+                str(body.get("expected_cluster", "")), "expected_cluster"
+            )
+            if cluster == LB_CLUSTER:
+                raise ValueError(
+                    "shared HA pool must use a dedicated cluster, not the LB/C3 cluster"
+                )
+            probes = probe_pool(
+                backends,
+                pubkey,
+                shared_ha=True,
+                code_id=code_id,
+                cluster=cluster,
+                require_serving=False,
+            )
+            members = [probe["member_id"] for probe in probes]
+            return (
+                {
+                    "backend": backends[0],
+                    "backends": backends,
+                    "pubkey": pubkey,
+                    "code_id": code_id,
+                    "cluster": cluster,
+                    "members": members,
+                    "operation_id": operation_id,
+                    "shared_ha": True,
+                    "prepared_at": int(time.time()),
+                },
+                probes,
+            )
+
+        def prepare_body_matches(prepared: dict, body: dict) -> bool:
+            """Allow an idempotent retry only for the exact bound generation."""
+            try:
+                if canonical_active_state(
+                    body.get("expected_previous"), "expected_previous"
+                ) != canonical_active_state(
+                    prepared.get("previous"), "prepared.previous"
+                ):
+                    return False
+                if prepared.get("shared_ha") is True:
+                    if body.get("protocol_v3_fleet_confirmed") is not True:
+                        return False
+                    return (
+                        validate_backends(body.get("backends"))
+                        == prepared.get("backends")
+                        and normalize_pubkey(str(body.get("expected_pubkey", "")))
+                        == prepared.get("pubkey")
+                        and normalize_hex32(
+                            str(body.get("expected_code_id", "")),
+                            "expected_code_id",
+                            nonzero=True,
+                        )
+                        == prepared.get("code_id")
+                        and normalize_address(
+                            str(body.get("expected_cluster", "")),
+                            "expected_cluster",
+                        )
+                        == prepared.get("cluster")
+                    )
+                if "backends" in body:
+                    return False
+                raw_code_id = str(body.get("expected_code_id", "")).strip()
+                code_id = (
+                    normalize_hex32(raw_code_id, "expected_code_id")
+                    if raw_code_id
+                    else ""
+                )
+                return (
+                    validate_backend(str(body.get("backend", "")).strip())
+                    == prepared.get("backend")
+                    and normalize_pubkey(str(body.get("expected_pubkey", "")))
+                    == prepared.get("pubkey")
+                    and code_id == prepared.get("code_id", "")
+                )
+            except (TypeError, ValueError):
+                return False
+
+        def restore_state_from_body(body: dict) -> dict:
+            backends = validate_backends(body.get("backends", []), allow_empty=True)
+            reject_reserved_backends(backends)
+            raw_pubkey = str(body.get("active_pubkey", "")).strip()
+            pubkey = normalize_pubkey(raw_pubkey) if raw_pubkey else ""
+            raw_code_id = str(body.get("active_code_id", "")).strip()
+            code_id = (
+                normalize_hex32(raw_code_id, "active_code_id", nonzero=True)
+                if raw_code_id
+                else ""
+            )
+            raw_cluster = str(body.get("active_cluster", "")).strip()
+            cluster = normalize_address(raw_cluster, "active_cluster") if raw_cluster else ""
+            members = body.get("active_members", [])
+            if not isinstance(members, list):
+                raise ValueError("active_members must be an array")
+            normalized_members = [
+                normalize_hex32(str(member), "active_members[]", nonzero=True)
+                for member in members
+            ]
+            if normalized_members and len(normalized_members) != len(backends):
+                raise ValueError("active_members length must match backends")
+            active_operation_id = str(body.get("active_operation_id", "")).strip()
+            if active_operation_id:
+                active_operation_id = normalize_operation_id(active_operation_id)
+            return {
+                "backends": backends,
+                "pubkey": pubkey,
+                "code_id": code_id,
+                "cluster": cluster,
+                "members": normalized_members,
+                "operation_id": active_operation_id,
+            }
+
+        def restore_from_body(body: dict, *, expected_state: dict | None = None) -> dict:
+            restored_state = restore_state_from_body(body)
+            if expected_state is not None:
+                expected = canonical_active_state(expected_state, "prepared.previous")
+                if restored_state != expected:
+                    raise ValueError(
+                        "restore payload does not exactly match prepared.previous"
+                    )
+            frontends(False)
+            try:
+                verified = validate_active_before_reopen(
+                    restored_state, tolerate_unavailable=True
+                )
+            except Exception:
+                quarantine_runtime_pool()
+                raise
+            restored = restore_state(
+                restored_state,
+                close_existing=True,
+                enabled_backends=verified,
+            )
+            frontends(True)
+            clear_prepared()
+            return {"restored": True, **restored}
+
+        class BoundedThreadingHTTPServer(ThreadingHTTPServer):
+            daemon_threads = True
+            request_queue_size = MAX_CONTROL_THREADS
+
+            def __init__(self, *args, **kwargs):
+                self._request_slots = threading.BoundedSemaphore(MAX_CONTROL_THREADS)
+                super().__init__(*args, **kwargs)
+
+            def process_request(self, request, client_address):
+                if not self._request_slots.acquire(blocking=False):
+                    self.shutdown_request(request)
+                    return
+                try:
+                    super().process_request(request, client_address)
+                except Exception:
+                    self._request_slots.release()
+                    raise
+
+            def process_request_thread(self, request, client_address):
+                try:
+                    super().process_request_thread(request, client_address)
+                finally:
+                    self._request_slots.release()
+
         class Handler(BaseHTTPRequestHandler):
+            def setup(self) -> None:
+                super().setup()
+                self.connection.settimeout(REQUEST_TIMEOUT_SECONDS)
+
             def _json(self, status: int, payload: dict) -> None:
                 data = json.dumps(payload, sort_keys=True).encode("utf-8")
                 self.send_response(status)
@@ -323,108 +1482,577 @@ services:
                 return hmac.compare_digest(supplied, f"Bearer {ADMIN_KEY}")
 
             def _body(self) -> dict:
-                length = min(int(self.headers.get("content-length", "0") or 0), 4096)
-                value = json.loads(self.rfile.read(length).decode("utf-8") or "{}")
+                if self.headers.get("transfer-encoding"):
+                    raise ValueError("Transfer-Encoding is not supported")
+                lengths = self.headers.get_all("content-length", [])
+                if len(lengths) > 1:
+                    raise ValueError("exactly one Content-Length is allowed")
+                raw_length = (lengths[0] if lengths else "0") or "0"
+                try:
+                    length = int(raw_length, 10)
+                except ValueError as exc:
+                    raise ValueError("Content-Length must be an integer") from exc
+                if length < 0 or length > 16384:
+                    raise ValueError("Content-Length must be between 0 and 16384")
+                raw = self.rfile.read(length)
+                if len(raw) != length:
+                    raise ValueError("request body ended before Content-Length")
+                value = json.loads(raw.decode("utf-8") or "{}")
                 if not isinstance(value, dict):
                     raise ValueError("request body must be a JSON object")
                 return value
 
             def do_GET(self) -> None:
-                if self.path not in ("/healthz", "/active"):
+                parsed = urlparse(self.path)
+                if parsed.path not in (
+                    "/healthz",
+                    "/active",
+                    "/operation",
+                    "/drain-reservations",
+                ):
                     self._json(404, {"error": "not found"})
                     return
+                if parsed.path != "/healthz" and not self._authorized():
+                    self._json(401, {"error": "unauthorized"})
+                    return
                 socket_ok = os.path.exists(SOCKET_PATH)
-                state = ""
-                if socket_ok:
+                if parsed.path == "/healthz":
+                    self._json(200 if socket_ok else 503, {"haproxy_socket": socket_ok})
+                    return
+                if parsed.path == "/operation":
+                    values = parse_qs(parsed.query)
                     try:
-                        state = haproxy_cmd("show servers state")[:8000]
-                    except Exception as exc:
-                        state = f"error: {type(exc).__name__}: {exc}"
+                        operation_id = normalize_operation_id(
+                            (values.get("operation_id") or [""])[0]
+                        )
+                    except ValueError as exc:
+                        self._json(400, {"error": str(exc)})
+                        return
+                    with MUTATION_LOCK:
+                        prepared = read_prepared()
+                        active = active_state()
+                    if prepared.get("operation_id") == operation_id:
+                        if (
+                            prepared.get("commit_complete") is True
+                            and active.get("operation_id") == operation_id
+                        ):
+                            status = "committed"
+                        elif prepared.get("commit_started") is True:
+                            status = "commit-started"
+                        elif prepared.get("registry_intent") is True:
+                            status = "registry-intent"
+                        else:
+                            status = "prepared"
+                    elif active.get("operation_id") == operation_id:
+                        status = "committed"
+                    else:
+                        status = "unknown"
+                    self._json(200, {"operation_id": operation_id, "status": status})
+                    return
+                if parsed.path == "/drain-reservations":
+                    with MUTATION_LOCK:
+                        reservations = read_drain_reservations()
+                    self._json(
+                        200,
+                        {
+                            "reservations": [
+                                reservations[key] for key in sorted(reservations)
+                            ]
+                        },
+                    )
+                    return
+                with MUTATION_LOCK:
+                    socket_ok = os.path.exists(SOCKET_PATH)
+                    state = ""
+                    if socket_ok:
+                        try:
+                            state = haproxy_cmd("show servers state")[:8000]
+                        except Exception as exc:
+                            state = f"error: {type(exc).__name__}: {exc}"
+                    active = active_state()
+                    prepared = read_prepared()
+                    reservations = read_drain_reservations()
                 self._json(
                     200,
                     {
-                        "active_backend": read_text(ACTIVE_BACKEND_PATH),
-                        "active_pubkey": read_text(ACTIVE_PUBKEY_PATH),
-                        "prepared": read_prepared(),
+                        "active_backend": ",".join(active.get("backends", [])),
+                        "active_backends": active.get("backends", []),
+                        "active_pubkey": active.get("pubkey", ""),
+                        "active_code_id": active.get("code_id", ""),
+                        "active_cluster": active.get("cluster", ""),
+                        "active_members": active.get("members", []),
+                        "active_operation_id": active.get("operation_id", ""),
+                        "prepared": prepared,
+                        "drain_reservations": [
+                            reservations[key] for key in sorted(reservations)
+                        ],
                         "haproxy_socket": socket_ok,
                         "haproxy_state": state,
                     },
                 )
 
             def do_POST(self) -> None:
-                if self.path not in ("/prepare", "/commit", "/abort"):
+                if self.path not in (
+                    "/prepare",
+                    "/intent",
+                    "/commit",
+                    "/abort",
+                    "/restore",
+                    "/assert-drained",
+                    "/release-drain",
+                ):
                     self._json(404, {"error": "not found"})
                     return
                 if not self._authorized():
                     self._json(401, {"error": "unauthorized"})
                     return
                 try:
-                    if self.path == "/prepare":
-                        body = self._body()
-                        backend = validate_backend(str(body.get("backend", "")).strip())
-                        pubkey = normalize_pubkey(
-                            str(body.get("expected_pubkey", ""))
+                    body = self._body()
+                    with MUTATION_LOCK:
+                        self._do_POST_locked(body)
+                except Exception as exc:
+                    self._json(400, {"error": f"{type(exc).__name__}: {exc}"})
+
+            def _do_POST_locked(self, body: dict) -> None:
+                    if self.path == "/assert-drained":
+                        operation_id = normalize_operation_id(
+                            str(body.get("operation_id", ""))
                         )
-                        probe = probe_backend(backend, pubkey)
-                        prepared = {
-                            "backend": backend,
-                            "pubkey": pubkey,
-                            "prepared_at": int(time.time()),
-                        }
+                        backend = validate_backend(str(body.get("backend", "")).strip())
+                        if read_prepared():
+                            self._json(
+                                409,
+                                {"error": "cannot assert drain while an operation is prepared"},
+                            )
+                            return
+                        active = active_state()
+                        active_operation = str(active.get("operation_id", ""))
+                        if not active_operation or not hmac.compare_digest(
+                            operation_id, active_operation
+                        ):
+                            self._json(
+                                409,
+                                {"error": "operation_id is not the active generation"},
+                            )
+                            return
+                        backends = validate_backends(
+                            active.get("backends", []), allow_empty=True
+                        )
+                        if backend in backends:
+                            self._json(
+                                409,
+                                {"error": "backend is still present in the active pool"},
+                            )
+                            return
+                        # Prove persisted state and the live runtime slots agree;
+                        # this makes the assertion safe for a worker-stop gate.
+                        verify_runtime_pool(backends, permit_disabled_active=True)
+                        reservations = read_drain_reservations()
+                        reservation = reservations.get(backend)
+                        idempotent = reservation is not None
+                        if reservation is None:
+                            if len(reservations) >= MAX_DRAIN_RESERVATIONS:
+                                raise RuntimeError(
+                                    "active drain reservation limit reached"
+                                )
+                            reservation = {
+                                "backend": backend,
+                                "reserved_at_operation_id": operation_id,
+                                "reservation_id": secrets.token_hex(32),
+                                "release_token": secrets.token_hex(32),
+                                "created_at": int(time.time()),
+                            }
+                            reservations[backend] = reservation
+                            # Atomic replace + file and parent fsync completes
+                            # before the proof is returned.
+                            write_drain_reservations(reservations)
+                        self._json(
+                            200,
+                            {
+                                "drained": True,
+                                **reservation,
+                                "operation_id": operation_id,
+                                "active_backends": backends,
+                                "idempotent": idempotent,
+                            },
+                        )
+                        return
+
+                    if self.path == "/release-drain":
+                        operation_id = normalize_operation_id(
+                            str(body.get("operation_id", ""))
+                        )
+                        backend = validate_backend(str(body.get("backend", "")).strip())
+                        reservation_id = normalize_operation_id(
+                            str(body.get("reservation_id", ""))
+                        )
+                        release_token = normalize_operation_id(
+                            str(body.get("release_token", ""))
+                        )
+                        if read_prepared():
+                            self._json(
+                                409,
+                                {"error": "cannot release drain while an operation is prepared"},
+                            )
+                            return
+                        active = active_state()
+                        active_operation = str(active.get("operation_id", ""))
+                        if not active_operation or not hmac.compare_digest(
+                            operation_id, active_operation
+                        ):
+                            self._json(
+                                409,
+                                {"error": "operation_id is not the active generation"},
+                            )
+                            return
+                        backends = validate_backends(
+                            active.get("backends", []), allow_empty=True
+                        )
+                        if backend in backends:
+                            self._json(
+                                409,
+                                {"error": "backend is present in the active pool"},
+                            )
+                            return
+                        verify_runtime_pool(backends, permit_disabled_active=True)
+                        journal = read_drain_journal()
+                        reservations = journal["active"]
+                        reservation = reservations.get(backend)
+                        if not reservation:
+                            tombstone = next(
+                                (
+                                    item
+                                    for item in reversed(journal["released"])
+                                    if item.get("backend") == backend
+                                    and hmac.compare_digest(
+                                        reservation_id,
+                                        str(item.get("reservation_id", "")),
+                                    )
+                                    and hmac.compare_digest(
+                                        release_token,
+                                        str(item.get("release_token", "")),
+                                    )
+                                ),
+                                None,
+                            )
+                            if tombstone:
+                                self._json(
+                                    200,
+                                    {
+                                        "released": True,
+                                        "idempotent": True,
+                                        "backend": backend,
+                                        "reservation_id": reservation_id,
+                                        "operation_id": operation_id,
+                                    },
+                                )
+                                return
+                            self._json(404, {"error": "drain reservation not found"})
+                            return
+                        if not hmac.compare_digest(
+                            reservation_id, str(reservation.get("reservation_id", ""))
+                        ) or not hmac.compare_digest(
+                            release_token, str(reservation.get("release_token", ""))
+                        ):
+                            self._json(409, {"error": "drain reservation token mismatch"})
+                            return
+                        del reservations[backend]
+                        journal["released"].append(
+                            {
+                                "backend": backend,
+                                "reservation_id": reservation_id,
+                                "release_token": release_token,
+                                "released_at_operation_id": operation_id,
+                                "released_at": int(time.time()),
+                            }
+                        )
+                        journal["released"] = journal["released"][-256:]
+                        write_drain_journal(journal)
+                        self._json(
+                            200,
+                            {
+                                "released": True,
+                                "backend": backend,
+                                "reservation_id": reservation_id,
+                                "operation_id": operation_id,
+                                "idempotent": False,
+                            },
+                        )
+                        return
+
+                    if self.path == "/prepare":
+                        operation_id = normalize_operation_id(
+                            str(body.get("operation_id", ""))
+                        )
+                        expected_previous = canonical_active_state(
+                            body.get("expected_previous"), "expected_previous"
+                        )
+                        current_active = active_state()
+                        if expected_previous != current_active:
+                            self._json(
+                                409,
+                                {"error": "active generation changed before prepare"},
+                            )
+                            return
+                        existing = read_prepared()
+                        if existing:
+                            if (
+                                existing.get("operation_id") == operation_id
+                                and prepare_body_matches(existing, body)
+                            ):
+                                self._json(
+                                    200,
+                                    {
+                                        "prepared": existing,
+                                        "operation_id": operation_id,
+                                        "idempotent": True,
+                                    },
+                                )
+                            else:
+                                self._json(
+                                    409,
+                                    {
+                                        "error": "operation_id is already bound to another prepared generation"
+                                    },
+                                )
+                            return
+                        prepared, probes = prepare_from_body(body)
+                        # This is the rollback journal for an interrupted commit.
+                        # It is cleared only after the new pool is fully persisted.
+                        prepared["previous"] = current_active
+                        prepared["commit_started"] = False
+                        prepared["commit_complete"] = False
+                        prepared["registry_intent"] = False
                         write_prepared(prepared)
                         try:
                             frontends(False)
                         except Exception:
-                            clear_prepared()
-                            frontends(True)
+                            # Keep the journal authoritative. Recovery can retry
+                            # the exact abort; never turn an enable failure into
+                            # an unknown operation.
+                            try:
+                                frontends(False)
+                            except Exception:
+                                pass
                             raise
-                        self._json(200, {"prepared": prepared, "probe": probe})
-                        return
-
-                    if self.path == "/abort":
-                        clear_prepared()
-                        frontends(True)
                         self._json(
                             200,
-                            {"aborted": True, "active_backend": read_text(ACTIVE_BACKEND_PATH)},
+                            {
+                                "prepared": prepared,
+                                "probes": probes,
+                                "operation_id": operation_id,
+                            },
                         )
                         return
 
                     prepared = read_prepared()
-                    if not prepared:
-                        self._json(409, {"error": "no prepared backend"})
+                    if self.path == "/commit" and not prepared:
+                        operation_id = normalize_operation_id(
+                            str(body.get("operation_id", ""))
+                        )
+                        if active_state().get("operation_id") == operation_id:
+                            self._json(
+                                200,
+                                {
+                                    "operation_id": operation_id,
+                                    "already_committed": True,
+                                },
+                            )
+                        else:
+                            self._json(409, {"error": "no matching prepared generation"})
                         return
-                    backend = validate_backend(str(prepared.get("backend", "")))
-                    pubkey = normalize_pubkey(str(prepared.get("pubkey", "")))
-                    # Re-probe after the on-chain registry transaction, immediately
-                    # before changing the data plane.
-                    probe = probe_backend(backend, pubkey)
-                    previous = read_text(ACTIVE_BACKEND_PATH)
-                    try:
-                        changed = set_backend(backend)
-                        sessions = close_sessions()
+                    if not prepared:
+                        if self.path == "/restore":
+                            operation_id = normalize_operation_id(
+                                str(body.get("operation_id", ""))
+                            )
+                            if active_state().get("operation_id") != operation_id:
+                                self._json(
+                                    409,
+                                    {"error": "no matching active generation to restore"},
+                                )
+                                return
+                            restore_target = restore_state_from_body(body)
+                            write_prepared(
+                                {
+                                    "operation_id": operation_id,
+                                    "previous": restore_target,
+                                    "registry_intent": True,
+                                    "commit_started": True,
+                                    "commit_complete": False,
+                                    "restore_only": True,
+                                    "prepared_at": int(time.time()),
+                                }
+                            )
+                            restored = restore_from_body(
+                                body, expected_state=restore_target
+                            )
+                            self._json(
+                                200,
+                                {
+                                    **restored,
+                                    "operation_id": operation_id,
+                                    "active_backend": ",".join(read_active_backends()),
+                                    "active_backends": read_active_backends(),
+                                },
+                            )
+                            return
+                        self._json(409, {"error": "no prepared backend or pool"})
+                        return
+                    operation_id = require_operation(
+                        prepared, str(body.get("operation_id", ""))
+                    )
+
+                    if self.path == "/commit" and prepared.get("commit_complete") is True:
+                        if active_state().get("operation_id") != operation_id:
+                            raise RuntimeError(
+                                "completed commit journal does not match active generation"
+                            )
+                        state = active_state()
+                        set_pool(state.get("backends", []))
                         frontends(True)
-                        write_text(ACTIVE_BACKEND_PATH, backend)
-                        write_text(ACTIVE_PUBKEY_PATH, pubkey)
                         clear_prepared()
-                    except Exception:
-                        if previous:
-                            set_backend(validate_backend(previous))
+                        self._json(
+                            200,
+                            {
+                                "operation_id": operation_id,
+                                "already_committed": True,
+                            },
+                        )
+                        return
+
+                    if self.path == "/intent":
+                        prepared["registry_intent"] = True
+                        prepared["registry_intent_at"] = int(time.time())
+                        write_prepared(prepared)
+                        frontends(False)
+                        self._json(
+                            200,
+                            {"operation_id": operation_id, "registry_intent": True},
+                        )
+                        return
+
+                    if self.path == "/abort":
+                        if prepared.get("registry_intent") is True:
+                            self._json(
+                                409,
+                                {
+                                    "error": "registry intent is durable; roll back the registry and use restore"
+                                },
+                            )
+                            return
+                        previous = prepared.get("previous") if prepared else None
+                        if isinstance(previous, dict):
+                            try:
+                                verified = validate_active_before_reopen(
+                                    previous, tolerate_unavailable=True
+                                )
+                            except Exception:
+                                quarantine_runtime_pool()
+                                raise
+                            restore_state(
+                                previous,
+                                close_existing=(
+                                    prepared.get("commit_started") is True
+                                    or prepared.get("registry_intent") is True
+                                ),
+                                enabled_backends=verified,
+                            )
+                        else:
+                            set_pool(read_active_backends())
                         frontends(True)
+                        clear_prepared()
+                        self._json(
+                            200,
+                            {
+                                "aborted": True,
+                                "operation_id": operation_id,
+                                "active_backend": ",".join(read_active_backends()),
+                            },
+                        )
+                        return
+
+                    if self.path == "/restore":
+                        previous = prepared.get("previous")
+                        if not isinstance(previous, dict):
+                            raise RuntimeError(
+                                "prepared generation has no authoritative previous state"
+                            )
+                        restored = restore_from_body(body, expected_state=previous)
+                        self._json(
+                            200,
+                            {
+                                **restored,
+                                "operation_id": operation_id,
+                                "active_backend": ",".join(read_active_backends()),
+                                "active_backends": read_active_backends(),
+                            },
+                        )
+                        return
+
+                    if prepared.get("registry_intent") is not True:
+                        self._json(409, {"error": "registry intent was not recorded"})
+                        return
+                    backends = validate_backends(prepared.get("backends", []))
+                    pubkey = normalize_pubkey(str(prepared.get("pubkey", "")))
+                    previous = prepared.get("previous")
+                    if not isinstance(previous, dict):
+                        previous = active_state()
+                    prepared["commit_started"] = True
+                    prepared["commit_complete"] = False
+                    write_prepared(prepared)
+                    # Re-probe after the on-chain registry transaction, immediately
+                    # before changing the data plane. Shared candidates may have been
+                    # intentionally non-serving until that transaction, so wait for
+                    # every member of the pool to open gRPC.
+                    probes = wait_until_serving(prepared)
+                    try:
+                        changed = set_pool(backends)
+                        sessions = close_sessions()
+                        persist_active(
+                            backends,
+                            pubkey,
+                            code_id=prepared.get("code_id", ""),
+                            cluster=prepared.get("cluster", ""),
+                            members=prepared.get("members", []),
+                            operation_id=operation_id,
+                        )
+                        frontends(True)
+                        prepared["commit_complete"] = True
+                        prepared["commit_completed_at"] = int(time.time())
+                        write_prepared(prepared)
+                    except Exception:
+                        # A partially applied runtime-slot update must not leave a
+                        # candidate connection alive while rollback is pending.
+                        prepared["commit_complete"] = False
+                        prepared.pop("commit_completed_at", None)
+                        try:
+                            frontends(False)
+                        finally:
+                            restore_state(previous, close_existing=True)
+                        write_prepared(prepared)
+                        # Registry intent may already have reached chain. Leave the
+                        # old pool paused until the driver rolls the tuple back and
+                        # calls the token-bound restore endpoint.
                         raise
+                    # If unlink/fsync reports an uncertain outcome, both the
+                    # active state and commit-complete marker still identify this
+                    # generation, so operation status remains safely queryable.
+                    clear_prepared()
                     self._json(
                         200,
                         {
-                            "active_backend": backend,
+                            "active_backend": ",".join(backends),
+                            "active_backends": backends,
                             "active_pubkey": pubkey,
-                            "previous_backend": previous,
-                            "probe": probe,
+                            "operation_id": operation_id,
+                            "previous_backend": ",".join(previous.get("backends", [])),
+                            "previous_backends": previous.get("backends", []),
+                            "probes": probes,
                             "haproxy": changed,
                             "closed_sessions": sessions,
                         },
                     )
-                except Exception as exc:
-                    self._json(400, {"error": f"{type(exc).__name__}: {exc}"})
 
             def log_message(self, fmt: str, *args) -> None:
                 print(
@@ -438,14 +2066,79 @@ services:
             time.sleep(1)
         if not os.path.exists(SOCKET_PATH):
             raise SystemExit("HAProxy runtime socket did not appear")
-        # A controller restart must never leave frontends paused from an abandoned
-        # prepare operation.
-        if read_prepared():
-            clear_prepared()
-            frontends(True)
+        # Controller-only restarts inherit HAProxy's live runtime. Quarantine it
+        # before reading any durable state so corrupt/invalid JSON cannot leave
+        # old streams routable while this process exits.
+        try:
+            quarantine_runtime_pool()
+        except Exception as exc:
+            raise SystemExit(
+                f"could not quarantine inherited HAProxy runtime: {exc}"
+            ) from exc
+        # HAProxy starts with disabled runtime slots. Restore and validate the
+        # persisted pool (or one-time initial backend); a prepared generation
+        # remains paused for explicit journal recovery.
+        active_backends = read_active_backends()
+        if not active_backends and INITIAL_BACKENDS.strip():
+            active_backends = validate_backends(INITIAL_BACKENDS)
+            reject_reserved_backends(active_backends)
+            if len(active_backends) >= 2:
+                initial_identity = probe_initial_shared_pool(active_backends)
+            else:
+                reject_singleton_shared_identity(active_backends[0])
+                initial_identity = {}
+            persist_active(
+                active_backends,
+                initial_identity.get("pubkey", read_text(ACTIVE_PUBKEY_PATH)),
+                code_id=initial_identity.get(
+                    "code_id", read_text(ACTIVE_CODE_ID_PATH)
+                ),
+                cluster=initial_identity.get(
+                    "cluster", read_text(ACTIVE_CLUSTER_PATH)
+                ),
+                members=initial_identity.get(
+                    "members",
+                    [
+                        member
+                        for member in read_text(ACTIVE_MEMBERS_PATH).split(",")
+                        if member
+                    ],
+                ),
+            )
+        elif active_backends and not os.path.exists(ACTIVE_STATE_PATH):
+            # One-time migration from the original split state files.
+            persist_active(
+                active_backends,
+                read_text(ACTIVE_PUBKEY_PATH),
+                code_id=read_text(ACTIVE_CODE_ID_PATH),
+                cluster=read_text(ACTIVE_CLUSTER_PATH),
+                members=[
+                    member
+                    for member in read_text(ACTIVE_MEMBERS_PATH).split(",")
+                    if member
+                ],
+                operation_id=read_text(ACTIVE_OPERATION_PATH),
+            )
+        try:
+            reconcile_haproxy("controller-start")
+        except Exception as exc:
+            # Reconciliation begins by pausing both frontends. Never start the
+            # control plane on an unvalidated or partially restored pool.
+            try:
+                quarantine_runtime_pool()
+            except Exception:
+                pass
+            raise SystemExit(f"initial HAProxy reconciliation failed: {exc}") from exc
+        generation = socket_generation()
+        threading.Thread(
+            target=watch_haproxy,
+            args=(generation,),
+            name="haproxy-generation-watch",
+            daemon=True,
+        ).start()
         ip = mesh_ip()
         print(f"indexer-lb-controller: listening on {ip}:50053", flush=True)
-        ThreadingHTTPServer((ip, 50053), Handler).serve_forever()
+        BoundedThreadingHTTPServer((ip, 50053), Handler).serve_forever()
         PY
         exec python3 /tmp/indexer_lb_controller.py
 

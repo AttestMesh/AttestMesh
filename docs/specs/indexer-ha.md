@@ -1,257 +1,290 @@
-# Indexer High Availability — Dog-Fooded Indexer Cluster
+# Indexer High Availability — Shared-Identity Replica Pool
 
-**Status:** APPROVED
+**Status:** STAGE-A CODE COMPLETE; PRODUCTION ROLLOUT PENDING
 **Author:** LSDan
 **Created:** 2026-06-10
-**Last Updated:** 2026-07-11
-**Parent spec:** [`attestmesh-coordination-layer.md`](./attestmesh-coordination-layer.md) §6, [`indexer.md`](./indexer.md) §3/§9
-**Components:** `indexer/`, `sidecar/`, `contracts/` (IndexerRegistry), `deploy/`
+**Last Updated:** 2026-07-14
+**Parent specs:** [`attestmesh-coordination-layer.md`](./attestmesh-coordination-layer.md), [`indexer.md`](./indexer.md)
+**Components:** `indexer/`, `sidecar/`, `deploy/`
 
-## Overview
+## Decision
 
-The live Indexer is a single attested CVM — one process, one attestation-bound signing
-key, one `IndexerRegistry` record. If it dies, every cluster on the chain loses event
-push until an operator intervenes. Protocol-v2 sidecars keep current-state peer
-reconciliation and their existing health result, but event delivery pauses because
-there is deliberately no direct-log fallback. The event tier is therefore a single
-point of failure and `setIndexer` rotation churns every subscriber.
+Stage A removes the Indexer worker single point of failure without changing the
+deployed `IndexerRegistry` ABI. A dedicated AttestMesh cluster contains two or
+more homogeneous Indexer replicas. Every replica derives the same Ed25519
+envelope-signing key from that cluster's CSK and is admitted to the existing
+stable HAProxy endpoint as part of one backend pool.
 
-Milestone B makes the Indexer **a customer of its own product**: N replicas form an
-AttestMesh cluster (the "indexer cluster"), and the two hard HA problems fall out of
-primitives we already shipped:
+The registry continues to contain exactly the deployed v1 tuple:
 
-1. **Identity.** Today each TEE instance derives a *different* signing key, and the
-   registry stores exactly one pubkey. Instead, every replica derives the envelope
-   signing key **from the indexer cluster's CSK** — a key that, by construction, only
-   attested members of that cluster can hold (P2P pull gated by on-chain membership,
-   verified against the `keccak256(CSK)` commitment). One pubkey in the registry, any
-   replica signs, attestation-boundness is preserved transitively.
-2. **Discovery/failover.** The registry record points at the indexer *cluster
-   contract* instead of one endpoint. Sidecars enumerate its live members from chain
-   state and derive each replica's gRPC ingress hostname exactly the way mesh peers
-   already derive each other's (`<member>-50051s.<gateway-domain>`). Replicas joining
-   or leaving never require a registry write — the chain stays the sole coordination
-   layer (CRITICAL directive).
+```text
+(stableEndpoint, composeCodeId, sharedPubKey, updatedAt)
+```
 
-The supposed circular dependency ("the indexer cluster needs an indexer") does not
-block mesh bootstrap: registration, peer enumeration/key reads, mesh convergence, and
-CSK distribution use current contract views and peer RPCs. The signed Indexer is the
-sole historical event/message source, but its connectivity is diagnostic rather than a
-sidecar health gate, so a dedicated indexer cluster can still bootstrap itself cold.
+Old and new sidecars therefore use the same discovery path. Backend loss causes
+HAProxy to route a reconnect to another replica, while protocol-v3's exact
+subscriber cursor makes that reconnect independent of the selected replica's
+local cursor database.
+
+Direct on-chain replica discovery, a new registry address, subscriber fan-in,
+and on-chain member tombstones are deferred to Stage B. The original PR changed
+the immutable v1 registry's tuple in place and replaced newer delivery logic;
+neither is a safe migration.
+
+## Architecture
+
+```text
+                         immutable IndexerRegistry v1
+                     stable endpoint + P_csk + codeId
+                                   |
+                                   v
+ subscriber sidecars ------> stable Indexer LB
+                              /      |      \
+                             /       |       \
+                    replica A   replica B   replica C
+                       |            |           |
+                       +--- dedicated dstack-only cluster ---+
+                                      |
+                                     CSK
+                                      |
+                         HKDF-SHA512 -> shared Ed25519 key
+```
+
+The stable LB remains a front-door single point of failure in Stage A. Its
+existing deployment and two-phase cutover machinery are retained because they
+already provide one registry-pinned endpoint and safe rollback. Stage A changes
+its active backend from one worker to a bounded, health-checked pool.
 
 ## Requirements
 
-### Must Have
+### Identity and admission
 
-- [ ] N ≥ 2 indexer replicas, each a CVM running the sidecar + the indexer process,
-      members of a dedicated AttestMesh cluster on the chain they serve.
-- [ ] Envelope signing key derived from the indexer cluster's CSK:
-      `seed = HKDF-SHA512(CSK, info="attestmesh.indexer.signing.v2")` → Ed25519.
-      All replicas produce signatures verifiable against the single registry pubkey.
-- [ ] Each replica still serves its own attestation quote on subscribe, with
-      `report_data = keccak256(abi.encode("attestmesh.indexer.v1", shared_pubkey))` —
-      i.e. each instance attests *its own* TEE committing to the *shared* key, so a
-      subscriber can verify any replica without caching per-replica identities.
-- [ ] `IndexerRecord` v2 carries `{ cluster: address, pubKey: bytes32, codeId:
-      bytes32, updatedAt: uint64 }`; sidecar discovery becomes: read registry → read
-      indexer-cluster members (`listMembers`) → derive gRPC ingress per member →
-      connect. Replica set changes require zero registry writes.
-- [ ] Replica selection: rendezvous hashing of `(subscriber memberId, replica
-      memberId)` for load spreading; on connect failure or stream death, fail over to
-      the next-ranked replica with backoff. Signature verification is identical on
-      every replica (shared key), so failover is invisible above the transport.
-- [ ] Resume is **subscriber-authoritative**: the replica honors `Hello.from_block`
-      (floored at the member's registration block) as the resume point. Per-replica
-      sled cursors become a local optimization (replay-from-memory window), never
-      cross-replica state. No shared cursor store, no leader, no replica-to-replica
-      consistency protocol on the serving path.
-- [ ] Replicas are independent watchers: each polls the chain, discovers clusters, and
-      builds its member cache alone (these paths are already deterministic from chain
-      state — `runtime.rs` boot catch-up + block watcher unchanged in shape).
-- [ ] Dedup stays where it is: subscribers already drop duplicate `(blockNumber,
-      logIndex)` — receiving overlapping pushes from two replicas during failover is
-      harmless by construction; an integration test must prove it.
-- [x] A stable single-active front door is available as the first rollout stage:
-      `deploy/indexer-lb-node.sh` coordinates HAProxy prepare/commit with the
-      registry-pinned backend key, while sidecars persist signed checkpoints and
-      supply the last handled block to a newly selected backend. This does not yet
-      provide active-active replica identity; it provides safe blue/green deployment.
-- [ ] The indexer cluster is deployed/joined via the existing `deploy/indexer.sh` +
-      smithers workflow, extended to `ensure` the indexer *cluster* (per the standing
-      rule: shared topology, never per-cluster deployments; one indexer cluster serves
-      all networks and clusters it watches).
-- [ ] Compromise/rotation runbook documented: a compromised replica ⇒ the shared
-      signing key is burned ⇒ rotate by deploying a fresh indexer cluster (new CSK ⇒
-      new key) and repointing the registry record once. Until CSK rotation exists as a
-      primitive, this is the rotation story and must be stated honestly.
+- [x] Replicas belong to a fresh, dedicated Indexer cluster. Reusing the main C3
+      CSK is forbidden because every C3 member would become an Indexer signer.
+- [x] `INDEXER_IDENTITY=cluster-shared` fetches the CSK and self identity only
+      from the co-located sidecar's Agent UDS.
+- [x] Signing seed derivation is
+      `HKDF-SHA512(CSK, info="attestmesh.indexer.signing.v2")`.
+- [x] Different replicas with the same CSK derive the same pubkey; a fresh
+      cluster/CSK produces a different pubkey.
+- [x] The replica obtains its code ID from dstack `/Info.compose_hash`, requires
+      a nonzero 32-byte value, and never trusts a blank/operator-supplied value in
+      cluster-shared mode.
+- [x] Before accepting gRPC subscriptions, a shared replica must match the v1
+      registry's exact shared pubkey and code ID. Candidates may warm their HTTP
+      read model before publication but fail closed on the serving path.
+- [x] `/status` exposes `identityMode`, `indexerCluster`, `servingMemberId`,
+      `codeId`, pubkey, read-model progress, and serving state for pool admission.
 
-### Should Have
+### Delivery continuity
 
-- [ ] Completeness cross-check: replicas exchange `last_indexed_block` heartbeats over
-      their own mesh (peer gRPC) and export a `replica_lag_blocks` metric; alerting on
-      divergence catches a stuck watcher even though serving never depends on it.
-- [ ] Subscriber-side multi-home option (`INDEXER_FANIN=2`): subscribe to two replicas
-      simultaneously and dedupe, trading bandwidth for zero-gap failover.
+- [x] Existing protocol-v2 replay/live ordering, awaited replay backpressure,
+      signed checkpoints, and explicit overflow termination remain unchanged.
+- [x] Protocol v3 adds an optional exact `DeliveryCursor(blockNumber, logIndex)`
+      to `Hello`. Presence distinguishes a fresh client from the real cursor
+      `(0, 0)`.
+- [x] When supplied, the subscriber cursor is authoritative even if the selected
+      replica's local Ack cursor is further ahead.
+- [x] A normal event cursor replays strictly after that log within the boundary
+      block. A checkpoint cursor starts at the following block.
+- [x] The sidecar makes its handled cursor durable before sending the Ack. A
+      failed durability write closes the stream without Ack so another replica
+      replays the position.
+- [x] An existing cursor file that is unreadable, malformed, or bound to another
+      member fails closed; only a genuinely absent file is treated as fresh.
+- [x] The Indexer accepts an Ack only for the exact next position emitted in that
+      session, and the sidecar refuses to Ack without an active delivery consumer.
+- [x] Sidecars retain `from_block` as a boundary-block fallback for older
+      Indexers during the protocol rollout.
 
-### Must NOT Have
+### Pool rollout
 
-- No shared mutable state between replicas (no shared sled/Postgres, no distributed
-  lock, no leader election).
-- No external key-management or remote-signing service (Model C); the CSK *is* the
-  shared-identity mechanism and it's already attestation-gated.
-- No change to envelope wire format, repro stubs, or the per-event verification story.
+- [x] The LB supports one legacy backend or a shared-identity pool of two to
+      eight distinct backends.
+- [x] Pool prepare probes every candidate and requires identical nonzero pubkey,
+      code ID, and Indexer-cluster address plus distinct serving member IDs.
+- [x] Shared-pool prepare rejects the LB/C3 cluster as the signer cluster.
+- [x] Prepare warms the pool without changing the data plane, then pauses new
+      accepts while existing streams remain open.
+- [x] The operator updates the unchanged v1 registry at the unchanged stable
+      endpoint, commits the pool, and force-closes old sessions so clients
+      rediscover the shared key and reconnect.
+- [x] Failed commit restores the previous endpoint, code ID, pubkey, and LB pool
+      before accepts reopen. The rollback is a new registry write and therefore
+      uses a fresh `updatedAt`; it cannot reproduce the old four-field tuple.
+- [x] Every mutation is serialized and bound to a durable operation ID. An
+      incomplete or uncertain prepared generation leaves accepts paused until
+      explicit recovery reconciles the journal, registry tuple, and runtime pool;
+      a response lost after durable commit may already have reopened frontends,
+      and recovery reports that committed outcome.
+- [x] The exact signed registry transaction is fsynced before publication. A
+      forward or rollback decision is not committed until the receipt and
+      canonical registry tuple agree at Base's `finalized` head.
+- [x] A registered worker cannot be stopped without a durable drain reservation
+      bound to its exact backend and active generation. The reservation survives
+      process/controller restart and blocks address reuse until an explicit,
+      token-bound release is reconciled.
+- [x] Worker identity, LB authority, control credentials, transaction journals,
+      and release tokens live in owner-only state directories with symlink-safe,
+      mode-checked reads; `deploy/logs/` is not an authority boundary.
+- [x] Image publication is gated on Rust formatting, clippy, tests, deployment
+      script parsing, and shell lint.
 
-## Non-Requirements
+## Security invariants
 
-- Geographic/multi-provider distribution of replicas (operational choice; nothing here
-  precludes it).
-- Subscription sharding for 10k+ streams (indexer.md §15 item 4 — separate concern,
-  composes with this design since any replica can serve any subscriber).
-- Byzantine replicas: a replica is a cluster member or it isn't; within the cluster the
-  threat model is the TEE + boot-gate story, same as any AttestMesh cluster.
+### Cluster policy is signing policy
 
-## Design
+The raw CSK is deliberately exposed to the co-located Indexer over a node-local
+UDS. Consequently, membership in the dedicated cluster is equivalent to
+authority to sign Indexer envelopes. The cluster must:
 
-### Architecture
+1. be owned by the org Safe;
+2. use only the dstack attestor facet;
+3. allow only the exact replica compose hash;
+4. use an explicit device allowlist (`allowAnyDevice=false`);
+5. require an up-to-date TCB; and
+6. contain no unrelated workload or weaker attestor.
 
+The deployment helper fails closed unless it receives an exact compose hash,
+one or more device IDs, and the intended Safe owner.
+
+### Per-replica attestation is not claimed
+
+The existing `IndexerAttestation` quote is diagnostic in Stage A. A quote that
+binds only the shared public key is replayable by any CSK holder, and the current
+wire protocol has no subscriber nonce or per-instance signing key. It therefore
+does not prove which replica answered a connection.
+
+A future cryptographic per-replica proof needs a challenge-bound instance key and
+a verified quote binding at least:
+
+```text
+(instanceKey, sharedKey, generation, indexerCluster, memberId, codeMeasurement, nonce)
 ```
-                       IndexerRegistry (per chain)
-                       record: { cluster: 0xIDX..., pubKey: P_csk, codeId, updatedAt }
-                                      │ read once
-   subscriber sidecar ────────────────┤
-        │  listMembers(0xIDX...) → [m1, m2, m3]          indexer cluster 0xIDX...
-        │  rank by rendezvous(self, mi)                 ┌──────────────────────────┐
-        ├── gRPC → <m1>-50051s.<gw-domain>  ──────────► │ replica 1  (sidecar+idx) │
-        │     verify envelopes against P_csk            │ replica 2  (sidecar+idx) │◄─ wg mesh,
-        └── on failure: next-ranked replica             │ replica 3  (sidecar+idx) │   CSK, heartbeats
-                                                        └──────────────────────────┘
-                                                          each: own RPC watcher,
-                                                          own local cursor cache,
-                                                          shared CSK-derived signer
-```
 
-Each replica is two cooperating processes in one CVM compose: the standard
-`cluster-mesh-agent` (registers the node into the indexer cluster, converges the mesh,
-acquires the CSK) and `attestmesh-indexer` (gets the CSK from the sidecar over the
-existing agent gRPC, derives the signing key, runs the watcher + gRPC server).
-The indexer process gates "ready" on `csk_acquired` from the sidecar health surface.
+Stage A instead trusts the dstack cluster boot gate, LB admission checks, public
+client-to-LB TLS routing, and the registry-pinned shared signature. LB-to-worker
+status and gRPC traffic is unauthenticated HTTP/h2c on the same-host private
+bridge, so host and bridge-network integrity remain part of the trust boundary.
 
-### Components
+### Removal versus compromise
 
-1. **`contracts/src/registry/IndexerRegistry.sol` v2** — record gains `cluster`
-   (replaces `endpoint` as the primary pointer; `endpoint` is kept and served as a
-   legacy fallback so v1 sidecars keep working against a designated replica during
-   migration). Owner (org Safe) writes it once per indexer-cluster generation.
-2. **`indexer/src/identity.rs` v2** — `Identity::derive_shared(csk: &[u8;32],
-   dstack: &dyn DstackRuntime)`: HKDF the signing seed from the CSK, quote binds the
-   shared pubkey. The v1 per-instance derivation path remains for single-instance
-   deployments (config: `INDEXER_IDENTITY=instance|cluster-shared`).
-3. **`indexer/src/main.rs` / `config.rs`** — new config: `AGENT_GRPC_ADDR` (to fetch
-   the CSK from the co-located sidecar), `INDEXER_IDENTITY`. The indexer subscribes to
-   *no* indexer for its own cluster's events (it watches all clusters directly,
-   including the indexer cluster itself — self-watching is just another cluster
-   address in the discovered set).
-4. **`indexer/src/grpc/service.rs`** — make `Hello.from_block` authoritative for
-   resume (today it's `max(persisted_cursor, from_block, registration_block)`,
-   `service.rs:123-132`; the persisted-cursor max() term is dropped to floor-only,
-   because a replica that never served this subscriber has no cursor and must not
-   start it at chain-head). Replay below the in-memory window falls back to
-   `eth_getLogs` paging for that range (bounded by `INDEXER_START_BLOCK`).
-5. **`sidecar/src/chain/registry.rs` + `indexer_client.rs`** — read record v2;
-   enumerate indexer-cluster members; derive ingress hostnames via the existing
-   `sni_for` convention (`bringup.rs:69-72`, gateway TLS-passthrough on the indexer's
-   gRPC port, the `assume_http2(true)` lesson already encoded); rendezvous-rank;
-   reconnect loop walks the ranking. Re-enumerate membership on every reconnect so
-   replica churn is picked up without restart.
-6. **`sidecar/src/agent_grpc.rs`** — expose the CSK to the co-located indexer process
-   over the existing app-facing surface (it already serves the CSK to the application
-   container; the indexer *is* the application container here — no new surface).
-7. **`deploy/`** — `indexer.sh` grows `ensure-cluster` (deploy the indexer cluster
-   diamond via the standard factory path), `join` (bring up replica i: CVM with
-   sidecar+indexer compose), and the registry-write step moves to once-per-generation.
-   The smithers workflow gains a fan-out over replicas.
+Removing a worker from the LB is routing eviction, not key revocation. That
+worker still knows the CSK and can produce valid signatures.
 
-### Interfaces
+- Planned maintenance: drain the worker, close its sessions, verify zero active
+  connections, then stop it.
+- Suspected compromise or CSK exposure: deploy an entirely fresh dedicated
+  cluster, validate a new shared key across at least two replicas, and roll
+  forward through the registry/LB transaction. Never reuse or roll back to the
+  burned generation.
 
-| Surface | Change |
-|---|---|
-| `IIndexerRegistry` | `IndexerRecord` v2 `{cluster, endpoint(legacy), codeId, pubKey, updatedAt}` |
-| `indexer.proto` | optional advisory `served_by` on the push envelope (unsigned; ignored by v1 subscribers); `Hello.from_block` semantics tightened, documented |
-| indexer config | `INDEXER_IDENTITY`, `AGENT_GRPC_ADDR` |
-| sidecar config | `INDEXER_FANIN` (default 1) |
-| sidecar↔indexer (co-located) | existing agent gRPC `GetClusterSharedKey` — unchanged |
+### Retained trust and durability boundaries
 
-### Data Model
+Stage A deliberately does not claim the following properties:
 
-- No new persistent stores. Per-replica sled cursor store is retained as a cache;
-  losing it costs a re-page from RPC, not correctness.
-- CSK→signing-key derivation is deterministic, so all replicas of one cluster
-  generation agree on `P_csk` with no exchange; the registry pubkey is written from
-  the first replica's derivation and every later replica's boot self-check
-  (`registry.rs:31-64`) verifies it matches — now a hard failure (refuse to serve)
-  rather than v1's log-and-continue, since a mismatch means wrong cluster or wrong
-  CSK, never a benign rollout state.
+- The stable LB is still a single front-door failure domain.
+- The deployed v1 `IndexerRegistry` has an immutable owner, which is currently
+  the configured deployer EOA on Base. The dedicated signer cluster is Safe-owned,
+  but registry rotation is not a Safe transaction until a registry migration.
+- The reviewed cluster Safe is currently a one-of-two Safe. Deployment tooling
+  pins its proxy and singleton code, exact owner set and threshold, module/guard
+  state, and fallback handler; any Safe configuration change requires a new
+  review before the tooling will proceed.
+- Protocol v3 still does not authenticate the subscriber to the Indexer. Message
+  bodies remain sealed to the addressed member, and subscriber authentication is
+  deferred.
+- Cursor persistence proves the sidecar handler completed and gives failover
+  continuity from the Indexer to the sidecar. It is not an application inbox or
+  outbox transaction. `SubscribeMessages` has no application Ack: the sidecar
+  advances after enqueueing to an active in-memory receiver, so an app disconnect,
+  crash, or lag overflow can still lose delivery. Durable application delivery
+  requires a future inbox/acknowledgment protocol or independent reconciliation.
+- Stopping or removing a worker does not erase its on-chain historical membership
+  or revoke a CSK it already learned.
+- The immutable Base cluster factory installs its reviewed pre-Ed25519
+  `NetworkFacet`. The Stage-A compose therefore keeps sealed `PeerEndpoint`
+  exchange enabled for this dedicated cluster. Moving heartbeat keys entirely
+  on-chain requires a separately reviewed and Safe-approved Network-facet cut;
+  it is not bundled into the narrowly scoped 19-selector Dstack cut.
 
-## Open Questions
+## Failure behavior
 
-- [ ] CSK-rotation primitive: fresh-cluster-per-generation is the honest v2 story, but
-      a real rotation mechanism (tied to the deferred RecoveryFacet / break-glass
-      research) would make compromise response cheaper. Track as a follow-on spec.
-- [x] ~~Member removal: does milestone B need deregistration on the diamond?~~
-      **Resolved (2026-06-10): yes — owner-only `AttestFacet.removeMember(memberId)`**
-      (cluster owner = org Safe for the indexer cluster). Additive core-facet change,
-      generally useful beyond HA. Removal semantics to pin down in the contracts
-      design: the freed mesh IP must not be reusable while live members may still
-      route to it (proposal: removal tombstones the memberId — `isClusterMember`
-      false, record retained); and a removed member **still holds the CSK** — removal
-      is eviction from coordination, not key revocation, which remains the
-      fresh-generation rotation story below.
-- [x] ~~Should envelopes name which replica served them?~~ **Resolved (2026-06-10):
-      yes — advisory `served_by` field** (the serving replica's memberId) in the push
-      envelope, explicitly **excluded from the signed bytes** so it is never an
-      authenticated claim and identical events keep identical signatures across
-      replicas. Used for subscriber-side logs and per-replica lag attribution only.
-      (This is the one `indexer.proto` addition; the "no wire change" line in
-      §Interfaces is amended accordingly — the field is optional and ignored by v1
-      subscribers.)
-- [ ] Indexer gRPC through the gateway requires the TLS-passthrough `s` route per
-      ingress; confirm the gateway's connection limits are comfortable with
-      (subscribers × replicas-tried) reconnect storms after a chain RPC outage.
+- **One worker dies:** HAProxy stops selecting it. Affected streams reconnect to
+  another worker with their exact cursor.
+- **Replica-local cursor is stale or ahead:** the explicit subscriber cursor wins.
+- **Subscriber cursor file is damaged:** the sidecar refuses to subscribe until
+  the operator repairs or deliberately removes the file; it never silently jumps
+  to the indexed head.
+- **Replay exceeds the delivery channel:** replay awaits capacity; live delivery
+  cannot overtake it. A live overflow closes the stream for replay.
+- **Registry does not yet contain the shared key/code ID:** candidates remain
+  visible on diagnostic HTTP but do not accept subscriptions.
+- **Registry changes away from a running shared generation:** serving fails
+  closed and existing connections are terminated.
+- **Pool commit fails:** after the forward write is finalized and controller
+  failure is proven quiescent, the deployer writes the previous endpoint/code
+  ID/pubkey with a fresh timestamp, waits for rollback finality, restores the
+  previous pool, and only then reopens the frontends.
+- **Stable LB dies:** worker capacity remains, but the public endpoint is down.
+  Eliminating this remaining Stage-A SPOF is Stage B scope.
 
-## Alternatives Considered
+## Rollout order
 
-### Multi-record registry, fully independent replicas (per-replica keys)
-Each replica registers its own `(endpoint, pubkey)`; subscribers verify per-replica.
-Honest and simple, but subscribers must track N identities and N attestations, failover
-churns identity caches, and the registry needs writes on every replica change —
-exactly the off-chain-coordination shape this project avoids. The CSK-shared key gives
-one identity with the same attestation guarantee.
+1. Roll protocol-v3 sidecars before enabling the shared worker pool.
+2. Build digest-pinned sidecar and Indexer images and record the rendered compose
+   hash.
+3. Create a fresh dedicated cluster with the closed policy above, have its Safe
+   accept ownership, then use `patha-safe-prepare` and execute only the emitted
+   exact `diamondCut` target/value/calldata.
+4. Persist and verify the exact installed DstackFacet and ClusterMember runtime
+   code, then start at least two replicas and verify identical cluster, code ID, and shared
+   pubkey with distinct member IDs and caught-up read models.
+5. Prepare the LB pool while the old Indexer remains active.
+6. Snapshot and update the v1 registry at the same stable endpoint. Keep the
+   controller paused until the signed transaction and tuple are canonical at
+   Base's `finalized` head; the default wait budget is 1800 seconds, and timeout
+   requires a later explicit `recover` rather than an inferred outcome.
+7. Commit the pool, close old sessions, and verify canary delivery and cursor
+   advancement.
+8. Keep the old, uncompromised generation available through the observation
+   window. Rollback is allowed only for operational failure, never suspected key
+   exposure.
 
-### Active-passive failover (operator repoints the single record)
-Minutes of downtime per failover, operator on the critical path, subscriber churn on
-every key change. Strictly dominated by the cluster design once the CSK insight is on
-the table.
+The operational commands and rollback payloads live in
+[`deploy/indexer-lb-runbook.md`](../../deploy/indexer-lb-runbook.md).
 
-### Shared identity via external KMS / remote signing (Model C)
-Introduces a trusted external service on the signing path — violates the
-trust-minimization thesis. The CSK already *is* an attestation-gated shared secret
-with an on-chain commitment; no new trusted party needed.
+## Stage B (deferred)
 
-### Shared cursor store (Postgres/replicated sled)
-Cross-replica mutable state, monotonic-advance conflicts (`cursor.rs:95-109`), and a
-new stateful dependency — all to optimize something the subscriber already knows
-(its own resume point). Subscriber-authoritative resume deletes the problem.
+- Add a companion RegistryV2 at a new address; never mutate the deployed v1 ABI.
+- Bind its cluster pointer to a hash of the exact current v1 tuple so any legacy
+  registry write automatically disables stale direct discovery.
+- Add direct chain-state replica discovery, rendezvous ranking, periodic
+  membership/generation revalidation, and optional fan-in through one serialized
+  delivery coordinator.
+- Add historical-preserving member tombstones with separate active-member views;
+  never change `listMembers()` or `memberCount()` semantics because the first
+  historical member is the CSK originator.
+- Remove the stable-LB SPOF or operate redundant front doors.
+- Add challenge-bound, cryptographically verified per-replica attestation if that
+  property remains required.
 
 ## Traceability
 
-*Filled in during implementation*
-
 | Requirement | Implementation | Tests |
-|-------------|----------------|-------|
-| | | |
+|---|---|---|
+| Shared CSK identity | `indexer/src/identity.rs`, `indexer/src/agent.rs` | identity + Agent client tests |
+| Actual code ID and serving gate | `indexer/src/dstack.rs`, `main.rs`, `registry.rs`, `health.rs` | config/registry/health tests |
+| Exact failover cursor | `sidecar/proto/indexer.proto`, sidecar client, Indexer service | protocol-v3 unit/integration tests |
+| Replica pool cutover | `deploy/indexer-lb-node.sh`, LB compose controller | controller concurrency, restart, recovery, health, and rollback tests |
+| Dedicated worker deployment | `deploy/indexer-ha-replica-node.sh`, dedicated compose | worker state, image, config-drift, cleanup, and Safe-admission tests |
+| Closed signer-cluster policy | `deploy/onchain.sh indexer-cluster` | signer-cluster host preflight tests |
+| Safe Path-A handoff | `PrepareDstackFacetPathASafe.s.sol`, `patha-safe-prepare` | calldata/topology Foundry tests + shell bundle tests |
 
 ## Changelog
 
-| Date | Author | Changes |
-|------|--------|---------|
-| 2026-06-10 | LSDan | Initial draft |
+| Date | Change |
+|---|---|
+| 2026-06-10 | Initial direct-discovery design. |
+| 2026-07-14 | Re-scoped to migration-safe Stage A after review: immutable v1 registry, shared-identity worker pool behind the stable LB, exact subscriber cursors, and explicit trust limits. |
+| 2026-07-14 | Stage-A code completed with Safe-owned signer-cluster handoff, digest-pinned workers, crash-recoverable LB operations, and CI-gated deployment tests; production rollout remains pending. |

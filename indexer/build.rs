@@ -6,19 +6,24 @@ fn main() {
     let protoc = protoc_bin_vendored::protoc_bin_path().expect("vendored protoc");
     std::env::set_var("PROTOC", protoc);
 
-    // The sidecar component owns the canonical indexer.proto (spec §2.2, §4). We
-    // compile THAT file directly via its relative path rather than forking it, so the
-    // wire format can never drift between the two components.
-    let proto = PathBuf::from("../sidecar/proto/indexer.proto");
-    let proto_dir = proto.parent().expect("proto parent");
+    // The sidecar owns both canonical wire definitions. Compile the source files in
+    // place rather than copying/forking them: indexer.proto is the service we expose,
+    // while agent.proto is the co-located sidecar API used only in shared mode.
+    let protos = [
+        PathBuf::from("../sidecar/proto/indexer.proto"),
+        PathBuf::from("../sidecar/proto/agent.proto"),
+    ];
+    let proto_dir = protos[0].parent().expect("proto parent").to_path_buf();
 
     tonic_build::configure()
         .build_server(true)
         // The indexer also needs the client types for the in-process integration
         // harness (spec §14.2) and for the round-trip unit coverage.
         .build_client(true)
-        .compile_protos(std::slice::from_ref(&proto), &[proto_dir])
-        .expect("compile indexer.proto");
+        .compile_protos(&protos, &[proto_dir])
+        .expect("compile canonical sidecar protos");
 
-    println!("cargo:rerun-if-changed={}", proto.display());
+    for proto in &protos {
+        println!("cargo:rerun-if-changed={}", proto.display());
+    }
 }

@@ -6,6 +6,9 @@ on:
   push:
     paths:
       - "sidecar/**"
+      - "deploy/compose/indexer-ha-replica-node.yaml"
+      - "deploy/compose/indexer-lb-node.yaml"
+      - "docs/specs/sidecar.md"
       - ".github/workflows/build-sidecar.yml"
   workflow_dispatch: {}
 
@@ -14,7 +17,31 @@ permissions:
   packages: write
 
 jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Cargo.lock currently contains edition-2024 dependencies, which Cargo 1.78
+      # cannot parse. Match the `rust:1-bookworm` release builder's stable channel.
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Format
+        working-directory: sidecar
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        working-directory: sidecar
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Test
+        working-directory: sidecar
+        run: cargo test --all-targets
+
   build:
+    needs: test
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

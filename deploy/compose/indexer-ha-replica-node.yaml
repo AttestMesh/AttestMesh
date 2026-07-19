@@ -1,0 +1,100 @@
+# Dedicated Stage-A Indexer replica. Every deployment of this file must join the
+# same dedicated signer cluster and must be rendered with the constant measured
+# compose name selected by deploy/indexer-ha-replica-node.sh.
+#
+# The Sidecar OCI index was published by CI from source commit
+# 1cbb85cc5bb71d12102417d18e2cc6c352e6021c; the Indexer OCI index was
+# published from fc700cb0bb23c6d13862ee2a989db90f378b185f.
+services:
+  sidecar:
+    image: ghcr.io/attestmesh/cluster-mesh-agent@sha256:87d7ee2b1a85e903d80791551e813001cfdd7b2cecf131c8d7e407d2c7d7ecfb
+    restart: unless-stopped
+    environment:
+      # MEMBER_CONTRACT is intentionally absent: Path A discovers the dstack app_id.
+      - CHAIN_ID=${CHAIN_ID}
+      - RPC_URL=${RPC_URL}
+      - BUNDLER_URL=${BUNDLER_URL}
+      - GAS_POLICY_ID=${GAS_POLICY_ID}
+      - INDEXER_REGISTRY_ADDR=${INDEXER_REGISTRY_ADDR}
+      - GATEWAY_DOMAIN=${GATEWAY_DOMAIN}
+      # The immutable factory installs its reviewed pre-Ed25519 NetworkFacet on a
+      # fresh cluster. Keep the sealed PeerEndpoint exchange enabled until a
+      # separate Safe-approved NetworkFacet cut moves this cluster to on-chain keys.
+      - PEER_ENVELOPE_FALLBACK=true
+      - DSTACK_SOCKET=/var/run/dstack.sock
+      - SIDECAR_STATE_DIR=/var/lib/attestmesh
+      - AGENT_GRPC_SOCKET=/var/run/attestmesh/agent.sock
+      # The Indexer owns public diagnostics on :9090 in the shared netns.
+      - HEALTH_HTTP_ADDR=0.0.0.0:9091
+      - LOG_FORMAT=pretty
+      - LOG_LEVEL=info,cluster_mesh_agent=debug
+    volumes:
+      - /var/run/dstack.sock:/var/run/dstack.sock
+      - sidecar-state:/var/lib/attestmesh
+      # This capability-bearing volume is mounted only by sidecar and indexer.
+      - agent-sock:/var/run/attestmesh
+    ports:
+      - "51900:51900"
+      - "50051:50051"
+      - "50052:50052"
+      - "9090:9090"
+      - "9091:9091"
+      - "9092:9092"
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun
+
+  indexer:
+    image: ghcr.io/attestmesh/attestmesh-indexer@sha256:5f74139bd53b04d1a9152dacd6e8bd4104f75c04a4fc37195ed43784766448a5
+    restart: unless-stopped
+    network_mode: service:sidecar
+    depends_on:
+      - sidecar
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - |
+        until [ -S /var/run/attestmesh/agent.sock ]; do sleep 1; done
+        chmod 0600 /var/run/attestmesh/agent.sock
+        exec /usr/local/bin/attestmesh-indexer
+    environment:
+      - CHAIN_ID=${CHAIN_ID}
+      - RPC_URL=${RPC_URL}
+      - INDEXER_REGISTRY_ADDR=${INDEXER_REGISTRY_ADDR}
+      - CLUSTER_DIAMOND_FACTORY_ADDR=0xf6E85fD138E3208d3AAE63ce4E2A33f20e82b9fb
+      - INDEXER_START_BLOCK=46868742
+      - BLOCK_BATCH_SIZE=5000
+      - INDEXER_GRPC_ADDR=0.0.0.0:50052
+      - HEALTH_HTTP_ADDR=0.0.0.0:9090
+      - GATEWAY_DOMAIN=${GATEWAY_DOMAIN}
+      - DSTACK_SOCKET=/var/run/dstack.sock
+      - STATE_DIR=/data/indexer-state
+      - INDEXER_IDENTITY=cluster-shared
+      - INDEXER_CLUSTER_ADDR=${CLUSTER}
+      - AGENT_GRPC_ADDR=unix:/var/run/attestmesh/agent.sock
+      - LOG_FORMAT=pretty
+      - LOG_LEVEL=info,attestmesh_indexer=debug
+    volumes:
+      - /var/run/dstack.sock:/var/run/dstack.sock
+      - indexer-state:/data/indexer-state
+      - agent-sock:/var/run/attestmesh
+
+  registration-calldata:
+    # Keep this pin in lockstep with the Indexer pin above.
+    image: ghcr.io/attestmesh/attestmesh-indexer@sha256:5f74139bd53b04d1a9152dacd6e8bd4104f75c04a4fc37195ed43784766448a5
+    restart: "no"
+    network_mode: service:sidecar
+    depends_on:
+      - sidecar
+    entrypoint: ["/usr/local/bin/attestmesh-registration-calldata"]
+    environment:
+      - CLUSTER=${CLUSTER}
+      - DSTACK_SOCKET=/var/run/dstack.sock
+      - REGISTRATION_HELPER_ADDR=0.0.0.0:9092
+    volumes:
+      - /var/run/dstack.sock:/var/run/dstack.sock
+
+volumes:
+  sidecar-state:
+  indexer-state:
+  agent-sock:
