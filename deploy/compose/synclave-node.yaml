@@ -195,8 +195,8 @@ services:
     # v21 = user-visible orchestrator failure details in enclave deploys;
     # v20 = CLUSTER_NETWORKS-only live mesh config + structured orchestrator errors;
     # v19 = Apps → Sandboxes rename (labels only, wire stays app).
-    # Synclave main a0545a2 — deterministic repository compatibility analyzer.
-    image: ghcr.io/attestmesh/synclave-app:sha-a0545a207ba51c1757a3c5303cc1e5c8e609428c@sha256:cfcb54cfdee391d59d7cddb84f2d0f3cdcc37d5f5405d1a27546512a04c5fd98
+    # Synclave main a14fa36 — testing strategy, hardened boundaries, and deploy guidance.
+    image: ghcr.io/attestmesh/synclave-app:sha-a14fa368340e7bb33ab69abe1aadd74add961219@sha256:c1c7003ccf5bf6ce5f9f3109fca19cd328414bddd5d2804bbb49352e7096d8f5
     environment:
       API_HOST: 0.0.0.0
       API_PORT: 80
@@ -217,6 +217,7 @@ services:
       SANDBOX_DAEMON_TOKEN: ${SANDBOX_DAEMON_TOKEN}
       SANDBOX_DEFAULT_IMAGE: ${SANDBOX_DEFAULT_IMAGE}
       SANDBOX_DEFAULT_PLAN: ${SANDBOX_DEFAULT_PLAN}
+      SANDBOX_APPS_DOMAIN: ${SANDBOX_APPS_DOMAIN}
       # Webhost admin panel operators (comma-separated emails).
       PLATFORM_ADMIN_EMAILS: ${PLATFORM_ADMIN_EMAILS:-}
       # Waitlist + concierge feedback → Telegram bot. All optional (unset ⇒ the send is a
