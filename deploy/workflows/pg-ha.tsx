@@ -2,7 +2,7 @@
 // Postgres HA cluster bring-up (Patroni + etcd + HAProxy over the AttestMesh wg mesh) —
 // durable, ordered (smithers). See docs/specs/pg-ha.md.
 //
-//   deployAll -> primeAll -> bindAll -> verifyAll -> runtime -> backup -> isolation
+//   ownership -> deployAll -> primeAll -> bindAll -> verifyAll -> runtime -> backup -> isolation
 //
 // deployAll internally runs register-all (N DstackApp contracts) -> compute-peers
 // (off-chain mesh-IP precompute + collision check) -> create-all (N CVMs with the
@@ -35,6 +35,7 @@ import { execSync } from "node:child_process";
 const Step = z.object({ ok: z.boolean(), step: z.string() });
 
 const { Workflow, smithers, outputs } = createSmithers({
+  ownership: Step,
   deployAll: Step,
   primeAll: Step,
   bindAll: Step,
@@ -67,6 +68,9 @@ export default smithers((ctx) => {
   return (
     <Workflow name="attestmesh-pg-ha">
       <Sequence>
+        <Task id="ownership" output={outputs.ownership}>
+          {() => run("ownership", pgha("verify-ownership"))}
+        </Task>
         <Task id="deployAll" output={outputs.deployAll}>
           {() => run("deployAll", pgha("deploy-all"))}
         </Task>

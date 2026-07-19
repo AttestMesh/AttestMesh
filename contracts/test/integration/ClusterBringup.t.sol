@@ -79,6 +79,14 @@ contract ClusterBringupTest is Test {
 
     // ── Scenario 1: three members register, exchange messages ─────────────────
 
+    function test_ownerCommandSelectorInstalledByCanonicalCut() public view {
+        (bool ok, bytes memory ret) = cluster.staticcall(
+            abi.encodeWithSignature("facetAddress(bytes4)", IMessage.sendOwnerCommand.selector)
+        );
+        assertTrue(ok);
+        assertTrue(abi.decode(ret, (address)) != address(0));
+    }
+
     function test_threeMembersRegisterAndMessage() public {
         (address mA, bytes32 idA) = _register(COMP3, 3, "xpub-A", "wg-A", 0);
         (address mB, bytes32 idB) = _register(COMP4, 4, "xpub-B", "wg-B", 1);

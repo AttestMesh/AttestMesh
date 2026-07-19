@@ -226,7 +226,6 @@ where it stopped.
 | `workflows/matrix-node.tsx` | `attestmesh-matrix-node` | `deploy -> cluster -> patha -> prime -> bind -> verify -> agent -> client -> isolation`, with an optional backup-status task when backups are enabled. |
 | `workflows/pg-ha.tsx` | `attestmesh-pg-ha` | New Safe-owned chain-only mesh: `deploy -> prime -> bind -> on-chain registration -> console runtime convergence -> fresh backup evidence -> isolation`; no Matrix, Tailscale, or SSH member dependency. Chain-agent E2E remains excluded until the Safe-specific sender is production-ready. |
 | `workflows/postgres-node.tsx` | `attestmesh-postgres-node` | `deploy -> prime -> bind -> verify -> meshEndpoint -> agent -> metrics -> isolation`. |
-| `workflows/pg-ha.tsx` | `attestmesh-pg-ha` | **Pending v0.2 update:** must prepend Safe/new-cluster ownership and replace SSH/Matrix checks with owner-command/runtime checks before production use. The checked-in v0.1 sequence is not valid for `andrew-xyn-pg`. |
 
 ### Compose payloads
 

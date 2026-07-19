@@ -197,6 +197,23 @@ compute-peers + create-all) → `prime-all` → `bind-all` → `verify-all` → 
 resume. Smithers workflow `attestmesh-pg-ha` mirrors this sequence; `--input
 '{"count":N}'`.
 
+`deploy/onchain.sh safe <name>` persists the threshold-one stock Safe in
+`deploy/logs/pg-ha-mesh-<name>.state`; `cluster <name>` defaults `clusterOwner` to
+that persisted Safe, reads `clusterOwner()` after deployment, and refuses to save
+the cluster on any mismatch. Every PG-HA driver action repeats that on-chain
+ownership assertion through `_default_cluster_env`. New clusters install
+`sendOwnerCommand` through the canonical `ClusterCut`. Existing clusters migrate
+with `deploy/onchain.sh message-owner-upgrade <cluster> <safe>`, which executes the
+selector ADD through the sole-signer Safe and verifies `facetAddress(selector)`.
+The action is idempotent and skips the cut when the selector is already present.
+
+Base deployment verification (2026-07-19, block `48819819`): cluster
+`0xF51ef3ad2B81f4D90D9c9fA2D5F5e2a38D3D7662` reports owner
+`0x7Fce84D3D3571e3E2BBaE085e324A879f966dCef` and maps selector
+`0xf21d2d40` (`sendOwnerCommand(bytes32,bytes32,bytes)`) to MessageFacet
+`0x3E1F61045A0bd3FEd3aeE6fF67013cAf82E28e73` (runtime code hash
+`0x17ced5c84ce1394c742f1282e5c9318654b99690afa2bdb07153fe1f010f3ef7`).
+
 `verify-runtime` is deliberately console/control-plane based: it proves every VM is running,
 every mesh peer is live, and a quorum of retained serial logs observes the same non-empty Patroni leader lock. It
 does not replace the write/replication/failover drill. The Smithers workflow does not claim

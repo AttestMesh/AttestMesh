@@ -15,7 +15,7 @@ source "$HERE/lib.sh"
 : "${RPC_URL:?source deploy/env.sh first}"
 require PRIVATE_KEY RPC_URL CHAIN_ID DEPLOYER_ADDR
 
-NODE="${1:?usage: pg-ha-node.sh <name> [deploy-all|prime-all|bind-all|verify-all|verify-ha|verify-failover|verify-isolation-all|verify-agent|rotation-preflight|rotation-candidate-gate|rotation-survivor-gate <pgN>|rotation-backup-gate|rotation-retire|rotation-final|switchover <pgN>|cycle-replica <pgN>|resize <pgN>|resize-all|update <pgN>|update-all|all|register-all|compute-peers|create-all|deploy|prime|bind|verify <pgN>]}"
+NODE="${1:?usage: pg-ha-node.sh <name> [verify-ownership|deploy-all|prime-all|bind-all|verify-all|verify-runtime|verify-ha|verify-failover|verify-isolation-all|rotation-preflight|rotation-candidate-gate|rotation-survivor-gate <pgN>|rotation-backup-gate|rotation-retire|rotation-final|cycle-replica <pgN>|resize <pgN>|update <pgN>|update-all|all|register-all|compute-peers|create-all|deploy|prime|bind|verify <pgN>]}"
 ACTION="${2:-all}"
 ARG3="${3:-}"
 ARG4="${4:-}"
@@ -101,8 +101,18 @@ _ipv4_from_u32() {
 }
 
 _default_cluster_env() {
-  [ -n "${CLUSTER:-}" ] && [ -n "${MEMBER_IMPL:-}" ] \
-    || die "new-mesh state lacks CLUSTER/MEMBER_IMPL: $CSTATE"
+  [ -n "${CLUSTER:-}" ] && [ -n "${MEMBER_IMPL:-}" ] && [ -n "${PGHA_SAFE_ADDRESS:-}" ] \
+    || die "new-mesh state lacks CLUSTER/MEMBER_IMPL/PGHA_SAFE_ADDRESS: $CSTATE"
+  local chain_owner
+  chain_owner=$(cast call "$CLUSTER" 'clusterOwner()(address)' --rpc-url "$RPC_URL" 2>/dev/null)
+  [ -n "$chain_owner" ] && [ "${chain_owner,,}" = "${PGHA_SAFE_ADDRESS,,}" ] \
+    || die "Safe ownership mismatch: clusterOwner=${chain_owner:-unset} expected=$PGHA_SAFE_ADDRESS"
+}
+
+verify_ownership() {
+  _load_cluster
+  _default_cluster_env
+  log "✔ cluster owner is the persisted sole-signer Safe: $PGHA_SAFE_ADDRESS"
 }
 
 _require_env() {
@@ -642,103 +652,6 @@ SCRIPT
   log "✔ host-isolation invariant holds on all $PGHA_COUNT nodes"
 }
 
-# ── Matrix agent verification (copied from postgres-node.sh) ─────────────────────────────
-
-_matrix_fqdn() {
-  if [ -n "${MATRIX_TAILNET_FQDN:-}" ]; then
-    printf '%s\n' "$MATRIX_TAILNET_FQDN"
-    return 0
-  fi
-  local n
-  for n in $(tailscale status 2>/dev/null | awk 'tolower($2) ~ /^matrix-attestmesh/ {print $2}'); do
-    curl -sS --max-time 6 "https://$n.$TS_SUFFIX/_matrix/client/versions" 2>/dev/null | grep -q '"versions"' && {
-      printf '%s\n' "$n.$TS_SUFFIX"
-      return 0
-    }
-  done
-  return 1
-}
-
-_matrix_verify_credentials() {
-  _load_cluster
-  _default_cluster_env
-  MATRIX_VERIFY_LOCALPART="${MATRIX_VERIFY_USER:-${INITIAL_ADMIN:-}}"
-  case "$MATRIX_VERIFY_LOCALPART" in
-    @*:*) MATRIX_VERIFY_LOCALPART="$(printf '%s' "$MATRIX_VERIFY_LOCALPART" | sed -nE 's/^@([^:]+):.*/\1/p')" ;;
-  esac
-  if [ -z "$MATRIX_VERIFY_LOCALPART" ]; then
-    MATRIX_VERIFY_LOCALPART="$(printf '%s' "$MATRIX_ADMIN_MXIDS" | cut -d, -f1 | sed -nE 's/^@([^:]+):.*/\1/p')"
-  fi
-  MATRIX_VERIFY_PASSWORD_RESOLVED="${MATRIX_VERIFY_PASSWORD:-${INITIAL_ADMIN_PASSWORD:-}}"
-  if [ -z "$MATRIX_VERIFY_PASSWORD_RESOLVED" ] && [ -f "$MATRIX_STATE" ]; then
-    MATRIX_VERIFY_PASSWORD_RESOLVED="$(grep '^IAPW=' "$MATRIX_STATE" | cut -d= -f2-)"
-  fi
-  [ -n "$MATRIX_VERIFY_LOCALPART" ] && [ -n "$MATRIX_VERIFY_PASSWORD_RESOLVED" ] || \
-    die "need Matrix verifier credentials: set MATRIX_VERIFY_USER/MATRIX_VERIFY_PASSWORD or keep IAPW in $MATRIX_STATE"
-}
-
-_matrix_expect_reply() {
-  local label="$1" bot="$2" command="$3" expect_re="$4" fqdn
-  _matrix_verify_credentials
-  fqdn="$(_matrix_fqdn)" || die "could not find live Matrix tailnet FQDN (set MATRIX_TAILNET_FQDN=...)"
-  log "▶ Matrix room check: $label via https://$fqdn"
-  if ! MATRIX_PROBE_FQDN="$fqdn" \
-    MATRIX_PROBE_ROOM_ID="$MATRIX_ROOM_ID" \
-    MATRIX_PROBE_USER="$MATRIX_VERIFY_LOCALPART" \
-    MATRIX_PROBE_PASSWORD="$MATRIX_VERIFY_PASSWORD_RESOLVED" \
-    MATRIX_PROBE_BOT="$bot" \
-    MATRIX_PROBE_COMMAND="$command" \
-    MATRIX_PROBE_EXPECT_RE="$expect_re" \
-    python3 "$HERE/matrix-probe.py"; then
-    die "Matrix room check failed: $label"
-  fi
-  log "✔ Matrix room check passed: $label"
-}
-
-verify_agent() {
-  _load_cluster; _default_cluster_env
-  local bot
-  bot="$(_bot_user_id pg1)"
-  _matrix_expect_reply "pgha-admin-agent status" "$bot" "$bot !pgha status" "HA cluster"
-}
-
-switchover() {
-  local candidate="${1:?usage: pg-ha-node.sh <name> switchover <pgN>}" bot fqdn
-  _load_cluster; _default_cluster_env; _matrix_verify_credentials
-  case " $(_nodes | tr '\n' ' ') " in
-    *" $candidate "*) ;;
-    *) die "unknown switchover candidate: $candidate" ;;
-  esac
-  bot="$(_bot_user_id pg1)"
-  fqdn="$(_matrix_fqdn)" || die "could not find live Matrix tailnet FQDN"
-  log "▶ controlled Patroni switchover to $candidate via $bot"
-  MATRIX_PROBE_FQDN="$fqdn" \
-    MATRIX_PROBE_ROOM_ID="$MATRIX_ROOM_ID" \
-    MATRIX_PROBE_USER="$MATRIX_VERIFY_LOCALPART" \
-    MATRIX_PROBE_PASSWORD="$MATRIX_VERIFY_PASSWORD_RESOLVED" \
-    MATRIX_PROBE_BOT="$bot" \
-    MATRIX_PROBE_COMMAND="$bot !pgha switchover $candidate" \
-    MATRIX_PROBE_EXPECT_RE='confirm ([a-f0-9]{6,12})' \
-    MATRIX_PROBE_FOLLOWUP_TEMPLATE='confirm {1}' \
-    MATRIX_PROBE_FOLLOWUP_EXPECT_RE='Switchover requested' \
-    python3 "$HERE/matrix-probe.py" || die "controlled switchover request failed"
-
-  local first_ip leader
-  first_ip="${PGHA_PEERS#*=}"; first_ip="${first_ip%%,*}"
-  for i in $(seq 1 30); do
-    leader=$(_mesh_ssh "curl -fsS --max-time 5 http://${first_ip}:8008/cluster" 2>/dev/null \
-      | jq -r '.members[]? | select(.role == "leader") | .name' || true)
-    if [ "$leader" = "$candidate" ]; then
-      verify_ha
-      log "✔ controlled switchover complete: leader=$candidate"
-      return 0
-    fi
-    log "… waiting for leader=$candidate (current=${leader:-none}, $i/30)"
-    sleep 2
-  done
-  die "Patroni did not make $candidate leader within 60s"
-}
-
 cycle_replica() {
   local target="${1:?usage: pg-ha-node.sh <name> cycle-replica <pgN>}" first_ip leader state role
   _load_cluster
@@ -973,31 +886,6 @@ resize_member() {
   log "✔ $target resized and verified at ${BOX_VCPU} vCPU / ${BOX_MEM} MB / ${BOX_DISK} GB"
 }
 
-resize_all() {
-  local first_ip topology leader candidate
-  local -a replicas
-  _load_cluster
-  verify_ha
-  first_ip="${PGHA_PEERS#*=}"; first_ip="${first_ip%%,*}"
-  topology=$(_mesh_ssh "curl -fsS --max-time 5 http://${first_ip}:8008/cluster")
-  leader=$(jq -r '.members[] | select(.role == "leader") | .name' <<<"$topology")
-  mapfile -t replicas < <(jq -r '.members[] | select(.role == "replica") | .name' <<<"$topology" | sort)
-  [ -n "$leader" ] && [ "${#replicas[@]}" -eq $((PGHA_COUNT - 1)) ] \
-    || die "unexpected Patroni topology before resize"
-
-  for candidate in "${replicas[@]}"; do
-    resize_member "$candidate"
-  done
-  candidate="${replicas[0]}"
-  switchover "$candidate"
-  resize_member "$leader"
-  verify_ha
-  if [ "${SKIP_CLIENT_PROBES:-0}" != 1 ]; then
-    "$HERE/pg-ha-client-failover.sh" probe-once
-  fi
-  log "✔ pg-ha fleet resize complete; leader=$candidate targets=${BOX_VCPU}/${BOX_MEM}/${BOX_DISK}"
-}
-
 # ── mixed-provider rotation gates (Smithers primitives) ───────────────────────────────
 
 _rotation_env() {
@@ -1144,6 +1032,7 @@ rotation_final() {
 }
 
 case "$ACTION" in
+  verify-ownership) verify_ownership ;;
   register-all) register_all ;;
   compute-peers) compute_peers ;;
   create-all) create_all ;;
@@ -1154,11 +1043,8 @@ case "$ACTION" in
   verify-ha) verify_ha ;;
   verify-failover) verify_failover ;;
   verify-isolation-all) verify_isolation_all ;;
-  verify-agent) verify_agent ;;
-  switchover) switchover "$ARG3" ;;
   cycle-replica) cycle_replica "$ARG3" ;;
   resize) resize_member "$ARG3" ;;
-  resize-all) resize_all ;;
   phala-env) build_phala_env "$ARG3" "$ARG4" ;;
   update) update_member "$ARG3"; verify_ha ;;
   update-only)
@@ -1175,6 +1061,6 @@ case "$ACTION" in
   rotation-backup-gate) rotation_backup_gate ;;
   rotation-retire) rotation_retire ;;
   rotation-final) rotation_final ;;
-  all) deploy_all; prime_all; bind_all; verify_all; verify_ha; verify_isolation_all; verify_agent ;;
+  all) verify_ownership; deploy_all; prime_all; bind_all; verify_all; verify_runtime; verify_backup; verify_isolation_all ;;
   *) die "unknown action: $ACTION" ;;
 esac
