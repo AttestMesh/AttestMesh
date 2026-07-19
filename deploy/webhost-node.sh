@@ -340,11 +340,14 @@ verify_app() {
 
 verify_daemon() {
   _load
-  local probe_host="${DAEMON_PROBE_HOST:-health-probe.${APP_DOMAIN}}" cvm_ip="${WEBHOST_CVM_IP:-}" i code
+  local probe_host="${DAEMON_PROBE_HOST:-$WEBHOST_ADMIN_HOST}" cvm_ip="${WEBHOST_CVM_IP:-}" i code
+  if ! [[ "$probe_host" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$ ]]; then
+    die "invalid daemon probe host: $probe_host"
+  fi
   # The directory host intentionally routes every path to the public UI, so it
-  # cannot prove daemon reachability. Resolve the running CVM's bridge address
-  # from its QEMU MAC and the box DHCP lease, then probe frontproxy over the
-  # private bridge with an app-domain Host header.
+  # cannot prove daemon reachability. Resolve the canonical daemon hostname to
+  # the running CVM's private bridge address so the probe verifies both the
+  # daemon route and its Synclave TLS certificate without traversing public DNS.
   for i in $(seq 1 30); do
     [ -n "$cvm_ip" ] || cvm_ip=$(_cvm_ip)
     if [ -z "$cvm_ip" ]; then
@@ -352,9 +355,9 @@ verify_daemon() {
       sleep 10
       continue
     fi
-    code=$(ssh_box "curl -sS -o /dev/null -w '%{http_code}' --max-time 10 -H 'Host: ${probe_host}' http://${cvm_ip}/_api/projects" 2>/dev/null || true)
+    code=$(ssh_box "curl --silent --show-error --proto '=https' --tlsv1.2 -o /dev/null -w '%{http_code}' --max-time 10 --resolve '${probe_host}:443:${cvm_ip}' 'https://${probe_host}/_api/projects'" 2>/dev/null || true)
     if [ "$code" = 401 ] || [ "$code" = 200 ]; then
-      log "✔ tee-daemon reachable: ${probe_host} via ${cvm_ip}/_api/projects -> $code"
+      log "✔ tee-daemon reachable over verified TLS: ${probe_host} via ${cvm_ip} -> $code"
       return 0
     fi
     log "… tee-daemon not ready ($i/30, /_api/projects -> ${code:-000})"
