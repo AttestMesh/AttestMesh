@@ -160,8 +160,9 @@ pub trait EgressSource: Send + Sync {
     async fn egress_ip(&self) -> Result<IpAddr>;
 }
 
-/// Egress IP from a DNS lookup of the gateway domain (verified live on prod5:
-/// gateway-domain DNS == egress IP). Cached briefly; NAT mappings outlive this.
+/// Egress IP from a DNS lookup of the provider-issued per-app gateway hostname.
+/// Gateway apexes are not required to have an A record. Cached briefly; NAT
+/// mappings outlive this.
 pub struct DnsEgress {
     domain: String,
     cache: tokio::sync::Mutex<Option<(IpAddr, std::time::Instant)>>,

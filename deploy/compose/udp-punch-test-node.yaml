@@ -6,8 +6,8 @@
 services:
   sidecar:
     # Phala's prod5 pre-launch verifier currently rejects digest-form refs.
-    # This revision tag resolves to sha256:a985079a6474ecd8f1bf22824d93f5d054ba9e2422e590a714ac8e8c2bca9b36.
-    image: ghcr.io/attestmesh/cluster-mesh-agent:fdec4260c20b1ccc249675666df99657f9000a61
+    # This revision tag resolves to sha256:a322a47508c1cb9001ea64198d352f0da706e304c4cf0c10bc8c791bd9e8c62a.
+    image: ghcr.io/attestmesh/cluster-mesh-agent:491f0d94fb276e0ca7acbb928b8c94a52dfa7f1b
     restart: unless-stopped
     environment:
       - CHAIN_ID=${CHAIN_ID}
@@ -38,7 +38,7 @@ services:
       - /dev/net/tun
 
   registration-calldata:
-    image: ghcr.io/attestmesh/cluster-mesh-agent:fdec4260c20b1ccc249675666df99657f9000a61
+    image: ghcr.io/attestmesh/cluster-mesh-agent:491f0d94fb276e0ca7acbb928b8c94a52dfa7f1b
     restart: "no"
     depends_on:
       - sidecar

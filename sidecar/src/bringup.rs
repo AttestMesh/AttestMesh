@@ -213,7 +213,10 @@ pub async fn launch(
                 backoff_initial_secs: config.punch_retry_backoff_secs,
                 wg_listen_port: shared.wg_listen_port,
             },
-            Arc::new(transport::punch::DnsEgress::new(gw_domain.clone())),
+            // Gateway apexes need not have an A record (Phala prod5 does not).
+            // The provider-issued per-app SNI name is routable and resolves to
+            // the same public gateway/egress address without host inspection.
+            Arc::new(transport::punch::DnsEgress::new(self_sni.clone())),
         ))
     } else {
         tracing::info!("WG_UDP_PUNCH=false — links stay on gateway TCP");
