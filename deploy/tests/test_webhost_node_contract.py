@@ -190,6 +190,18 @@ class WebhostNodeContractTests(unittest.TestCase):
         self.assertNotIn('docker rm -f "$tombstone_id"', box)
         self.assertIn("Webhost CVM bridge lease not ready", driver)
 
+    def test_daemon_probe_uses_canonical_host_with_verified_tls(self) -> None:
+        driver = (ROOT / "deploy/webhost-node.sh").read_text(encoding="utf-8")
+        self.assertIn(
+            'local probe_host="${DAEMON_PROBE_HOST:-$WEBHOST_ADMIN_HOST}"',
+            driver,
+        )
+        self.assertIn("--proto '=https'", driver)
+        self.assertIn("--tlsv1.2", driver)
+        self.assertIn("--resolve '${probe_host}:443:${cvm_ip}'", driver)
+        self.assertIn("'https://${probe_host}/_api/projects'", driver)
+        self.assertNotIn("http://${cvm_ip}/_api/projects", driver)
+
     def test_snapshot_and_restore_commands_round_trip(self) -> None:
         backup_service = self.candidate["services"]["migration-backup"]
         restore_service = self.rollback["services"]["migration-restore"]
