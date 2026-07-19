@@ -1055,6 +1055,10 @@ async fn csk_once(
         }
         let csk = csk::derive_originator(ctx.dstack.as_ref()).await?;
         let expected_commitment = csk::commitment(&csk);
+        tracing::info!(
+            commitment = %hex::encode(expected_commitment),
+            "CSK originator commitment derived"
+        );
         let inner =
             message_facet::build_set_csk_commitment_calldata(B256::from(expected_commitment));
         let tx = ctx.submit_op(inner).await.context("setCskCommitment")?;

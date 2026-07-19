@@ -1,0 +1,169 @@
+# Isolated two-node direct-UDP validation member (issue #36).
+# The permanent gateway-TCP bootstrap/fallback port and temporary direct-member
+# registration helper are published. The canary shares the sidecar netns,
+# serves a mesh-bound workload, and emits redacted evidence to the CVM log;
+# health :9090 is never public.
+services:
+  sidecar:
+    # Phala's prod5 pre-launch verifier currently rejects digest-form refs.
+    # This revision tag resolves to sha256:a985079a6474ecd8f1bf22824d93f5d054ba9e2422e590a714ac8e8c2bca9b36.
+    image: ghcr.io/attestmesh/cluster-mesh-agent:fdec4260c20b1ccc249675666df99657f9000a61
+    restart: unless-stopped
+    environment:
+      - CHAIN_ID=${CHAIN_ID}
+      - RPC_URL=${RPC_URL}
+      - BUNDLER_URL=${BUNDLER_URL}
+      - GAS_POLICY_ID=${GAS_POLICY_ID}
+      - INDEXER_REGISTRY_ADDR=${INDEXER_REGISTRY_ADDR}
+      - GATEWAY_DOMAIN=${GATEWAY_DOMAIN}
+      - WG_UDP_PUNCH=true
+      - PUNCH_TIMEOUT_SECS=10
+      - PUNCH_RETRY_BACKOFF_SECS=30
+      - WG_TCP_PORT=51900
+      - WG_LISTEN_PORT=51821
+      - DSTACK_SOCKET=/var/run/dstack.sock
+      - SIDECAR_STATE_DIR=/var/lib/attestmesh
+      - HEALTH_HTTP_ADDR=127.0.0.1:9090
+      - LOG_FORMAT=pretty
+      - LOG_LEVEL=info,cluster_mesh_agent=debug
+    volumes:
+      - /var/run/dstack.sock:/var/run/dstack.sock
+      - sidecar-state:/var/lib/attestmesh
+    ports:
+      - "51900:51900"
+      - "51821:51821/udp"
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun
+
+  registration-calldata:
+    image: ghcr.io/attestmesh/cluster-mesh-agent:fdec4260c20b1ccc249675666df99657f9000a61
+    restart: "no"
+    depends_on:
+      - sidecar
+    entrypoint: ["/usr/local/bin/attestmesh-registration-calldata"]
+    environment:
+      - CLUSTER=${CLUSTER}
+      - DSTACK_SOCKET=/var/run/dstack.sock
+      - REGISTRATION_HELPER_ADDR=0.0.0.0:9092
+    ports:
+      - "9092:9092"
+    volumes:
+      - /var/run/dstack.sock:/var/run/dstack.sock
+
+  canary:
+    image: alpine:3.20@sha256:d9e853e87e55526f6b2917df91a2115c36dd7c696a35be12163d44e6e2a4b6bc
+    restart: unless-stopped
+    network_mode: service:sidecar
+    depends_on:
+      - sidecar
+    cap_add:
+      - NET_ADMIN
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - |
+        apk add --no-cache busybox-extras curl jq wireguard-tools iptables iproute2 >/dev/null
+        health() { curl -sS http://127.0.0.1:9090/healthz; }
+        emit() {
+          h="$$(health)"
+          endpoints="$$(wg show attestmesh0 endpoints 2>/dev/null || true)"
+          jq -cn --arg at "$$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            --arg event "$$1" --argjson health "$$h" --arg endpoints "$$endpoints" \
+            '{at:$$at,event:$$event,health:{phase:$$health.phase,live_peers:$$health.live_peers,
+              transports:$$health.transports,punch_peer_status:$$health.punch_peer_status,
+              punch:$$health.punch},wg_endpoints:$$endpoints}'
+        }
+        until ip link show attestmesh0 >/dev/null 2>&1; do sleep 2; done
+        until [ "$$(wg show attestmesh0 peers 2>/dev/null | wc -l)" -eq 1 ]; do sleep 2; done
+        self_ip="$$(ip -4 -o addr show dev attestmesh0 | awk '{print $$4}' | cut -d/ -f1)"
+        peer_pub="$$(wg show attestmesh0 peers | head -1)"
+        self_pub="$$(wg show attestmesh0 public-key)"
+        peer_ip="$$(wg show attestmesh0 allowed-ips | awk 'NR==1 {print $$2}' | cut -d/ -f1)"
+        punch_port=51821
+        member_id=""
+        mkdir -p /tmp/canary-www
+        printf 'attestmesh udp canary ok\n' >/tmp/canary-www/probe
+        httpd -f -p "$$self_ip:18080" -h /tmp/canary-www &
+        httpd_pid=$$!
+        rule_ip=""; rule_port=""
+        cleanup() {
+          if [ -n "$$rule_ip" ]; then
+            iptables -D OUTPUT -p udp --sport "$$punch_port" -d "$$rule_ip" --dport "$$rule_port" -j DROP 2>/dev/null || true
+          fi
+          kill "$$httpd_pid" 2>/dev/null || true
+        }
+        trap cleanup EXIT INT TERM
+        last_transport=""
+        until h="$$(health)" && member_id="$$(printf '%s' "$$h" | jq -r '.transports | keys[0] // empty')" && \
+          transport="$$(printf '%s' "$$h" | jq -r --arg id "$$member_id" '.transports[$$id] // "missing"')"; do
+          sleep 2
+        done
+        while [ "$$transport" != udp ]; do
+          if [ "$$transport" != "$$last_transport" ]; then emit "transport_$$transport"; last_transport="$$transport"; fi
+          sleep 2
+          h="$$(health)"
+          transport="$$(printf '%s' "$$h" | jq -r --arg id "$$member_id" '.transports[$$id] // "missing"')"
+        done
+        emit transport_udp
+        until curl -fsS --max-time 3 "http://$$peer_ip:18080/probe" >/dev/null; do sleep 2; done
+        emit udp_latched
+
+        # Clean sustained traffic before fault injection.
+        soak_end=$$(( $$(date +%s) + 60 ))
+        while [ "$$(date +%s)" -lt "$$soak_end" ]; do
+          curl -fsS --max-time 3 "http://$$peer_ip:18080/probe" >/dev/null
+          sleep 2
+        done
+        emit pre_fault_soak_passed
+
+        # Exactly one node injects the fault, selected deterministically by its
+        # public WireGuard key. Public keys and endpoints are safe evidence.
+        leader="$$(printf '%s\n%s\n' "$$self_pub" "$$peer_pub" | sort | head -1)"
+        if [ "$$self_pub" = "$$leader" ]; then
+          # Let the peer finish its own clean-soak assertion before disruption.
+          sleep 20
+          endpoint="$$(wg show attestmesh0 endpoints | awk -v key="$$peer_pub" '$$1==key {print $$2}')"
+          rule_ip="$${endpoint%:*}"; rule_port="$${endpoint##*:}"
+          case "$$rule_ip" in 127.*|0.0.0.0|'') echo 'refusing non-direct fault endpoint' >&2; exit 1 ;; esac
+          iptables -I OUTPUT 1 -p udp --sport "$$punch_port" -d "$$rule_ip" --dport "$$rule_port" -j DROP
+          fault_started="$$(date +%s)"
+          emit direct_udp_fault_started
+          deadline=$$(( $$(date +%s) + 260 ))
+          while [ "$$(date +%s)" -lt "$$deadline" ]; do
+            h="$$(health)"
+            transport="$$(printf '%s' "$$h" | jq -r --arg id "$$member_id" '.transports[$$id] // "missing"')"
+            status="$$(printf '%s' "$$h" | jq -r --arg id "$$member_id" '.punch_peer_status[$$id] // "missing"')"
+            if [ "$$transport" = tcp ] && [ "$$status" = reverted ]; then break; fi
+            sleep 2
+          done
+          [ "$$transport" = tcp ] && [ "$$status" = reverted ] || { emit fallback_timeout; exit 1; }
+          until curl -fsS --max-time 3 "http://$$peer_ip:18080/probe" >/dev/null; do sleep 2; done
+          recovery_seconds=$$(( $$(date +%s) - fault_started ))
+          emit "tcp_fallback_workload_passed_after_$${recovery_seconds}s"
+          iptables -D OUTPUT -p udp --sport "$$punch_port" -d "$$rule_ip" --dport "$$rule_port" -j DROP
+          rule_ip=""; rule_port=""
+          deadline=$$(( $$(date +%s) + 180 ))
+          while [ "$$(date +%s)" -lt "$$deadline" ]; do
+            h="$$(health)"
+            [ "$$(printf '%s' "$$h" | jq -r --arg id "$$member_id" '.transports[$$id] // "missing"')" = udp ] && break
+            sleep 2
+          done
+          [ "$$(printf '%s' "$$h" | jq -r --arg id "$$member_id" '.transports[$$id] // "missing"')" = udp ] || { emit relatch_timeout; exit 1; }
+          curl -fsS --max-time 3 "http://$$peer_ip:18080/probe" >/dev/null
+          emit udp_relatched_after_fault
+        fi
+
+        # Keep the persistent network under workload and emit one redacted sample
+        # per minute. This continues after the functional proof for soak evidence.
+        while :; do
+          if curl -fsS --max-time 3 "http://$$peer_ip:18080/probe" >/dev/null; then
+            emit continuing_soak
+          else
+            emit workload_temporarily_unavailable
+          fi
+          sleep 60
+        done
+
+volumes:
+  sidecar-state:
