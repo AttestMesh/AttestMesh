@@ -32,6 +32,10 @@ pub struct WgPeerStatus {
     pub endpoint: Option<SocketAddr>,
     /// Unix seconds of the latest completed handshake; 0 = never.
     pub last_handshake_unix: u64,
+    /// Authenticated bytes received from this peer. An increase proves that
+    /// the current WireGuard session carried peer traffic even when no new
+    /// handshake was needed after an endpoint change.
+    pub rx_bytes: u64,
 }
 
 #[async_trait]
@@ -155,6 +159,7 @@ fn parse_wg_dump(dump: &str, peer_b64: &str) -> Option<WgPeerStatus> {
         return Some(WgPeerStatus {
             endpoint: f[2].parse().ok(),
             last_handshake_unix: f[4].parse().unwrap_or(0),
+            rx_bytes: f.get(5).and_then(|v| v.parse().ok()).unwrap_or(0),
         });
     }
     None
@@ -273,6 +278,7 @@ mod tests {
         let st = WgPeerStatus {
             endpoint: Some("203.0.113.7:51821".parse().unwrap()),
             last_handshake_unix: 1234,
+            rx_bytes: 100,
         };
         wg.script_status(key, st.clone());
         assert_eq!(wg.peer_status(&key).await.unwrap(), Some(st));
@@ -290,11 +296,13 @@ mod tests {
         let st = parse_wg_dump(&dump, pk).unwrap();
         assert_eq!(st.endpoint, Some("203.0.113.7:51821".parse().unwrap()));
         assert_eq!(st.last_handshake_unix, 1765432100);
+        assert_eq!(st.rx_bytes, 100);
 
         // peer with no endpoint / no handshake yet
         let st = parse_wg_dump(&dump, other).unwrap();
         assert_eq!(st.endpoint, None);
         assert_eq!(st.last_handshake_unix, 0);
+        assert_eq!(st.rx_bytes, 0);
 
         assert!(parse_wg_dump(&dump, "missing").is_none());
         // a peer pubkey never matches the interface line

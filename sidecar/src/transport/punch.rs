@@ -219,9 +219,12 @@ pub struct PunchOutcome {
 }
 
 /// The punch itself: at T0 retarget the wg peer endpoint to the best candidate
-/// and watch the device for a fresh handshake on a non-loopback endpoint within
-/// the window. A fresh handshake whose endpoint is loopback means the peer is
-/// still reaching us through the TCP ingress — that is NOT a punched path.
+/// and watch the device for authenticated activity on a non-loopback endpoint
+/// within the window. A fresh handshake or an increase in received bytes proves
+/// the peer reached us; checking RX matters because WireGuard may reuse the
+/// existing session after an endpoint change without immediately rekeying.
+/// Activity whose endpoint is loopback means the peer is still reaching us
+/// through the TCP ingress — that is NOT a punched path.
 /// On timeout the endpoint is restored to the TCP bridge (`revert_to`).
 pub async fn execute_punch(
     wg: &dyn MeshControl,
@@ -240,6 +243,12 @@ pub async fn execute_punch(
         tokio::time::sleep(Duration::from_millis(t0_ms - now)).await;
     }
 
+    let baseline_rx = wg
+        .peer_status(peer_wg_pub)
+        .await?
+        .map(|st| st.rx_bytes)
+        .unwrap_or(0);
+
     wg.set_peer_endpoint(peer_wg_pub, &target.to_string())
         .await
         .context("retarget wg endpoint to punch candidate")?;
@@ -248,7 +257,8 @@ pub async fn execute_punch(
     while tokio::time::Instant::now() < deadline {
         if let Some(st) = wg.peer_status(peer_wg_pub).await? {
             let fresh = st.last_handshake_unix >= t0_ms / 1000 && st.last_handshake_unix > 0;
-            if fresh {
+            let authenticated_rx = st.rx_bytes > baseline_rx;
+            if fresh || authenticated_rx {
                 if let Some(ep) = st.endpoint {
                     if !ep.ip().is_loopback() {
                         if !targets.iter().any(|t| t.ip() == ep.ip()) {
@@ -966,6 +976,7 @@ mod tests {
             WgPeerStatus {
                 endpoint: Some(observed),
                 last_handshake_unix: t0 / 1000 + 1,
+                rx_bytes: 0,
             },
         );
 
@@ -996,6 +1007,7 @@ mod tests {
             WgPeerStatus {
                 endpoint: Some("127.0.0.1:55555".parse().unwrap()),
                 last_handshake_unix: t0 / 1000 + 1,
+                rx_bytes: 0,
             },
         );
 
@@ -1023,6 +1035,7 @@ mod tests {
             WgPeerStatus {
                 endpoint: Some(target),
                 last_handshake_unix: t0 / 1000 - 60,
+                rx_bytes: 0,
             },
         );
 
@@ -1031,6 +1044,38 @@ mod tests {
             .unwrap();
         assert!(!out.success);
         assert_eq!(wg.last_endpoint_of(&key).unwrap(), bridge.to_string());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn execute_punch_latches_authenticated_rx_without_rekey() {
+        let wg = Arc::new(MockWg::default());
+        let key = [8u8; 32];
+        let target: SocketAddr = "203.0.113.8:51821".parse().unwrap();
+        let bridge: SocketAddr = "127.0.0.1:40000".parse().unwrap();
+        let t0 = now_ms();
+
+        let task = {
+            let wg = wg.clone();
+            tokio::spawn(async move {
+                execute_punch(&*wg, &key, &[target], bridge, t0, Duration::from_secs(2)).await
+            })
+        };
+        tokio::task::yield_now().await;
+        wg.script_status(
+            key,
+            WgPeerStatus {
+                endpoint: Some(target),
+                // The TCP-path handshake predates the endpoint swap.
+                last_handshake_unix: t0 / 1000 - 60,
+                // Authenticated receive traffic arrived on the direct endpoint.
+                rx_bytes: 128,
+            },
+        );
+        tokio::time::advance(POLL_INTERVAL).await;
+
+        let out = task.await.unwrap().unwrap();
+        assert!(out.success);
+        assert_eq!(out.observed, Some(target));
     }
 
     #[tokio::test]
@@ -1125,6 +1170,7 @@ mod tests {
             WgPeerStatus {
                 endpoint: Some(observed),
                 last_handshake_unix: now_ms() / 1000 + 2,
+                rx_bytes: 0,
             },
         );
 
@@ -1177,6 +1223,7 @@ mod tests {
             WgPeerStatus {
                 endpoint: Some(observed),
                 last_handshake_unix: now_ms() / 1000 - 300,
+                rx_bytes: 0,
             },
         );
         let reverted = p.watchdog_pass(now_ms()).await;
@@ -1331,6 +1378,7 @@ mod tests {
             WgPeerStatus {
                 endpoint: Some(healthy_ep),
                 last_handshake_unix: now / 1000 - 10,
+                rx_bytes: 0,
             },
         );
 
@@ -1343,6 +1391,7 @@ mod tests {
             WgPeerStatus {
                 endpoint: Some("127.0.0.1:50000".parse().unwrap()),
                 last_handshake_unix: now / 1000 - 10, // fresh, but via the TCP ingress
+                rx_bytes: 0,
             },
         );
 
