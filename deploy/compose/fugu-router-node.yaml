@@ -29,7 +29,7 @@
 
 services:
   sidecar:
-    image: ghcr.io/attestmesh/cluster-mesh-agent@sha256:b9e0ae107d9db015c22059c9fecdc28f2b35e09b257eabb4739bd4e46d96f641
+    image: ghcr.io/attestmesh/cluster-mesh-agent@sha256:b4f66282008888d1fd6a0b444ed72267282be3d2eabc0b1b7039c0e352f81aff
     restart: unless-stopped
     environment:
       - MEMBER_CONTRACT=${APP_ID}
@@ -39,6 +39,13 @@ services:
       - GAS_POLICY_ID=${GAS_POLICY_ID}
       - INDEXER_REGISTRY_ADDR=${INDEXER_REGISTRY_ADDR}
       - GATEWAY_DOMAIN=${GATEWAY_DOMAIN}
+      # Issue #36 canary: explicit values are evidence; do not rely on image
+      # defaults during transport validation.
+      - WG_UDP_PUNCH=true
+      - PUNCH_TIMEOUT_SECS=10
+      - PUNCH_RETRY_BACKOFF_SECS=30
+      - WG_TCP_PORT=51900
+      - WG_LISTEN_PORT=51821
       - DSTACK_SOCKET=/var/run/dstack.sock
       - SIDECAR_STATE_DIR=/var/lib/attestmesh
       - AGENT_GRPC_SOCKET=/var/run/attestmesh/agent.sock

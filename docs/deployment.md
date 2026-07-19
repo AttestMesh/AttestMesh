@@ -353,7 +353,7 @@ the image contains a feature based on its build date.
 |---|---|---|---|---|
 | `sha256:b9e0ae107d9db015c22059c9fecdc28f2b35e09b257eabb4739bd4e46d96f641` | Created 2026-07-11 15:23:39Z; no OCI source/revision labels; published as the isolated CSK-only build | unproven | general fleet templates including ssh/workbench, routers, database, Matrix, and app members | rebuild candidate from a revision-labeled source; do not use as canary proof |
 | `sha256:e3d53442aa6e52d47227fb3528c1141302ad4fc63c4b3fb6dc38df7ce907d486` | GHCR tag/revision `449da276136d5e8063b10794b2e62672c53b1314`, built 2026-07-11 16:12:21Z; commit tree has no `sidecar/src/transport/punch.rs` | no | indexer trio and Hindsight template | rebuild and roll target canaries before validation |
-| `sha256:b4f66282008888d1fd6a0b444ed72267282be3d2eabc0b1b7039c0e352f81aff` | OCI revision `3bd212617971207458e7bc7f26b7cde0563d3abc`, built 2026-07-19 01:19:41Z by [build-sidecar run 29668334767](https://github.com/AttestMesh/AttestMesh/actions/runs/29668334767); revision descends from `12a8289` | yes | prepared ssh/workbench and Hindsight canary templates | candidate; roll only after canary pair/freeze approval |
+| `sha256:b4f66282008888d1fd6a0b444ed72267282be3d2eabc0b1b7039c0e352f81aff` | OCI revision `3bd212617971207458e7bc7f26b7cde0563d3abc`, built 2026-07-19 01:19:41Z by [build-sidecar run 29668334767](https://github.com/AttestMesh/AttestMesh/actions/runs/29668334767); revision descends from `12a8289` | yes | prepared ssh/workbench, Hindsight, and Fugu-router canary templates | candidate; roll only after canary pair/freeze approval |
 
 New sidecar builds stamp `org.opencontainers.image.source` and
 `org.opencontainers.image.revision`. The canary procedure and redaction rules live in

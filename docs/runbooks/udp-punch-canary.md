@@ -22,6 +22,11 @@ support two-sided punching.
 The code/config/docs portion can merge before the live run. The issue cannot
 close until the full 24-hour soak and forced-failure recovery are recorded.
 
+If the workbench freeze remains in force, use the prepared persistent
+**Hindsight ↔ Fugu-router** pair. Hindsight's existing mesh-only provider calls
+to the router are the sustained workload. Do not route the canary through the
+workbench merely for evidence collection.
+
 ## 1. Establish image provenance
 
 Inventory live members from their on-chain compose hash, reconcile that against
