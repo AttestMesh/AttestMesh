@@ -50,6 +50,13 @@ services:
       - GAS_POLICY_ID=${GAS_POLICY_ID}
       - INDEXER_REGISTRY_ADDR=${INDEXER_REGISTRY_ADDR}
       - GATEWAY_DOMAIN=${GATEWAY_DOMAIN}
+      # Issue #36 canary: explicit values are evidence; do not rely on image
+      # defaults during transport validation.
+      - WG_UDP_PUNCH=true
+      - PUNCH_TIMEOUT_SECS=10
+      - PUNCH_RETRY_BACKOFF_SECS=30
+      - WG_TCP_PORT=51900
+      - WG_LISTEN_PORT=51821
       - DSTACK_SOCKET=/var/run/dstack.sock
       - SIDECAR_STATE_DIR=/var/lib/attestmesh
       - AGENT_GRPC_SOCKET=/var/run/attestmesh/agent.sock

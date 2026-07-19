@@ -38,5 +38,8 @@ jobs:
           tags: |
             ${{ github.ref == 'refs/heads/main' && 'ghcr.io/attestmesh/cluster-mesh-agent:latest' || '' }}
             ghcr.io/attestmesh/cluster-mesh-agent:${{ github.sha }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/AttestMesh/AttestMesh
+            org.opencontainers.image.revision=${{ github.sha }}
           cache-from: type=gha
           cache-to: type=gha,mode=max

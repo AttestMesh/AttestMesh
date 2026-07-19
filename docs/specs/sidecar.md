@@ -130,6 +130,9 @@ All configuration is via environment variables (no config files). The sidecar fa
 | `GATEWAY_DOMAIN` | no | — | dstack gateway base domain (live value: `dstack-base-prod5.phala.network`). Peer ingress hostnames are `<app_id>-<port>s.<domain>` (§10). Unset → mesh bring-up is skipped (registration-only mode). |
 | `WG_TCP_PORT` | no | `51900` | TCP port of the wg-over-TCP ingress, exposed through the gateway (§10) |
 | `WG_LISTEN_PORT` | no | `51821` | wireguard outer listen port. Distinct from the in-mesh heartbeat port `51820` (§11.1) because kernel wg owns its UDP socket — the two must not collide |
+| `WG_UDP_PUNCH` | no | `true` | Upgrade eligible established gateway-TCP links to direct punched UDP; TCP remains bootstrap and permanent fallback |
+| `PUNCH_TIMEOUT_SECS` | no | `10` | Window after the agreed punch start in which a fresh direct WireGuard handshake counts as success |
+| `PUNCH_RETRY_BACKOFF_SECS` | no | `30` | Initial failed-punch retry delay; doubles to a 3600-second cap |
 | `DSTACK_SOCKET` | no | `/var/run/dstack.sock` | path to dstack guest-agent socket |
 | `SIDECAR_STATE_DIR` | no | — | sidecar-only durable directory for the KMS-wrapped CSK, public peer-key cache, and last signed Indexer checkpoint. Production mounts `/var/lib/attestmesh` from the `sidecar-state` named volume; unset preserves memory-only restart behavior. |
 | `AGENT_GRPC_SOCKET` | no | `/var/run/attestmesh/agent.sock` | path the app facade listens on |
@@ -340,13 +343,13 @@ As wired in protocol v2, the Indexer is the sidecar's sole event source: there i
 
 ## 10. Wireguard management
 
-> **v1 transport reality (live).** This spec originally assumed direct UDP wireguard endpoints; dstack CVMs have **no inbound UDP**, so the v1 mesh bootstraps as **wireguard over length-prefixed UDP-over-TCP** through the dstack gateway's TLS-passthrough route (`<app_id>-<port>s.<GATEWAY_DOMAIN>`). The `transport` module bridges a loopback UDP socket per peer (which kernel wg uses as that peer's endpoint) to the peer's gateway ingress; `bringup` derives every peer's hostname from chain state + `GATEWAY_DOMAIN` — no off-chain config. The TLS on that leg is a throwaway self-signed cert (the gateway routes on SNI only); wireguard itself, with on-chain-pinned peer keys, remains the security layer. Two-sided simultaneous UDP hole-punching was live-verified on the prod5 fleet (including hairpin), so upgrading established links to pure punched UDP is deferred work, not a research risk.
+> **Transport maturity.** Gateway WireGuard-over-TCP is the live-proven bootstrap and permanent fallback through the dstack TLS-passthrough route (`<app_id>-<port>s.<GATEWAY_DOMAIN>`). The `transport` module keeps a loopback UDP bridge per peer alive for that path. Direct two-sided UDP punching is **code-landed and default-enabled**: once the TCP link is configured and heartbeat-live, the sidecars coordinate over the authenticated mesh and retarget the same kernel WireGuard peer to the punched endpoint. A failed or dead UDP path reverts to the loopback bridge. Throwaway prod5 probes proved the NAT technique, but persistent-member adoption remains **not canary-proven** until the issue #36 runbook records a qualifying 24-hour live soak and forced fallback. Code availability, canary proof, and fleet adoption are separate maturity states.
 
 ### 10.1 Interface lifecycle
 
 - Interface name: `attestmesh0` (single mesh per node in v1).
 - Created at boot via netlink (`defguard_wireguard_rs`).
-- Listen port: `WG_LISTEN_PORT` (default `51821` — the outer wg port; see §11.1 for why it differs from the heartbeat port). The endpoint peers actually dial is the gateway ingress hostname, advertised via PeerEndpoint.
+- Listen port: `WG_LISTEN_PORT` (default `51821` — the outer wg port; see §11.1 for why it differs from the heartbeat port). Peers bootstrap through the gateway ingress and may then observe a NAT-remapped direct UDP endpoint whose external port differs from `51821`.
 - Self IP: derived per §7.3 from own `memberId` + cluster CIDR.
 - MTU: 1420 (standard wg overhead on 1500 underlay).
 

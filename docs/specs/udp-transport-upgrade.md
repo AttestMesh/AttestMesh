@@ -1,9 +1,9 @@
 # Pure-UDP Hole-Punched Mesh Transport
 
-**Status:** IMPLEMENTED
+**Status:** CODE-LANDED / DEFAULT-ON / LIVE CANARY UNVERIFIED
 **Author:** LSDan
 **Created:** 2026-06-10
-**Last Updated:** 2026-06-10
+**Last Updated:** 2026-07-19
 **Parent spec:** [`attestmesh-coordination-layer.md`](./attestmesh-coordination-layer.md) §7 / [`sidecar.md`](./sidecar.md) §10
 **Component:** `sidecar/`
 
@@ -26,6 +26,19 @@ This spec wires that result in: each established wireguard link is upgraded in p
 from the gateway-TCP leg to a direct punched UDP path, with **gateway TCP remaining the
 permanent, first-class fallback**. Mesh bring-up, health gating, and on-chain surface
 are unchanged; punch coordination rides the already-authenticated mesh itself.
+
+### Maturity labels
+
+- **CODE-LANDED:** the state machine, endpoint retargeting, fallback, configuration,
+  and unit tests are merged.
+- **DEFAULT-ON:** new binaries use `WG_UDP_PUNCH=true` unless explicitly disabled.
+- **CANARY-PROVEN:** two persistent members complete the issue #36 24-hour live
+  workload soak, forced UDP failure, TCP fallback, and UDP re-latch procedure.
+- **FLEET-ADOPTED:** live inventory demonstrates that qualifying fleet links prefer
+  UDP while unsupported or restricted-NAT links remain healthy on TCP.
+
+The first two labels describe source behavior. As of 2026-07-19 neither of the
+last two has been established by recorded persistent-member evidence.
 
 ## Requirements
 
@@ -162,8 +175,15 @@ inside wireguard and are transport-oblivious.
   `PUNCH_TIMEOUT_SECS` (default 10), `PUNCH_RETRY_BACKOFF_SECS` (default 30, doubling,
   cap 3600), `PUNCH_INITIATOR_RULE` — the peer with the lexically lower memberId sends
   `PunchOffer` (deterministic, avoids offer glare).
-- **Health endpoint** — per-peer `transport: "tcp"|"punching"|"udp"`, plus counters
+- **Health endpoint** — existing per-peer `transport: "tcp"|"punching"|"udp"`, an
+  additive `punch_peer_status` reason (`bootstrapping`, `punching`, `udp`,
+  `reverted`, `backing_off`, `unsupported`, or `disabled`), plus counters
   `punch_attempts_total`, `punch_success_total`, `udp_reverts_total`.
+- **Prometheus** — the existing `attestmesh_peer_transport` gauge remains stable;
+  `attestmesh_peer_punch_status{member_id,status}` makes TCP bootstrap/fallback,
+  unsupported peers, and watchdog reverts machine-readable. Restricted-NAT timeout
+  remains a runbook/topology classification until two-sided report correlation can
+  identify it truthfully.
 - **`PeerEndpoint` envelope** — unchanged Must-Have; Should-Have adds optional
   `udp_ip`/`udp_port` fields (CBOR maps tolerate unknown fields both directions —
   verified property of the existing `ciborium` decode).
@@ -228,7 +248,7 @@ All implementation and tests live in `sidecar/`; test names are in
 | Simultaneous punch from the kernel wg socket (endpoint retarget) | `MeshControl::set_peer_endpoint` + `peer_status` (`src/wg/mod.rs`, `wg show dump` parser), `execute_punch`; deterministic T0 agreement in `handle_offer`/`initiate` | `wg::parse_wg_dump_finds_peer_endpoint_and_handshake`, `transport::punch::execute_punch_latches_fresh_handshake_on_candidate_path` |
 | Fresh-handshake success window; auto-revert on failure/UDP death; health independent of punch | `execute_punch` (loopback-handshake rejection, timeout revert), `Puncher::watchdog_pass`; health gates untouched (`src/health.rs`) | `transport::punch::execute_punch_{rejects_loopback_handshake,times_out_on_stale_handshake}_and_reverts`, `transport::punch::responder_punch_latches_udp_then_watchdog_reverts`, `health::healthz_and_metrics_expose_transport_state` |
 | Old peers degrade cleanly (`UNIMPLEMENTED` → stay on TCP) | `Puncher::on_unimplemented` (re-probe only at the backoff cap); disabled nodes present the same surface (`src/peer_grpc.rs`) | `peer_grpc::punch_rpcs_unimplemented_when_disabled`, `transport::punch::unimplemented_marks_peer_unsupported_at_cap_cadence` |
-| Per-peer transport on health endpoint + metrics | `LinkTransport` in `src/wg/peer.rs`; `/healthz` `transports` + `punch` counters and `/metrics` Prometheus text in `src/health.rs`; counters in `state::PunchMetrics` | `health::healthz_and_metrics_expose_transport_state`, `wg::peer::transport_swaps_and_nonce_lookup` |
+| Per-peer transport and punch reason on health endpoint + metrics | `LinkTransport` / `PunchStatus` in `src/wg/peer.rs`; `/healthz` `transports`, `punch_peer_status`, and counters; `/metrics` stable transport plus additive punch-status gauges in `src/health.rs` | `health::healthz_and_metrics_expose_diagnostics_without_gating`, `wg::peer::{transport_swaps_and_nonce_lookup,disabled_policy_applies_to_existing_and_future_peers}` |
 | Bounded exponential backoff, no churn | `backoff_ms` (doubling, cap 3600 s), `fail_backoff`, `watchdog_pass` re-punch scheduling | `transport::punch::backoff_doubles_and_caps`, `transport::punch::responder_punch_failure_reverts_and_backs_off` |
 | Peer-reflexive refinement (Should-Have) | `PunchReport.observed_source` capture in `run_punch`; `handle_report` stores `self_reflexive`; `rank_targets` prefers reflexive candidates | `transport::punch::handle_report_stores_self_reflexive_by_nonce`, `transport::punch::rank_targets_orders_dedups_and_sanitizes` |
 | Advertised UDP candidate in `PeerEndpoint` (Should-Have, CBOR-compatible) | optional `udp_ip`/`udp_port` in `src/envelopes.rs`; sent in `bringup::send_peer_endpoint`, absorbed in `bringup::poll_envelopes` | `envelopes::peer_endpoint_udp_fields_are_backward_and_forward_compatible`, `envelopes::peer_endpoint_udp_addr_rejects_garbage` |
@@ -242,3 +262,4 @@ All implementation and tests live in `sidecar/`; test names are in
 | 2026-06-10 | LSDan | Initial draft |
 | 2026-06-10 | LSDan | Status → IMPLEMENTING; implementation started on `milestone-b-udp-transport-upgrade` |
 | 2026-06-10 | LSDan | Status → IMPLEMENTED: `transport::punch` module, `NegotiatePunch`/`ReportPunch` RPCs, per-peer link state machine with revert, UDP-path watchdog, config knobs, health/metrics exposure, traceability filled. Fleet-validation-only items (clock-skew tolerance on `start_at_ms`, defguard endpoint-retarget soak) remain open checkboxes above. |
+| 2026-07-19 | Codex | Split source and deployment maturity, added machine-readable per-peer punch reasons, explicit canary configuration, and the issue #36 24-hour soak/fallback runbook. Live canary remains unverified. |

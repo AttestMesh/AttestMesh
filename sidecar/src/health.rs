@@ -32,7 +32,7 @@ async fn healthz(State(shared): State<Arc<Shared>>) -> (StatusCode, Json<serde_j
     let first_converged = shared.gates.first_converged();
     let csk_acquired = shared.gates.csk_acquired();
     let healthy = first_converged && csk_acquired;
-    let (live_peers, transports) = {
+    let (live_peers, transports, punch_peer_status) = {
         let peers = shared.peers.lock().await;
         let transports: serde_json::Map<String, serde_json::Value> = peers
             .all()
@@ -43,7 +43,16 @@ async fn healthz(State(shared): State<Arc<Shared>>) -> (StatusCode, Json<serde_j
                 )
             })
             .collect();
-        (peers.live_count(), transports)
+        let punch_peer_status: serde_json::Map<String, serde_json::Value> = peers
+            .all()
+            .map(|p| {
+                (
+                    hex::encode(p.member_id),
+                    serde_json::Value::String(p.punch.status.as_str().to_string()),
+                )
+            })
+            .collect();
+        (peers.live_count(), transports, punch_peer_status)
     };
     let (attempts, success, reverts) = shared.punch_metrics.snapshot();
     let body = serde_json::json!({
@@ -52,6 +61,7 @@ async fn healthz(State(shared): State<Arc<Shared>>) -> (StatusCode, Json<serde_j
         "csk_acquired": csk_acquired,
         "live_peers": live_peers,
         "transports": transports,
+        "punch_peer_status": punch_peer_status,
         "punch": {
             "punch_attempts_total": attempts,
             "punch_success_total": success,
@@ -80,19 +90,32 @@ async fn metrics(State(shared): State<Arc<Shared>>) -> String {
     let _ = writeln!(out, "# TYPE attestmesh_udp_reverts_total counter");
     let _ = writeln!(out, "attestmesh_udp_reverts_total {reverts}");
     let _ = writeln!(out, "# TYPE attestmesh_peer_transport gauge");
-    let peer_transports: Vec<([u8; 32], &'static str)> = {
+    let peer_transports: Vec<([u8; 32], &'static str, &'static str)> = {
         let peers = shared.peers.lock().await;
         peers
             .all()
-            .map(|peer| (peer.member_id, peer.transport.as_str()))
+            .map(|peer| {
+                (
+                    peer.member_id,
+                    peer.transport.as_str(),
+                    peer.punch.status.as_str(),
+                )
+            })
             .collect()
     };
-    for (member_id, transport) in peer_transports {
+    let _ = writeln!(out, "# TYPE attestmesh_peer_punch_status gauge");
+    for (member_id, transport, punch_status) in peer_transports {
         let _ = writeln!(
             out,
             "attestmesh_peer_transport{{member_id=\"{}\",transport=\"{}\"}} 1",
             hex::encode(member_id),
             transport
+        );
+        let _ = writeln!(
+            out,
+            "attestmesh_peer_punch_status{{member_id=\"{}\",status=\"{}\"}} 1",
+            hex::encode(member_id),
+            punch_status
         );
     }
     out
@@ -102,7 +125,7 @@ async fn metrics(State(shared): State<Arc<Shared>>) -> String {
 mod tests {
     use super::*;
     use crate::dstack::MockDstack;
-    use crate::wg::peer::LinkTransport;
+    use crate::wg::peer::{LinkTransport, PunchStatus};
     use alloy::primitives::Address;
 
     async fn shared() -> Arc<Shared> {
@@ -146,6 +169,7 @@ mod tests {
         // node healthy.
         assert_eq!(code, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(body["transports"][hex::encode(id)], "udp");
+        assert_eq!(body["punch_peer_status"][hex::encode(id)], "udp");
         assert_eq!(body["punch"]["punch_attempts_total"], 3);
         assert_eq!(body["punch"]["punch_success_total"], 1);
         assert_eq!(body["punch"]["udp_reverts_total"], 2);
@@ -170,5 +194,45 @@ mod tests {
             "attestmesh_peer_transport{{member_id=\"{}\",transport=\"udp\"}} 1",
             hex::encode(id)
         )));
+        assert!(text.contains(&format!(
+            "attestmesh_peer_punch_status{{member_id=\"{}\",status=\"udp\"}} 1",
+            hex::encode(id)
+        )));
+    }
+
+    #[tokio::test]
+    async fn healthz_and_metrics_expose_every_punch_reason_additively() {
+        let shared = shared().await;
+        let statuses = [
+            PunchStatus::Bootstrapping,
+            PunchStatus::Punching,
+            PunchStatus::Udp,
+            PunchStatus::Reverted,
+            PunchStatus::BackingOff,
+            PunchStatus::Unsupported,
+            PunchStatus::Disabled,
+        ];
+        {
+            let mut peers = shared.peers.lock().await;
+            for (index, status) in statuses.into_iter().enumerate() {
+                let id = [index as u8 + 1; 32];
+                peers.ensure_chain(id, 0x0a0d0002 + index as u32, [index as u8 + 20; 32]);
+                peers.punch_mut(&id).unwrap().status = status;
+            }
+        }
+
+        let (_, Json(body)) = healthz(State(shared.clone())).await;
+        let text = metrics(State(shared)).await;
+        for (index, status) in statuses.into_iter().enumerate() {
+            let member_id = hex::encode([index as u8 + 1; 32]);
+            assert_eq!(
+                body["punch_peer_status"][member_id.as_str()],
+                status.as_str()
+            );
+            assert!(text.contains(&format!(
+                "attestmesh_peer_punch_status{{member_id=\"{member_id}\",status=\"{}\"}} 1",
+                status.as_str()
+            )));
+        }
     }
 }

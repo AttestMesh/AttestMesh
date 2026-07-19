@@ -35,10 +35,40 @@ impl LinkTransport {
     }
 }
 
+/// Operator-facing reason for the current punch state. This is deliberately
+/// separate from [`LinkTransport`]: several materially different states use the
+/// TCP fallback and must not collapse into a bare `tcp` diagnostic.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum PunchStatus {
+    #[default]
+    Bootstrapping,
+    Punching,
+    Udp,
+    Reverted,
+    BackingOff,
+    Unsupported,
+    Disabled,
+}
+
+impl PunchStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            PunchStatus::Bootstrapping => "bootstrapping",
+            PunchStatus::Punching => "punching",
+            PunchStatus::Udp => "udp",
+            PunchStatus::Reverted => "reverted",
+            PunchStatus::BackingOff => "backing_off",
+            PunchStatus::Unsupported => "unsupported",
+            PunchStatus::Disabled => "disabled",
+        }
+    }
+}
+
 /// Punch bookkeeping per peer. No persistent state: NAT mappings don't survive
 /// reboots, and the TCP bootstrap makes rediscovery cheap.
 #[derive(Debug, Clone, Default)]
 pub struct PunchState {
+    pub status: PunchStatus,
     pub attempts: u32,
     pub next_retry_ms: u64,
     /// Our external mapping toward this peer, as the peer's wg observed it
@@ -73,9 +103,18 @@ pub struct PeerInfo {
     pub punch: PunchState,
 }
 
-#[derive(Default)]
 pub struct PeerTable {
     peers: HashMap<MemberId, PeerInfo>,
+    punch_enabled: bool,
+}
+
+impl Default for PeerTable {
+    fn default() -> Self {
+        Self {
+            peers: HashMap::new(),
+            punch_enabled: true,
+        }
+    }
 }
 
 impl PeerTable {
@@ -95,7 +134,14 @@ impl PeerTable {
             bridge_addr: None,
             advertised_udp: None,
             transport: LinkTransport::Tcp,
-            punch: PunchState::default(),
+            punch: PunchState {
+                status: if self.punch_enabled {
+                    PunchStatus::Bootstrapping
+                } else {
+                    PunchStatus::Disabled
+                },
+                ..PunchState::default()
+            },
         })
     }
 
@@ -175,6 +221,25 @@ impl PeerTable {
     pub fn set_transport(&mut self, member_id: &MemberId, t: LinkTransport) {
         if let Some(p) = self.peers.get_mut(member_id) {
             p.transport = t;
+            match t {
+                LinkTransport::Punching { .. } => p.punch.status = PunchStatus::Punching,
+                LinkTransport::Udp { .. } => p.punch.status = PunchStatus::Udp,
+                LinkTransport::Tcp => {}
+            }
+        }
+    }
+
+    /// Set the node-wide punch policy and make it the default for peers learned
+    /// later. Configuration is immutable at runtime, but updating existing peers
+    /// keeps diagnostics truthful when launch applies `WG_UDP_PUNCH=false`.
+    pub fn set_punch_enabled(&mut self, enabled: bool) {
+        self.punch_enabled = enabled;
+        for peer in self.peers.values_mut() {
+            peer.punch.status = if enabled {
+                PunchStatus::Bootstrapping
+            } else {
+                PunchStatus::Disabled
+            };
         }
     }
 
@@ -242,8 +307,21 @@ mod tests {
         let p = t.get(&id).unwrap();
         assert_eq!(p.transport, LinkTransport::Tcp);
         assert_eq!(p.punch.attempts, 0);
+        assert_eq!(p.punch.status, PunchStatus::Bootstrapping);
         assert!(!p.punch.unsupported);
         assert!(p.bridge_addr.is_none());
+    }
+
+    #[test]
+    fn disabled_policy_applies_to_existing_and_future_peers() {
+        let mut t = PeerTable::new();
+        let first = [1u8; 32];
+        let second = [2u8; 32];
+        t.ensure_chain(first, 1, [3u8; 32]);
+        t.set_punch_enabled(false);
+        t.ensure_chain(second, 2, [4u8; 32]);
+        assert_eq!(t.get(&first).unwrap().punch.status, PunchStatus::Disabled);
+        assert_eq!(t.get(&second).unwrap().punch.status, PunchStatus::Disabled);
     }
 
     #[test]

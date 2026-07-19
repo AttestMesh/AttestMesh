@@ -202,6 +202,7 @@ pub async fn launch(
 
     // UDP punch upgrader (udp-transport-upgrade spec). Gateway TCP stays the
     // bootstrap path and permanent fallback; this only upgrades live links.
+    ctx_set_punch_policy(&shared, config.wg_udp_punch).await;
     let puncher = if config.wg_udp_punch {
         Some(transport::punch::Puncher::new(
             shared.clone(),
@@ -325,6 +326,10 @@ pub async fn launch(
     }
 
     Ok(())
+}
+
+async fn ctx_set_punch_policy(shared: &Shared, enabled: bool) {
+    shared.peers.lock().await.set_punch_enabled(enabled);
 }
 
 /// One pass + steady-state loop: enumerate members from current chain views,

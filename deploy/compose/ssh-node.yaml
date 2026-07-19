@@ -30,6 +30,13 @@ services:
       - GAS_POLICY_ID=${GAS_POLICY_ID}
       - INDEXER_REGISTRY_ADDR=${INDEXER_REGISTRY_ADDR}
       - GATEWAY_DOMAIN=${GATEWAY_DOMAIN}
+      # Issue #36 canary: keep these explicit so image/default drift cannot
+      # silently turn the direct-UDP upgrade off or change its timing.
+      - WG_UDP_PUNCH=true
+      - PUNCH_TIMEOUT_SECS=10
+      - PUNCH_RETRY_BACKOFF_SECS=30
+      - WG_TCP_PORT=51900
+      - WG_LISTEN_PORT=51821
       - DSTACK_SOCKET=/var/run/dstack.sock
       - SIDECAR_STATE_DIR=/var/lib/attestmesh
       - HEALTH_HTTP_ADDR=0.0.0.0:9090
@@ -59,7 +66,7 @@ services:
             ca-certificates openssh-server openssh-client \
             build-essential git python3 python3-pip python3-venv \
             curl wget jq ripgrep unzip rsync \
-            iproute2 iputils-ping dnsutils netcat-openbsd socat wireguard-tools \
+            iproute2 iputils-ping dnsutils netcat-openbsd socat wireguard-tools iptables \
             vim nano tmux htop less \
           && rm -rf /var/lib/apt/lists/*
         RUN mkdir -p /run/sshd \
@@ -102,7 +109,7 @@ services:
             ca-certificates openssh-server openssh-client \
             build-essential git python3 python3-pip python3-venv \
             curl wget jq ripgrep unzip rsync \
-            iproute2 iputils-ping dnsutils netcat-openbsd socat wireguard-tools \
+            iproute2 iputils-ping dnsutils netcat-openbsd socat wireguard-tools iptables \
             vim nano tmux htop less \
           && rm -rf /var/lib/apt/lists/*
         RUN mkdir -p /run/sshd \

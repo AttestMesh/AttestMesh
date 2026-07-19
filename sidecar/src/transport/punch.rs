@@ -16,7 +16,7 @@ use crate::proto::peer::peer_control_client::PeerControlClient;
 use crate::proto::peer::{Candidate, CandidateKind, PunchAccept, PunchOffer, PunchReport};
 use crate::state::Shared;
 use crate::wg::cidr;
-use crate::wg::peer::{LinkTransport, MemberId, PeerTable};
+use crate::wg::peer::{LinkTransport, MemberId, PeerTable, PunchStatus};
 use crate::wg::MeshControl;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
@@ -390,6 +390,9 @@ impl Puncher {
         if mine.is_empty() {
             let mut peers = self.shared.peers.lock().await;
             peers.set_transport(&peer_id, LinkTransport::Tcp);
+            if let Some(ps) = peers.punch_mut(&peer_id) {
+                ps.status = PunchStatus::BackingOff;
+            }
             return Err(Status::failed_precondition(
                 "no local candidates (egress IP unknown)",
             ));
@@ -528,11 +531,11 @@ impl Puncher {
         };
         let Some(bridge) = bridge else {
             // Never fire without the fallback in hand.
-            self.shared
-                .peers
-                .lock()
-                .await
-                .set_transport(&peer, LinkTransport::Tcp);
+            let mut peers = self.shared.peers.lock().await;
+            peers.set_transport(&peer, LinkTransport::Tcp);
+            if let Some(ps) = peers.punch_mut(&peer) {
+                ps.status = PunchStatus::BackingOff;
+            }
             return;
         };
 
@@ -580,12 +583,15 @@ impl Puncher {
             if let Some(ep) = outcome.observed.filter(|_| outcome.success) {
                 peers.set_transport(&peer, LinkTransport::Udp { endpoint: ep });
                 if let Some(ps) = peers.punch_mut(&peer) {
+                    ps.status = PunchStatus::Udp;
                     ps.attempts = 0;
+                    ps.unsupported = false;
                     ps.peer_reflexive = Some(ep);
                 }
             } else {
                 peers.set_transport(&peer, LinkTransport::Tcp);
                 if let Some(ps) = peers.punch_mut(&peer) {
+                    ps.status = PunchStatus::BackingOff;
                     ps.attempts = ps.attempts.saturating_add(1);
                     ps.next_retry_ms = now + backoff_ms(&self.cfg, ps.attempts);
                 }
@@ -631,6 +637,7 @@ impl Puncher {
         let mut peers = self.shared.peers.lock().await;
         peers.set_transport(peer, LinkTransport::Tcp);
         if let Some(ps) = peers.punch_mut(peer) {
+            ps.status = PunchStatus::Unsupported;
             ps.unsupported = true;
             ps.next_retry_ms = now_ms() + BACKOFF_CAP_SECS * 1000;
         }
@@ -643,6 +650,7 @@ impl Puncher {
         let mut peers = self.shared.peers.lock().await;
         peers.set_transport(peer, LinkTransport::Tcp);
         if let Some(ps) = peers.punch_mut(peer) {
+            ps.status = PunchStatus::BackingOff;
             ps.attempts = ps.attempts.saturating_add(1);
             ps.next_retry_ms = now + backoff_ms(&self.cfg, ps.attempts);
             tracing::debug!(peer = %hex::encode(peer), attempts = ps.attempts, why,
@@ -681,7 +689,8 @@ impl Puncher {
                     if dead {
                         tracing::info!(peer = %hex::encode(id),
                             "UDP path dead; reverting to gateway TCP and scheduling re-punch");
-                        self.revert_to_tcp(&id, &wg_pub, bridge, now).await;
+                        self.revert_to_tcp(&id, &wg_pub, bridge, now, PunchStatus::Reverted)
+                            .await;
                         self.shared
                             .punch_metrics
                             .udp_reverts_total
@@ -694,7 +703,8 @@ impl Puncher {
                 {
                     tracing::warn!(peer = %hex::encode(id),
                         "punch stuck in PUNCHING; resetting to TCP");
-                    self.revert_to_tcp(&id, &wg_pub, bridge, now).await;
+                    self.revert_to_tcp(&id, &wg_pub, bridge, now, PunchStatus::BackingOff)
+                        .await;
                 }
                 _ => {}
             }
@@ -708,6 +718,7 @@ impl Puncher {
         wg_pub: &[u8; 32],
         bridge: Option<SocketAddr>,
         now: u64,
+        status: PunchStatus,
     ) {
         if let Some(b) = bridge {
             if let Err(e) = self.wg.set_peer_endpoint(wg_pub, &b.to_string()).await {
@@ -718,6 +729,7 @@ impl Puncher {
         let mut peers = self.shared.peers.lock().await;
         peers.set_transport(id, LinkTransport::Tcp);
         if let Some(ps) = peers.punch_mut(id) {
+            ps.status = status;
             ps.attempts = ps.attempts.saturating_add(1);
             ps.next_retry_ms = now + backoff_ms(&self.cfg, ps.attempts);
         }
@@ -1154,6 +1166,7 @@ mod tests {
             let info = peers.get(&initiator).unwrap();
             assert_eq!(info.punch.peer_reflexive, Some(observed));
             assert_eq!(info.punch.attempts, 0);
+            assert_eq!(info.punch.status, PunchStatus::Udp);
         }
         let (attempts, success, reverts) = shared.punch_metrics.snapshot();
         assert_eq!((attempts, success, reverts), (1, 1, 0));
@@ -1173,6 +1186,7 @@ mod tests {
             let info = peers.get(&initiator).unwrap();
             assert_eq!(info.transport, LinkTransport::Tcp);
             assert_eq!(info.punch.attempts, 1);
+            assert_eq!(info.punch.status, PunchStatus::Reverted);
             assert!(
                 info.punch.next_retry_ms > now_ms(),
                 "re-punch scheduled with backoff"
@@ -1290,6 +1304,7 @@ mod tests {
         let info = peers.get(&peer).unwrap();
         assert_eq!(info.transport, LinkTransport::Tcp);
         assert!(info.punch.unsupported);
+        assert_eq!(info.punch.status, PunchStatus::Unsupported);
         // re-probe no sooner than the cap (allow scheduling slack)
         assert!(info.punch.next_retry_ms >= now_ms() + (BACKOFF_CAP_SECS - 5) * 1000);
         // and the scheduler now skips it
@@ -1369,9 +1384,17 @@ mod tests {
         );
         assert_eq!(peers.transport_of(&roamed).unwrap(), LinkTransport::Tcp);
         assert_eq!(
+            peers.get(&roamed).unwrap().punch.status,
+            PunchStatus::Reverted
+        );
+        assert_eq!(
             peers.transport_of(&stuck).unwrap(),
             LinkTransport::Tcp,
             "stale PUNCHING reset to TCP"
+        );
+        assert_eq!(
+            peers.get(&stuck).unwrap().punch.status,
+            PunchStatus::BackingOff
         );
         assert!(wg.last_endpoint_of(&healthy_pub).is_none());
         assert_eq!(wg.last_endpoint_of(&roamed_pub).unwrap(), "127.0.0.1:40000");

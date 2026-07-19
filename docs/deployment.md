@@ -342,6 +342,23 @@ Procedure: `source deploy/env.sh && CLUSTER=… MEMBER_IMPL=… ENV_FILE=… COM
 
 ## Status log
 
+### Direct UDP rollout provenance (issue #36)
+
+Live fleet state, deployed compose, and running container digest are the source of
+truth. Generated snapshots under `deploy/orchestrator/compose/` are excluded until
+deployed. An unknown source revision is a failed provenance check, not evidence that
+the image contains a feature based on its build date.
+
+| Digest | Source commit / build evidence | Contains `12a8289`+? | Live node templates | Decision |
+|---|---|---|---|---|
+| `sha256:b9e0ae107d9db015c22059c9fecdc28f2b35e09b257eabb4739bd4e46d96f641` | Created 2026-07-11 15:23:39Z; no OCI source/revision labels; published as the isolated CSK-only build | unproven | general fleet templates including ssh/workbench, routers, database, Matrix, and app members | rebuild candidate from a revision-labeled source; do not use as canary proof |
+| `sha256:e3d53442aa6e52d47227fb3528c1141302ad4fc63c4b3fb6dc38df7ce907d486` | GHCR tag/revision `449da276136d5e8063b10794b2e62672c53b1314`, built 2026-07-11 16:12:21Z; commit tree has no `sidecar/src/transport/punch.rs` | no | indexer trio and Hindsight template | rebuild and roll target canaries before validation |
+
+New sidecar builds stamp `org.opencontainers.image.source` and
+`org.opencontainers.image.revision`. The canary procedure and redaction rules live in
+[`docs/runbooks/udp-punch-canary.md`](runbooks/udp-punch-canary.md). Do not mark the
+feature canary-proven from source or compose changes alone.
+
 | Date | Step | Result |
 |---|---|---|
 | 2026-06-03 | recon + env bridge + preflight | ✔ key→deployer verified, chain 8453, balance OK |
@@ -374,6 +391,7 @@ Procedure: `source deploy/env.sh && CLUSTER=… MEMBER_IMPL=… ENV_FILE=… COM
 | 2026-07-01 | **✅ Hindsight memory node LIVE (C3 member #5)** | vectorize-io Hindsight 0.8.4 as a mesh-ONLY node: app_id `0xa151d945…`, memberId `0xd1ab76cf…`, mesh IP `10.18.78.76` (API `:18888`, UI `:18999`, tenant-key auth), LLM `openai/gpt-oss-120b` via redpill with the netns egress-locked to that one host (verified in-TEE: example.com BLOCKED, redpill 200). E2E verified over the mesh (retain→LLM extraction→recall + 401 without key) + host-isolation PASS. Lessons codified in `deploy/hindsight-node-runbook.md`: sidecar `:9090` binds only POST-bind (pre-bind loops "cluster not resolvable"); pre-bind container-log access via a temporary docker.sock debug-shell roll allowlisted on the stock DstackApp (box deployer), rolled back clean before bind; `ip neigh` stale for fresh CVMs → ping-sweep first. |
 | 2026-07-11 | **CSK boot-latency root cause + fix** | A fugu-router reboot spent 135s inside one CSK pass: every configured member was dialed serially in randomized `HashMap` order, Tonic had no connect deadline, and three dead member routes preceded a holder. The sidecar now prioritizes originator/live peers, probes at most eight concurrently with 1s/2s deadlines, wakes on peer changes, and keeps retries at 250ms–2s. The nonexistent live `/Seal`/`/Unseal` path is replaced by a sidecar-only named volume containing a KMS-wrapped, commitment-bound XChaCha20-Poly1305 cache. |
 | 2026-07-11 | **✅ CSK canary thresholds passed** | Published the isolated CSK-only image `ghcr.io/attestmesh/cluster-mesh-agent@sha256:b9e0ae107d9db015c22059c9fecdc28f2b35e09b257eabb4739bd4e46d96f641`. On empty volumes, blue acquired 216ms after its first reachable holder was configured (118ms probe round) and green acquired in 212ms (193ms probe round), both with dead routes present. A stop/start of the same green VM loaded and commitment-verified the encrypted cache 455ms after cluster discovery (13ms cache operation). No `Seal`/`Unseal` service errors occurred; router liveliness/readiness returned 200 after each boot and the LB was restored to green. |
+| 2026-07-19 | **Direct UDP rollout implementation prepared (not live-verified)** | Added per-peer punch reasons to health/metrics, explicit canary transport configuration, revision-labeled image builds, and a redaction-safe 24-hour soak plus scoped UDP-failure runbook. Existing `b9e0ae…` / `e3d53442…` images are not valid canary proof; no persistent-member UDP result is claimed by this row. |
 
 ## Milestone-A reference: the real dstack guest-agent API
 
