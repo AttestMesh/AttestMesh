@@ -6,8 +6,8 @@
 services:
   sidecar:
     # Phala's prod5 pre-launch verifier currently rejects digest-form refs.
-    # This revision tag resolves to sha256:a322a47508c1cb9001ea64198d352f0da706e304c4cf0c10bc8c791bd9e8c62a.
-    image: ghcr.io/attestmesh/cluster-mesh-agent:491f0d94fb276e0ca7acbb928b8c94a52dfa7f1b
+    # This revision tag resolves to sha256:35bb8425918396e32c2942c1c53a924ed33ae67be723dd6e3c1c9bf16535c315.
+    image: ghcr.io/attestmesh/cluster-mesh-agent:e02777c3f8157b503fff51908169498097785838
     restart: unless-stopped
     environment:
       - CHAIN_ID=${CHAIN_ID}
@@ -20,7 +20,7 @@ services:
       - PUNCH_TIMEOUT_SECS=10
       - PUNCH_RETRY_BACKOFF_SECS=30
       - WG_TCP_PORT=51900
-      - WG_LISTEN_PORT=51821
+      - WG_LISTEN_PORT=${WG_LISTEN_PORT:-51821}
       - DSTACK_SOCKET=/var/run/dstack.sock
       - SIDECAR_STATE_DIR=/var/lib/attestmesh
       - HEALTH_HTTP_ADDR=127.0.0.1:9090
@@ -31,14 +31,14 @@ services:
       - sidecar-state:/var/lib/attestmesh
     ports:
       - "51900:51900"
-      - "51821:51821/udp"
+      - "${WG_LISTEN_PORT:-51821}:${WG_LISTEN_PORT:-51821}/udp"
     cap_add:
       - NET_ADMIN
     devices:
       - /dev/net/tun
 
   registration-calldata:
-    image: ghcr.io/attestmesh/cluster-mesh-agent:491f0d94fb276e0ca7acbb928b8c94a52dfa7f1b
+    image: ghcr.io/attestmesh/cluster-mesh-agent:e02777c3f8157b503fff51908169498097785838
     restart: "no"
     depends_on:
       - sidecar
@@ -80,7 +80,7 @@ services:
         peer_pub="$$(wg show attestmesh0 peers | head -1)"
         self_pub="$$(wg show attestmesh0 public-key)"
         peer_ip="$$(wg show attestmesh0 allowed-ips | awk 'NR==1 {print $$2}' | cut -d/ -f1)"
-        punch_port=51821
+        punch_port=${WG_LISTEN_PORT:-51821}
         member_id=""
         mkdir -p /tmp/canary-www
         printf 'attestmesh udp canary ok\n' >/tmp/canary-www/probe
