@@ -47,6 +47,7 @@ Known pre-canary state:
 |---|---|---|---|
 | `b9e0ae107d9d...` | Built 2026-07-11; no OCI source labels; deployment record calls it an isolated CSK-only build | unproven | rebuild candidate from labeled source; do not canary |
 | `e3d53442aa6e...` | GHCR tag maps to `449da276136d...`; that tree has no `sidecar/src/transport/punch.rs` | no | rebuild and roll before canary |
+| `b4f662820088...` | OCI revision `3bd212617971...`; built 2026-07-19; revision descends from `12a8289` | yes | issue #36 canary candidate; pending approved roll |
 
 ## 2. Pin the canary image and explicit configuration
 

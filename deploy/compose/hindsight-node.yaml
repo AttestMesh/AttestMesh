@@ -38,7 +38,7 @@
 services:
   # --- AttestMesh sidecar: on-chain self-registration + wg mesh (Path A) --------
   sidecar:
-    image: ghcr.io/attestmesh/cluster-mesh-agent@sha256:e3d53442aa6e52d47227fb3528c1141302ad4fc63c4b3fb6dc38df7ce907d486
+    image: ghcr.io/attestmesh/cluster-mesh-agent@sha256:b4f66282008888d1fd6a0b444ed72267282be3d2eabc0b1b7039c0e352f81aff
     restart: unless-stopped
     environment:
       # MEMBER_CONTRACT intentionally unset. Path A upgrades this stock DstackApp
