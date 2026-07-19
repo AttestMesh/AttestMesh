@@ -28,6 +28,21 @@ class SynclaveNodeContractTests(unittest.TestCase):
         self.assertIn("\nname: dstack\n", compose)
         self.assertNotIn("\nname: attestmesh-synclave\n", compose)
 
+    def test_sandbox_public_suffix_is_sealed_into_the_synclave_cvm(self) -> None:
+        compose = (ROOT / "deploy/compose/synclave-node.yaml").read_text(
+            encoding="utf-8"
+        )
+        driver = (ROOT / "deploy/synclave-node.sh").read_text(encoding="utf-8")
+        box = (ROOT / "deploy/synclave-node-box.py").read_text(encoding="utf-8")
+
+        self.assertIn("SANDBOX_APPS_DOMAIN: ${SANDBOX_APPS_DOMAIN}", compose)
+        self.assertIn(
+            'SANDBOX_APPS_DOMAIN="${SANDBOX_APPS_DOMAIN:-sandbox.synclave.net}"',
+            driver,
+        )
+        self.assertIn("printf 'E_SANDBOX_APPS_DOMAIN=%q", driver)
+        self.assertIn('"SANDBOX_APPS_DOMAIN"', box)
+
     def test_prelaunch_removes_only_the_stopped_compose_sidecar_tombstone(self) -> None:
         box = (ROOT / "deploy/synclave-node-box.py").read_text(encoding="utf-8")
 
