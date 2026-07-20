@@ -542,12 +542,35 @@ Per master spec §8.
 
 ---
 
-## 14. Healthcheck
+## 14. Healthcheck & node HTTP surface
 
-Two surfaces, same semantics:
+Two health surfaces, same semantics:
 
-- **HTTP** at `HEALTH_HTTP_ADDR` (`/healthz` only): returns `200 OK` once `first_converged && csk_acquired`, else `503 Service Unavailable` with a JSON body containing the current phase and which gates are open/closed. This is what docker-compose's `healthcheck:` directive curls.
+- **HTTP** at `HEALTH_HTTP_ADDR` (`/healthz`): returns `200 OK` once `first_converged && csk_acquired`, else `503 Service Unavailable` with a JSON body containing the current phase and which gates are open/closed. This is what docker-compose's `healthcheck:` directive curls.
 - **gRPC** (`Agent.GetMeshStatus`): structured status (§12.1).
+
+The same HTTP listener also serves:
+
+- **`GET /metrics`** — Prometheus text form of the punch counters and per-peer link transport.
+- **`GET /attestation`** — this member's public TEE attestation bundle, served node-locally so a UI or remote verifier can pull and verify each node **directly** rather than trusting a central API (the same node-local pattern TeeSQL uses for its `/attestation` route). It re-queries the dstack guest agent for a fresh quote on each call. Returns `200 OK` with the bundle when a quote is obtained, `503 Service Unavailable` with `available:false` and an `errors` map when the guest agent is unreachable **or returns a malformed `/Info`**, or `400 Bad Request` when a supplied `?nonce=` challenge is malformed — it never fabricates a quote and never publishes hollow evidence. The bundle is **public by design**: it is meant to be pulled and independently verified by anyone — a UI, a counterparty, or a third-party auditor — so remote attestation delivers its value without trusting any central API. It is safe to expose precisely because it carries **only public material** (see fields below): the no-secrets property, not a network wall, is what makes public exposure correct. The listener binds `HEALTH_HTTP_ADDR` (code default `127.0.0.1:9090`); the shipped deploy templates set `HEALTH_HTTP_ADDR=0.0.0.0:9090` and publish host port `9090`, so `/attestation` — alongside `/healthz` and `/metrics` — is reachable by external verifiers. Only **public** material is returned; never secret key material, the CSK, or env values.
+
+  Query parameters:
+  - `nonce` (optional) — a verifier-supplied freshness challenge, hex (`0x`-prefixed or bare), 1..=64 bytes. It is folded into the quote as `report_data[32..64] = keccak256(nonce)` and echoed back, so a remote party can prove the returned quote is **fresh** (bound to their challenge) rather than a replay of a captured response. A malformed/empty/oversized nonce is a client error (`400`), never a silent `200` — otherwise a verifier could be misled into trusting a stale quote. Absent → `report_data[32..64]` stays zero and `fresh:false`.
+
+  CORS: responses carry `Access-Control-Allow-Origin: *` (and `GET, OPTIONS`), and `OPTIONS /attestation` answers the browser preflight with `204`. This is scoped to `/attestation` only — `/healthz` and `/metrics` are unchanged — and is safe because the endpoint is public and returns only public material. It lets browser UIs on any origin fetch and verify a node directly.
+
+  Body fields:
+  - `attestor` — attestation method label (`"dstack"`); mirrors the on-chain attestor id and the mesh-state-api display label.
+  - `member_id`, `member_contract`, `cluster`, `mesh_ip`, `phase` — this member's on-chain/mesh identity and current bring-up phase.
+  - `identity` — the public keys already published on chain: `x_pub`, `ed25519_pub`, `wg_pub`.
+  - `dstack` — guest-agent `/Info`: `app_id`, `compose_hash`, `instance_id`, `device_id`. Present only when `/Info` is well-formed (`app_id` and `instance_id` are 20-byte addresses, while `compose_hash` and `device_id` are 32-byte values); a malformed `/Info` is rejected into `errors.info` instead of being published. dstack AppInfo does not carry `tcb_status`: a verifier derives the current TCB verdict from the raw quote and attestation collateral rather than trusting an unverified status string from the node.
+  - `code_id` — `bytes32(bytes20(app_id))`, the same value the on-chain `DstackProof` and the cluster boot gate use.
+  - `report_data` — the 64-byte quote user-data; `report_data_binding` gives the recipe (`keccak256(cluster||memberContract||xPubKey||wgPubKey||ed25519PubKey)` in `report_data[0..32]`, and `keccak256(nonce)` in `report_data[32..64]` when a nonce is supplied) so a verifier can independently recompute it from the public fields and confirm the quote is bound to this identity and their challenge.
+  - `fresh` — `true` only when a `?nonce=` challenge was supplied and bound into the quote; `false` for an identity-only bundle (which is not replay-evident).
+  - `nonce` — the accepted challenge echoed back (`0x`-hex), or `null` when none was supplied.
+  - `quote` — `{ provider, format:"raw", len, bytes, header }`: the non-empty raw TEE-signed attestation blob over `report_data`, plus its decoded TDX v4 header (`version`, attestation-key/TEE type, QE/PCE SVN, vendor id, user data). A missing, malformed, unsupported, or empty quote — or one whose embedded `REPORTDATA` differs from the requested binding — is rejected into `errors.quote`.
+  - `measurements` — the fields decoded directly from the signed TDX TDREPORT body: `mrtd`, `rtmr0`..`rtmr3`, `tee_tcb_svn`, `mr_seam`, `mr_signer_seam`, `seam_attributes`, `td_attributes`, `debug`, `xfam`, `mr_config_id`, `mr_owner`, and `mr_owner_config`. These are structural extracts for inspection and policy matching; cryptographic authenticity and the current TCB verdict still come from verifying `quote.bytes` with Intel collateral.
+  - `available` — `true` when `/GetQuote` succeeded **and** `/Info` was well-formed; otherwise `false` with an `errors` object (`info`/`quote`) and HTTP 503.
 
 Phases reported (`MeshStatus.phase`):
 - `booting` — pre key-derivation
