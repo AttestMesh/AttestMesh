@@ -53,7 +53,7 @@ services:
   # through a networkless one-shot into a read-only worker volume, leaving the upstream BuildKit
   # image itself exactly at its official digest.
   sandbox-builder-tools:
-    image: ghcr.io/dmvt/confidential-sandboxes@sha256:097ca556c69a75e454810fee718e5c5412b6c266aeb5cf36b5c044ff03faa12b
+    image: ghcr.io/dmvt/confidential-sandboxes@sha256:786720fcac62597c536ba30337954b472fb40c5844882c01089a61a232accce4
     restart: "no"
     network_mode: none
     read_only: true
@@ -133,14 +133,11 @@ services:
         condition: service_completed_successfully
 
   sandboxd:
-    image: ghcr.io/dmvt/confidential-sandboxes@sha256:097ca556c69a75e454810fee718e5c5412b6c266aeb5cf36b5c044ff03faa12b
+    image: ghcr.io/dmvt/confidential-sandboxes@sha256:786720fcac62597c536ba30337954b472fb40c5844882c01089a61a232accce4
     restart: unless-stopped
     init: true
     stop_grace_period: 90s
-    # Tenant runsc containers are launched through the host Docker daemon beneath this service's
-    # delegated CPU parent. Its ceiling must cover the full admitted tenant pool or recovery of a
-    # Medium/Large sandbox fails before runsc starts. Tenant containers retain their own exact caps.
-    cpus: "5.0"
+    cpus: "1.0"
     mem_limit: 2304m
     pids_limit: 1024
     sysctls:
@@ -236,7 +233,7 @@ services:
       SANDBOX_NETWORK_POOL: 10.192.0.0/10
       SANDBOX_NETWORK_PREFIXLEN: "29"
       SANDBOXD_REQUIRE_NETWORK_FIREWALL: "1"
-      SANDBOXD_FIREWALL_HELPER_IMAGE: ghcr.io/dmvt/confidential-sandboxes@sha256:097ca556c69a75e454810fee718e5c5412b6c266aeb5cf36b5c044ff03faa12b
+      SANDBOXD_FIREWALL_HELPER_IMAGE: ghcr.io/dmvt/confidential-sandboxes@sha256:786720fcac62597c536ba30337954b472fb40c5844882c01089a61a232accce4
       SANDBOXD_FIREWALL_WATCHDOG_INTERVAL_SECONDS: "15"
       # Preview URLs (/app/{id}/…) are capability URLs reachable without the daemon bearer; /_api/*
       # stays bearer-gated.
