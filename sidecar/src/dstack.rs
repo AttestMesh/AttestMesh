@@ -31,7 +31,6 @@ pub struct DstackInfo {
     pub compose_hash: Vec<u8>,
     pub instance_id: Vec<u8>,
     pub device_id: Vec<u8>,
-    pub tcb_status: String,
 }
 
 /// The dstack runtime surface the sidecar depends on. Deterministic per TEE state:
@@ -51,7 +50,9 @@ pub trait DstackRuntime: Send + Sync {
     /// `DstackFacet.dstack_register` verifies.
     async fn get_key(&self, path: &str, purpose: &str) -> Result<DstackKey>;
 
-    /// CVM identity from the guest-agent `/Info` (app_id, compose_hash, instance/device id, tcb).
+    /// CVM identity from the guest-agent `/Info` (app_id, compose hash, instance/device id).
+    /// TCB status is not an AppInfo field; a verifier derives it from the quote and
+    /// current attestation collateral.
     async fn info(&self) -> Result<DstackInfo>;
 }
 
@@ -134,7 +135,6 @@ impl DstackRuntime for MockDstack {
             )[..20]
                 .to_vec(),
             device_id: Keccak256::digest(b"mock-device").to_vec(),
-            tcb_status: "UpToDate".to_string(),
         })
     }
 }
@@ -181,7 +181,9 @@ impl DstackRuntime for UnixSocketDstack {
             .get("quote")
             .and_then(|v| v.as_str())
             .context("missing quote")?;
-        Ok(hex::decode(q.trim_start_matches("0x"))?)
+        let quote = hex::decode(q.trim_start_matches("0x")).context("invalid quote hex")?;
+        ensure!(!quote.is_empty(), "empty quote");
+        Ok(quote)
     }
 
     async fn get_key(&self, path: &str, purpose: &str) -> Result<DstackKey> {
@@ -253,18 +255,11 @@ impl DstackRuntime for UnixSocketDstack {
             "/Info device_id is {} bytes, expected 32 bytes",
             device_id.len()
         );
-        let tcb_status = resp
-            .get("tcb_status")
-            .and_then(|v| v.as_str())
-            .context("/Info missing 'tcb_status'")?
-            .to_string();
-        ensure!(!tcb_status.trim().is_empty(), "/Info tcb_status is empty");
         Ok(DstackInfo {
             app_id,
             compose_hash,
             instance_id,
             device_id,
-            tcb_status,
         })
     }
 }
@@ -372,7 +367,6 @@ mod tests {
         assert_eq!(info.compose_hash.len(), 32, "compose_hash is bytes32");
         assert_eq!(info.instance_id.len(), 20, "instance_id is an address");
         assert_eq!(info.device_id.len(), 32, "device_id is bytes32");
-        assert_eq!(info.tcb_status, "UpToDate");
     }
 
     fn http_response(status: &str, body: &str) -> String {
@@ -425,7 +419,6 @@ mod tests {
             "compose_hash": "0x01",
             "instance_id": format!("0x{}", hex::encode([0x22u8; 20])),
             "device_id": format!("0x{}", hex::encode([0x33u8; 32])),
-            "tcb_status": "UpToDate",
         })
         .to_string();
         let (_dir, socket_path, task) = spawn_uds_response(http_response("200 OK", &body)).await;
@@ -434,6 +427,42 @@ mod tests {
         let err = d.info().await.unwrap_err().to_string();
         assert!(err.contains("compose_hash"), "unexpected error: {err}");
         assert!(err.contains("expected 32 bytes"), "unexpected error: {err}");
+        task.await.unwrap();
+    }
+
+    /// dstack v0.5.x AppInfo has no top-level `tcb_status`; accepting the official
+    /// shape prevents attestation hardening from breaking boot and registration.
+    #[tokio::test]
+    async fn unix_info_accepts_official_shape_without_tcb_status() {
+        let body = serde_json::json!({
+            "app_id": format!("0x{}", hex::encode([0x11u8; 20])),
+            "compose_hash": format!("0x{}", hex::encode([0x22u8; 32])),
+            "instance_id": format!("0x{}", hex::encode([0x33u8; 20])),
+            "device_id": format!("0x{}", hex::encode([0x44u8; 32])),
+            "tcb_info": "{}",
+        })
+        .to_string();
+        let (_dir, socket_path, task) = spawn_uds_response(http_response("200 OK", &body)).await;
+        let d = UnixSocketDstack::new(socket_path);
+
+        let info = d.info().await.unwrap();
+        assert_eq!(info.app_id, [0x11u8; 20]);
+        assert_eq!(info.compose_hash, [0x22u8; 32]);
+        assert_eq!(info.instance_id, [0x33u8; 20]);
+        assert_eq!(info.device_id, [0x44u8; 32]);
+        task.await.unwrap();
+    }
+
+    /// A syntactically valid response with no quote bytes is not attestation
+    /// evidence and must be rejected at the provider boundary.
+    #[tokio::test]
+    async fn unix_get_quote_rejects_empty_quote() {
+        let body = serde_json::json!({ "quote": "" }).to_string();
+        let (_dir, socket_path, task) = spawn_uds_response(http_response("200 OK", &body)).await;
+        let d = UnixSocketDstack::new(socket_path);
+
+        let err = d.get_quote([0u8; 64]).await.unwrap_err().to_string();
+        assert!(err.contains("empty quote"), "unexpected error: {err}");
         task.await.unwrap();
     }
 }

@@ -563,12 +563,12 @@ The same HTTP listener also serves:
   - `attestor` — attestation method label (`"dstack"`); mirrors the on-chain attestor id and the mesh-state-api display label.
   - `member_id`, `member_contract`, `cluster`, `mesh_ip`, `phase` — this member's on-chain/mesh identity and current bring-up phase.
   - `identity` — the public keys already published on chain: `x_pub`, `ed25519_pub`, `wg_pub`.
-  - `dstack` — guest-agent `/Info`: `app_id`, `compose_hash`, `instance_id`, `device_id`, `tcb_status`. Present only when `/Info` is well-formed (`app_id` and `instance_id` are 20-byte addresses, `compose_hash` and `device_id` are 32-byte values, and TCB status is non-empty); a malformed `/Info` is rejected into `errors.info` instead of being published.
+  - `dstack` — guest-agent `/Info`: `app_id`, `compose_hash`, `instance_id`, `device_id`. Present only when `/Info` is well-formed (`app_id` and `instance_id` are 20-byte addresses, while `compose_hash` and `device_id` are 32-byte values); a malformed `/Info` is rejected into `errors.info` instead of being published. dstack AppInfo does not carry `tcb_status`: a verifier derives the current TCB verdict from the raw quote and attestation collateral rather than trusting an unverified status string from the node.
   - `code_id` — `bytes32(bytes20(app_id))`, the same value the on-chain `DstackProof` and the cluster boot gate use.
   - `report_data` — the 64-byte quote user-data; `report_data_binding` gives the recipe (`keccak256(cluster||memberContract||xPubKey||wgPubKey||ed25519PubKey)` in `report_data[0..32]`, and `keccak256(nonce)` in `report_data[32..64]` when a nonce is supplied) so a verifier can independently recompute it from the public fields and confirm the quote is bound to this identity and their challenge.
   - `fresh` — `true` only when a `?nonce=` challenge was supplied and bound into the quote; `false` for an identity-only bundle (which is not replay-evident).
   - `nonce` — the accepted challenge echoed back (`0x`-hex), or `null` when none was supplied.
-  - `quote` — `{ provider, format:"raw", len, bytes }`: the raw TEE-signed attestation blob over `report_data`.
+  - `quote` — `{ provider, format:"raw", len, bytes }`: the non-empty raw TEE-signed attestation blob over `report_data`. A missing, malformed, or empty quote is rejected into `errors.quote`.
   - `available` — `true` when `/GetQuote` succeeded **and** `/Info` was well-formed; otherwise `false` with an `errors` object (`info`/`quote`) and HTTP 503.
 
 Phases reported (`MeshStatus.phase`):

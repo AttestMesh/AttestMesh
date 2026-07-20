@@ -204,7 +204,7 @@ fn code_id_from_app_id(app_id: &[u8]) -> [u8; 32] {
 /// `code_id`. We reject that here so the handler falls through to `errors.info` +
 /// 503 instead of publishing hollow attestation evidence. `app_id` must be exactly
 /// the 20-byte contract address (`code_id = bytes20(app_id)` depends on it); the
-/// other identifiers and the TCB status must be present.
+/// other identifiers must have their canonical lengths.
 fn require_info_field_len(name: &str, actual: usize, expected: usize) -> Result<(), String> {
     if actual != expected {
         return Err(format!(
@@ -219,9 +219,6 @@ fn validate_dstack_info(info: &DstackInfo) -> Result<(), String> {
     require_info_field_len("compose_hash", info.compose_hash.len(), 32)?;
     require_info_field_len("instance_id", info.instance_id.len(), 20)?;
     require_info_field_len("device_id", info.device_id.len(), 32)?;
-    if info.tcb_status.trim().is_empty() {
-        return Err("/Info tcb_status is empty".to_string());
-    }
     Ok(())
 }
 
@@ -343,7 +340,7 @@ async fn attestation(
 
     let mut errors = serde_json::Map::new();
 
-    // dstack `/Info`: app_id, compose_hash, instance/device id, TCB status. Validate
+    // dstack `/Info`: app_id, compose_hash, and instance/device id. Validate
     // the fields before trusting them — a malformed/empty `/Info` must NOT be
     // published as successful evidence (issue [P2]).
     match dstack.info().await {
@@ -354,7 +351,6 @@ async fn attestation(
                     "compose_hash": format!("0x{}", hex::encode(&info.compose_hash)),
                     "instance_id": format!("0x{}", hex::encode(&info.instance_id)),
                     "device_id": format!("0x{}", hex::encode(&info.device_id)),
-                    "tcb_status": info.tcb_status,
                 });
                 body["code_id"] = serde_json::json!(format!(
                     "0x{}",
@@ -372,13 +368,16 @@ async fn attestation(
 
     // dstack `/GetQuote`: the raw TEE-signed attestation blob over `report_data`.
     match dstack.get_quote(report_data).await {
-        Ok(quote) => {
+        Ok(quote) if !quote.is_empty() => {
             body["quote"] = serde_json::json!({
                 "provider": ATTESTOR_LABEL,
                 "format": "raw",
                 "len": quote.len(),
                 "bytes": format!("0x{}", hex::encode(&quote)),
             });
+        }
+        Ok(_) => {
+            errors.insert("quote".to_string(), serde_json::json!("empty quote"));
         }
         Err(e) => {
             errors.insert("quote".to_string(), serde_json::json!(e.to_string()));
@@ -548,7 +547,6 @@ mod tests {
             body["dstack"]["app_id"],
             format!("0x{}", hex::encode(&info.app_id))
         );
-        assert_eq!(body["dstack"]["tcb_status"], info.tcb_status);
         assert_eq!(
             body["code_id"],
             format!("0x{}", hex::encode(code_id_from_app_id(&info.app_id)))
@@ -632,7 +630,6 @@ mod tests {
                 compose_hash: Vec::new(),
                 instance_id: Vec::new(),
                 device_id: Vec::new(),
-                tcb_status: String::new(),
             })
         }
     }
@@ -654,6 +651,44 @@ mod tests {
         // The malformed /Info must not be published as evidence.
         assert!(body.get("dstack").is_none());
         assert!(body.get("code_id").is_none());
+    }
+
+    /// A provider returning `Ok` with no quote bytes must not produce a successful
+    /// attestation bundle, even if its `/Info` response is valid.
+    struct EmptyQuoteDstack(MockDstack);
+
+    #[async_trait::async_trait]
+    impl DstackRuntime for EmptyQuoteDstack {
+        async fn derive_key(
+            &self,
+            p: &str,
+            s: &str,
+        ) -> anyhow::Result<zeroize::Zeroizing<[u8; 32]>> {
+            self.0.derive_key(p, s).await
+        }
+        async fn get_quote(&self, _: [u8; 64]) -> anyhow::Result<Vec<u8>> {
+            Ok(Vec::new())
+        }
+        async fn get_key(&self, p: &str, s: &str) -> anyhow::Result<crate::dstack::DstackKey> {
+            self.0.get_key(p, s).await
+        }
+        async fn info(&self) -> anyhow::Result<crate::dstack::DstackInfo> {
+            self.0.info().await
+        }
+    }
+
+    #[tokio::test]
+    async fn attestation_rejects_empty_quote() {
+        let shared = shared().await;
+        let dstack: Arc<dyn DstackRuntime> =
+            Arc::new(EmptyQuoteDstack(MockDstack::from_label("health-test")));
+
+        let (code, _headers, Json(body)) =
+            attestation(State(shared), State(dstack), Query(HashMap::new())).await;
+        assert_eq!(code, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["available"], false);
+        assert_eq!(body["errors"]["quote"], "empty quote");
+        assert!(body.get("quote").is_none());
     }
 
     /// Issue [P1]: a verifier-supplied `?nonce=` challenge is folded into
