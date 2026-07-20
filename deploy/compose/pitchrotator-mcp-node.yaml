@@ -1,0 +1,114 @@
+# PitchRotator standalone MCP server, dedicated AttestMesh node.
+#
+# Immutable source inputs for the pending hardened release:
+#   PITCHROTATOR_SOURCE_COMMIT=66b5495b0ea0695ef6d2a35969d444da4f680a52
+#   PITCHROTATOR_SOURCE_TREE=30ef21a38034bf1d1f7001445a6feea89a424cb3
+#   PITCHROTATOR_SOURCE_SHA256=57aa6a29108cdaa5a46cd6d12b962c7c01c8ca824882b77f16767ea395843e1d
+# The SHA-256 is over `git archive --format=tar.gz --prefix=Pitch-Rotator-66b5495/`
+# at that commit; package-lock.json SHA-256 is
+# 3a3e75e10c0ebb9ed132cf93fd4641cc3c8d043c55e4a443ac42f32c25d73342.
+# The driver requires PITCHROTATOR_IMAGE as a full @sha256 reference and renders
+# it into a mode-0600 temporary compose before hashing/upload. Thus the resolved
+# image digest, not this placeholder, is bound by Path-A compose admission.
+services:
+  sidecar:
+    image: ghcr.io/attestmesh/cluster-mesh-agent@sha256:b9e0ae107d9db015c22059c9fecdc28f2b35e09b257eabb4739bd4e46d96f641
+    restart: unless-stopped
+    environment:
+      - CHAIN_ID=${CHAIN_ID}
+      - RPC_URL=${RPC_URL}
+      - BUNDLER_URL=${BUNDLER_URL}
+      - GAS_POLICY_ID=${GAS_POLICY_ID}
+      - INDEXER_REGISTRY_ADDR=${INDEXER_REGISTRY_ADDR}
+      - GATEWAY_DOMAIN=${GATEWAY_DOMAIN}
+      - DSTACK_SOCKET=/var/run/dstack.sock
+      - SIDECAR_STATE_DIR=/var/lib/attestmesh
+      - AGENT_GRPC_SOCKET=/var/run/attestmesh/agent.sock
+      - HEALTH_HTTP_ADDR=0.0.0.0:9090
+      - LOG_FORMAT=pretty
+      - LOG_LEVEL=info,cluster_mesh_agent=debug
+    volumes:
+      - /var/run/dstack.sock:/var/run/dstack.sock
+      - sidecar-state:/var/lib/attestmesh
+      - agent-sock:/var/run/attestmesh
+    ports:
+      - "9090:9090"
+      - "51900:51900"
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun
+
+  pitchrotator-mcp:
+    image: ${PITCHROTATOR_IMAGE}
+    restart: unless-stopped
+    environment:
+      - PORT=8787
+      - PUBLIC_URL=http://pitchrotator-mcp:8787
+      - OPENROUTER_API_KEY=${OPENROUTER_API_KEY}
+      - PITCH_MODEL=anthropic/claude-opus-4-8
+      - PITCHROTATOR_SOURCE_COMMIT=66b5495b0ea0695ef6d2a35969d444da4f680a52
+      - PITCHROTATOR_SOURCE_TREE=30ef21a38034bf1d1f7001445a6feea89a424cb3
+      - PITCHROTATOR_SOURCE_SHA256=57aa6a29108cdaa5a46cd6d12b962c7c01c8ca824882b77f16767ea395843e1d
+    volumes:
+      - /var/run/dstack.sock:/var/run/dstack.sock
+    expose:
+      - "8787"
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - fetch('http://127.0.0.1:8787/health').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 15s
+
+  # Deny all workload egress except DNS and OpenRouter HTTPS. Founder-derived
+  # model payloads therefore have one network-enforced destination.
+  app-egress-fw:
+    image: ghcr.io/attestmesh/agent-egress-fw@sha256:c6c00d1fc5e73dde050c1a8cf2fef43a93cc9cd0dc0f5f368e7c763f1f1c242c
+    restart: unless-stopped
+    network_mode: service:pitchrotator-mcp
+    depends_on:
+      - pitchrotator-mcp
+    environment:
+      - ALLOW_BASE_URL=https://openrouter.ai
+      - ALLOW_PORT=443
+      - ALLOW_CIDRS=
+      - INTERNAL_HOSTS=
+      - INTERNAL_HOST_PORTS=
+      - ALLOW_DNS=127.0.0.11
+      - RERESOLVE_SECONDS=30
+    cap_add:
+      - NET_ADMIN
+
+  # Bind only the attestmesh0 address. The CVM has no gateway and no host port.
+  mesh-proxy-mcp:
+    image: alpine/socat:1.8.0.0@sha256:0a861c561b21bf3509a897a07f0daa2e2069cf8973ac55b00d6079c5207ba761
+    restart: unless-stopped
+    network_mode: service:sidecar
+    depends_on:
+      sidecar:
+        condition: service_started
+      pitchrotator-mcp:
+        condition: service_healthy
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - |
+        while :; do
+          ip="$$(ip -4 -o addr show dev attestmesh0 2>/dev/null | awk '{print $$4}' | cut -d/ -f1)"
+          [ -n "$$ip" ] && break
+          sleep 1
+        done
+        exec socat TCP-LISTEN:8787,fork,reuseaddr,bind="$${ip}" TCP:pitchrotator-mcp:8787
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+
+volumes:
+  sidecar-state:
+  agent-sock:
