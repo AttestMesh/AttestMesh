@@ -49,18 +49,106 @@ services:
     devices:
       - /dev/net/tun
 
+  # The measured sandboxd release contains the narrowly scoped runsc compatibility adapter. Copy it
+  # through a networkless one-shot into a read-only worker volume, leaving the upstream BuildKit
+  # image itself exactly at its official digest.
+  sandbox-builder-tools:
+    image: ghcr.io/dmvt/confidential-sandboxes@sha256:097ca556c69a75e454810fee718e5c5412b6c266aeb5cf36b5c044ff03faa12b
+    restart: "no"
+    network_mode: none
+    read_only: true
+    user: "0:0"
+    cpus: "0.05"
+    mem_limit: 32m
+    pids_limit: 16
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    entrypoint: ["/bin/cp"]
+    command: ["/usr/local/libexec/runsc-buildkit-shim", "/tools/runsc-buildkit-shim"]
+    volumes:
+      - sandboxd-builder-tools:/tools
+
+  # Fleet submits bounded source archives to sandboxd over the authenticated control API. BuildKit
+  # is a separate measured worker: sandboxd receives only this private Unix socket, and arbitrary
+  # Dockerfile RUN steps execute through the same checksum-pinned runsc binary as tenant workloads.
+  sandbox-builder:
+    image: moby/buildkit@sha256:6b59b7df63a8cb9902736f9ddf7fcff8261613d3e7449b8ea8b7537fc399c03a
+    restart: unless-stopped
+    privileged: true
+    init: true
+    stop_grace_period: 60s
+    cpus: "0.50"
+    mem_limit: 1024m
+    pids_limit: 2048
+    read_only: true
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,noexec,size=128m
+      - /run:rw,nosuid,nodev,noexec,size=32m
+      - /var/lib/cni:rw,nosuid,nodev,noexec,size=16m
+    logging:
+      driver: local
+      options:
+        max-size: "20m"
+        max-file: "3"
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
+    command:
+      - --addr=unix:///run/buildkit/buildkitd.sock
+      - --containerd-worker=false
+      - --oci-worker=true
+      - --oci-worker-binary=/opt/synclave/runsc-buildkit-shim
+      - --oci-worker-snapshotter=native
+      - --oci-worker-net=bridge
+      - --oci-max-parallelism=2
+      - --oci-worker-gc=true
+      - --oci-worker-gc-keepstorage=4096
+    healthcheck:
+      test:
+        - CMD
+        - buildctl
+        - --addr=unix:///run/buildkit/buildkitd.sock
+        - debug
+        - workers
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    volumes:
+      - sandboxd-buildkit-socket:/run/buildkit
+      - type: bind
+        source: /var/lib/sandboxd-buildkit
+        target: /var/lib/buildkit
+        bind:
+          create_host_path: false
+      - /dstack/persistent/bin/runsc:/usr/local/bin/runsc:ro
+      - sandboxd-builder-tools:/opt/synclave:ro
+    networks:
+      - build-egress
+    depends_on:
+      sandbox-builder-tools:
+        condition: service_completed_successfully
+
   sandboxd:
-    image: ghcr.io/dmvt/confidential-sandboxes@sha256:360248c7139bea2cee716d33acbd66e7aa3252f7750f8420a819c2d37ef4e938
+    image: ghcr.io/dmvt/confidential-sandboxes@sha256:097ca556c69a75e454810fee718e5c5412b6c266aeb5cf36b5c044ff03faa12b
     restart: unless-stopped
     init: true
     stop_grace_period: 90s
     cpus: "1.0"
-    mem_limit: 1536m
+    mem_limit: 2304m
     pids_limit: 1024
     sysctls:
       net.ipv4.ip_forward: "0"
       net.ipv6.conf.all.forwarding: "0"
     ulimits:
+      # Sandboxd opens sealed values in CVM memory immediately before launch. Never allow a process
+      # crash to serialize that memory into a durable core file.
+      core:
+        soft: 0
+        hard: 0
       nofile:
         soft: 65536
         hard: 65536
@@ -68,6 +156,8 @@ services:
     tmpfs:
       - /tmp:rw,nosuid,nodev,noexec,size=128m
       - /run:rw,nosuid,nodev,noexec,size=32m
+      # One active extraction plus four queued 64 MiB archives remains ephemeral and hard-capped.
+      - /var/lib/sandboxd-builds:rw,nosuid,nodev,noexec,size=768m
     logging:
       driver: local
       options:
@@ -95,13 +185,14 @@ services:
       SANDBOXD_MAX_CONCURRENT_IMAGE_PULLS: "1"
       SANDBOXD_IMAGE_CACHE_GC: "1"
       SANDBOXD_MAX_IMAGE_BYTES: "4294967296"
-      SANDBOXD_IMAGE_CACHE_BUDGET_BYTES: "17179869184"
-      SANDBOXD_DOCKER_DATA_LIMIT_BYTES: "30064771072"
+      # Six GiB of the combined 28 GiB Docker/build cache ceiling is reserved for BuildKit.
+      SANDBOXD_IMAGE_CACHE_BUDGET_BYTES: "10737418240"
+      SANDBOXD_DOCKER_DATA_LIMIT_BYTES: "23622320128"
       SANDBOXD_DOCKER_DATA_RESERVE_BYTES: "6442450944"
       SANDBOXD_MAX_CONCURRENT_EXECS: "16"
-      # Arbitrary command execution is intentionally unavailable on the first production release.
-      # It can be enabled only by a new measured compose and an explicit operator decision.
-      SANDBOXD_ENABLE_EXEC: "0"
+      # Fleet authenticates and authorizes the caller; sandboxd additionally bounds duration,
+      # argv/output sizes, and host-wide concurrency before dispatch through runsc.
+      SANDBOXD_ENABLE_EXEC: "1"
       SANDBOXD_MAX_CONCURRENT_QUOTES: "2"
       SANDBOXD_QUOTES_PER_ID_PER_MINUTE: "10"
       SANDBOXD_QUOTES_GLOBAL_PER_MINUTE: "60"
@@ -109,23 +200,40 @@ services:
       SANDBOXD_MAX_PROXY_CONNECTIONS_PER_SANDBOX: "4"
       SANDBOXD_PROXY_TOTAL_TIMEOUT_SECONDS: "300"
       SANDBOXD_PROXY_READ_TIMEOUT_SECONDS: "60"
+      SANDBOXD_PROXY_STREAM_TIMEOUT_SECONDS: "3600"
       # Initial production guardrail for the permanent handle ledger and append-only RTMR3 history.
       # Raising this is an explicit measured deployment change after quote-size monitoring.
       SANDBOXD_MAX_LIFETIME_ALLOCATIONS: "1000"
-      SANDBOXD_ALLOWED_IMAGE_REPOSITORIES: "ghcr.io/dmvt/cs-sandbox-base"
+      SANDBOXD_ALLOWED_IMAGE_REPOSITORIES: "ghcr.io/attestmesh/synclave-workloads"
       DOCKER_CONFIG: /run/sandboxd-docker
+      # Fleet-only async source-build boundary. Repository and builder identity are server-owned;
+      # callers provide only team/idempotency metadata and verified application/gzip bytes.
+      SANDBOXD_BUILDKIT_ADDRESS: unix:///run/buildkit/buildkitd.sock
+      SANDBOXD_BUILD_REPOSITORY: ghcr.io/attestmesh/synclave-workloads
+      SANDBOXD_BUILDER_ID: moby/buildkit@sha256:6b59b7df63a8cb9902736f9ddf7fcff8261613d3e7449b8ea8b7537fc399c03a
+      SANDBOXD_BUILD_WORK_ROOT: /var/lib/sandboxd-builds
+      SANDBOXD_BUILD_STATE_DB: /var/lib/sandboxd/builds.sqlite3
+      SANDBOXD_BUILD_CONCURRENCY: "1"
+      SANDBOXD_MAX_PENDING_BUILDS: "4"
+      SANDBOXD_MAX_BUILD_ARCHIVE_BYTES: "67108864"
+      SANDBOXD_MAX_BUILD_SOURCE_BYTES: "268435456"
+      SANDBOXD_MAX_BUILD_MEMBERS: "20000"
+      SANDBOXD_MAX_BUILD_FILE_BYTES: "67108864"
+      SANDBOXD_BUILD_TIMEOUT_SECONDS: "1800"
+      SANDBOXD_REQUIRE_BUILDER: "1"
       SANDBOXD_HOST: 10.191.255.250
       SANDBOXD_PORT: "8088"
       # Durable state on a pre-provisioned, separately reserved ZFS filesystem: sandbox store +
       # org/handle/uid ledger share one sqlite file. No private key material is persisted.
       SANDBOX_ALLOCATION_DB: /var/lib/sandboxd/state.sqlite3
       SANDBOX_STATE_DB: /var/lib/sandboxd/state.sqlite3
+      SANDBOXD_SECRET_RUNTIME_ROOT: /run/sandboxd-secrets
       # Fixed control-only bridge; each tenant instead receives its own labeled `csn_*` bridge.
       SANDBOX_INGRESS_NETWORK: cs-ingress
       SANDBOX_NETWORK_POOL: 10.192.0.0/10
       SANDBOX_NETWORK_PREFIXLEN: "29"
       SANDBOXD_REQUIRE_NETWORK_FIREWALL: "1"
-      SANDBOXD_FIREWALL_HELPER_IMAGE: ghcr.io/dmvt/confidential-sandboxes@sha256:360248c7139bea2cee716d33acbd66e7aa3252f7750f8420a819c2d37ef4e938
+      SANDBOXD_FIREWALL_HELPER_IMAGE: ghcr.io/dmvt/confidential-sandboxes@sha256:097ca556c69a75e454810fee718e5c5412b6c266aeb5cf36b5c044ff03faa12b
       SANDBOXD_FIREWALL_WATCHDOG_INTERVAL_SECONDS: "15"
       # Preview URLs (/app/{id}/…) are capability URLs reachable without the daemon bearer; /_api/*
       # stays bearer-gated.
@@ -134,6 +242,7 @@ services:
       # the shared /app/{id} route is disabled so tenants cannot share a browser origin.
       SANDBOXD_REQUIRE_UNIQUE_APP_ORIGINS: "1"
       SANDBOX_APPS_DOMAIN: ${APP_DOMAIN:?set to the dedicated sandbox wildcard domain}
+      SANDBOXD_PUBLIC_HTTPS_PORTS: "443,8787"
       # One-shot image to chown a fresh per-sandbox /data volume to the tenant uid (65534) so the
       # attested durable writable area is writable under read-only rootfs + non-root user.
       SANDBOX_VOLUME_INIT_IMAGE: busybox@sha256:73aaf090f3d85aa34ee199857f03fa3a95c8ede2ffd4cc2cdb5b94e566b11662
@@ -144,7 +253,8 @@ services:
       SANDBOXD_MIN_RUNSC_PIDS: "128"
       SANDBOXD_MIN_RUNSC_DISK_MB: "16"
       # Fixed admission budgets for BOX_VCPU=8 / BOX_MEM=16384 / BOX_DISK=300. Tenant plus trusted
-      # service maxima total 7 vCPU / 12.5 GiB, leaving host dockerd/OS/ZFS headroom. Tenant PIDs
+      # service maxima total 7.25 vCPU / 14.25 GiB including the source builder and build tmpfs,
+      # leaving host dockerd/OS/ZFS CPU and memory headroom. Tenant PIDs
       # are hard-capped at 16,384. The 251 GiB XFS zvol sells 232 GiB, preserves 18 GiB of usable
       # reserve, and absorbs its own filesystem metadata in the remaining space.
       HOST_VCPU_MILLIS: "5000"
@@ -171,6 +281,10 @@ services:
     volumes:
       - /var/run/dstack.sock:/var/run/dstack.sock:ro
       - /var/run/docker.sock:/var/run/docker.sock
+      - sandboxd-buildkit-socket:/run/buildkit
+      # Same absolute host/CVM path: plaintext exists only on the guest's /run tmpfs and dockerd can
+      # bind the per-sandbox file read-only without copying values into Docker Config.Env.
+      - /run/sandboxd-secrets:/run/sandboxd-secrets
       # Pre-launch creates this as dstack/sandboxd-state with exact 2 GiB quota, refquota, and
       # refreservation. It remains writable even if the separate Docker data-root reaches its cap.
       - type: bind
@@ -193,6 +307,9 @@ services:
       # Preserve the existing dstack gateway/control URL while moving the in-container listener to
       # the Caddy image's fixed upstream port.
       - "8080:8088"
+    depends_on:
+      sandbox-builder:
+        condition: service_healthy
 
   # Unique-origin TLS ingress. The image is the exact digest currently used by the production
   # webhost; wildcard certificates are obtained through a sealed, zone-scoped Cloudflare token.
@@ -234,17 +351,22 @@ services:
             timeouts {
               read_body 30s
               read_header 10s
-              write 5m
+              # sandboxd bounds MCP/SSE proxy requests at one hour; leave TLS-proxy headroom so
+              # the application layer, not Caddy, owns reconnect timing.
+              write 65m
               idle 30s
             }
           }
         }
-        *.{$$SANDBOX_APPS_DOMAIN} {
+        # MCP servers conventionally bind :8787. Both listeners terminate the same wildcard TLS
+        # certificate and dispatch by the sandbox hostname, so tenants cannot collide on the
+        # shared external port. Sandboxd still selects each tenant's declared container port.
+        *.{$$SANDBOX_APPS_DOMAIN}, *.{$$SANDBOX_APPS_DOMAIN}:8787 {
           log {
             output stdout
             format json
           }
-          @sandbox_host header_regexp Host ^sbx-[0-9a-f]{52}\.sandbox\.synclave\.net$
+          @sandbox_host header_regexp Host ^sbx-[0-9a-f]{52}[.]{$$SANDBOX_APPS_DOMAIN}(?::8787)?$
           handle @sandbox_host {
             reverse_proxy frontproxy:8088 {
               header_up Accept-Encoding identity
@@ -270,6 +392,7 @@ services:
         exec caddy run --config /tmp/Caddyfile --adapter caddyfile
     ports:
       - "443:443"
+      - "8787:8787"
     volumes:
       - sandboxd-caddy-data:/data
       - sandboxd-caddy-config:/config
@@ -327,8 +450,21 @@ networks:
     ipam:
       config:
         - subnet: 10.191.255.248/29
+  # The builder has public egress for ordinary package installation but no Compose-level path to
+  # sandboxd/sidecar. Pre-launch filters private, link-local, metadata, and host destinations on the
+  # stable bridge interface before this measured service can start.
+  build-egress:
+    name: sandboxd-build-egress
+    driver: bridge
+    driver_opts:
+      com.docker.network.bridge.name: csbuild0
+    ipam:
+      config:
+        - subnet: 172.30.255.0/29
 
 volumes:
   sidecar-state:
   sandboxd-caddy-data:
   sandboxd-caddy-config:
+  sandboxd-buildkit-socket:
+  sandboxd-builder-tools:

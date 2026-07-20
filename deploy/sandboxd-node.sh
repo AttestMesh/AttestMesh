@@ -615,13 +615,15 @@ smoke() {
   _load; _require_env
   [ -z "${REPLACEMENT_PHASE:-}" ] || die "cannot smoke-test during replacement phase $REPLACEMENT_PHASE"
   [ -n "${GATEWAY_URL:-}" ] || die "need GATEWAY_URL"
+  [[ "${SANDBOX_SMOKE_IMAGE:-}" =~ ^ghcr\.io/attestmesh/synclave-workloads@sha256:[0-9a-f]{64}$ ]] \
+    || die "SANDBOX_SMOKE_IMAGE must be an existing official digest in ghcr.io/attestmesh/synclave-workloads"
   _wait_health 3 5 || die "smoke target does not prove the recorded app/compose identity"
-  TOK="$SANDBOX_DAEMON_TOKEN" GW="$GATEWAY_URL" python3 - <<'PY'
+  TOK="$SANDBOX_DAEMON_TOKEN" GW="$GATEWAY_URL" IMAGE="$SANDBOX_SMOKE_IMAGE" python3 - <<'PY'
 import hashlib, json, os, subprocess, sys, time
 
 tok = os.environ["TOK"]
 gw = os.environ["GW"].rstrip("/")
-image = "ghcr.io/dmvt/cs-sandbox-base@sha256:8ccfb22336a73e28b7fd8bef024d355ec5673d70d09a6099ad5094836f65e9d3"
+image = os.environ["IMAGE"]
 payload = {
     "owner": "ops:release-smoke",
     "org_id": "ops",
@@ -644,6 +646,13 @@ def request(method, url, body=None, *, auth=False):
 
 sid = None
 try:
+    code, raw = request("GET", f"{gw}/healthz")
+    if code != 200:
+        raise RuntimeError(f"health returned HTTP {code}: {raw[:500]}")
+    capabilities = json.loads(raw).get("capabilities") or {}
+    if capabilities.get("exec") is not True or capabilities.get("sealed_environment") is not True:
+        raise RuntimeError(f"required sandbox capabilities are unavailable: {capabilities}")
+
     code, raw = request("POST", f"{gw}/_api/sandboxes", payload, auth=True)
     if code != 201:
         raise RuntimeError(f"create returned HTTP {code}: {raw[:500]}")
@@ -676,12 +685,14 @@ try:
     if not all(checks.values()):
         raise RuntimeError("structural attestation smoke failed")
 
-    # Production policy must reject arbitrary exec even for the authenticated control caller.
-    code, _ = request(
-        "POST", f"{gw}/_api/sandboxes/{sid}/exec", {"command": "true"}, auth=True
+    code, raw = request(
+        "POST", f"{gw}/_api/sandboxes/{sid}/exec", {"command": "/bin/true"}, auth=True
     )
-    if code != 400:
-        raise RuntimeError(f"disabled exec returned HTTP {code}, expected 400")
+    if code != 200:
+        raise RuntimeError(f"exec returned HTTP {code}, expected 200: {raw[:500]}")
+    executed = json.loads(raw)
+    if executed != {"exit_code": 0, "stdout": "", "stderr": ""}:
+        raise RuntimeError("exec did not return the bounded success envelope")
 except Exception as error:
     print(f"smoke failed: {error}", file=sys.stderr)
     sys.exit_code = 1
