@@ -15,7 +15,7 @@ class SandboxdDeployContract(unittest.TestCase):
     def test_release_pins_one_daemon_image_and_enables_bounded_exec(self) -> None:
         daemon_digest = (
             "ghcr.io/dmvt/confidential-sandboxes@sha256:"
-            "097ca556c69a75e454810fee718e5c5412b6c266aeb5cf36b5c044ff03faa12b"
+            "786720fcac62597c536ba30337954b472fb40c5844882c01089a61a232accce4"
         )
         self.assertEqual(COMPOSE.count(daemon_digest), 3)
         self.assertIn(f'QUOTA_TOOLS_IMAGE="{daemon_digest}"', PRELAUNCH)
@@ -68,7 +68,7 @@ class SandboxdDeployContract(unittest.TestCase):
         self.assertNotIn("dstack.sock", builder)
         self.assertNotIn("SANDBOX_DAEMON_TOKEN", builder)
         self.assertIn('SANDBOXD_REQUIRE_BUILDER: "1"', daemon)
-        self.assertIn('cpus: "5.0"', daemon)
+        self.assertIn('cpus: "1.0"', daemon)
         self.assertIn(
             "SANDBOXD_BUILD_REPOSITORY: ghcr.io/attestmesh/synclave-workloads",
             daemon,
