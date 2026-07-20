@@ -22,15 +22,20 @@ while :; do
   in_recovery="$(psql -tAc 'select pg_is_in_recovery()' 2>/dev/null | tr -d '[:space:]')"
   if [ "$in_recovery" != "f" ]; then
     _st "replica (in_recovery=${in_recovery:-?}) — skipping backup-push"
+    # Promotion can occur at any time. Poll cheaply instead of waiting a full
+    # backup interval before the newly responsible node notices its new role.
+    sleep 60
+    continue
   else
     _st "primary — backup-push starting (timeout 600s)"
     out="$(timeout 600 wal-g backup-push "$PGDATA_DIR" 2>&1)"; rc=$?
     if [ "$rc" -eq 0 ]; then
       _st "backup-push OK"
       wal-g delete retain FIND_FULL "$RETAIN" --confirm >/dev/null 2>&1 || true
+      sleep "$INTERVAL"
     else
       _st "backup-push FAILED rc=$rc :: $(printf '%s' "$out" | tr '\n' ' ' | tail -c 420)"
+      sleep 300
     fi
   fi
-  sleep "$INTERVAL"
 done

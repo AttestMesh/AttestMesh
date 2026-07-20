@@ -6,7 +6,12 @@
 
 STAT="${PGHA_STATUS_FILE:-/pgha-status/state}"
 mkdir -p "$(dirname "$STAT")" 2>/dev/null || true
-_st() { echo "$(date -u +%FT%TZ) ${PGHA_LOG_TAG:-pgha}: $*" >> "$STAT" 2>/dev/null || true; }
+_st() {
+  local line
+  line="$(date -u +%FT%TZ) ${PGHA_LOG_TAG:-pgha}: $*"
+  echo "$line" >> "$STAT" 2>/dev/null || true
+  [ "${PGHA_LOG_TAG:-}" != etcd ] || echo "$line" >/dev/ttyS0 2>/dev/null || true
+}
 _die() { _st "FATAL: $*"; echo "pgha: FATAL: $*" >&2; exit 1; }
 
 # Block until the sidecar's wireguard interface exists, then print its IPv4.

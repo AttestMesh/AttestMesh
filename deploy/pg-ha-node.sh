@@ -15,19 +15,21 @@ source "$HERE/lib.sh"
 : "${RPC_URL:?source deploy/env.sh first}"
 require PRIVATE_KEY RPC_URL CHAIN_ID DEPLOYER_ADDR
 
-NODE="${1:?usage: pg-ha-node.sh <name> [deploy-all|prime-all|bind-all|verify-all|verify-ha|verify-failover|verify-isolation-all|verify-agent|switchover <pgN>|cycle-replica <pgN>|resize <pgN>|resize-all|update <pgN>|update-all|all|register-all|compute-peers|create-all|deploy|prime|bind|verify <pgN>]}"
+NODE="${1:?usage: pg-ha-node.sh <name> [verify-ownership|deploy-all|prime-all|bind-all|verify-all|verify-runtime|verify-ha|verify-failover|verify-isolation-all|rotation-preflight|rotation-candidate-gate|rotation-survivor-gate <pgN>|rotation-backup-gate|rotation-retire|rotation-final|cycle-replica <pgN>|resize <pgN>|update <pgN>|update-all|all|register-all|compute-peers|create-all|deploy|prime|bind|verify <pgN>]}"
 ACTION="${2:-all}"
 ARG3="${3:-}"
+ARG4="${4:-}"
 BOX_HOST="${BOX_HOST:-ubuntu@173.231.234.133}"
 BOX_PY="${BOX_PY:-/opt/dstack-mcp/venv/bin/python}"
 BOX_DEPLOYER_KEY="${BOX_DEPLOYER_KEY:-/root/.attestmesh/base-deployer.json}"
 BOX_RPC="${BOX_RPC:-https://base-rpc.publicnode.com}"
 COMPOSE="${COMPOSE:-$ROOT/deploy/compose/pg-ha-node.yaml}"
-MATRIX_STATE="${MATRIX_STATE:-$LOGDIR/matrix-node-matrix-node.state}"
-SSH_STATE="${SSH_STATE:-$LOGDIR/ssh-node-ssh-node.state}"
 SECRETS_FILE="${SECRETS_FILE:-$HOME/.attestmesh/pg-ha.env}"
 [ -f "$SECRETS_FILE" ] && source "$SECRETS_FILE"
-export BOX_VCPU="${BOX_VCPU:-8}" BOX_MEM="${BOX_MEM:-65536}" BOX_DISK="${BOX_DISK:-256}"
+# Direct upstream credentials used only by the node-local encrypting gateways.
+# The R2_* values above remain the loopback gateway's client credentials.
+R2_UPSTREAM_CREDS="${R2_UPSTREAM_CREDS:-$HOME/.attestmesh/r2-host-r2.toml}"
+export BOX_VCPU="${BOX_VCPU:-2}" BOX_MEM="${BOX_MEM:-4096}" BOX_DISK="${BOX_DISK:-80}"
 export BOX_PORTS="${BOX_PORTS:-[]}" BOX_GATEWAY_ENABLED="${BOX_GATEWAY_ENABLED:-true}" BOX_NET_MODE="${BOX_NET_MODE:-bridge}"
 GATEWAY_DOMAIN="${GATEWAY_DOMAIN:-gateway.attestmesh.xyz}"
 TS_SUFFIX="${TS_SUFFIX:-tail39cb2e.ts.net}"
@@ -35,6 +37,22 @@ PGHA_COUNT="${PGHA_COUNT:-3}"
 BACKUP_ENABLED="${BACKUP_ENABLED:-true}"
 BACKUP_PREFIX="${BACKUP_PREFIX:-pg-ha}"
 BACKUP_RESTORE="${BACKUP_RESTORE:-}"
+BACKUP_DUMP_INTERVAL_SECONDS="${BACKUP_DUMP_INTERVAL_SECONDS:-21600}"
+PGHA_CLUSTER_NAME="${PGHA_CLUSTER_NAME:-andrew-xyn-pg}"
+PGHA_SAFE_ADDRESS="${PGHA_SAFE_ADDRESS:-}"
+# This driver targets the self-hosted dstack box, whose KMS signer is distinct from
+# deploy/env.sh's Phala production root. An incorrect root fails as InvalidSigChain().
+PGHA_KMS_ROOT="${PGHA_KMS_ROOT:-0x7fa63d99495be2129cf28eee54e2ef2724e3aa2e}"
+# Keep the Pimlico endpoint bundler-only. Operators should set PGHA_CVM_RPC_URL to
+# the node's dedicated box-proxyd route; it deliberately overrides env.sh's default.
+CVM_RPC_URL="${PGHA_CVM_RPC_URL:-${CVM_RPC_URL:-$RPC_URL}}"
+
+_assert_chain_only_control_plane() {
+  local forbidden
+  forbidden=$(grep -Ein 'tailscale|matrix|sshd|openssh' "$COMPOSE" || true)
+  [ -z "$forbidden" ] || die "chain-only control-plane invariant failed; forbidden service/config in $COMPOSE: $forbidden"
+  [ "${BOX_PORTS:-[]}" = "[]" ] || die "host application ports forbidden (BOX_PORTS must be [])"
+}
 
 CSTATE="$LOGDIR/pg-ha-${NODE}.state"
 ZERO32=0x0000000000000000000000000000000000000000000000000000000000000000
@@ -48,16 +66,12 @@ _save_cluster() {
   cat > "$CSTATE" <<EOF
 CLUSTER=${CLUSTER:-}
 MEMBER_IMPL=${MEMBER_IMPL:-}
-MATRIX_X=${MATRIX_X:-}
-MATRIX_MESH_IP=${MATRIX_MESH_IP:-}
-MATRIX_ROOM_ID=${MATRIX_ROOM_ID:-}
-MATRIX_ADMIN_MXIDS=${MATRIX_ADMIN_MXIDS:-}
+PGHA_SAFE_ADDRESS=${PGHA_SAFE_ADDRESS:-}
 CIDR_IP=${CIDR_IP:-}
 CIDR_PREFIX=${CIDR_PREFIX:-}
 MESH_CIDR_STR=${MESH_CIDR_STR:-}
 PGHA_PEERS=${PGHA_PEERS:-}
 PGHA_VERIFY_PASSWORD=${PGHA_VERIFY_PASSWORD:-}
-BOTPASSWORD=${BOTPASSWORD:-}
 PGHA_INITIALIZED=${PGHA_INITIALIZED:-}
 EOF
 }
@@ -86,33 +100,19 @@ _ipv4_from_u32() {
   printf '%d.%d.%d.%d' "$(( (n >> 24) & 255 ))" "$(( (n >> 16) & 255 ))" "$(( (n >> 8) & 255 ))" "$(( n & 255 ))"
 }
 
-_matrix_server_name() {
-  printf '%s.gateway.attestmesh.xyz' "$(printf '%s' "${MATRIX_X#0x}" | tr A-Z a-z)"
+_default_cluster_env() {
+  [ -n "${CLUSTER:-}" ] && [ -n "${MEMBER_IMPL:-}" ] && [ -n "${PGHA_SAFE_ADDRESS:-}" ] \
+    || die "new-mesh state lacks CLUSTER/MEMBER_IMPL/PGHA_SAFE_ADDRESS: $CSTATE"
+  local chain_owner
+  chain_owner=$(cast call "$CLUSTER" 'clusterOwner()(address)' --rpc-url "$RPC_URL" 2>/dev/null)
+  [ -n "$chain_owner" ] && [ "${chain_owner,,}" = "${PGHA_SAFE_ADDRESS,,}" ] \
+    || die "Safe ownership mismatch: clusterOwner=${chain_owner:-unset} expected=$PGHA_SAFE_ADDRESS"
 }
 
-_bot_user_id() { printf '@pgha-%s:%s' "$1" "$(_matrix_server_name)"; }
-
-_default_matrix_env() {
-  [ -f "$MATRIX_STATE" ] || die "missing Matrix state: $MATRIX_STATE"
-  local m_x m_cluster m_impl
-  m_x=$(grep '^X=' "$MATRIX_STATE" | cut -d= -f2-)
-  m_cluster=$(grep '^CLUSTER=' "$MATRIX_STATE" | cut -d= -f2-)
-  m_impl=$(grep '^MEMBER_IMPL=' "$MATRIX_STATE" | cut -d= -f2-)
-  [ -n "$m_x" ] && [ -n "$m_cluster" ] && [ -n "$m_impl" ] || die "Matrix state lacks X/CLUSTER/MEMBER_IMPL"
-
-  MATRIX_X="${MATRIX_X:-$m_x}"
-  CLUSTER="${CLUSTER:-$m_cluster}"
-  MEMBER_IMPL="${MEMBER_IMPL:-$m_impl}"
-  local matrix_member_id mesh_u32
-  matrix_member_id=$(cast call "$CLUSTER" 'memberIdOf(address)(bytes32)' "$MATRIX_X" --rpc-url "$RPC_URL" 2>/dev/null)
-  [ -n "$matrix_member_id" ] && [ "$matrix_member_id" != "$ZERO32" ] || die "Matrix app is not registered in cluster $CLUSTER"
-  mesh_u32=$(cast call "$CLUSTER" 'meshIpOf(bytes32)(uint32)' "$matrix_member_id" --rpc-url "$RPC_URL" 2>/dev/null | awk '{print int($1)}')
-  [ -n "$mesh_u32" ] && [ "$mesh_u32" != 0 ] || die "could not resolve Matrix mesh IP"
-  MATRIX_MESH_IP="${MATRIX_MESH_IP:-$(_ipv4_from_u32 "$mesh_u32")}"
-
-  local server_name; server_name="$(_matrix_server_name)"
-  MATRIX_ROOM_ID="${MATRIX_ROOM_ID:-!QlbJvhWoxMNcJvVwCr:${server_name}}"
-  MATRIX_ADMIN_MXIDS="${MATRIX_ADMIN_MXIDS:-@lsdan:${server_name}}"
+verify_ownership() {
+  _load_cluster
+  _default_cluster_env
+  log "✔ cluster owner is the persisted sole-signer Safe: $PGHA_SAFE_ADDRESS"
 }
 
 _require_env() {
@@ -130,8 +130,18 @@ _require_env() {
     for v in R2_ACCESS_KEY_ID R2_SECRET_ACCESS_KEY R2_ENDPOINT R2_BUCKET; do
       [ -n "${!v:-}" ] || missing="$missing $v"
     done
+    if [ -f "$R2_UPSTREAM_CREDS" ]; then
+      R2_UPSTREAM_ENDPOINT="$(sed -nE 's/^endpoint *= *"?([^" ]+)"?.*/\1/p' "$R2_UPSTREAM_CREDS")"
+      R2_UPSTREAM_BUCKET="$(sed -nE 's/^bucket *= *"?([^" ]+)"?.*/\1/p' "$R2_UPSTREAM_CREDS")"
+      R2_UPSTREAM_REGION="$(sed -nE 's/^region *= *"?([^" ]+)"?.*/\1/p' "$R2_UPSTREAM_CREDS")"; : "${R2_UPSTREAM_REGION:=auto}"
+      R2_UPSTREAM_ACCESS_KEY_ID="$(sed -nE 's/^access_key_id *= *"?([^" ]+)"?.*/\1/p' "$R2_UPSTREAM_CREDS")"
+      R2_UPSTREAM_SECRET_ACCESS_KEY="$(sed -nE 's/^secret_access_key *= *"?([^" ]+)"?.*/\1/p' "$R2_UPSTREAM_CREDS")"
+    fi
+    for v in R2_UPSTREAM_ENDPOINT R2_UPSTREAM_BUCKET R2_UPSTREAM_ACCESS_KEY_ID R2_UPSTREAM_SECRET_ACCESS_KEY; do
+      [ -n "${!v:-}" ] || missing="$missing $v"
+    done
   fi
-  [ -z "$missing" ] || die "missing required env:$missing (put R2_*/BOTPASSWORD in $SECRETS_FILE)"
+  [ -z "$missing" ] || die "missing required env:$missing (put R2_* in $SECRETS_FILE)"
 }
 
 send_seq() {
@@ -176,11 +186,6 @@ _box_run() {
   gtok=$(grep  -E '^\s*token\s*='    "$HOME/.teesql/ghcr-pull.toml" 2>/dev/null | head -1 | sed -E 's/.*=\s*//' | tr -d "\"' ")
   [ -n "$gtok" ] || die "no ghcr token in ~/.teesql/ghcr-pull.toml"
   bootstrap="${NODE_BOOTSTRAP:-new}"
-  # Per-node mention alias so `@pgha-pgN` addresses exactly one bot. Only pg1 also answers to
-  # the friendly shared "pg-ha" alias — giving it to every node would make one `pg-ha: …`
-  # message activate all N agents in the shared room (N staged switchovers, N LLM runs).
-  local aliases="pgha-${node}"
-  [ "$node" = pg1 ] && aliases="${aliases},pg-ha"
   scp -o BatchMode=yes -q "$COMPOSE" "$BOX_HOST:/tmp/${NODE}.yaml"
   scp -o BatchMode=yes -q "$HERE/pg-ha-node-box.py" "$BOX_HOST:/tmp/pg-ha-node-box.py"
   {
@@ -189,40 +194,76 @@ _box_run() {
     printf 'E_BUNDLER_URL=%q\n'           "${CVM_BUNDLER_URL:-${BUNDLER_URL:-$RPC_URL}}"
     printf 'E_GAS_POLICY_ID=%q\n'         "${GAS_POLICY_ID:-}"
     printf 'E_INDEXER_REGISTRY_ADDR=%q\n' "${INDEXER_REGISTRY_ADDR:-}"
+    printf 'E_CLUSTER=%q\n'               "${CLUSTER:-}"
     printf 'E_GATEWAY_DOMAIN=%q\n'        "$GATEWAY_DOMAIN"
+    printf 'E_GATEWAY_DOMAIN_OVERRIDES=%q\n' "${GATEWAY_DOMAIN_OVERRIDES:-}"
     printf 'E_PGHA_NODE_NAME=%q\n'        "$node"
-    printf 'E_PGHA_PEERS=%q\n'            "${PGHA_PEERS:-}"
+    printf 'E_PGHA_PEERS=%q\n'            "${PGHA_PEERS_OVERRIDE:-${PGHA_PEERS:-}}"
+    printf 'E_PGHA_ETCD_FORCE_REJOIN=%q\n' "${PGHA_ETCD_FORCE_REJOIN:-false}"
+    printf 'E_PGHA_ETCD_FORCE_NEW_CLUSTER=%q\n' "${PGHA_ETCD_FORCE_NEW_CLUSTER:-false}"
     printf 'E_PGHA_BOOTSTRAP=%q\n'        "$bootstrap"
     printf 'E_PGHA_MESH_CIDR=%q\n'        "${MESH_CIDR_STR:-}"
     printf 'E_PGHA_VERIFY_PASSWORD=%q\n'  "${PGHA_VERIFY_PASSWORD:-}"
+    printf 'E_PGHA_CLUSTER_NAME=%q\n'     "$PGHA_CLUSTER_NAME"
+    printf 'E_PGHA_SAFE_ADDRESS=%q\n'      "$PGHA_SAFE_ADDRESS"
+    printf 'E_PGHA_RECOVERY_CANDIDATE=%q\n' "${PGHA_RECOVERY_CANDIDATE:-}"
+    printf 'E_PGHA_REINIT_NODE=%q\n'        "${PGHA_REINIT_NODE:-}"
+    printf 'E_PGHA_CRASH_RECOVERY_ONLY=%q\n' "${PGHA_CRASH_RECOVERY_ONLY:-false}"
     printf 'E_BACKUP_ENABLED=%q\n'        "$BACKUP_ENABLED"
     printf 'E_BACKUP_PREFIX=%q\n'         "$BACKUP_PREFIX"
     printf 'E_BACKUP_RESTORE=%q\n'        "$BACKUP_RESTORE"
+    printf 'E_BACKUP_DUMP_INTERVAL_SECONDS=%q\n' "$BACKUP_DUMP_INTERVAL_SECONDS"
     printf 'E_R2_ACCESS_KEY_ID=%q\n'      "${R2_ACCESS_KEY_ID:-}"
     printf 'E_R2_SECRET_ACCESS_KEY=%q\n'  "${R2_SECRET_ACCESS_KEY:-}"
     printf 'E_R2_ENDPOINT=%q\n'           "${R2_ENDPOINT:-}"
     printf 'E_R2_BUCKET=%q\n'             "${R2_BUCKET:-}"
     printf 'E_R2_REGION=%q\n'             "${R2_REGION:-us-east-1}"
-    printf 'E_MATRIX_MESH_IP=%q\n'        "${MATRIX_MESH_IP:-}"
-    printf 'E_MATRIX_USER_ID=%q\n'        "$(_bot_user_id "$node")"
-    printf 'E_MATRIX_PASSWORD=%q\n'       "${BOTPASSWORD:-}"
-    printf 'E_MATRIX_ROOM_ID=%q\n'        "${MATRIX_ROOM_ID:-}"
-    printf 'E_MATRIX_ADMIN_MXIDS=%q\n'    "${MATRIX_ADMIN_MXIDS:-}"
-    printf 'E_MATRIX_MENTION_ALIASES=%q\n' "$aliases"
+    printf 'E_R2_UPSTREAM_ENDPOINT=%q\n'  "${R2_UPSTREAM_ENDPOINT:-}"
+    printf 'E_R2_UPSTREAM_BUCKET=%q\n'    "${R2_UPSTREAM_BUCKET:-}"
+    printf 'E_R2_UPSTREAM_REGION=%q\n'    "${R2_UPSTREAM_REGION:-auto}"
+    printf 'E_R2_UPSTREAM_ACCESS_KEY_ID=%q\n' "${R2_UPSTREAM_ACCESS_KEY_ID:-}"
+    printf 'E_R2_UPSTREAM_SECRET_ACCESS_KEY=%q\n' "${R2_UPSTREAM_SECRET_ACCESS_KEY:-}"
     printf 'E_LLM_BASE_URL=%q\n'          "${LLM_BASE_URL:-}"
     printf 'E_LLM_MODEL=%q\n'             "${LLM_MODEL:-}"
     printf 'E_LLM_API_KEY=%q\n'           "${LLM_API_KEY:-}"
     printf 'E_DSTACK_DOCKER_USERNAME=%q\n' "${guser:-dmvt}"
     printf 'E_DSTACK_DOCKER_PASSWORD=%q\n' "$gtok"
     printf 'E_DSTACK_DOCKER_REGISTRY=%q\n' "ghcr.io"
-  } | ssh_box "sudo BOX_APP_NAME='${NODE}' BOX_NAME='${NODE}-${node}' BOX_COMPOSE='/tmp/${NODE}.yaml' BOX_VCPU=$BOX_VCPU BOX_MEM=$BOX_MEM BOX_DISK=$BOX_DISK BOX_PORTS='$BOX_PORTS' BOX_GATEWAY_ENABLED='$BOX_GATEWAY_ENABLED' BOX_NET_MODE='$BOX_NET_MODE' BOX_FRESH_DISK='${BOX_FRESH_DISK:-}' \
+  } | ssh_box "sudo BOX_RPC='$BOX_RPC' BOX_APP_NAME='${NODE}' BOX_NAME='${NODE}-${node}' BOX_COMPOSE='/tmp/${NODE}.yaml' BOX_VCPU=$BOX_VCPU BOX_MEM=$BOX_MEM BOX_DISK=$BOX_DISK BOX_PORTS='$BOX_PORTS' BOX_GATEWAY_ENABLED='$BOX_GATEWAY_ENABLED' BOX_NET_MODE='$BOX_NET_MODE' BOX_FRESH_DISK='${BOX_FRESH_DISK:-}' \
     bash -c 'set -a; . /dev/stdin; set +a; exec $BOX_PY /tmp/pg-ha-node-box.py $mode $app_id $vm_id'"
+}
+
+# Build a Phala-sealed environment without putting secrets in CLI arguments. The caller
+# supplies the provider-local gateway domain/overrides and passes the resulting file to
+# `phala deploy -e`; the file is always mode 0600 and must be removed after deployment.
+build_phala_env() {
+  local node="${1:?phala-env requires pgN}" out="${2:?phala-env requires output path}" guser gtok peers
+  _load_cluster; _default_cluster_env; _require_env; _mesh_math_init; _nload "$node"
+  [ -n "${PGHA_PEERS:-}" ] || die "need PGHA_PEERS"
+  peers="${PGHA_PEERS_OVERRIDE:-$PGHA_PEERS}"
+  guser=$(grep -E '^\s*username\s*=' "$HOME/.teesql/ghcr-pull.toml" | head -1 | sed -E 's/.*=\s*//' | tr -d "\"' ")
+  gtok=$(grep -E '^\s*token\s*=' "$HOME/.teesql/ghcr-pull.toml" | head -1 | sed -E 's/.*=\s*//' | tr -d "\"' ")
+  [ -n "$gtok" ] || die "no ghcr token"
+  umask 077
+  {
+    printf 'CHAIN_ID=%s\nRPC_URL=%s\nBUNDLER_URL=%s\nGAS_POLICY_ID=%s\nCLUSTER=%s\n' "$CHAIN_ID" "${CVM_RPC_URL:-$RPC_URL}" "${CVM_BUNDLER_URL:-${BUNDLER_URL:-$RPC_URL}}" "${GAS_POLICY_ID:-}" "$CLUSTER"
+    printf 'INDEXER_REGISTRY_ADDR=%s\nGATEWAY_DOMAIN=%s\nGATEWAY_DOMAIN_OVERRIDES=%s\n' "$INDEXER_REGISTRY_ADDR" "$GATEWAY_DOMAIN" "${GATEWAY_DOMAIN_OVERRIDES:-}"
+    printf 'PGHA_NODE_NAME=%s\nPGHA_PEERS=%s\nPGHA_BOOTSTRAP=join\nPGHA_MESH_CIDR=%s\nPGHA_ETCD_FORCE_REJOIN=%s\nPGHA_ETCD_FORCE_NEW_CLUSTER=%s\n' "$node" "$peers" "$MESH_CIDR_STR" "${PGHA_ETCD_FORCE_REJOIN:-false}" "${PGHA_ETCD_FORCE_NEW_CLUSTER:-false}"
+    printf 'PGHA_VERIFY_PASSWORD=%s\nPGHA_CLUSTER_NAME=%s\nPGHA_SAFE_ADDRESS=%s\nPGHA_CRASH_RECOVERY_ONLY=false\n' "$PGHA_VERIFY_PASSWORD" "$PGHA_CLUSTER_NAME" "$PGHA_SAFE_ADDRESS"
+    printf 'BACKUP_ENABLED=%s\nBACKUP_PREFIX=%s\nBACKUP_RESTORE=%s\nBACKUP_DUMP_INTERVAL_SECONDS=%s\n' "$BACKUP_ENABLED" "$BACKUP_PREFIX" "$BACKUP_RESTORE" "$BACKUP_DUMP_INTERVAL_SECONDS"
+    printf 'R2_ACCESS_KEY_ID=%s\nR2_SECRET_ACCESS_KEY=%s\nR2_ENDPOINT=%s\nR2_BUCKET=%s\nR2_REGION=%s\n' "$R2_ACCESS_KEY_ID" "$R2_SECRET_ACCESS_KEY" "$R2_ENDPOINT" "$R2_BUCKET" "${R2_REGION:-us-east-1}"
+    printf 'R2_UPSTREAM_ENDPOINT=%s\nR2_UPSTREAM_BUCKET=%s\nR2_UPSTREAM_REGION=%s\nR2_UPSTREAM_ACCESS_KEY_ID=%s\nR2_UPSTREAM_SECRET_ACCESS_KEY=%s\n' "$R2_UPSTREAM_ENDPOINT" "$R2_UPSTREAM_BUCKET" "$R2_UPSTREAM_REGION" "$R2_UPSTREAM_ACCESS_KEY_ID" "$R2_UPSTREAM_SECRET_ACCESS_KEY"
+    printf 'LLM_BASE_URL=%s\nLLM_MODEL=%s\nLLM_API_KEY=%s\n' "$LLM_BASE_URL" "$LLM_MODEL" "$LLM_API_KEY"
+    printf 'DSTACK_DOCKER_REGISTRY=ghcr.io\nDSTACK_DOCKER_USERNAME=%s\nDSTACK_DOCKER_PASSWORD=%s\n' "$guser" "$gtok"
+  } >"$out"
+  log "✔ built Phala sealed env for $node at $out (mode $(stat -c %a "$out"))"
 }
 
 # ── pipeline: register-all -> compute-peers -> create-all ───────────────────────────────
 
 register_all() {
-  _load_cluster; _default_matrix_env; _require_env
+  _assert_chain_only_control_plane
+  _load_cluster; _default_cluster_env; _require_env
   _save_cluster
   local n out j
   for n in $(_nodes); do
@@ -240,7 +281,7 @@ register_all() {
 }
 
 compute_peers() {
-  _load_cluster; _default_matrix_env; _mesh_math_init
+  _load_cluster; _default_cluster_env; _mesh_math_init
   local used=" " n mid ip attempts out j existing id
   # Our own nodes' member IDs — so a RE-RUN (resume) doesn't treat a node we already
   # registered as an external collision and needlessly register a throwaway app_id.
@@ -292,9 +333,8 @@ compute_peers() {
 }
 
 create_all() {
-  _load_cluster; _default_matrix_env; _require_env; _mesh_math_init
+  _load_cluster; _default_cluster_env; _require_env; _mesh_math_init
   [ -n "${PGHA_PEERS:-}" ] || die "no PGHA_PEERS — run compute-peers first"
-  [ -n "${BOTPASSWORD:-}" ] || die "missing BOTPASSWORD (shared password of the @pgha-pgN bot users; put it in $SECRETS_FILE)"
   PGHA_VERIFY_PASSWORD="${PGHA_VERIFY_PASSWORD:-$(openssl rand -hex 24)}"
   _save_cluster
   local n out j bootstrap
@@ -318,8 +358,14 @@ create_all() {
 deploy_all() { register_all; compute_peers; create_all; }
 
 prime_all() {
-  _load_cluster; _default_matrix_env
+  _load_cluster; _default_cluster_env
   local n h="" allowed
+  allowed=$(cast call "$CLUSTER" 'allowedKmsRoots(address)(bool)' "$PGHA_KMS_ROOT" --rpc-url "$RPC_URL" 2>/dev/null)
+  if [ "$allowed" = true ]; then
+    log "self-hosted box KMS root already allowlisted"
+  else
+    send_seq "pgha-addKmsRoot-${NODE}" "$CLUSTER" "addAllowedKmsRoot(address)" "$PGHA_KMS_ROOT"
+  fi
   for n in $(_nodes); do
     _nload "$n"
     [ -n "$H" ] || die "$n has no compose hash — run register-all first"
@@ -344,7 +390,7 @@ prime_all() {
 }
 
 bind_all() {
-  _load_cluster; _default_matrix_env
+  _load_cluster; _default_cluster_env
   [ -n "${MEMBER_IMPL:-}" ] || die "need MEMBER_IMPL"
   local n reinit c
   reinit=$(cast calldata "reinitializeFromDstackApp(address)" "$CLUSTER")
@@ -372,7 +418,7 @@ SCRIPT
 }
 
 verify_all() {
-  _load_cluster; _default_matrix_env; _mesh_math_init
+  _load_cluster; _default_cluster_env; _mesh_math_init
   local n i id count onchain_u32 onchain_ip
   for n in $(_nodes); do
     _nload "$n"
@@ -606,103 +652,6 @@ SCRIPT
   log "✔ host-isolation invariant holds on all $PGHA_COUNT nodes"
 }
 
-# ── Matrix agent verification (copied from postgres-node.sh) ─────────────────────────────
-
-_matrix_fqdn() {
-  if [ -n "${MATRIX_TAILNET_FQDN:-}" ]; then
-    printf '%s\n' "$MATRIX_TAILNET_FQDN"
-    return 0
-  fi
-  local n
-  for n in $(tailscale status 2>/dev/null | awk 'tolower($2) ~ /^matrix-attestmesh/ {print $2}'); do
-    curl -sS --max-time 6 "https://$n.$TS_SUFFIX/_matrix/client/versions" 2>/dev/null | grep -q '"versions"' && {
-      printf '%s\n' "$n.$TS_SUFFIX"
-      return 0
-    }
-  done
-  return 1
-}
-
-_matrix_verify_credentials() {
-  _load_cluster
-  _default_matrix_env
-  MATRIX_VERIFY_LOCALPART="${MATRIX_VERIFY_USER:-${INITIAL_ADMIN:-}}"
-  case "$MATRIX_VERIFY_LOCALPART" in
-    @*:*) MATRIX_VERIFY_LOCALPART="$(printf '%s' "$MATRIX_VERIFY_LOCALPART" | sed -nE 's/^@([^:]+):.*/\1/p')" ;;
-  esac
-  if [ -z "$MATRIX_VERIFY_LOCALPART" ]; then
-    MATRIX_VERIFY_LOCALPART="$(printf '%s' "$MATRIX_ADMIN_MXIDS" | cut -d, -f1 | sed -nE 's/^@([^:]+):.*/\1/p')"
-  fi
-  MATRIX_VERIFY_PASSWORD_RESOLVED="${MATRIX_VERIFY_PASSWORD:-${INITIAL_ADMIN_PASSWORD:-}}"
-  if [ -z "$MATRIX_VERIFY_PASSWORD_RESOLVED" ] && [ -f "$MATRIX_STATE" ]; then
-    MATRIX_VERIFY_PASSWORD_RESOLVED="$(grep '^IAPW=' "$MATRIX_STATE" | cut -d= -f2-)"
-  fi
-  [ -n "$MATRIX_VERIFY_LOCALPART" ] && [ -n "$MATRIX_VERIFY_PASSWORD_RESOLVED" ] || \
-    die "need Matrix verifier credentials: set MATRIX_VERIFY_USER/MATRIX_VERIFY_PASSWORD or keep IAPW in $MATRIX_STATE"
-}
-
-_matrix_expect_reply() {
-  local label="$1" bot="$2" command="$3" expect_re="$4" fqdn
-  _matrix_verify_credentials
-  fqdn="$(_matrix_fqdn)" || die "could not find live Matrix tailnet FQDN (set MATRIX_TAILNET_FQDN=...)"
-  log "▶ Matrix room check: $label via https://$fqdn"
-  if ! MATRIX_PROBE_FQDN="$fqdn" \
-    MATRIX_PROBE_ROOM_ID="$MATRIX_ROOM_ID" \
-    MATRIX_PROBE_USER="$MATRIX_VERIFY_LOCALPART" \
-    MATRIX_PROBE_PASSWORD="$MATRIX_VERIFY_PASSWORD_RESOLVED" \
-    MATRIX_PROBE_BOT="$bot" \
-    MATRIX_PROBE_COMMAND="$command" \
-    MATRIX_PROBE_EXPECT_RE="$expect_re" \
-    python3 "$HERE/matrix-probe.py"; then
-    die "Matrix room check failed: $label"
-  fi
-  log "✔ Matrix room check passed: $label"
-}
-
-verify_agent() {
-  _load_cluster; _default_matrix_env
-  local bot
-  bot="$(_bot_user_id pg1)"
-  _matrix_expect_reply "pgha-admin-agent status" "$bot" "$bot !pgha status" "HA cluster"
-}
-
-switchover() {
-  local candidate="${1:?usage: pg-ha-node.sh <name> switchover <pgN>}" bot fqdn
-  _load_cluster; _default_matrix_env; _matrix_verify_credentials
-  case " $(_nodes | tr '\n' ' ') " in
-    *" $candidate "*) ;;
-    *) die "unknown switchover candidate: $candidate" ;;
-  esac
-  bot="$(_bot_user_id pg1)"
-  fqdn="$(_matrix_fqdn)" || die "could not find live Matrix tailnet FQDN"
-  log "▶ controlled Patroni switchover to $candidate via $bot"
-  MATRIX_PROBE_FQDN="$fqdn" \
-    MATRIX_PROBE_ROOM_ID="$MATRIX_ROOM_ID" \
-    MATRIX_PROBE_USER="$MATRIX_VERIFY_LOCALPART" \
-    MATRIX_PROBE_PASSWORD="$MATRIX_VERIFY_PASSWORD_RESOLVED" \
-    MATRIX_PROBE_BOT="$bot" \
-    MATRIX_PROBE_COMMAND="$bot !pgha switchover $candidate" \
-    MATRIX_PROBE_EXPECT_RE='confirm ([a-f0-9]{6,12})' \
-    MATRIX_PROBE_FOLLOWUP_TEMPLATE='confirm {1}' \
-    MATRIX_PROBE_FOLLOWUP_EXPECT_RE='Switchover requested' \
-    python3 "$HERE/matrix-probe.py" || die "controlled switchover request failed"
-
-  local first_ip leader
-  first_ip="${PGHA_PEERS#*=}"; first_ip="${first_ip%%,*}"
-  for i in $(seq 1 30); do
-    leader=$(_mesh_ssh "curl -fsS --max-time 5 http://${first_ip}:8008/cluster" 2>/dev/null \
-      | jq -r '.members[]? | select(.role == "leader") | .name' || true)
-    if [ "$leader" = "$candidate" ]; then
-      verify_ha
-      log "✔ controlled switchover complete: leader=$candidate"
-      return 0
-    fi
-    log "… waiting for leader=$candidate (current=${leader:-none}, $i/30)"
-    sleep 2
-  done
-  die "Patroni did not make $candidate leader within 60s"
-}
-
 cycle_replica() {
   local target="${1:?usage: pg-ha-node.sh <name> cycle-replica <pgN>}" first_ip leader state role
   _load_cluster
@@ -738,23 +687,26 @@ cycle_replica() {
 
 update_member() {
   local n="${1:?usage: pg-ha-node.sh <name> update <pgN>}"
-  _load_cluster; _default_matrix_env; _require_env; _mesh_math_init
-  [ -n "${PGHA_PEERS:-}" ] && [ -n "${BOTPASSWORD:-}" ] || die "need PGHA_PEERS/BOTPASSWORD in $CSTATE / $SECRETS_FILE"
+  _load_cluster; _default_cluster_env; _require_env; _mesh_math_init
+  [ -n "${PGHA_PEERS:-}" ] || die "need PGHA_PEERS in $CSTATE"
   _nload "$n"
   [ -n "$X" ] && [ -n "$VM_ID" ] || die "need X/VM_ID for $n"
   local nh allowed out j
-  nh=$(NODE_BOOTSTRAP=join _box_run hash "$n" | grep -oE '^[0-9a-f]{64}$' | tail -1)
+  local roll_bootstrap=new
+  [ -n "${PGHA_INITIALIZED:-}" ] && roll_bootstrap=join
+  nh=$(NODE_BOOTSTRAP="$roll_bootstrap" _box_run hash "$n" | grep -oE '^[0-9a-f]{64}$' | tail -1)
   [ -n "$nh" ] || die "could not compute new compose_hash"
   log "new compose_hash=0x$nh"
   allowed=$(cast call "$CLUSTER" 'allowedComposeHashes(bytes32)(bool)' "0x$nh" --rpc-url "$RPC_URL" 2>/dev/null)
   if [ "$allowed" = true ]; then
     log "compose hash already allowlisted"
   else
-    send_seq "pgha-update-addHash-${NODE}" "$CLUSTER" "addComposeHash(bytes32)" "0x$nh"
+    send_seq "pgha-update-addHash-${NODE}" "$CLUSTER" "addComposeHash(bytes32)" "0x$nh" \
+      || die "compose hash admission failed; refusing to stop or update $n"
   fi
   # BOOTSTRAP=join is safe on every roll: a preserved data dir short-circuits it, and a
   # fresh disk (BOX_FRESH_DISK=1) must re-join the established quorum anyway.
-  out=$(NODE_BOOTSTRAP=join _box_run update "$n" "$X" "$VM_ID") || die "in-place update failed for $n"
+  out=$(NODE_BOOTSTRAP="$roll_bootstrap" _box_run update "$n" "$X" "$VM_ID") || die "in-place update failed for $n"
   echo "$out"
   j=$(echo "$out" | grep '"app_id"' | tail -1)
   H=$(echo "$j" | jq -r .compose_hash)
@@ -779,6 +731,68 @@ update_all() {
     verify_ha
   done
   log "✔ rolled all $PGHA_COUNT nodes"
+}
+
+verify_backup() {
+  _load_cluster
+  local n serial line stamp epoch now gateway_ok=0 base_epoch=0 dump_epoch=0
+  now=$(date -u +%s)
+  for n in $(_nodes); do
+    _nload "$n"
+    [ -n "$VM_ID" ] || die "no VM_ID for $n"
+    serial=$(_box_run logs "$n" "$VM_ID" 2>/dev/null) || die "could not read $n serial log"
+    line=$(grep 's3gw: ready: serving S3 on :19000' <<<"$serial" | tail -1)
+    [ -n "$line" ] || die "$n has no local encrypted-gateway ready evidence"
+    gateway_ok=$((gateway_ok + 1))
+    while IFS= read -r line; do
+      stamp=$(grep -oE '^20[0-9]{2}-[0-9]{2}-[0-9]{2}T[0-9:.+-]+Z?' <<<"$line" | head -1)
+      [ -n "$stamp" ] || continue
+      epoch=$(date -u -d "$stamp" +%s 2>/dev/null || echo 0)
+      case "$line" in
+        *'base: backup-push OK'*) [ "$epoch" -le "$base_epoch" ] || base_epoch=$epoch ;;
+        *'logical: uploaded '*) [ "$epoch" -le "$dump_epoch" ] || dump_epoch=$epoch ;;
+      esac
+    done <<<"$serial"
+  done
+  [ "$gateway_ok" -eq "$PGHA_COUNT" ] || die "not every node reported a ready local gateway"
+  [ "$base_epoch" -gt 0 ] || die "no successful base backup observed"
+  [ "$dump_epoch" -gt 0 ] || die "no successful logical dump observed"
+  [ $((now - base_epoch)) -le "${BACKUP_VERIFY_MAX_AGE_SECONDS:-25200}" ] \
+    || die "latest base backup is older than 7h"
+  [ $((now - dump_epoch)) -le "${BACKUP_VERIFY_MAX_AGE_SECONDS:-25200}" ] \
+    || die "latest logical dump is older than 7h"
+  log "✔ backup verification passed: $PGHA_COUNT local gateways ready; base + logical successes are fresh"
+}
+
+verify_runtime() {
+  _load_cluster
+  local n info serial recent peers lock owner="" lock_observers=0
+  for n in $(_nodes); do
+    _nload "$n"
+    info=$(_box_run info "$n" "$VM_ID" 2>/dev/null | grep -E '^\{.*"vm_id"' | tail -1)
+    [ "$(jq -r '.status // ""' <<<"$info")" = running ] \
+      && [ -z "$(jq -r '.boot_error // empty' <<<"$info")" ] \
+      || die "$n is not running cleanly"
+    serial=$(_box_run logs "$n" "$VM_ID" 2>/dev/null) || die "could not read $n serial log"
+    recent=$(tail -1000 <<<"$serial")
+    peers=$(grep 'wg diagnostic.*live=true' <<<"$recent" \
+      | sed -nE 's/.* peer=([0-9a-f]+).*/\1/p' | sort -u | wc -l)
+    [ "$peers" -ge $((PGHA_COUNT - 1)) ] || die "$n lacks live evidence for every mesh peer"
+    lock=$(grep 'Lock owner:' <<<"$recent" | tail -1 | sed -nE 's/.*Lock owner: ([^; ]+).*/\1/p')
+    # Quiet replicas usually emit this steady-state form after bootstrap; a transient
+    # "Lock owner" line should not have to remain in the bounded serial-log tail.
+    [ -n "$lock" ] || lock=$(grep 'following a leader (' <<<"$recent" | tail -1 \
+      | sed -nE 's/.*following a leader \(([^)]+)\).*/\1/p')
+    if [ -n "$lock" ]; then
+      [ "$lock" != None ] || die "$n most recently observed no Patroni leader"
+      [ -z "$owner" ] && owner="$lock"
+      [ "$lock" = "$owner" ] || die "Patroni leader disagreement: expected $owner, $n observes $lock"
+      lock_observers=$((lock_observers + 1))
+    fi
+  done
+  [ "$lock_observers" -ge $((PGHA_COUNT / 2 + 1)) ] \
+    || die "fewer than a quorum of serial logs contain current leader evidence"
+  log "✔ runtime verification passed: all nodes running, mesh-live, quorum observes leader=$owner"
 }
 
 host_storage_guard() {
@@ -808,6 +822,9 @@ resize_member() {
 
   before="$(vm_info_json "$target" "$VM_ID")"
   [ -n "$before" ] || die "could not read VMM resources for $target"
+  if [ "$(jq -r .disk_size <<<"$before")" -gt "$BOX_DISK" ]; then
+    die "$target disk cannot shrink in place; use BOX_FRESH_DISK=1 update $target to recreate and re-seed it"
+  fi
   if [ "$(jq -r .vcpu <<<"$before")" = "$BOX_VCPU" ] \
     && [ "$(jq -r .memory <<<"$before")" = "$BOX_MEM" ] \
     && [ "$(jq -r .disk_size <<<"$before")" = "$BOX_DISK" ]; then
@@ -869,32 +886,153 @@ resize_member() {
   log "✔ $target resized and verified at ${BOX_VCPU} vCPU / ${BOX_MEM} MB / ${BOX_DISK} GB"
 }
 
-resize_all() {
-  local first_ip topology leader candidate
-  local -a replicas
-  _load_cluster
-  verify_ha
-  first_ip="${PGHA_PEERS#*=}"; first_ip="${first_ip%%,*}"
-  topology=$(_mesh_ssh "curl -fsS --max-time 5 http://${first_ip}:8008/cluster")
-  leader=$(jq -r '.members[] | select(.role == "leader") | .name' <<<"$topology")
-  mapfile -t replicas < <(jq -r '.members[] | select(.role == "replica") | .name' <<<"$topology" | sort)
-  [ -n "$leader" ] && [ "${#replicas[@]}" -eq $((PGHA_COUNT - 1)) ] \
-    || die "unexpected Patroni topology before resize"
+# ── mixed-provider rotation gates (Smithers primitives) ───────────────────────────────
 
-  for candidate in "${replicas[@]}"; do
-    resize_member "$candidate"
+_rotation_env() {
+  : "${PGHA_ROTATION_CANDIDATE:?set PGHA_ROTATION_CANDIDATE (for example pg4)}"
+  : "${PGHA_ROTATION_RETIRED:?set PGHA_ROTATION_RETIRED (for example pg2)}"
+  : "${PGHA_ROTATION_FINAL_PEERS:?set PGHA_ROTATION_FINAL_PEERS}"
+  : "${PGHA_ROTATION_PHALA_CVM_ID:?set PGHA_ROTATION_PHALA_CVM_ID}"
+  : "${PGHA_ROTATION_EVIDENCE_NODE:?set PGHA_ROTATION_EVIDENCE_NODE (surviving box node)}"
+  : "${PGHA_ROTATION_BOX_COMPOSE_HASH:?set PGHA_ROTATION_BOX_COMPOSE_HASH}"
+  : "${PGHA_ROTATION_PHALA_COMPOSE_HASH:?set PGHA_ROTATION_PHALA_COMPOSE_HASH}"
+  case ",${PGHA_ROTATION_FINAL_PEERS}," in
+    *",${PGHA_ROTATION_CANDIDATE}="*) ;;
+    *) die "final peer map does not contain candidate ${PGHA_ROTATION_CANDIDATE}" ;;
+  esac
+  case ",${PGHA_ROTATION_FINAL_PEERS}," in
+    *",${PGHA_ROTATION_RETIRED}="*) die "final peer map still contains retired node ${PGHA_ROTATION_RETIRED}" ;;
+  esac
+  local count
+  count=$(printf '%s' "$PGHA_ROTATION_FINAL_PEERS" | awk -F, '{print NF}')
+  [ $((count % 2)) -eq 1 ] || die "final peer map must have an odd member count (got $count)"
+}
+
+rotation_preflight() {
+  _rotation_env; _load_cluster
+  command -v phala >/dev/null || die "phala CLI unavailable"
+  local j
+  j=$(phala cvms get "$PGHA_ROTATION_PHALA_CVM_ID" --json) || die "cannot read Phala candidate"
+  [ "$(jq -r '.status' <<<"$j")" = running ] || die "Phala candidate is not running"
+  [ "$(jq -r '.resource.vcpu' <<<"$j")" = 2 ] || die "Phala candidate must have 2 vCPU"
+  [ "$(jq -r '.resource.memory_in_gb' <<<"$j")" = 4 ] || die "Phala candidate must have 4GB RAM"
+  [ "$(jq -r '.resource.disk_in_gb' <<<"$j")" = 80 ] || die "Phala candidate must have 80GB disk"
+  [ "$(jq -r '.public_logs' <<<"$j")" = false ] || die "Phala public logs must be disabled"
+  [ "$(jq -r '.public_sysinfo' <<<"$j")" = false ] || die "Phala public sysinfo must be disabled"
+  [ "$(jq -r '.listed' <<<"$j")" = false ] || die "Phala CVM must not be listed"
+  [ "$(jq -r '.ssh_pubkey // ""' <<<"$j")" = "" ] || die "Phala candidate has an SSH key"
+  [ "$(cast call "$CLUSTER" 'allowedComposeHashes(bytes32)(bool)' "$PGHA_ROTATION_BOX_COMPOSE_HASH" --rpc-url "$RPC_URL")" = true ] \
+    || die "box compose hash is not Safe-admitted"
+  [ "$(cast call "$CLUSTER" 'allowedComposeHashes(bytes32)(bool)' "$PGHA_ROTATION_PHALA_COMPOSE_HASH" --rpc-url "$RPC_URL")" = true ] \
+    || die "Phala compose hash is not Safe-admitted"
+  _nload "$PGHA_ROTATION_RETIRED"
+  [ -n "$VM_ID" ] || die "no recorded VM for retired node"
+  j=$(_box_run info "$PGHA_ROTATION_RETIRED" "$VM_ID") || die "cannot read retired VM"
+  [ "$(jq -r '.vcpu' <<<"$j")" = 2 ] && [ "$(jq -r '.memory' <<<"$j")" = 4096 ] \
+    && [ "$(jq -r '.disk_size' <<<"$j")" = 80 ] || die "retired VM has unexpected resources"
+  log "✔ rotation preflight: exact resources, no SSH, no public Phala diagnostics, odd final map"
+}
+
+rotation_survivor_gate() {
+  _rotation_env
+  local n="${1:?rotation-survivor-gate requires pgN}" serial i
+  _nload "$n"; [ -n "$VM_ID" ] || die "no VM for survivor $n"
+  for i in $(seq 1 40); do
+    serial=$(_box_run logs "$n" "$VM_ID") || die "cannot read survivor serial"
+    if grep -Fq "backends: ${PGHA_ROTATION_FINAL_PEERS}" <<<"$serial" \
+      && grep -Eq "I am \($n\), (the leader with the lock|a secondary, and following a leader)" <<<"$serial"; then
+      grep -Eq 'PANIC:|could not locate a valid checkpoint record' <<<"$(tail -n 500 <<<"$serial")" \
+        && die "$n has a recent PostgreSQL panic"
+      log "✔ survivor $n has final map and a healthy Patroni role"
+      return 0
+    fi
+    log "… waiting for $n final-map/Patroni evidence ($i/40); observed=$(grep -F 'backends:' <<<"$serial" | tail -1 | tr -s ' ' | cut -c1-220); role=$(grep -E "I am \($n\)" <<<"$serial" | tail -1 | tr -s ' ' | cut -c1-160)"
+    sleep 5
   done
-  candidate="${replicas[0]}"
-  switchover "$candidate"
-  resize_member "$leader"
-  verify_ha
-  if [ "${SKIP_CLIENT_PROBES:-0}" != 1 ]; then
-    "$HERE/pg-ha-client-failover.sh" probe-once
+  die "$n did not seal the final peer map with healthy Patroni evidence"
+}
+
+rotation_candidate_gate() {
+  _rotation_env; _load_cluster
+  local info member_id serial
+  info=$(phala cvms get "$PGHA_ROTATION_PHALA_CVM_ID" --json) || die "cannot read Phala candidate"
+  [ "$(jq -r '.status' <<<"$info")" = running ] || die "candidate CVM is not running"
+  member_id=$(cast call "$CLUSTER" 'memberIdOf(address)(bytes32)' "$(jq -r '.app_id' <<<"$info")" --rpc-url "$RPC_URL" 2>/dev/null)
+  [ -n "$member_id" ] && [ "$member_id" != "$ZERO32" ] || die "candidate is not registered in the mesh"
+  _nload "$PGHA_ROTATION_EVIDENCE_NODE"; [ -n "$VM_ID" ] || die "no evidence-node VM"
+  serial=$(_box_run logs "$PGHA_ROTATION_EVIDENCE_NODE" "$VM_ID") || die "cannot read survivor serial"
+  grep -Eiq "PATRONI_CLUSTER_EVIDENCE.*(\"name\"[[:space:]]*:[[:space:]]*\"${PGHA_ROTATION_CANDIDATE}\".*\"state\"[[:space:]]*:[[:space:]]*\"streaming\"|\"state\"[[:space:]]*:[[:space:]]*\"streaming\".*\"name\"[[:space:]]*:[[:space:]]*\"${PGHA_ROTATION_CANDIDATE}\")" <<<"$serial" \
+    || die "survivor has no streaming-replica evidence for ${PGHA_ROTATION_CANDIDATE}"
+  log "✔ survivor observes registered candidate as a streaming replica"
+}
+
+rotation_backup_gate() {
+  _rotation_env
+  local n="$PGHA_ROTATION_EVIDENCE_NODE" serial base dump now stamp epoch
+  _nload "$n"; [ -n "$VM_ID" ] || die "no VM for evidence node $n"
+  serial=$(_box_run logs "$n" "$VM_ID") || die "cannot read evidence-node serial"
+  grep -q 's3gw: ready: serving S3 on :19000' <<<"$serial" || die "local encrypted R2 gateway not ready"
+  base=$(grep 'base: backup-push OK' <<<"$serial" | tail -1)
+  dump=$(grep 'logical: uploaded ' <<<"$serial" | tail -1)
+  [ -n "$base" ] && [ -n "$dump" ] || die "fresh base/logical backup evidence missing"
+  now=$(date -u +%s)
+  for line in "$base" "$dump"; do
+    stamp=$(grep -oE '^20[0-9]{2}-[0-9]{2}-[0-9]{2}T[0-9:.+-]+Z?' <<<"$line" | head -1)
+    epoch=$(date -u -d "$stamp" +%s 2>/dev/null || echo 0)
+    [ "$epoch" -gt 0 ] && [ $((now - epoch)) -le "${BACKUP_VERIFY_MAX_AGE_SECONDS:-25200}" ] \
+      || die "backup evidence is missing or older than seven hours"
+  done
+  log "✔ fresh encrypted base + logical backup evidence"
+}
+
+rotation_retire() {
+  _rotation_env
+  local survivor_serial retired_serial j
+  _nload "$PGHA_ROTATION_EVIDENCE_NODE"; [ -n "$VM_ID" ] || die "no evidence-node VM"
+  survivor_serial=$(_box_run logs "$PGHA_ROTATION_EVIDENCE_NODE" "$VM_ID")
+  grep -q "removing retired member ${PGHA_ROTATION_RETIRED}" <<<"$survivor_serial" \
+    || die "no evidence that etcd removed ${PGHA_ROTATION_RETIRED}"
+  grep -Fq "backends: ${PGHA_ROTATION_FINAL_PEERS}" <<<"$survivor_serial" \
+    || die "survivor has not sealed the final HAProxy peer map"
+  _nload "$PGHA_ROTATION_RETIRED"; [ -n "$VM_ID" ] || die "no retired-node VM"
+  retired_serial=$(_box_run logs "$PGHA_ROTATION_RETIRED" "$VM_ID")
+  grep -Eq "I am \(${PGHA_ROTATION_RETIRED}\), a secondary, and following a leader" <<<"$retired_serial" \
+    || die "retired node is not proven to be a secondary"
+  _box_run stop "$PGHA_ROTATION_RETIRED" "$VM_ID" >/dev/null || die "failed to stop retired VM"
+  for _ in $(seq 1 40); do
+    j=$(_box_run info "$PGHA_ROTATION_RETIRED" "$VM_ID" 2>/dev/null || true)
+    case "$(jq -r '.status // ""' <<<"$j" 2>/dev/null)" in stopped|exited*)
+      log "✔ retired node stopped after etcd removal"; return 0;;
+    esac
+    sleep 2
+  done
+  die "retired VM did not stop"
+}
+
+rotation_final() {
+  rotation_preflight
+  rotation_backup_gate
+  local n="$PGHA_ROTATION_EVIDENCE_NODE" serial
+  _nload "$n"; serial=$(_box_run logs "$n" "$VM_ID")
+  grep -Eq 'the leader with the lock|a secondary, and following a leader' <<<"$serial" \
+    || die "no final Patroni health evidence"
+  _nload "$PGHA_ROTATION_RETIRED"
+  [ -n "$VM_ID" ] || die "no retired-node VM recorded"
+  local retired_info retired_status
+  retired_info=$(_box_run info "$PGHA_ROTATION_RETIRED" "$VM_ID" 2>/dev/null || true)
+  retired_status=$(jq -r '.status // ""' <<<"$retired_info" 2>/dev/null)
+  case "$retired_status" in
+    stopped|exited*) ;;
+    *) die "retired VM is not stopped (status=${retired_status:-unknown})" ;;
+  esac
+  if [ -n "${PGHA_ROTATION_ENV_FILE:-}" ] && [ -e "$PGHA_ROTATION_ENV_FILE" ]; then
+    die "temporary Phala sealed env still exists: $PGHA_ROTATION_ENV_FILE"
   fi
-  log "✔ pg-ha fleet resize complete; leader=$candidate targets=${BOX_VCPU}/${BOX_MEM}/${BOX_DISK}"
+  log "✔ rotation final gate passed"
 }
 
 case "$ACTION" in
+  verify-ownership) verify_ownership ;;
   register-all) register_all ;;
   compute-peers) compute_peers ;;
   create-all) create_all ;;
@@ -905,14 +1043,24 @@ case "$ACTION" in
   verify-ha) verify_ha ;;
   verify-failover) verify_failover ;;
   verify-isolation-all) verify_isolation_all ;;
-  verify-agent) verify_agent ;;
-  switchover) switchover "$ARG3" ;;
   cycle-replica) cycle_replica "$ARG3" ;;
   resize) resize_member "$ARG3" ;;
-  resize-all) resize_all ;;
+  phala-env) build_phala_env "$ARG3" "$ARG4" ;;
   update) update_member "$ARG3"; verify_ha ;;
-  update-only) update_member "$ARG3" ;;   # diagnostic roll without the verify-ha gate
+  update-only)
+    [ "${PGHA_ALLOW_UNVERIFIED_ROLL:-0}" = 1 ] \
+      || die "update-only bypasses HA verification; set PGHA_ALLOW_UNVERIFIED_ROLL=1 for a deliberate single-node diagnostic/recovery roll"
+    update_member "$ARG3"
+    ;;
   update-all) update_all ;;
-  all) deploy_all; prime_all; bind_all; verify_all; verify_ha; verify_isolation_all; verify_agent ;;
+  verify-backup) verify_backup ;;
+  verify-runtime) verify_runtime ;;
+  rotation-preflight) rotation_preflight ;;
+  rotation-candidate-gate) rotation_candidate_gate ;;
+  rotation-survivor-gate) rotation_survivor_gate "$ARG3" ;;
+  rotation-backup-gate) rotation_backup_gate ;;
+  rotation-retire) rotation_retire ;;
+  rotation-final) rotation_final ;;
+  all) verify_ownership; deploy_all; prime_all; bind_all; verify_all; verify_runtime; verify_backup; verify_isolation_all ;;
   *) die "unknown action: $ACTION" ;;
 esac

@@ -26,6 +26,7 @@ NODE="${1:?usage: node-pathA.sh <node-name> [all|setup|deploy|prime|upgrade|veri
 NODE_ID="${NODE_ID:-26}"
 INSTANCE_TYPE="${INSTANCE_TYPE:-}"
 DISK_SIZE="${DISK_SIZE:-}"
+SSH_PUBKEY="${SSH_PUBKEY:-}"
 COMPOSE="${COMPOSE:-$ROOT/deploy/compose/${NODE}.yaml}"
 # Sealed env (Alchemy + ghcr secrets) — never committed; auto-built by env-file/deploy if absent.
 ENV_FILE="${ENV_FILE:-/tmp/attestmesh-${NODE}.env}"
@@ -78,11 +79,12 @@ deploy_cvm() {
   local resource_flags=()
   [ -z "$INSTANCE_TYPE" ] || resource_flags+=(--instance-type "$INSTANCE_TYPE")
   [ -z "$DISK_SIZE" ] || resource_flags+=(--disk-size "$DISK_SIZE")
+  [ -z "$SSH_PUBKEY" ] || resource_flags+=(--ssh-pubkey "$SSH_PUBKEY")
   npx --yes phala deploy --kms base --kms-contract "$KMS_CONTRACT" \
     --name "$NODE" --compose "$COMPOSE" -e "$ENV_FILE" --node-id "$NODE_ID" \
-    "${resource_flags[@]}" \
+    --no-dev-os --no-public-logs --no-public-sysinfo --no-listed "${resource_flags[@]}" \
     --private-key "$PRIVATE_KEY" --rpc-url "$RPC_URL" \
-    --ssh-pubkey "$HOME/.ssh/id_ed25519.pub" 2>&1 | tee "$lf"
+    2>&1 | tee "$lf"
   CVM_ID=$(grep -iE 'CVM ID:' "$lf" | awk '{print $NF}' | tr -d '[:space:]')
   local appid; appid=$(grep -iE 'App ID:' "$lf" | awk '{print $NF}' | tr -d '[:space:]')
   [ -n "$CVM_ID" ] && [ -n "$appid" ] || die "could not parse CVM ID / App ID from phala deploy"
@@ -106,6 +108,10 @@ prime_gate() {
 # 3. Upgrade the stock proxy to ClusterMember + bind the cluster (atomic upgradeToAndCall).
 upgrade_member() {
   _load; [ -n "${X:-}" ] || die "no app_id state; run 'deploy' first"
+  # Fail before touching the proxy when deployment metadata points at an older
+  # ClusterMember build without the Path-A migration entrypoint.
+  cast code "$MEMBER_IMPL" --rpc-url "$RPC_URL" 2>/dev/null | grep -qi '319e8561' \
+    || die "MEMBER_IMPL=$MEMBER_IMPL lacks reinitializeFromDstackApp(address)"
   local reinit; reinit=$(cast calldata "reinitializeFromDstackApp(address)" "$CLUSTER")
   send_seq "upgrade-member-${NODE}" "$X" "upgradeToAndCall(address,bytes)" "$MEMBER_IMPL" "$reinit"
   # Read-back can briefly hit a lagging RPC node right after the tx; retry (no sleep —

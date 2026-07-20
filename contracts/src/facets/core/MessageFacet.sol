@@ -25,4 +25,23 @@ contract MessageFacet is IMessage, ClusterAccess {
 
         emit MessageSent(_senderMemberId(), recipientMemberId, envelopeId, ciphertext);
     }
+
+    /// @notice Encrypted Safe-owner control-plane message. This is deliberately not a generic
+    /// owner impersonation path: the event carries a domain-separated pseudo member ID, allowing
+    /// application agents to authorize the cluster owner without treating it as a mesh peer.
+    function sendOwnerCommand(
+        bytes32 recipientMemberId,
+        bytes32 envelopeId,
+        bytes calldata ciphertext
+    ) external onlyClusterOwner {
+        if (MemberStorage.layout().members[recipientMemberId].memberContract == address(0)) {
+            revert RecipientNotMember();
+        }
+        MessageStorage.Layout storage m = MessageStorage.layout();
+        if (m.envelopeNonces[recipientMemberId][envelopeId]) revert DuplicateEnvelope();
+        m.envelopeNonces[recipientMemberId][envelopeId] = true;
+        bytes32 ownerSenderId =
+            keccak256(abi.encodePacked("attestmesh.cluster-owner.v1", msg.sender));
+        emit MessageSent(ownerSenderId, recipientMemberId, envelopeId, ciphertext);
+    }
 }

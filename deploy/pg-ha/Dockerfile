@@ -5,6 +5,9 @@
 # the image contains none. Built/pushed by .github/workflows/build-pg-ha.yml.
 FROM ghcr.io/attestmesh/postgres-walg@sha256:0edf068ddf5f89f73b41a00ffaf94679495c1d67a559f47f2e713036c6a681ad
 
+ARG PGHA_FORCE_NEW_NODE=""
+ENV PGHA_IMAGE_FORCE_NEW_NODE=${PGHA_FORCE_NEW_NODE}
+
 ARG ETCD_VERSION=v3.5.17
 ARG PATRONI_SPEC="patroni[etcd3]~=4.0.4"
 
@@ -13,7 +16,7 @@ RUN set -eux; \
     apt-get install -y --no-install-recommends \
         python3-venv haproxy jq iproute2 curl ca-certificates postgresql-16-pgvector; \
     python3 -m venv /opt/patroni; \
-    /opt/patroni/bin/pip install --no-cache-dir "${PATRONI_SPEC}" "psycopg[binary]"; \
+    /opt/patroni/bin/pip install --no-cache-dir "${PATRONI_SPEC}" "psycopg[binary]" boto3; \
     ln -s /opt/patroni/bin/patroni /usr/local/bin/patroni; \
     ln -s /opt/patroni/bin/patronictl /usr/local/bin/patronictl; \
     curl -fsSL -o /tmp/etcd.tar.gz \
@@ -25,5 +28,6 @@ RUN set -eux; \
     etcd --version; patroni --version; haproxy -v
 
 COPY pgha-common.sh pgha-etcd-entrypoint.sh pgha-patroni-entrypoint.sh pgha-haproxy-entrypoint.sh \
-     pgha-backup-loop.sh pgha-post-init.sh pgha-walg-bootstrap.sh /usr/local/bin/
-RUN chmod +x /usr/local/bin/pgha-*.sh
+     pgha-backup-loop.sh pgha-logical-backups.py pgha-post-init.sh pgha-walg-bootstrap.sh \
+     pgha-walg-archive /usr/local/bin/
+RUN chmod +x /usr/local/bin/pgha-*.sh /usr/local/bin/pgha-walg-archive

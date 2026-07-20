@@ -153,7 +153,7 @@ deploy/
 │   ├── indexer-lb-node.yaml       # stable public gRPC/HTTP LB + mesh control API
 │   ├── matrix-node.yaml           # Matrix homeserver + sidecar + agents + metrics
 │   ├── postgres-node.yaml         # Postgres service node + sidecar + admin agent
-│   ├── pg-ha-node.yaml            # one Postgres HA node: sidecar-netns Patroni/etcd/HAProxy + admin agent
+│   ├── pg-ha-node.yaml            # one PG-HA member + chain-command agent; no interactive ingress
 │   ├── ssh-node.yaml              # sidecar + two sshd workbench shells (bridge :1022, mesh :1023)
 │   └── hindsight-node.yaml        # mesh-only Hindsight memory node (sidecar + socat mesh proxies + egress-fw)
 ├── agent-egress-fw/
@@ -176,15 +176,20 @@ deploy/
 │   ├── pgha-patroni-entrypoint.sh # renders patroni.yml from CSK-derived credentials
 │   ├── pgha-haproxy-entrypoint.sh # primary/replica routing on the mesh IP
 │   ├── pgha-backup-loop.sh        # WAL-G base backups, primary-only
+│   ├── pgha-logical-backups.py    # 6-hour/daily/monthly logical dump retention + 12h WAL prune
 │   ├── pgha-post-init.sh          # creates the meshverify verification user
 │   └── pgha-walg-bootstrap.sh     # Patroni custom bootstrap: DR restore from R2
 ├── postgres-admin-agent/
 │   ├── Dockerfile
 │   ├── pyproject.toml
 │   ├── README.md
-│   └── postgres_admin_agent/      # Matrix bot for Postgres status/query/admin ops (+ Patroni !pgha)
+│   └── postgres_admin_agent/      # legacy Matrix agent used by other deployment profiles
 └── matrix-node-*.md               # Matrix-specific runbooks, journals, and history
 ```
+
+The dedicated PG-HA control plane lives at `services/pg-ha-command-mcp/`: its MCP process
+authors constrained Safe-owner messages and its agent process consumes decrypted commands on
+each PG member. It replaces `postgres-admin-agent` only for the `andrew-xyn-pg` profile.
 
 ### Root drivers
 
@@ -205,7 +210,7 @@ step can be re-run without rediscovering app IDs or VM IDs.
 | `node.sh` | Legacy custom-app-id flow. | Kept as a reference for a future KMS that supports `--custom-app-id`; the Base KMS path uses `node-pathA.sh`. |
 | `matrix-node.sh` | Private Matrix homeserver on the self-hosted dstack box. | `deploy -> cluster -> patha -> prime -> bind -> verify -> verify-agent -> verify-client -> verify-isolation`; `update` is disk-preserving by default, `restore` is a deliberate fresh-disk WAL-G recovery, `backup-status` checks R2. |
 | `postgres-node.sh` | Standalone PostgreSQL node on the self-hosted box. | Joins the Matrix node's cluster, inherits the Matrix mesh endpoint, then verifies registration, mesh DB endpoint, Matrix admin-agent replies, Prometheus-backed metrics, and host isolation. |
-| `pg-ha-node.sh` | Postgres HA cluster (Patroni + etcd + HAProxy) as `PGHA_COUNT` nodes (default 3) on the self-hosted box. | `deploy-all` (= `register-all` -> `compute-peers` -> `create-all`, precomputing every node's mesh IP off-chain for etcd static bootstrap) -> `prime-all` -> `bind-all` -> `verify-all` (incl. on-chain `meshIpOf` cross-check) -> `verify-ha` (leader/replica/routing/replication from the ssh-node mesh shell) -> `verify-isolation-all` -> `verify-agent`. Day-2: `update <pgN>` / serialized `update-all`, `verify-failover` drill. See `docs/specs/pg-ha.md`. |
+| `pg-ha-node.sh` | Dedicated Safe-owned Postgres HA mesh (Patroni + etcd + HAProxy), default three nodes. No Matrix, Tailscale, SSH member, or admin host port. | Safe/new-cluster bootstrap -> member registration and deterministic mesh-IP precompute -> CVM creation -> on-chain binding -> node-local chain-command checks -> host isolation. Day-2 operations remain serialized and quorum-gated. See `docs/specs/pg-ha.md`. |
 | `ssh-node.sh` | SSH ingress + operator workbench node on the self-hosted box (8 vcpu / 64 GB / 100 GB, full ubuntu 26.04 shells). | Joins the existing Matrix cluster by default, seals the union key file `~/.attestmesh/ssh-node-authorized-keys` (falls back to `~/.ssh/authorized_keys`), and exposes TWO root shells through gateway TLS: `<app_id>-1022.<gw>:443` (compose bridge) and `<app_id>-1023.<gw>:443` (**inside the sidecar netns = ON the wg mesh**; `ssh -D` = SOCKS onto the mesh). Verifies the gateway SSH banner. |
 | `hindsight-node.sh` | Hindsight agent-memory node (vectorize-io Hindsight 0.8.4) on the self-hosted box — **mesh-only, no Tailscale, no public HTTP**. | `deploy -> prime -> bind -> verify -> verify-sidecar -> verify-app -> verify-e2e -> verify-isolation`; verify-app/e2e run over the wg mesh via the ssh-node mesh shell (retain→LLM→recall roundtrip + 401-without-key auth check). `update` is disk-preserving (pg0 memory store survives); LLM model/keys are sealed values → rotate with a plain `update`, no re-allowlist. See `deploy/hindsight-node-runbook.md`. |
 
@@ -219,8 +224,8 @@ where it stopped.
 |---|---|---|
 | `workflows/deploy.tsx` | `attestmesh-deploy-full` | `preflight -> infra -> cluster -> pathaUpgrade -> webhook -> indexerEnsure -> node1 env/deploy/prime/upgrade/verify -> node2 env/deploy/prime/upgrade/verify -> meshVerify`. |
 | `workflows/matrix-node.tsx` | `attestmesh-matrix-node` | `deploy -> cluster -> patha -> prime -> bind -> verify -> agent -> client -> isolation`, with an optional backup-status task when backups are enabled. |
+| `workflows/pg-ha.tsx` | `attestmesh-pg-ha` | New Safe-owned chain-only mesh: `deploy -> prime -> bind -> on-chain registration -> console runtime convergence -> fresh backup evidence -> isolation`; no Matrix, Tailscale, or SSH member dependency. Chain-agent E2E remains excluded until the Safe-specific sender is production-ready. |
 | `workflows/postgres-node.tsx` | `attestmesh-postgres-node` | `deploy -> prime -> bind -> verify -> meshEndpoint -> agent -> metrics -> isolation`. |
-| `workflows/pg-ha.tsx` | `attestmesh-pg-ha` | `deployAll -> primeAll -> bindAll -> verifyAll -> ha -> isolation -> agent`; node count via `--input '{"count":N}'` (looping lives in the driver's re-entrant `-all` actions, so the graph stays static). |
 
 ### Compose payloads
 
@@ -236,7 +241,7 @@ CVM boots.
 | `compose/indexer-lb-node.yaml` | C3 sidecar plus HAProxy stable frontends (`:50052` gRPC, `:9090` HTTP) and an authenticated mesh-only two-phase switch API on `:50053`. |
 | `compose/matrix-node.yaml` | Full private Matrix stack: sidecar, mesh proxy, WAL-G-enabled Postgres, Synapse init, Synapse, nginx, Tailscale serve, matrix-admin-agent, egress firewalls, Prometheus, node-exporter, cAdvisor, and persistent volumes. The Matrix HTTP path stays tailnet-only; the host-isolation checks assert private ports are not reachable from the box. |
 | `compose/postgres-node.yaml` | Standalone Postgres service node: sidecar, mesh proxies to Matrix/Postgres, Postgres, postgres-admin-agent, egress firewalls, Prometheus, node-exporter, cAdvisor, and persistent volumes. It has no Tailscale; Matrix control traffic goes over the AttestMesh mesh. |
-| `compose/pg-ha-node.yaml` | One Postgres HA node: sidecar, then Patroni/etcd/HAProxy sharing the SIDECAR netns (they bind the mesh IP directly — clients hit any node's mesh IP `:5432` for the primary, `:5433` for replicas; Postgres itself is on `:5434`), a mesh-only `:8009` status page, the Matrix mesh proxy, the Patroni-aware postgres-admin-agent + egress firewall, and the observability trio. All shared credentials are HKDF-derived from the CSK at boot. |
+| `compose/pg-ha-node.yaml` | One PG-HA member: sidecar plus Patroni/etcd/HAProxy in the sidecar netns, a mesh-only status page, chain-command agent with deny-all egress firewall, and local observability. Mesh clients use `:5432` for primary routing and `:5433` for replicas; Postgres replication/backends use `:5434`. No application/admin port is host-published. Credentials are HKDF-derived from the CSK. |
 | `compose/ssh-node.yaml` | Operator workbench node: sidecar plus TWO full-ubuntu-26.04 OpenSSH shells — `sshd` (`:1022`, compose bridge) and `sshd-mesh` (`:1023`, `network_mode: service:sidecar` so it sits ON the wg mesh; wireguard-tools + NET_ADMIN for peer discovery). Both share a `/root` workspace volume; the driver seals `authorized_keys` as base64 and the gateway exposes SSH via the dstack TLS endpoints (`ssh-over-gateway` pattern from `Dstack-TEE/dstack-examples`). |
 | `compose/hindsight-node.yaml` | Mesh-only Hindsight memory node: sidecar (publishes only `:9090` health + `:51900` wg), two socat listeners in the SIDECAR netns (`<mesh-ip>:18888` → API, `:18999` → control-plane UI — reachable by cluster members only), the Hindsight 0.8.4 container (embedded pg0, baked-in local embeddings, `HF_HUB_OFFLINE`), and an egress firewall pinning the netns to the single redpill.ai LLM host. API is tenant-key gated (`ApiKeyTenantExtension`), UI access-key gated; keys persist in the driver state file. |
 
@@ -269,11 +274,10 @@ The subdirectories under `deploy/` build images consumed by the compose payloads
   restores into an empty data directory when requested, writes a WAL-G encryption key from the
   cluster shared key, runs periodic base backups, and enables WAL archiving. With backups off, it
   behaves like stock Postgres.
-- `postgres-admin-agent/` is a Python Matrix bot for the Postgres nodes. It supports deterministic
+- `postgres-admin-agent/` is a legacy Python Matrix bot for standalone Postgres and older profiles. It supports deterministic
   `!pg` status/metrics/query/exec commands, gates write/admin SQL behind explicit confirmation, and
-  can route natural-language requests through an OpenAI-compatible LLM. On pg-ha nodes it is
-  Patroni-aware: `!pgha status|cluster|lag` plus a confirmation-gated `!pgha switchover`, with the
-  DB superuser and Patroni REST credentials read lazily from the CSK-derived `pgha-secrets` volume.
+  can route natural-language requests through an OpenAI-compatible LLM. It is not included in the
+  `andrew-xyn-pg` compose; that profile uses `services/pg-ha-command-mcp/agent.py` instead.
 - `pg-ha/` builds `ghcr.io/attestmesh/pg-ha` — Patroni, a pinned etcd, and HAProxy layered on the
   `postgres-walg` base. One image serves three container roles via entrypoint selection; every
   cluster-wide secret (superuser, replication, rewind, Patroni REST, etcd root, WAL-G key) is
@@ -299,8 +303,20 @@ Generated state is intentionally local:
   `postgres-node-<name>.state` / `ssh-node-<name>.state` / `hindsight-node-<name>.state`
   (the matrix and hindsight state files hold live credentials — IAPW/PGPW and the Hindsight
   tenant + UI access keys respectively — treat them as secrets). The pg-ha driver keeps one cluster
-  state file `pg-ha-<name>.state` (PGHA_PEERS, verify credential, initialized flag) plus
+  state file `pg-ha-<name>.state` (Safe, cluster, member implementation, PGHA_PEERS, verify
+  credential, initialized flag) plus
   per-node `pg-ha-node-<name>-pg<i>.state` files (app id, compose hash, VM id, mesh IP).
+
+  Recovery joins are fail-closed: the first non-self member in `PGHA_PEERS` is the
+  authoritative etcd seed. A joining node retries that seed and never falls through
+  to another healthy endpoint, because a retired node may still report healthy from
+  a stale etcd cluster. Put the verified newest-timeline survivor first, stop stale
+  members, and require matching etcd cluster ID plus Patroni timeline/streaming
+  evidence before joining the next node.
+
+  Path-A rotations also verify that `clusterMemberImpl` contains
+  `reinitializeFromDstackApp(address)` before upgrading the stock app proxy. Stale
+  deployment metadata is a hard failure.
 - `deploy/.smithers/` and `deploy/smithers.db*` are Smithers execution state.
 - `deploy/node_modules/`, temporary env files, and Python `__pycache__/` directories are not
   deployment source.

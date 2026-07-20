@@ -116,6 +116,14 @@ fn sni_for(member_contract: Address, tcp_port: u16, gw_domain: &str) -> String {
     )
 }
 
+fn gateway_domain_for<'a>(config: &'a Config, member: &Address, fallback: &'a str) -> &'a str {
+    config
+        .gateway_domain_overrides
+        .get(member)
+        .map(String::as_str)
+        .unwrap_or(fallback)
+}
+
 impl Ctx {
     /// Wrap an inner cluster call as `ClusterMember.execute` and submit it as a
     /// sponsored UserOp signed by the registration-derived owner key.
@@ -290,6 +298,13 @@ pub async fn launch(
         tokio::spawn(async move { reconcile_loop(ctx, gw, wake_rx).await });
     }
 
+    // Serial-console diagnostics for mesh bring-up. This exposes only public peer
+    // identifiers/keys and kernel counters; no secrets or application payloads.
+    {
+        let ctx = ctx.clone();
+        tokio::spawn(async move { wg_diagnostic_loop(ctx).await });
+    }
+
     // 3b. Indexer subscription (sidecar spec §9): discover via IndexerRegistry,
     // verify every push, dispatch, Ack, and reconnect with backoff.
     {
@@ -325,6 +340,47 @@ pub async fn launch(
     }
 
     Ok(())
+}
+
+async fn wg_diagnostic_loop(ctx: Arc<Ctx>) {
+    loop {
+        tokio::time::sleep(Duration::from_secs(15)).await;
+        let peers: Vec<_> = {
+            let table = ctx.shared.peers.lock().await;
+            table
+                .all()
+                .map(|p| (p.member_id, p.mesh_ip, p.wg_pub, p.configured, p.live, p.transport))
+                .collect()
+        };
+        if peers.is_empty() {
+            let phase = ctx.shared.current_phase().await;
+            tracing::info!(phase = phase.as_str(),
+                "wg diagnostic: no peers discovered");
+            continue;
+        }
+        for (member_id, mesh_ip, wg_pub, configured, live, transport) in peers {
+            match ctx.wg.peer_status(&wg_pub).await {
+                Ok(Some(status)) => {
+                    let phase = ctx.shared.current_phase().await;
+                    tracing::info!(
+                        peer = %hex::encode(member_id),
+                        mesh_ip = %cidr::fmt_ipv4(mesh_ip),
+                        configured,
+                        live,
+                        transport = transport.as_str(),
+                        endpoint = ?status.endpoint,
+                        handshake_unix = status.last_handshake_unix,
+                        phase = phase.as_str(),
+                        "wg diagnostic"
+                    )
+                }
+                Ok(None) => tracing::warn!(peer = %hex::encode(member_id), configured,
+                    "wg diagnostic: peer absent from kernel interface"),
+                Err(error) => tracing::warn!(peer = %hex::encode(member_id), error = ?error,
+                    "wg diagnostic: status read failed"),
+            }
+        }
+    }
 }
 
 /// One pass + steady-state loop: enumerate members from current chain views,
@@ -446,7 +502,8 @@ async fn reconcile_once(ctx: &Ctx, gw_domain: &str) -> Result<()> {
                 .chain
                 .mesh_ip_of(cluster, B256::from(*member_id))
                 .await?;
-            let sni = sni_for(rec.member_contract, ctx.config.wg_tcp_port, gw_domain);
+            let peer_domain = gateway_domain_for(&ctx.config, &rec.member_contract, gw_domain);
+            let sni = sni_for(rec.member_contract, ctx.config.wg_tcp_port, peer_domain);
             let endpoint =
                 transport::spawn_peer_bridge(sni.clone(), 443, ctx.shared.wg_listen_port)
                     .await
@@ -1339,6 +1396,7 @@ mod tests {
                 gas_policy_id: String::new(),
                 indexer_registry_addr: Address::repeat_byte(0x22),
                 gateway_domain: Some("gateway.invalid".into()),
+                gateway_domain_overrides: HashMap::new(),
                 peer_envelope_fallback: false,
                 wg_tcp_port: 51900,
                 wg_listen_port: 51821,

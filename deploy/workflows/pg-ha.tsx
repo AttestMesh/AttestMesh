@@ -2,7 +2,7 @@
 // Postgres HA cluster bring-up (Patroni + etcd + HAProxy over the AttestMesh wg mesh) —
 // durable, ordered (smithers). See docs/specs/pg-ha.md.
 //
-//   deployAll -> primeAll -> bindAll -> verifyAll -> ha -> isolation -> agent
+//   ownership -> deployAll -> primeAll -> bindAll -> verifyAll -> runtime -> backup -> isolation
 //
 // deployAll internally runs register-all (N DstackApp contracts) -> compute-peers
 // (off-chain mesh-IP precompute + collision check) -> create-all (N CVMs with the
@@ -11,10 +11,9 @@
 // are re-entrant against per-node state files — so a failed step resumes without
 // redoing on-chain work.
 //
-// The Matrix node must already be deployed and registered (CLUSTER/MEMBER_IMPL and
-// the Matrix mesh IP are inherited from deploy/logs/matrix-node-matrix-node.state),
-// and the ssh-node mesh shell must be live (it is the verification vantage). Secrets
-// (BOTPASSWORD, R2_*) flow through inherited env / ~/.attestmesh/pg-ha.env and are
+// This workflow targets a new Safe-owned, chain-only mesh. It does not depend on
+// Matrix, Tailscale, or an SSH member. Client R2 credentials and the path to the
+// direct upstream bucket-scoped TOML flow from ~/.attestmesh/pg-ha.env and are
 // sealed by dstack; they are never put on the Smithers command line.
 //
 // Run from the repo root:
@@ -36,13 +35,14 @@ import { execSync } from "node:child_process";
 const Step = z.object({ ok: z.boolean(), step: z.string() });
 
 const { Workflow, smithers, outputs } = createSmithers({
+  ownership: Step,
   deployAll: Step,
   primeAll: Step,
   bindAll: Step,
   verifyAll: Step,
   ha: Step,
+  backup: Step,
   isolation: Step,
-  agent: Step,
 });
 
 const ROOT = new URL("../..", import.meta.url).pathname;
@@ -59,20 +59,18 @@ export default smithers((ctx) => {
   const input = (ctx.input || {}) as {
     name?: string;
     count?: number;
-    matrixTailnetFqdn?: string;
-    matrixVerifyUser?: string;
   };
   const name = input.name || "pg-ha";
 
   if (input.count) process.env.PGHA_COUNT = String(input.count);
-  if (input.matrixTailnetFqdn) process.env.MATRIX_TAILNET_FQDN = input.matrixTailnetFqdn;
-  if (input.matrixVerifyUser) process.env.MATRIX_VERIFY_USER = input.matrixVerifyUser;
-
   const pgha = (sub: string) => `deploy/pg-ha-node.sh ${name} ${sub}`;
 
   return (
     <Workflow name="attestmesh-pg-ha">
       <Sequence>
+        <Task id="ownership" output={outputs.ownership}>
+          {() => run("ownership", pgha("verify-ownership"))}
+        </Task>
         <Task id="deployAll" output={outputs.deployAll}>
           {() => run("deployAll", pgha("deploy-all"))}
         </Task>
@@ -86,13 +84,13 @@ export default smithers((ctx) => {
           {() => run("verifyAll", pgha("verify-all"))}
         </Task>
         <Task id="ha" output={outputs.ha}>
-          {() => run("ha", pgha("verify-ha"))}
+          {() => run("runtime", pgha("verify-runtime"))}
+        </Task>
+        <Task id="backup" output={outputs.backup}>
+          {() => run("backup", pgha("verify-backup"))}
         </Task>
         <Task id="isolation" output={outputs.isolation}>
           {() => run("isolation", pgha("verify-isolation-all"))}
-        </Task>
-        <Task id="agent" output={outputs.agent}>
-          {() => run("agent", pgha("verify-agent"))}
         </Task>
       </Sequence>
     </Workflow>

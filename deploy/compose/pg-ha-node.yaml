@@ -1,5 +1,5 @@
 # Postgres HA node (one of N): Patroni + etcd + HAProxy over the AttestMesh wireguard mesh,
-# plus a Matrix-connected administrative agent. See docs/specs/pg-ha.md.
+# plus a chain-command administrative agent. See docs/specs/pg-ha.md.
 #
 # The HA trio (etcd/patroni/haproxy) shares the SIDECAR netns so it can bind the mesh IP and
 # reach the other pg nodes over attestmesh0 — etcd peers, Patroni's DCS + REST, replication,
@@ -10,8 +10,21 @@
 
 services:
   sidecar:
-    image: ghcr.io/attestmesh/cluster-mesh-agent@sha256:b9e0ae107d9db015c22059c9fecdc28f2b35e09b257eabb4739bd4e46d96f641
+    # Phala's pre-launch registry probe returns 404 for private GHCR digest refs;
+    # this release tag includes the bounded dstack UDS HTTP response reader needed
+    # by Phala's keep-alive guest agent.
+    image: ghcr.io/attestmesh/cluster-mesh-agent:phala-uds-http-fix-20260718
     restart: unless-stopped
+    # The CVM serial console is the only operational log sink: it is visible through
+    # the deployment control plane without adding SSH or an administrative network port.
+    entrypoint:
+      - /bin/sh
+      - -ec
+    command:
+      - |
+        timeout 20 /usr/local/bin/attestmesh-registration-calldata \
+          >/pgha-status/registration-helper.log 2>&1 &
+        exec /usr/local/bin/cluster-mesh-agent 2>&1 | tee /pgha-status/sidecar.log
     environment:
       # MEMBER_CONTRACT intentionally unset: the sidecar self-discovers the app_id.
       - CHAIN_ID=${CHAIN_ID}
@@ -19,7 +32,9 @@ services:
       - BUNDLER_URL=${BUNDLER_URL}
       - GAS_POLICY_ID=${GAS_POLICY_ID}
       - INDEXER_REGISTRY_ADDR=${INDEXER_REGISTRY_ADDR}
+      - CLUSTER=${CLUSTER}
       - GATEWAY_DOMAIN=${GATEWAY_DOMAIN}
+      - GATEWAY_DOMAIN_OVERRIDES=${GATEWAY_DOMAIN_OVERRIDES:-}
       - DSTACK_SOCKET=/var/run/dstack.sock
       - SIDECAR_STATE_DIR=/var/lib/attestmesh
       - AGENT_GRPC_SOCKET=/var/run/attestmesh/agent.sock
@@ -30,6 +45,7 @@ services:
     volumes:
       - /var/run/dstack.sock:/var/run/dstack.sock
       - sidecar-state:/var/lib/attestmesh
+      - pgha-status:/pgha-status
       - agent-sock:/var/run/attestmesh
     ports:
       - "51900:51900"
@@ -37,11 +53,12 @@ services:
       - NET_ADMIN
     devices:
       - /dev/net/tun
+      - /dev/ttyS0:/dev/ttyS0
 
   # Patroni's DCS. One member per pg node; quorum forms over the mesh. Bootstrap state
   # machine (new/join/restart) lives in the entrypoint — see docs/specs/pg-ha.md §3.1.
   etcd:
-    image: ghcr.io/attestmesh/pg-ha@sha256:3cce594b31cc9c57dea6f1b7fc4e6a3e9b31be15853c49e22c4c6423d7a9b066 # pinned 2026-07-07 r6 (pgvector for Hindsight + pg_hba localhost replication entries)
+    image: ghcr.io/attestmesh/pg-ha:quorum-recovery-v7-20260718
     restart: unless-stopped
     network_mode: service:sidecar
     entrypoint: ["/usr/local/bin/pgha-etcd-entrypoint.sh"]
@@ -51,6 +68,9 @@ services:
       - PGHA_NODE_NAME=${PGHA_NODE_NAME}
       - PGHA_PEERS=${PGHA_PEERS}
       - PGHA_BOOTSTRAP=${PGHA_BOOTSTRAP}
+      - PGHA_ETCD_FORCE_REJOIN=${PGHA_ETCD_FORCE_REJOIN:-false}
+      - PGHA_ETCD_FORCE_NEW_CLUSTER=${PGHA_ETCD_FORCE_NEW_CLUSTER:-false}
+      - PGHA_RECOVERY_CANDIDATE=${PGHA_RECOVERY_CANDIDATE:-}
       - AGENT_GRPC_SOCKET=/var/run/attestmesh/agent.sock
     volumes:
       - etcd-data:/var/lib/etcd
@@ -61,7 +81,7 @@ services:
   # the CSK at boot; the superuser/REST creds the admin agent needs are dropped on the
   # pgha-secrets volume. Data survives disk-preserving rolls (UpgradeApp).
   patroni:
-    image: ghcr.io/attestmesh/pg-ha@sha256:3cce594b31cc9c57dea6f1b7fc4e6a3e9b31be15853c49e22c4c6423d7a9b066 # pinned 2026-07-07 r6 (pgvector for Hindsight + pg_hba localhost replication entries)
+    image: ghcr.io/attestmesh/pg-ha:quorum-recovery-v7-20260718
     restart: unless-stopped
     network_mode: service:sidecar
     entrypoint: ["/usr/local/bin/pgha-patroni-entrypoint.sh"]
@@ -72,13 +92,17 @@ services:
       - PGHA_PEERS=${PGHA_PEERS}
       - PGHA_MESH_CIDR=${PGHA_MESH_CIDR}
       - PGHA_VERIFY_PASSWORD=${PGHA_VERIFY_PASSWORD}
+      - PGHA_CRASH_RECOVERY_ONLY=${PGHA_CRASH_RECOVERY_ONLY}
       - AGENT_GRPC_SOCKET=/var/run/attestmesh/agent.sock
       - BACKUP_ENABLED=${BACKUP_ENABLED}
       - BACKUP_PREFIX=${BACKUP_PREFIX}
       - BACKUP_RESTORE=${BACKUP_RESTORE}
+      - BACKUP_DUMP_INTERVAL_SECONDS=${BACKUP_DUMP_INTERVAL_SECONDS:-21600}
       - R2_ACCESS_KEY_ID=${R2_ACCESS_KEY_ID}
       - R2_SECRET_ACCESS_KEY=${R2_SECRET_ACCESS_KEY}
-      - R2_ENDPOINT=${R2_ENDPOINT}
+      # Backups never leave through the mesh. Each member has a node-local,
+      # CSK-keyed encrypting gateway which alone talks to upstream R2.
+      - R2_ENDPOINT=http://127.0.0.1:19000
       - R2_BUCKET=${R2_BUCKET}
       - R2_REGION=${R2_REGION}
     volumes:
@@ -87,9 +111,70 @@ services:
       - pgha-status:/pgha-status
       - pgha-secrets:/pgha-secrets
 
+  # Loopback-only S3 endpoint for WAL-G and logical dumps. This shares the
+  # sidecar/Patroni netns, but the encrypting gateway itself retains a separate
+  # namespace so its deny-by-default egress firewall cannot affect Postgres.
+  s3-local-proxy:
+    image: alpine/socat:1.8.0.0
+    restart: unless-stopped
+    network_mode: service:sidecar
+    depends_on:
+      - sidecar
+      - s3gw
+    command: ["TCP-LISTEN:19000,fork,reuseaddr,bind=127.0.0.1", "TCP:s3gw:19000"]
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+
+  # rclone serve-s3 over a CSK-derived crypt remote. Every PG member derives the
+  # same crypt key, so whichever node Patroni promotes can continue the same
+  # backup history. No gateway listener is exposed on the mesh or CVM bridge.
+  s3gw:
+    image: ghcr.io/attestmesh/r2host-s3gw:pgha-bucket-r2-v2-20260717
+    restart: unless-stopped
+    depends_on:
+      - sidecar
+    environment:
+      - R2_ENDPOINT=${R2_UPSTREAM_ENDPOINT}
+      - R2_BUCKET=${R2_UPSTREAM_BUCKET}
+      - R2_REGION=${R2_UPSTREAM_REGION}
+      - R2_ACCESS_KEY_ID=${R2_UPSTREAM_ACCESS_KEY_ID}
+      - R2_SECRET_ACCESS_KEY=${R2_UPSTREAM_SECRET_ACCESS_KEY}
+      - S3GW_ACCESS_KEY_ID=${R2_ACCESS_KEY_ID}
+      - S3GW_SECRET_ACCESS_KEY=${R2_SECRET_ACCESS_KEY}
+      - S3GW_LISTEN_PORT=19000
+      - S3GW_DEFAULT_BUCKET=${R2_BUCKET}
+      - S3GW_VFS_CACHE_MODE=writes
+      - S3GW_VFS_CACHE_MAX_SIZE=20G
+      - S3GW_STATUS_FILE=/pgha-status/s3gw
+      - S3GW_RCLONE_LOG=/pgha-status/s3gw-rclone.log
+      - AGENT_GRPC_SOCKET=/var/run/attestmesh/agent.sock
+    volumes:
+      - agent-sock:/var/run/attestmesh
+      - pgha-status:/pgha-status
+      - s3gw-cache:/vfs-cache
+    expose:
+      - "19000"
+
+  s3gw-egress-fw:
+    image: ghcr.io/attestmesh/agent-egress-fw:phala-rotation-20260718
+    restart: unless-stopped
+    network_mode: service:s3gw
+    depends_on:
+      - s3gw
+    environment:
+      - ALLOW_BASE_URL=${R2_UPSTREAM_ENDPOINT}
+      - INTERNAL_HOSTS=
+      - ALLOW_DNS=127.0.0.11
+      - RERESOLVE_SECONDS=30
+    cap_add:
+      - NET_ADMIN
+
   # Primary/replica routing on the mesh IP. Backend health = Patroni's public role GETs.
   haproxy:
-    image: ghcr.io/attestmesh/pg-ha@sha256:3cce594b31cc9c57dea6f1b7fc4e6a3e9b31be15853c49e22c4c6423d7a9b066 # pinned 2026-07-07 r6 (pgvector for Hindsight + pg_hba localhost replication entries)
+    image: ghcr.io/attestmesh/pg-ha:quorum-recovery-v7-20260718
     restart: unless-stopped
     network_mode: service:sidecar
     entrypoint: ["/usr/local/bin/pgha-haproxy-entrypoint.sh"]
@@ -104,7 +189,7 @@ services:
   # Mesh-only status page (:8009): the TEE blocks container logs, so every pg-ha entrypoint
   # self-reports to /pgha-status and this serves it read-only to mesh peers for debugging.
   status-server:
-    image: ghcr.io/attestmesh/pg-ha@sha256:3cce594b31cc9c57dea6f1b7fc4e6a3e9b31be15853c49e22c4c6423d7a9b066 # pinned 2026-07-07 r6 (pgvector for Hindsight + pg_hba localhost replication entries)
+    image: ghcr.io/attestmesh/pg-ha:andrew-xyn-20260716
     restart: unless-stopped
     network_mode: service:sidecar
     entrypoint:
@@ -125,74 +210,148 @@ services:
     volumes:
       - pgha-status:/pgha-status:ro
 
-  # Local bridge from the admin agent to the Matrix homeserver over AttestMesh.
-  matrix-mesh-proxy:
-    image: alpine/socat:1.8.0.0
+  # The TEE suppresses ordinary container logs. Mirror only bounded backup/HA
+  # status files to the CVM serial console so backup failures are observable
+  # without SSH, a debug port, or another mesh member.
+  status-console:
+    image: alpine:3.20
+    restart: unless-stopped
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - |
+        while :; do
+          echo "=== pgha-status:patroni-cluster ===" >/dev/ttyS0
+          wget -qO- --timeout=5 http://sidecar:8008/cluster >/dev/ttyS0 2>&1 || true
+          echo >/dev/ttyS0
+          for f in /pgha-status/walg /pgha-status/s3gw /pgha-status/s3gw-rclone.log /pgha-status/registration-helper.log /pgha-status/sidecar.log /pgha-status/patroni-*.log /pgha-status/pglog/postgresql-*.log /pgha-status/crash-recovery-*.log /pgha-status/state; do
+            [ -f "$$f" ] || continue
+            echo "=== pgha-status:$$f ===" >/dev/ttyS0
+            tail -n 30 "$$f" >/dev/ttyS0 2>&1 || true
+          done
+          sleep 30
+        done
+    volumes:
+      - pgha-status:/pgha-status:ro
+    devices:
+      - /dev/ttyS0:/dev/ttyS0
+
+  # Dedicated fail-closed rotation evidence. This opens no listener: it reads Patroni's
+  # existing loopback API from the shared sidecar netns and mirrors bounded cluster JSON
+  # to the serial console consumed by Smithers.
+  patroni-evidence-console:
+    image: alpine:3.20
     restart: unless-stopped
     network_mode: service:sidecar
     depends_on:
-      - sidecar
+      - patroni
+    entrypoint: ["/bin/sh", "-ec"]
     command:
-      - -d
-      - -d
-      - TCP-LISTEN:18080,fork,reuseaddr,bind=0.0.0.0
-      - TCP:${MATRIX_MESH_IP}:18080
-    read_only: true
-    cap_drop:
-      - ALL
-    security_opt:
-      - no-new-privileges:true
+      - |
+        while :; do
+          body="$$(wget -qO- --timeout=5 http://127.0.0.1:8008/cluster 2>/dev/null || true)"
+          if [ -n "$$body" ]; then
+            echo "PATRONI_CLUSTER_EVIDENCE $$body" >/dev/ttyS0
+          fi
+          sleep 15
+        done
+    devices:
+      - /dev/ttyS0:/dev/ttyS0
 
-  # Matrix chat-ops (!pg + Patroni-aware !pgha). Own netns; reaches Postgres/Patroni via the
-  # sidecar service address (Postgres listens 0.0.0.0:5434 CVM-internally) and Matrix via the
-  # mesh proxy. Credentials it needs are read lazily from the pgha-secrets volume, so start
-  # order relative to patroni does not matter.
-  postgres-admin-agent:
-    image: ghcr.io/attestmesh/postgres-admin-agent@sha256:3d38a34f7f0858ca45d87e4235881bd24762f7407dfba4a6de3be0fd110da4e3 # pinned 2026-07-02 (Patroni-aware)
+  etcd-evidence-console:
+    image: alpine:3.20
     restart: unless-stopped
+    network_mode: service:sidecar
     depends_on:
-      matrix-mesh-proxy:
-        condition: service_started
-      prometheus:
-        condition: service_started
+      - etcd
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - |
+        while :; do
+          body="$$(wget -qO- --timeout=3 http://127.0.0.1:2379/health 2>/dev/null || true)"
+          echo "ETCD_HEALTH_EVIDENCE $${body:-unreachable}" >/dev/ttyS0
+          sleep 15
+        done
+    devices:
+      - /dev/ttyS0:/dev/ttyS0
+
+  # One-shot, explicitly sealed disaster-recovery control. Empty during normal
+  # operation. When Patroni has no leader, an operator may name the verified
+  # recovery candidate; the request stays inside the node-local REST endpoint.
+  patroni-recovery:
+    image: curlimages/curl:8.12.1
+    restart: "no"
+    network_mode: service:sidecar
+    depends_on:
+      - patroni
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - |
+        candidate="$${PGHA_RECOVERY_CANDIDATE:-}"
+        [ -n "$$candidate" ] || exit 0
+        pw="$$(cat /pgha-secrets/patroni-api)"
+        while :; do
+          code="$$(curl -sS --max-time 10 -o /dev/null -w '%{http_code}' \
+            -u "patroni:$$pw" -H 'content-type: application/json' \
+            -d "{\"candidate\":\"$$candidate\"}" \
+            http://127.0.0.1:8008/failover || true)"
+          case "$$code" in 200|202) exit 0;; esac
+          sleep 5
+        done
     environment:
-      - PG_DSN=postgresql://postgres@sidecar:5434/postgres
-      - PG_PASSWORD_FILE=/pgha-secrets/pg-superuser
-      - PATRONI_URL=http://sidecar:8008
-      - PATRONI_PASSWORD_FILE=/pgha-secrets/patroni-api
-      - MATRIX_HOMESERVER_URL=http://sidecar:18080
-      - MATRIX_SSL_VERIFY=0
-      - MATRIX_USER_ID=${MATRIX_USER_ID}
-      - MATRIX_PASSWORD=${MATRIX_PASSWORD}
-      - MATRIX_ROOM_ID=${MATRIX_ROOM_ID}
-      - MATRIX_ADMIN_MXIDS=${MATRIX_ADMIN_MXIDS}
-      - MATRIX_REQUIRE_MENTION=1
-      - MATRIX_MENTION_ALIASES=${MATRIX_MENTION_ALIASES}
-      - LLM_BASE_URL=${LLM_BASE_URL}
-      - LLM_API_KEY=${LLM_API_KEY}
-      - LLM_MODEL=${LLM_MODEL}
-      - PROMETHEUS_URL=http://prometheus:9090
-      - METRICS_WINDOW_MINUTES=60
-      - HEALTH_HTTP_ADDR=0.0.0.0:9100
-      - RESPONSE_TIMEOUT_SECONDS=60
-      - LLM_TIMEOUT_SECONDS=25
-      - CONFIRM_WRITES=1
-      - LOG_LEVEL=info
+      - PGHA_RECOVERY_CANDIDATE=${PGHA_RECOVERY_CANDIDATE}
     volumes:
       - pgha-secrets:/pgha-secrets:ro
 
-  # Agent egress is deny-by-default: local Patroni/Postgres + the sidecar Matrix proxy,
-  # internal Prometheus, Docker DNS, and the pinned LLM endpoint only.
-  agent-egress-fw:
-    image: ghcr.io/attestmesh/agent-egress-fw@sha256:c75c9668e905ca00f86e9583505d52624ba87cb7114a4633f84330bb497ca58f
-    restart: unless-stopped
-    network_mode: service:postgres-admin-agent
+  patroni-reinitialize:
+    image: curlimages/curl:8.12.1
+    restart: "no"
+    network_mode: service:sidecar
     depends_on:
-      - postgres-admin-agent
+      - patroni
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - |
+        [ "$${PGHA_REINIT_NODE:-}" = "$${PGHA_NODE_NAME}" ] || exit 0
+        pw="$$(cat /pgha-secrets/patroni-api)"
+        until curl -fsS --max-time 10 -u "patroni:$$pw" -H 'content-type: application/json' \
+          -d '{"force":true}' http://127.0.0.1:8008/reinitialize; do sleep 5; done
+    environment:
+      - PGHA_NODE_NAME=${PGHA_NODE_NAME}
+      - PGHA_REINIT_NODE=${PGHA_REINIT_NODE:-}
+    volumes:
+      - pgha-secrets:/pgha-secrets:ro
+
+  # Decrypted MessageFacet consumer. Redpill is advisory-only; the receiver validates sender,
+  # target, expiry, UUID replay key, and a closed command allowlist before reading diagnostics.
+  pgha-command-agent:
+    image: ghcr.io/attestmesh/pg-ha-command-agent:andrew-xyn-20260716
+    restart: unless-stopped
+    depends_on:
+      - patroni
+    environment:
+      - AGENT_GRPC_SOCKET=/var/run/attestmesh/agent.sock
+      - PGHA_NODE_NAME=${PGHA_NODE_NAME}
+      - PGHA_CLUSTER_NAME=${PGHA_CLUSTER_NAME:-andrew-xyn-pg}
+      - PGHA_SAFE_ADDRESS=${PGHA_SAFE_ADDRESS}
+      - LLM_BASE_URL=${LLM_BASE_URL}
+      - LLM_API_KEY=${LLM_API_KEY}
+      - LLM_MODEL=${LLM_MODEL}
+    volumes:
+      - agent-sock:/var/run/attestmesh:ro
+      - pgha-status:/pgha-status:ro
+      - pgha-command-replay:/var/lib/pgha-command-agent
+
+  # The command agent can reach only the node-local sidecar/Patroni endpoint and redpill.
+  command-agent-egress-fw:
+    image: ghcr.io/attestmesh/agent-egress-fw:phala-rotation-20260718
+    restart: unless-stopped
+    network_mode: service:pgha-command-agent
+    depends_on:
+      - pgha-command-agent
     environment:
       - LLM_BASE_URL=${LLM_BASE_URL}
       - LLM_ALLOW_CIDRS=66.220.6.0/24
-      - INTERNAL_HOSTS=sidecar prometheus
+      - INTERNAL_HOSTS=sidecar
       - ALLOW_DNS=127.0.0.11
       - RERESOLVE_SECONDS=15
     cap_add:
@@ -270,3 +429,5 @@ volumes:
   pgha-status:
   pgha-secrets:
   prometheus-data:
+  pgha-command-replay:
+  s3gw-cache:

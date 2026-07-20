@@ -28,6 +28,10 @@ import time
 sys.path.insert(0, "/opt/dstack-mcp")
 import mcp_dstack as m  # noqa: E402
 
+# Per-run RPC override avoids mutating the box-global MCP service and permits a rate-limit
+# failover for DstackApp registration.
+m.RPC = os.environ.get("BOX_RPC", m.RPC)
+
 # APP_NAME is measured into app_compose (and thus the compose hash), so it MUST be identical
 # across every node of one cluster. VM_NAME is only the qemu/vmm display label and may vary per
 # node. Splitting them keeps the compose hash the same for pg1..pgN (see docs/specs/pg-ha.md §3).
@@ -36,7 +40,7 @@ VM_NAME = os.environ.get("BOX_NAME", APP_NAME)
 COMPOSE_PATH = os.environ.get("BOX_COMPOSE", "/tmp/pg-ha-node.yaml")
 VCPU = int(os.environ.get("BOX_VCPU", "2"))
 MEM = int(os.environ.get("BOX_MEM", "4096"))
-DISK = int(os.environ.get("BOX_DISK", "40"))
+DISK = int(os.environ.get("BOX_DISK", "80"))
 PORTS = json.loads(os.environ.get("BOX_PORTS", "[]"))
 NET_MODE = (os.environ.get("BOX_NET_MODE", "bridge").strip().lower() or "bridge")
 GATEWAY_ENABLED = os.environ.get("BOX_GATEWAY_ENABLED", "true").strip().lower() in {
@@ -52,26 +56,35 @@ ENV_KEYS = [
     "BUNDLER_URL",
     "GAS_POLICY_ID",
     "INDEXER_REGISTRY_ADDR",
+    "CLUSTER",
     "GATEWAY_DOMAIN",
+    "GATEWAY_DOMAIN_OVERRIDES",
     "PGHA_NODE_NAME",
     "PGHA_PEERS",
     "PGHA_BOOTSTRAP",
     "PGHA_MESH_CIDR",
+    "PGHA_ETCD_FORCE_REJOIN",
+    "PGHA_ETCD_FORCE_NEW_CLUSTER",
     "PGHA_VERIFY_PASSWORD",
+    "PGHA_CLUSTER_NAME",
+    "PGHA_SAFE_ADDRESS",
+    "PGHA_RECOVERY_CANDIDATE",
+    "PGHA_REINIT_NODE",
+    "PGHA_CRASH_RECOVERY_ONLY",
     "BACKUP_ENABLED",
     "BACKUP_PREFIX",
     "BACKUP_RESTORE",
+    "BACKUP_DUMP_INTERVAL_SECONDS",
     "R2_ACCESS_KEY_ID",
     "R2_SECRET_ACCESS_KEY",
     "R2_ENDPOINT",
     "R2_BUCKET",
     "R2_REGION",
-    "MATRIX_MESH_IP",
-    "MATRIX_USER_ID",
-    "MATRIX_PASSWORD",
-    "MATRIX_ROOM_ID",
-    "MATRIX_ADMIN_MXIDS",
-    "MATRIX_MENTION_ALIASES",
+    "R2_UPSTREAM_ENDPOINT",
+    "R2_UPSTREAM_BUCKET",
+    "R2_UPSTREAM_REGION",
+    "R2_UPSTREAM_ACCESS_KEY_ID",
+    "R2_UPSTREAM_SECRET_ACCESS_KEY",
     "LLM_BASE_URL",
     "LLM_MODEL",
     "LLM_API_KEY",
@@ -217,6 +230,13 @@ def main() -> None:
         )
         return
 
+    if mode == "logs":
+        vm_id = sys.argv[2] if len(sys.argv) > 2 else ""
+        if not vm_id:
+            raise SystemExit("usage: pg-ha-node-box.py logs <vm_id>")
+        print(m.vm_logs(vm_id=vm_id, lines=30000, channel="serial"))
+        return
+
     if mode == "resize":
         vm_id = sys.argv[2] if len(sys.argv) > 2 else ""
         if not vm_id:
@@ -322,7 +342,7 @@ def main() -> None:
         return
 
     raise SystemExit(
-        "usage: pg-ha-node-box.py [register|create <app_id>|hash|update <app_id> <vm_id>|resize <vm_id>|info <vm_id>|stop <vm_id>|start <vm_id>]"
+        "usage: pg-ha-node-box.py [register|create <app_id>|hash|update <app_id> <vm_id>|resize <vm_id>|info <vm_id>|logs <vm_id>|stop <vm_id>|start <vm_id>]"
     )
 
 

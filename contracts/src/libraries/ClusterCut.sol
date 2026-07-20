@@ -76,8 +76,9 @@ library ClusterCut {
     }
 
     function _messageSelectors() private pure returns (bytes4[] memory s) {
-        s = new bytes4[](1);
+        s = new bytes4[](2);
         s[0] = IMessage.send.selector;
+        s[1] = IMessage.sendOwnerCommand.selector;
     }
 
     function _networkSelectors() private pure returns (bytes4[] memory s) {
