@@ -15,13 +15,20 @@
 //! keys already published on chain, the guest-agent `/Info`, and the raw TEE quote);
 //! no secret key material, CSK, or env values ever appear.
 
-use crate::dstack::DstackRuntime;
+use crate::dstack::{DstackInfo, DstackRuntime};
 use crate::state::Shared;
-use axum::extract::{FromRef, State};
-use axum::http::StatusCode;
+use axum::extract::{FromRef, Query, State};
+use axum::http::{HeaderMap, StatusCode};
 use axum::routing::get;
 use axum::{Json, Router};
+use std::collections::HashMap;
 use std::sync::Arc;
+
+/// Upper bound on the verifier-supplied `/attestation?nonce=` challenge (raw bytes
+/// after hex-decoding). 32 bytes is the natural challenge size; we accept up to 64
+/// so callers can pass a slightly larger opaque token, and reject anything longer
+/// to keep the request cheap and bounded.
+const MAX_NONCE_BYTES: usize = 64;
 
 /// Axum state for the sidecar HTTP surface. Bundles the cross-cutting `Shared`
 /// runtime state with the dstack runtime handle so `/attestation` can re-query the
@@ -45,15 +52,21 @@ impl FromRef<HttpState> for Arc<dyn DstackRuntime> {
     }
 }
 
-pub async fn serve(state: HttpState, addr: String) -> anyhow::Result<()> {
-    let app = Router::new()
+fn app(state: HttpState) -> Router {
+    Router::new()
         .route("/healthz", get(healthz))
         .route("/metrics", get(metrics))
-        .route("/attestation", get(attestation))
-        .with_state(state);
+        .route(
+            "/attestation",
+            get(attestation).options(attestation_preflight),
+        )
+        .with_state(state)
+}
+
+pub async fn serve(state: HttpState, addr: String) -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     tracing::info!(%addr, "health server listening");
-    axum::serve(listener, app).await?;
+    axum::serve(listener, app(state)).await?;
     Ok(())
 }
 
@@ -137,13 +150,18 @@ const ATTESTOR_LABEL: &str = "dstack";
 
 /// Recipe (also emitted in the response) for the 64-byte quote `report_data`, so a
 /// remote verifier can independently recompute it from the public fields we return
-/// and confirm the TEE quote is bound to *this* member's identity:
+/// and confirm the TEE quote is bound to *this* member's identity **and** to their
+/// own freshness challenge:
 /// `report_data[..32] = keccak256(cluster ‖ memberContract ‖ xPub ‖ wgPub ‖ ed25519Pub)`,
-/// `report_data[32..] = 0`.
+/// `report_data[32..] = keccak256(nonce)` when a `?nonce=` challenge is supplied,
+/// else all-zero.
 const REPORT_DATA_BINDING: &str =
-    "keccak256(cluster||memberContract||xPubKey||wgPubKey||ed25519PubKey) in report_data[0..32]";
+    "report_data[0..32]=keccak256(cluster||memberContract||xPubKey||wgPubKey||ed25519PubKey); report_data[32..64]=keccak256(nonce) if a ?nonce= challenge is supplied, else 0";
 
-fn attestation_report_data(shared: &Shared) -> [u8; 64] {
+/// Identity half of `report_data` (bytes `[0..32]`): binds the quote to this
+/// member's on-chain identity. Constant across requests — this is what a verifier
+/// recomputes to confirm the quote is *this* node's, not the freshness input.
+fn attestation_identity_binding(shared: &Shared) -> [u8; 32] {
     use alloy::primitives::keccak256;
     let mut preimage = Vec::with_capacity(20 + 20 + 32 + 32 + 32);
     preimage.extend_from_slice(shared.cluster.as_slice());
@@ -151,9 +169,20 @@ fn attestation_report_data(shared: &Shared) -> [u8; 64] {
     preimage.extend_from_slice(&shared.keys.x_pub);
     preimage.extend_from_slice(&shared.keys.wg_pub);
     preimage.extend_from_slice(&shared.keys.ed25519_pub);
-    let digest = keccak256(&preimage);
+    *keccak256(&preimage)
+}
+
+/// Assemble the 64-byte quote `report_data`. The identity binding fills `[0..32]`;
+/// the optional verifier freshness challenge fills `[32..64]` as `keccak256(nonce)`
+/// (hashing lets any 1..=MAX_NONCE_BYTES challenge map cleanly to 32 bytes). With no
+/// challenge the upper half is zero, matching the pre-nonce identity-only binding.
+fn attestation_report_data(shared: &Shared, nonce: Option<&[u8]>) -> [u8; 64] {
+    use alloy::primitives::keccak256;
     let mut report_data = [0u8; 64];
-    report_data[..32].copy_from_slice(digest.as_slice());
+    report_data[..32].copy_from_slice(&attestation_identity_binding(shared));
+    if let Some(nonce) = nonce {
+        report_data[32..].copy_from_slice(keccak256(nonce).as_slice());
+    }
     report_data
 }
 
@@ -167,18 +196,125 @@ fn code_id_from_app_id(app_id: &[u8]) -> [u8; 32] {
     code_id
 }
 
+/// Validate a `DstackInfo` before it is allowed to count as successful evidence.
+///
+/// Issue [P2]: a lenient `/Info` client (or a malformed guest-agent response) can
+/// yield a `DstackInfo` whose fields are empty/zero — which would otherwise be
+/// serialized as a "successful" bundle with blank identifiers and an all-zero
+/// `code_id`. We reject that here so the handler falls through to `errors.info` +
+/// 503 instead of publishing hollow attestation evidence. `app_id` must be exactly
+/// the 20-byte contract address (`code_id = bytes20(app_id)` depends on it); the
+/// other identifiers and the TCB status must be present.
+fn require_info_field_len(name: &str, actual: usize, expected: usize) -> Result<(), String> {
+    if actual != expected {
+        return Err(format!(
+            "/Info {name} is {actual} bytes, expected {expected} bytes"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_dstack_info(info: &DstackInfo) -> Result<(), String> {
+    require_info_field_len("app_id", info.app_id.len(), 20)?;
+    require_info_field_len("compose_hash", info.compose_hash.len(), 32)?;
+    require_info_field_len("instance_id", info.instance_id.len(), 20)?;
+    require_info_field_len("device_id", info.device_id.len(), 32)?;
+    if info.tcb_status.trim().is_empty() {
+        return Err("/Info tcb_status is empty".to_string());
+    }
+    Ok(())
+}
+
+/// Parse the optional `?nonce=` freshness challenge. Accepts hex (with or without a
+/// `0x` prefix). Returns:
+/// - `Ok(None)` when absent (identity-only binding, `fresh:false`),
+/// - `Ok(Some(bytes))` for a well-formed 1..=`MAX_NONCE_BYTES` challenge,
+/// - `Err(msg)` for a malformed/empty/oversized nonce — the caller turns this into a
+///   `400`, never a silent `200`, so a verifier is never misled into thinking they
+///   got a fresh, challenge-bound quote when they did not.
+fn parse_nonce(params: &HashMap<String, String>) -> Result<Option<Vec<u8>>, String> {
+    let Some(raw) = params.get("nonce") else {
+        return Ok(None);
+    };
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return Err("nonce query parameter is empty".to_string());
+    }
+    let bytes =
+        hex::decode(raw.trim_start_matches("0x")).map_err(|e| format!("nonce must be hex: {e}"))?;
+    if bytes.is_empty() {
+        return Err("nonce decoded to zero bytes".to_string());
+    }
+    if bytes.len() > MAX_NONCE_BYTES {
+        return Err(format!(
+            "nonce is {} bytes, max {MAX_NONCE_BYTES}",
+            bytes.len()
+        ));
+    }
+    Ok(Some(bytes))
+}
+
+/// CORS headers for the public `/attestation` endpoint. The bundle is public by
+/// design and carries only public material, so an open read policy is correct and
+/// lets browser UIs on any origin fetch and verify a node directly. Scoped to this
+/// endpoint's responses only (see `attestation` / `attestation_preflight`); the
+/// method-agnostic `/healthz` and `/metrics` surfaces are unchanged.
+fn apply_attestation_cors(headers: &mut HeaderMap) {
+    use axum::http::header::{
+        ACCESS_CONTROL_ALLOW_HEADERS, ACCESS_CONTROL_ALLOW_METHODS, ACCESS_CONTROL_ALLOW_ORIGIN,
+        ACCESS_CONTROL_MAX_AGE,
+    };
+    headers.insert(ACCESS_CONTROL_ALLOW_ORIGIN, "*".parse().unwrap());
+    headers.insert(
+        ACCESS_CONTROL_ALLOW_METHODS,
+        "GET, OPTIONS".parse().unwrap(),
+    );
+    headers.insert(ACCESS_CONTROL_ALLOW_HEADERS, "*".parse().unwrap());
+    headers.insert(ACCESS_CONTROL_MAX_AGE, "86400".parse().unwrap());
+}
+
+/// `OPTIONS /attestation` preflight — answer browser CORS preflight with `204` and
+/// the same open policy the `GET` handler returns.
+async fn attestation_preflight() -> (StatusCode, HeaderMap) {
+    let mut headers = HeaderMap::new();
+    apply_attestation_cors(&mut headers);
+    (StatusCode::NO_CONTENT, headers)
+}
+
 /// `GET /attestation` — this member's public TEE attestation bundle, served
 /// node-locally (TeeSQL pattern). Returns `200 OK` with the full bundle when a
-/// fresh quote is obtained, or `503 Service Unavailable` with `available:false`
-/// and an `errors` map when the dstack guest agent is unreachable. Never returns
-/// secret material: only *public* keys (already published on chain), the public
-/// `/Info`, and the raw TEE quote whose `report_data` binds them together.
+/// fresh quote is obtained, `503 Service Unavailable` with `available:false` and an
+/// `errors` map when the dstack guest agent is unreachable *or* returns malformed
+/// `/Info`, or `400 Bad Request` when a supplied `?nonce=` challenge is malformed.
+///
+/// A verifier-supplied `?nonce=` challenge (hex) is folded into `report_data[32..64]`
+/// as `keccak256(nonce)` and echoed back, so a remote party can prove the quote is
+/// **fresh** rather than a replay of a captured response. Never returns secret
+/// material: only *public* keys (already published on chain), the public `/Info`,
+/// and the raw TEE quote whose `report_data` binds them together.
 async fn attestation(
     State(shared): State<Arc<Shared>>,
     State(dstack): State<Arc<dyn DstackRuntime>>,
-) -> (StatusCode, Json<serde_json::Value>) {
+    Query(params): Query<HashMap<String, String>>,
+) -> (StatusCode, HeaderMap, Json<serde_json::Value>) {
+    // Parse the freshness challenge first: a malformed nonce is a client error, and
+    // returning 200 for it would defeat the anti-replay guarantee (the verifier would
+    // believe they got a challenge-bound quote).
+    let nonce = match parse_nonce(&params) {
+        Ok(n) => n,
+        Err(msg) => {
+            let mut headers = HeaderMap::new();
+            apply_attestation_cors(&mut headers);
+            let body = serde_json::json!({
+                "available": false,
+                "error": msg,
+            });
+            return (StatusCode::BAD_REQUEST, headers, Json(body));
+        }
+    };
+
     let phase = shared.current_phase().await;
-    let report_data = attestation_report_data(&shared);
+    let report_data = attestation_report_data(&shared, nonce.as_deref());
 
     // Local, always-available public identity. These are the same values published
     // on chain during registration (xPubKey/wgPubKey) and via publishEd25519Key.
@@ -198,23 +334,37 @@ async fn attestation(
         "identity": identity,
         "report_data": format!("0x{}", hex::encode(report_data)),
         "report_data_binding": REPORT_DATA_BINDING,
+        // Freshness: echo the verifier's challenge (if any) so they can confirm it
+        // was bound into report_data[32..64]. `fresh` is true only when a nonce was
+        // supplied and accepted — an identity-only bundle is not replay-evident.
+        "fresh": nonce.is_some(),
+        "nonce": nonce.as_ref().map(|n| format!("0x{}", hex::encode(n))),
     });
 
     let mut errors = serde_json::Map::new();
 
-    // dstack `/Info`: app_id, compose_hash, instance/device id, TCB status.
+    // dstack `/Info`: app_id, compose_hash, instance/device id, TCB status. Validate
+    // the fields before trusting them — a malformed/empty `/Info` must NOT be
+    // published as successful evidence (issue [P2]).
     match dstack.info().await {
-        Ok(info) => {
-            body["dstack"] = serde_json::json!({
-                "app_id": format!("0x{}", hex::encode(&info.app_id)),
-                "compose_hash": format!("0x{}", hex::encode(&info.compose_hash)),
-                "instance_id": format!("0x{}", hex::encode(&info.instance_id)),
-                "device_id": format!("0x{}", hex::encode(&info.device_id)),
-                "tcb_status": info.tcb_status,
-            });
-            body["code_id"] =
-                serde_json::json!(format!("0x{}", hex::encode(code_id_from_app_id(&info.app_id))));
-        }
+        Ok(info) => match validate_dstack_info(&info) {
+            Ok(()) => {
+                body["dstack"] = serde_json::json!({
+                    "app_id": format!("0x{}", hex::encode(&info.app_id)),
+                    "compose_hash": format!("0x{}", hex::encode(&info.compose_hash)),
+                    "instance_id": format!("0x{}", hex::encode(&info.instance_id)),
+                    "device_id": format!("0x{}", hex::encode(&info.device_id)),
+                    "tcb_status": info.tcb_status,
+                });
+                body["code_id"] = serde_json::json!(format!(
+                    "0x{}",
+                    hex::encode(code_id_from_app_id(&info.app_id))
+                ));
+            }
+            Err(msg) => {
+                errors.insert("info".to_string(), serde_json::json!(msg));
+            }
+        },
         Err(e) => {
             errors.insert("info".to_string(), serde_json::json!(e.to_string()));
         }
@@ -246,7 +396,9 @@ async fn attestation(
     } else {
         StatusCode::SERVICE_UNAVAILABLE
     };
-    (code, Json(body))
+    let mut headers = HeaderMap::new();
+    apply_attestation_cors(&mut headers);
+    (code, headers, Json(body))
 }
 
 #[cfg(test)]
@@ -356,10 +508,25 @@ mod tests {
         let shared = shared().await;
         let dstack: Arc<dyn DstackRuntime> = Arc::new(MockDstack::from_label("health-test"));
 
-        let (code, Json(body)) = attestation(State(shared.clone()), State(dstack.clone())).await;
+        let (code, headers, Json(body)) = attestation(
+            State(shared.clone()),
+            State(dstack.clone()),
+            Query(HashMap::new()),
+        )
+        .await;
         assert_eq!(code, StatusCode::OK);
         assert_eq!(body["available"], true);
         assert_eq!(body["attestor"], "dstack");
+        // CORS is applied so browser UIs can read the public bundle cross-origin.
+        assert_eq!(
+            headers
+                .get(axum::http::header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                .unwrap(),
+            "*"
+        );
+        // No freshness challenge was supplied: identity-only binding, fresh:false.
+        assert_eq!(body["fresh"], false);
+        assert!(body["nonce"].is_null());
 
         // Identity is the public keys, hex-0x encoded.
         assert_eq!(
@@ -388,7 +555,7 @@ mod tests {
         );
 
         // report_data is recomputable by a verifier from the public fields.
-        let expected_rd = attestation_report_data(&shared);
+        let expected_rd = attestation_report_data(&shared, None);
         assert_eq!(
             body["report_data"],
             format!("0x{}", hex::encode(expected_rd))
@@ -398,10 +565,7 @@ mod tests {
         // quote embeds report_data so the binding is checkable).
         let quote = dstack.get_quote(expected_rd).await.unwrap();
         assert_eq!(body["quote"]["len"], quote.len());
-        assert_eq!(
-            body["quote"]["bytes"],
-            format!("0x{}", hex::encode(&quote))
-        );
+        assert_eq!(body["quote"]["bytes"], format!("0x{}", hex::encode(&quote)));
 
         // No-secrets invariant: the serialized bundle must not contain any secret
         // key material.
@@ -426,7 +590,8 @@ mod tests {
         let shared = shared().await;
         let dstack: Arc<dyn DstackRuntime> = Arc::new(FailingDstack);
 
-        let (code, Json(body)) = attestation(State(shared.clone()), State(dstack)).await;
+        let (code, _headers, Json(body)) =
+            attestation(State(shared.clone()), State(dstack), Query(HashMap::new())).await;
         assert_eq!(code, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(body["available"], false);
         assert!(body["errors"]["quote"].is_string());
@@ -438,5 +603,200 @@ mod tests {
             body["identity"]["x_pub"],
             format!("0x{}", hex::encode(shared.keys.x_pub))
         );
+    }
+
+    /// A dstack runtime that answers `/GetQuote` but returns a malformed `/Info`
+    /// (empty app_id). Models a guest-agent error body that a lenient client would
+    /// silently accept — the handler must reject it (issue [P2]) rather than publish
+    /// a hollow bundle with a zero code_id.
+    struct MalformedInfoDstack(MockDstack);
+
+    #[async_trait::async_trait]
+    impl DstackRuntime for MalformedInfoDstack {
+        async fn derive_key(
+            &self,
+            p: &str,
+            s: &str,
+        ) -> anyhow::Result<zeroize::Zeroizing<[u8; 32]>> {
+            self.0.derive_key(p, s).await
+        }
+        async fn get_quote(&self, rd: [u8; 64]) -> anyhow::Result<Vec<u8>> {
+            self.0.get_quote(rd).await
+        }
+        async fn get_key(&self, p: &str, s: &str) -> anyhow::Result<crate::dstack::DstackKey> {
+            self.0.get_key(p, s).await
+        }
+        async fn info(&self) -> anyhow::Result<crate::dstack::DstackInfo> {
+            Ok(crate::dstack::DstackInfo {
+                app_id: Vec::new(),
+                compose_hash: Vec::new(),
+                instance_id: Vec::new(),
+                device_id: Vec::new(),
+                tcb_status: String::new(),
+            })
+        }
+    }
+
+    /// Issue [P2]: a malformed `/Info` (empty fields) must NOT be reported as
+    /// `available:true`. Even though `/GetQuote` succeeds, the handler must surface
+    /// `errors.info`, omit the `dstack`/`code_id` fields, and return 503.
+    #[tokio::test]
+    async fn attestation_rejects_malformed_info() {
+        let shared = shared().await;
+        let dstack: Arc<dyn DstackRuntime> =
+            Arc::new(MalformedInfoDstack(MockDstack::from_label("health-test")));
+
+        let (code, _headers, Json(body)) =
+            attestation(State(shared.clone()), State(dstack), Query(HashMap::new())).await;
+        assert_eq!(code, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["available"], false);
+        assert!(body["errors"]["info"].is_string());
+        // The malformed /Info must not be published as evidence.
+        assert!(body.get("dstack").is_none());
+        assert!(body.get("code_id").is_none());
+    }
+
+    /// Issue [P1]: a verifier-supplied `?nonce=` challenge is folded into
+    /// `report_data[32..64]` as keccak256(nonce), echoed back, and marks the bundle
+    /// `fresh:true` — so the same captured response cannot be replayed for a
+    /// different challenge.
+    #[tokio::test]
+    async fn attestation_binds_nonce_for_freshness() {
+        use alloy::primitives::keccak256;
+        let shared = shared().await;
+        let dstack: Arc<dyn DstackRuntime> = Arc::new(MockDstack::from_label("health-test"));
+
+        let nonce_hex = "0xdeadbeef";
+        let mut params = HashMap::new();
+        params.insert("nonce".to_string(), nonce_hex.to_string());
+
+        let (code, _headers, Json(body)) =
+            attestation(State(shared.clone()), State(dstack.clone()), Query(params)).await;
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(body["fresh"], true);
+        assert_eq!(body["nonce"], nonce_hex);
+
+        // report_data[32..64] == keccak256(nonce); [0..32] is the identity binding.
+        let nonce_bytes = hex::decode("deadbeef").unwrap();
+        let expected_rd = attestation_report_data(&shared, Some(&nonce_bytes));
+        assert_eq!(
+            body["report_data"],
+            format!("0x{}", hex::encode(expected_rd))
+        );
+        assert_eq!(
+            &expected_rd[32..],
+            keccak256(&nonce_bytes).as_slice(),
+            "upper half must bind the challenge"
+        );
+        assert_eq!(
+            &expected_rd[..32],
+            &attestation_report_data(&shared, None)[..32],
+            "identity half is unchanged by the nonce"
+        );
+        // Anti-replay: a different challenge yields a different report_data, so a
+        // captured response cannot satisfy a fresh challenge.
+        let other = attestation_report_data(&shared, Some(b"different"));
+        assert_ne!(expected_rd, other);
+
+        // The quote actually commits to the nonce-bound report_data.
+        let quote = dstack.get_quote(expected_rd).await.unwrap();
+        assert_eq!(body["quote"]["len"], quote.len());
+    }
+
+    /// Issue [P1]: a malformed `?nonce=` (non-hex) is a client error — 400, never a
+    /// silent 200 that would mislead a verifier into thinking they got a fresh quote.
+    #[tokio::test]
+    async fn attestation_rejects_malformed_nonce() {
+        let shared = shared().await;
+        let dstack: Arc<dyn DstackRuntime> = Arc::new(MockDstack::from_label("health-test"));
+
+        let mut params = HashMap::new();
+        params.insert("nonce".to_string(), "nothex!!".to_string());
+
+        let (code, _headers, Json(body)) =
+            attestation(State(shared), State(dstack), Query(params)).await;
+        assert_eq!(code, StatusCode::BAD_REQUEST);
+        assert_eq!(body["available"], false);
+        assert!(body["error"].is_string());
+    }
+
+    /// Issue [P2]: CORS must be real routing behavior, not just a direct-handler
+    /// unit test artifact. Exercise the Axum router over HTTP to prove
+    /// `OPTIONS /attestation` answers preflight and `GET /attestation` carries CORS,
+    /// while `/healthz` stays unchanged (CORS scoped to `/attestation`).
+    #[tokio::test]
+    async fn attestation_route_supports_scoped_cors() {
+        let shared = shared().await;
+        let dstack: Arc<dyn DstackRuntime> = Arc::new(MockDstack::from_label("health-test"));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app(HttpState { shared, dstack }))
+                .await
+                .unwrap();
+        });
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+
+        let preflight = client
+            .request(
+                reqwest::Method::OPTIONS,
+                format!("http://{addr}/attestation"),
+            )
+            .header("origin", "https://ui.example")
+            .header("access-control-request-method", "GET")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(preflight.status().as_u16(), StatusCode::NO_CONTENT.as_u16());
+        assert_eq!(
+            preflight
+                .headers()
+                .get("access-control-allow-origin")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "*"
+        );
+        assert_eq!(
+            preflight
+                .headers()
+                .get("access-control-allow-methods")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "GET, OPTIONS"
+        );
+
+        let get = client
+            .get(format!("http://{addr}/attestation?nonce=deadbeef"))
+            .header("origin", "https://ui.example")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(get.status().as_u16(), StatusCode::OK.as_u16());
+        assert_eq!(
+            get.headers()
+                .get("access-control-allow-origin")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "*"
+        );
+        let body: serde_json::Value = get.json().await.unwrap();
+        assert_eq!(body["fresh"], true);
+        assert_eq!(body["nonce"], "0xdeadbeef");
+
+        let healthz = client
+            .get(format!("http://{addr}/healthz"))
+            .header("origin", "https://ui.example")
+            .send()
+            .await
+            .unwrap();
+        assert!(healthz
+            .headers()
+            .get("access-control-allow-origin")
+            .is_none());
+
+        server.abort();
     }
 }
