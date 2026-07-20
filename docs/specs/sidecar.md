@@ -542,12 +542,27 @@ Per master spec §8.
 
 ---
 
-## 14. Healthcheck
+## 14. Healthcheck & node HTTP surface
 
-Two surfaces, same semantics:
+Two health surfaces, same semantics:
 
-- **HTTP** at `HEALTH_HTTP_ADDR` (`/healthz` only): returns `200 OK` once `first_converged && csk_acquired`, else `503 Service Unavailable` with a JSON body containing the current phase and which gates are open/closed. This is what docker-compose's `healthcheck:` directive curls.
+- **HTTP** at `HEALTH_HTTP_ADDR` (`/healthz`): returns `200 OK` once `first_converged && csk_acquired`, else `503 Service Unavailable` with a JSON body containing the current phase and which gates are open/closed. This is what docker-compose's `healthcheck:` directive curls.
 - **gRPC** (`Agent.GetMeshStatus`): structured status (§12.1).
+
+The same HTTP listener also serves:
+
+- **`GET /metrics`** — Prometheus text form of the punch counters and per-peer link transport.
+- **`GET /attestation`** — this member's public TEE attestation bundle, served node-locally so a UI or remote verifier can pull and verify each node **directly** rather than trusting a central API (the same node-local pattern TeeSQL uses for its `/attestation` route). It re-queries the dstack guest agent for a fresh quote on each call. Returns `200 OK` with the bundle when a quote is obtained, or `503 Service Unavailable` with `available:false` and an `errors` map when the guest agent is unreachable — it never fabricates a quote. The bundle is **public by design**: it is meant to be pulled and independently verified by anyone — a UI, a counterparty, or a third-party auditor — so remote attestation delivers its value without trusting any central API. It is safe to expose precisely because it carries **only public material** (see fields below): the no-secrets property, not a network wall, is what makes public exposure correct. The listener binds `HEALTH_HTTP_ADDR` (code default `127.0.0.1:9090`); the shipped deploy templates set `HEALTH_HTTP_ADDR=0.0.0.0:9090` and publish host port `9090`, so `/attestation` — alongside `/healthz` and `/metrics` — is reachable by external verifiers. Only **public** material is returned; never secret key material, the CSK, or env values.
+
+  Body fields:
+  - `attestor` — attestation method label (`"dstack"`); mirrors the on-chain attestor id and the mesh-state-api display label.
+  - `member_id`, `member_contract`, `cluster`, `mesh_ip`, `phase` — this member's on-chain/mesh identity and current bring-up phase.
+  - `identity` — the public keys already published on chain: `x_pub`, `ed25519_pub`, `wg_pub`.
+  - `dstack` — guest-agent `/Info`: `app_id`, `compose_hash`, `instance_id`, `device_id`, `tcb_status`.
+  - `code_id` — `bytes32(bytes20(app_id))`, the same value the on-chain `DstackProof` and the cluster boot gate use.
+  - `report_data` — the 64-byte quote user-data; `report_data_binding` gives the recipe (`keccak256(cluster||memberContract||xPubKey||wgPubKey||ed25519PubKey)` in `report_data[0..32]`) so a verifier can independently recompute it from the public fields and confirm the quote is bound to this identity.
+  - `quote` — `{ provider, format:"raw", len, bytes }`: the raw TEE-signed attestation blob over `report_data`.
+  - `available` — `true` when both `/Info` and `/GetQuote` succeeded; otherwise `false` with an `errors` object (`info`/`quote`) and HTTP 503.
 
 Phases reported (`MeshStatus.phase`):
 - `booting` — pre key-derivation

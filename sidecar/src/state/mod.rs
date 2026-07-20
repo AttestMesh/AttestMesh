@@ -357,7 +357,14 @@ pub async fn run(config: Config) -> Result<()> {
         .await?;
     }
 
-    crate::health::serve(shared.clone(), config.health_http_addr.clone()).await?;
+    crate::health::serve(
+        crate::health::HttpState {
+            shared: shared.clone(),
+            dstack: dstack.clone(),
+        },
+        config.health_http_addr.clone(),
+    )
+    .await?;
     Ok(())
 }
 
