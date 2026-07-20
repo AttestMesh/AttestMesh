@@ -68,6 +68,7 @@ class SandboxdDeployContract(unittest.TestCase):
         self.assertNotIn("dstack.sock", builder)
         self.assertNotIn("SANDBOX_DAEMON_TOKEN", builder)
         self.assertIn('SANDBOXD_REQUIRE_BUILDER: "1"', daemon)
+        self.assertIn('cpus: "5.0"', daemon)
         self.assertIn(
             "SANDBOXD_BUILD_REPOSITORY: ghcr.io/attestmesh/synclave-workloads",
             daemon,
