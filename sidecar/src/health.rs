@@ -222,6 +222,82 @@ fn validate_dstack_info(info: &DstackInfo) -> Result<(), String> {
     Ok(())
 }
 
+/// Byte layout of an Intel TDX ECDSA quote v4. The quote header is 48 bytes and
+/// is followed by the 584-byte TDREPORT body described by Intel's quote ABI.
+/// Measurements are decoded only for the TDX TEE type; the raw quote remains the
+/// canonical evidence a verifier must cryptographically validate.
+const TDX_TEE_TYPE: u32 = 0x0000_0081;
+const TDX_QUOTE_V4_HEADER_LEN: usize = 48;
+const TDX_REPORT_BODY_LEN: usize = 584;
+
+fn quote_hex(bytes: &[u8]) -> String {
+    format!("0x{}", hex::encode(bytes))
+}
+
+/// Decode the signed report body from a TDX quote and prove that its embedded
+/// REPORTDATA is the value requested from `/GetQuote`. This is structural parsing,
+/// not DCAP verification; callers still verify the returned raw quote and Intel
+/// certificate chain independently.
+fn decode_tdx_quote(
+    quote: &[u8],
+    expected_report_data: &[u8; 64],
+) -> Result<serde_json::Value, String> {
+    let min_len = TDX_QUOTE_V4_HEADER_LEN + TDX_REPORT_BODY_LEN;
+    if quote.len() < min_len {
+        return Err(format!(
+            "TDX quote is {} bytes, expected at least {min_len} bytes",
+            quote.len()
+        ));
+    }
+
+    let version = u16::from_le_bytes([quote[0], quote[1]]);
+    if version != 4 {
+        return Err(format!("unsupported TDX quote version {version}"));
+    }
+    let attestation_key_type = u16::from_le_bytes([quote[2], quote[3]]);
+    let tee_type = u32::from_le_bytes(quote[4..8].try_into().unwrap());
+    if tee_type != TDX_TEE_TYPE {
+        return Err(format!("quote TEE type 0x{tee_type:08x} is not Intel TDX"));
+    }
+
+    let body = &quote[TDX_QUOTE_V4_HEADER_LEN..min_len];
+    let embedded_report_data = &body[520..584];
+    if embedded_report_data != expected_report_data {
+        return Err("TDX quote REPORTDATA does not match requested report_data".to_string());
+    }
+
+    let td_attributes = u64::from_le_bytes(body[120..128].try_into().unwrap());
+    Ok(serde_json::json!({
+        "header": {
+            "version": version,
+            "attestation_key_type": attestation_key_type,
+            "tee_type": "tdx",
+            "tee_type_raw": format!("0x{tee_type:08x}"),
+            "qe_svn": u16::from_le_bytes([quote[8], quote[9]]),
+            "pce_svn": u16::from_le_bytes([quote[10], quote[11]]),
+            "qe_vendor_id": quote_hex(&quote[12..28]),
+            "user_data": quote_hex(&quote[28..48]),
+        },
+        "measurements": {
+            "tee_tcb_svn": quote_hex(&body[0..16]),
+            "mr_seam": quote_hex(&body[16..64]),
+            "mr_signer_seam": quote_hex(&body[64..112]),
+            "seam_attributes": quote_hex(&body[112..120]),
+            "td_attributes": quote_hex(&body[120..128]),
+            "debug": td_attributes & 1 != 0,
+            "xfam": quote_hex(&body[128..136]),
+            "mrtd": quote_hex(&body[136..184]),
+            "mr_config_id": quote_hex(&body[184..232]),
+            "mr_owner": quote_hex(&body[232..280]),
+            "mr_owner_config": quote_hex(&body[280..328]),
+            "rtmr0": quote_hex(&body[328..376]),
+            "rtmr1": quote_hex(&body[376..424]),
+            "rtmr2": quote_hex(&body[424..472]),
+            "rtmr3": quote_hex(&body[472..520]),
+        },
+    }))
+}
+
 /// Parse the optional `?nonce=` freshness challenge. Accepts hex (with or without a
 /// `0x` prefix). Returns:
 /// - `Ok(None)` when absent (identity-only binding, `fresh:false`),
@@ -369,12 +445,33 @@ async fn attestation(
     // dstack `/GetQuote`: the raw TEE-signed attestation blob over `report_data`.
     match dstack.get_quote(report_data).await {
         Ok(quote) if !quote.is_empty() => {
-            body["quote"] = serde_json::json!({
-                "provider": ATTESTOR_LABEL,
-                "format": "raw",
-                "len": quote.len(),
-                "bytes": format!("0x{}", hex::encode(&quote)),
-            });
+            // Real dstack evidence is a TDX quote. Tests use a deliberately tagged
+            // mock quote, whose only contract is that it embeds report_data.
+            let decoded = if quote.starts_with(b"MOCKQUOTE-v1") {
+                quote
+                    .ends_with(&report_data)
+                    .then(|| serde_json::json!({"format": "mock"}))
+                    .ok_or_else(|| "mock quote REPORTDATA mismatch".to_string())
+            } else {
+                decode_tdx_quote(&quote, &report_data)
+            };
+            match decoded {
+                Ok(decoded) => {
+                    body["quote"] = serde_json::json!({
+                        "provider": ATTESTOR_LABEL,
+                        "format": "raw",
+                        "len": quote.len(),
+                        "bytes": format!("0x{}", hex::encode(&quote)),
+                        "header": decoded.get("header").cloned().unwrap_or_default(),
+                    });
+                    if let Some(measurements) = decoded.get("measurements") {
+                        body["measurements"] = measurements.clone();
+                    }
+                }
+                Err(msg) => {
+                    errors.insert("quote".to_string(), serde_json::json!(msg));
+                }
+            }
         }
         Ok(_) => {
             errors.insert("quote".to_string(), serde_json::json!("empty quote"));
@@ -689,6 +786,39 @@ mod tests {
         assert_eq!(body["available"], false);
         assert_eq!(body["errors"]["quote"], "empty quote");
         assert!(body.get("quote").is_none());
+    }
+
+    #[test]
+    fn decodes_tdx_v4_measurements_and_checks_report_data() {
+        let report_data = [0xa5; 64];
+        let mut quote = vec![0u8; TDX_QUOTE_V4_HEADER_LEN + TDX_REPORT_BODY_LEN];
+        quote[0..2].copy_from_slice(&4u16.to_le_bytes());
+        quote[2..4].copy_from_slice(&2u16.to_le_bytes());
+        quote[4..8].copy_from_slice(&TDX_TEE_TYPE.to_le_bytes());
+        let body = &mut quote[TDX_QUOTE_V4_HEADER_LEN..];
+        body[120..128].copy_from_slice(&1u64.to_le_bytes());
+        body[136..184].fill(0x11);
+        body[328..376].fill(0x20);
+        body[376..424].fill(0x21);
+        body[424..472].fill(0x22);
+        body[472..520].fill(0x23);
+        body[520..584].copy_from_slice(&report_data);
+
+        let decoded = decode_tdx_quote(&quote, &report_data).unwrap();
+        assert_eq!(decoded["header"]["version"], 4);
+        assert_eq!(decoded["header"]["tee_type"], "tdx");
+        assert_eq!(decoded["measurements"]["debug"], true);
+        assert_eq!(
+            decoded["measurements"]["mrtd"],
+            format!("0x{}", "11".repeat(48))
+        );
+        assert_eq!(
+            decoded["measurements"]["rtmr3"],
+            format!("0x{}", "23".repeat(48))
+        );
+
+        let err = decode_tdx_quote(&quote, &[0x5a; 64]).unwrap_err();
+        assert!(err.contains("REPORTDATA does not match"));
     }
 
     /// Issue [P1]: a verifier-supplied `?nonce=` challenge is folded into

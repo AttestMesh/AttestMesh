@@ -568,7 +568,8 @@ The same HTTP listener also serves:
   - `report_data` — the 64-byte quote user-data; `report_data_binding` gives the recipe (`keccak256(cluster||memberContract||xPubKey||wgPubKey||ed25519PubKey)` in `report_data[0..32]`, and `keccak256(nonce)` in `report_data[32..64]` when a nonce is supplied) so a verifier can independently recompute it from the public fields and confirm the quote is bound to this identity and their challenge.
   - `fresh` — `true` only when a `?nonce=` challenge was supplied and bound into the quote; `false` for an identity-only bundle (which is not replay-evident).
   - `nonce` — the accepted challenge echoed back (`0x`-hex), or `null` when none was supplied.
-  - `quote` — `{ provider, format:"raw", len, bytes }`: the non-empty raw TEE-signed attestation blob over `report_data`. A missing, malformed, or empty quote is rejected into `errors.quote`.
+  - `quote` — `{ provider, format:"raw", len, bytes, header }`: the non-empty raw TEE-signed attestation blob over `report_data`, plus its decoded TDX v4 header (`version`, attestation-key/TEE type, QE/PCE SVN, vendor id, user data). A missing, malformed, unsupported, or empty quote — or one whose embedded `REPORTDATA` differs from the requested binding — is rejected into `errors.quote`.
+  - `measurements` — the fields decoded directly from the signed TDX TDREPORT body: `mrtd`, `rtmr0`..`rtmr3`, `tee_tcb_svn`, `mr_seam`, `mr_signer_seam`, `seam_attributes`, `td_attributes`, `debug`, `xfam`, `mr_config_id`, `mr_owner`, and `mr_owner_config`. These are structural extracts for inspection and policy matching; cryptographic authenticity and the current TCB verdict still come from verifying `quote.bytes` with Intel collateral.
   - `available` — `true` when `/GetQuote` succeeded **and** `/Info` was well-formed; otherwise `false` with an `errors` object (`info`/`quote`) and HTTP 503.
 
 Phases reported (`MeshStatus.phase`):
