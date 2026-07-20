@@ -140,7 +140,10 @@ services:
     restart: "no"
     init: true
     stop_grace_period: 90s
-    cpus: "1.0"
+    # Tenant runsc containers are launched through the host Docker daemon beneath this service's
+    # delegated CPU parent. Its ceiling must cover the full admitted tenant pool or recovery of a
+    # Medium/Large sandbox fails before runsc starts. Tenant containers retain their own exact caps.
+    cpus: "5.0"
     mem_limit: 2304m
     pids_limit: 1024
     sysctls:
