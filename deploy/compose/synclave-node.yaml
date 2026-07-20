@@ -195,8 +195,8 @@ services:
     # v21 = user-visible orchestrator failure details in enclave deploys;
     # v20 = CLUSTER_NETWORKS-only live mesh config + structured orchestrator errors;
     # v19 = Apps → Sandboxes rename (labels only, wire stays app).
-    # Synclave main a14fa36 — testing strategy, hardened boundaries, and deploy guidance.
-    image: ghcr.io/attestmesh/synclave-app:sha-a14fa368340e7bb33ab69abe1aadd74add961219@sha256:c1c7003ccf5bf6ce5f9f3109fca19cd328414bddd5d2804bbb49352e7096d8f5
+    # Synclave main 164b8ff — verbatim deployment log streaming across UI, API, and CLI.
+    image: ghcr.io/attestmesh/synclave-app:sha-164b8ff62c1185a3e8f1e57d2fe72713477dd1c7@sha256:1d600ab070c1cd0c25211e308ab0b6246a1ee7ace16a1bc6f72bc078017324f0
     environment:
       API_HOST: 0.0.0.0
       API_PORT: 80
