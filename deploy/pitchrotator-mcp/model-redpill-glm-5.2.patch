@@ -15,6 +15,14 @@ diff --git a/mcp-server/src/model.ts b/mcp-server/src/model.ts
 @@ -19 +21 @@
 -    return STUB_MARKER + JSON.stringify({ note: "stub model output (no OPENROUTER_API_KEY)" });
 +    return STUB_MARKER + JSON.stringify({ note: "stub model output (no MODEL_API_KEY)" });
-@@ -28 +30 @@
+@@ -22 +24,2 @@
+     method: "POST",
++    signal: AbortSignal.timeout(parseInt(process.env.MODEL_TIMEOUT_MS || "60000", 10)),
+@@ -28,3 +31,6 @@
 -      model: process.env.PITCH_MODEL || "anthropic/claude-opus-4-8",
 +      model: process.env.MODEL_NAME || "z-ai/glm-5.2",
+       messages,
+       temperature: 0.4,
++      max_tokens: parseInt(process.env.MODEL_MAX_TOKENS || "2048", 10),
++      thinking: { type: "disabled" },
++      reasoning_effort: "none",

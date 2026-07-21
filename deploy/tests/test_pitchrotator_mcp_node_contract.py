@@ -19,7 +19,7 @@ SOURCE_ARCHIVE_SHA256 = (
     "57aa6a29108cdaa5a46cd6d12b962c7c01c8ca824882b77f16767ea395843e1d"
 )
 LOCKFILE_SHA256 = "3a3e75e10c0ebb9ed132cf93fd4641cc3c8d043c55e4a443ac42f32c25d73342"
-OVERLAY_SHA256 = "baa89e6b4c2eaf04c1fd81b7c4c0a026c68e1de8c7c5ec5cfa4275b733807559"
+OVERLAY_SHA256 = "b13e1cb243f3978ccaee8a1eb1a82c987503066c550b1703ae4b65b37dd93b7a"
 
 
 class PitchRotatorMcpNodeContractTests(unittest.TestCase):
@@ -103,6 +103,8 @@ class PitchRotatorMcpNodeContractTests(unittest.TestCase):
         self.assertIn("MODEL_API_KEY", self.compose)
         self.assertIn("MODEL_BASE_URL=https://api.redpill.ai/v1", self.compose)
         self.assertIn("MODEL_NAME=z-ai/glm-5.2", self.compose)
+        self.assertIn("MODEL_MAX_TOKENS=2048", self.compose)
+        self.assertIn("MODEL_TIMEOUT_MS=60000", self.compose)
         self.assertRegex(
             self.driver,
             r"printf\s+['\"]E_MODEL_API_KEY=%q",
@@ -117,6 +119,9 @@ class PitchRotatorMcpNodeContractTests(unittest.TestCase):
         self.assertIn("https://api.redpill.ai/v1", self.model_overlay)
         self.assertIn('process.env.MODEL_API_KEY', self.model_overlay)
         self.assertIn('process.env.MODEL_NAME || "z-ai/glm-5.2"', self.model_overlay)
+        self.assertIn('thinking: { type: "disabled" }', self.model_overlay)
+        self.assertIn('reasoning_effort: "none"', self.model_overlay)
+        self.assertIn("AbortSignal.timeout", self.model_overlay)
         self.assertIn(OVERLAY_SHA256, self.build_script)
         self.assertIn("sha256sum -c", self.build_script)
         self.assertIn("patch -d", self.build_script)

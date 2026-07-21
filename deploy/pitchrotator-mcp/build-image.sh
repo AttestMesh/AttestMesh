@@ -10,7 +10,7 @@ SOURCE_COMMIT=66b5495b0ea0695ef6d2a35969d444da4f680a52
 SOURCE_TREE=30ef21a38034bf1d1f7001445a6feea89a424cb3
 SOURCE_ARCHIVE_SHA256=57aa6a29108cdaa5a46cd6d12b962c7c01c8ca824882b77f16767ea395843e1d
 LOCKFILE_SHA256=3a3e75e10c0ebb9ed132cf93fd4641cc3c8d043c55e4a443ac42f32c25d73342
-OVERLAY_SHA256=baa89e6b4c2eaf04c1fd81b7c4c0a026c68e1de8c7c5ec5cfa4275b733807559
+OVERLAY_SHA256=b13e1cb243f3978ccaee8a1eb1a82c987503066c550b1703ae4b65b37dd93b7a
 
 for tool in git sha256sum tar patch docker jq; do
   command -v "$tool" >/dev/null || { echo "missing required tool: $tool" >&2; exit 1; }
