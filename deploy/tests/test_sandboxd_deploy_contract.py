@@ -15,7 +15,7 @@ class SandboxdDeployContract(unittest.TestCase):
     def test_release_pins_one_daemon_image_and_enables_bounded_exec(self) -> None:
         daemon_digest = (
             "ghcr.io/dmvt/confidential-sandboxes@sha256:"
-            "786720fcac62597c536ba30337954b472fb40c5844882c01089a61a232accce4"
+            "83ccea6d327a61e273bce610f7a191b2faaae73cc00449704418045eb34b27cf"
         )
         self.assertEqual(COMPOSE.count(daemon_digest), 3)
         self.assertIn(f'QUOTA_TOOLS_IMAGE="{daemon_digest}"', PRELAUNCH)
@@ -77,7 +77,9 @@ class SandboxdDeployContract(unittest.TestCase):
         self.assertIn('DOCKER_DATA_LIMIT="22G"', PRELAUNCH)
         self.assertIn('COMBINED_CACHE_LIMIT="28G"', PRELAUNCH)
         self.assertIn('BUILDKIT_LIMIT="6G"', PRELAUNCH)
-        self.assertIn('HOST_VCPU_MILLIS: "5000"', daemon)
+        self.assertIn('HOST_VCPU_MILLIS: "9000"', daemon)
+        self.assertIn('HOST_MEMORY_MB: "18432"', daemon)
+        self.assertIn('HOST_CPU_OVERCOMMIT: "10.0"', daemon)
         self.assertIn("csbuild0 -j SANDBOXD-TENANT", PRELAUNCH)
         self.assertIn("csbuild0 -j REJECT", PRELAUNCH)
 

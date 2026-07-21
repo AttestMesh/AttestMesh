@@ -53,7 +53,7 @@ services:
   # through a networkless one-shot into a read-only worker volume, leaving the upstream BuildKit
   # image itself exactly at its official digest.
   sandbox-builder-tools:
-    image: ghcr.io/dmvt/confidential-sandboxes@sha256:786720fcac62597c536ba30337954b472fb40c5844882c01089a61a232accce4
+    image: ghcr.io/dmvt/confidential-sandboxes@sha256:83ccea6d327a61e273bce610f7a191b2faaae73cc00449704418045eb34b27cf
     restart: "no"
     network_mode: none
     read_only: true
@@ -133,7 +133,7 @@ services:
         condition: service_completed_successfully
 
   sandboxd:
-    image: ghcr.io/dmvt/confidential-sandboxes@sha256:786720fcac62597c536ba30337954b472fb40c5844882c01089a61a232accce4
+    image: ghcr.io/dmvt/confidential-sandboxes@sha256:83ccea6d327a61e273bce610f7a191b2faaae73cc00449704418045eb34b27cf
     # The dstack compose runner starts this service only after pre_launch_script has mounted and
     # verified the XFS quota filesystem. Dockerd must never restore it early against the underlying
     # directory during host boot; pre-launch recovery remains the sole restart authority.
@@ -237,7 +237,7 @@ services:
       SANDBOX_NETWORK_POOL: 10.192.0.0/10
       SANDBOX_NETWORK_PREFIXLEN: "29"
       SANDBOXD_REQUIRE_NETWORK_FIREWALL: "1"
-      SANDBOXD_FIREWALL_HELPER_IMAGE: ghcr.io/dmvt/confidential-sandboxes@sha256:786720fcac62597c536ba30337954b472fb40c5844882c01089a61a232accce4
+      SANDBOXD_FIREWALL_HELPER_IMAGE: ghcr.io/dmvt/confidential-sandboxes@sha256:83ccea6d327a61e273bce610f7a191b2faaae73cc00449704418045eb34b27cf
       SANDBOXD_FIREWALL_WATCHDOG_INTERVAL_SECONDS: "15"
       # Preview URLs (/app/{id}/…) are capability URLs reachable without the daemon bearer; /_api/*
       # stays bearer-gated.
@@ -256,17 +256,16 @@ services:
       SANDBOXD_MIN_RUNSC_MEMORY_MB: "128"
       SANDBOXD_MIN_RUNSC_PIDS: "128"
       SANDBOXD_MIN_RUNSC_DISK_MB: "16"
-      # Fixed admission budgets for BOX_VCPU=8 / BOX_MEM=16384 / BOX_DISK=300. Tenant plus trusted
-      # service maxima total 7.25 vCPU / 14.25 GiB including the source builder and build tmpfs,
-      # leaving host dockerd/OS/ZFS CPU and memory headroom. Tenant PIDs
-      # are hard-capped at 16,384. The 251 GiB XFS zvol sells 232 GiB, preserves 18 GiB of usable
-      # reserve, and absorbs its own filesystem metadata in the remaining space.
-      HOST_VCPU_MILLIS: "5000"
-      HOST_MEMORY_MB: "10240"
+      # Fixed admission budgets for BOX_VCPU=12 / BOX_MEM=24576 / BOX_DISK=450. The physical
+      # 9-vCPU tenant pool plus trusted services preserves host dockerd/OS/ZFS headroom. Sandbox
+      # CFS quota ceilings are sold at 10x; memory, disk, PIDs, and sandbox count remain strict.
+      # The existing 251 GiB XFS zvol continues to sell 232 GiB conservatively.
+      HOST_VCPU_MILLIS: "9000"
+      HOST_MEMORY_MB: "18432"
       HOST_DISK_MB: "237568"
       HOST_PIDS: "16384"
       HOST_MAX_SANDBOXES: "50"
-      HOST_CPU_OVERCOMMIT: "1.0"
+      HOST_CPU_OVERCOMMIT: "10.0"
       HOST_MEMORY_OVERCOMMIT: "1.0"
       HOST_DISK_OVERCOMMIT: "1.0"
       SANDBOXD_REQUIRE_CAPACITY: "1"  # fail closed if any production ceiling is invalid/missing
