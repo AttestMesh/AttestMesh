@@ -26,9 +26,11 @@ export BOX_VCPU="${BOX_VCPU:-2}" BOX_MEM="${BOX_MEM:-4096}" BOX_DISK="${BOX_DISK
 export BOX_PORTS="${BOX_PORTS:-[]}" BOX_GATEWAY_ENABLED="${BOX_GATEWAY_ENABLED:-false}" BOX_NET_MODE="${BOX_NET_MODE:-bridge}"
 
 SECRETS_FILE="${SECRETS_FILE:-$HOME/.attestmesh/pitchrotator-mcp.env}"
+REDPILL_KEY_FILE="${REDPILL_KEY_FILE:-$HOME/.attestmesh/pitchrotator-redpill.key}"
 PITCHROTATOR_SOURCE_COMMIT=66b5495b0ea0695ef6d2a35969d444da4f680a52
 PITCHROTATOR_SOURCE_TREE=30ef21a38034bf1d1f7001445a6feea89a424cb3
 PITCHROTATOR_SOURCE_SHA256=57aa6a29108cdaa5a46cd6d12b962c7c01c8ca824882b77f16767ea395843e1d
+PITCHROTATOR_OVERLAY_SHA256=baa89e6b4c2eaf04c1fd81b7c4c0a026c68e1de8c7c5ec5cfa4275b733807559
 
 STATE="$LOGDIR/pitchrotator-mcp-node-${NODE}.state"
 ZERO32=0x0000000000000000000000000000000000000000000000000000000000000000
@@ -59,10 +61,16 @@ _require_env() {
     command -v "$tool" >/dev/null || die "missing required tool: $tool"
   done
   [ -s "$COMPOSE" ] || die "missing compose: $COMPOSE"
-  [ -s "$SECRETS_FILE" ] || die "missing $SECRETS_FILE (must contain OPENROUTER_API_KEY)"
-  # shellcheck disable=SC1090
-  source "$SECRETS_FILE"
-  : "${OPENROUTER_API_KEY:?set OPENROUTER_API_KEY in $SECRETS_FILE}"
+  if [ -s "$SECRETS_FILE" ]; then
+    # shellcheck disable=SC1090
+    source "$SECRETS_FILE"
+  fi
+  MODEL_API_KEY="${MODEL_API_KEY:-${REDPILL_API_KEY:-}}"
+  if [ -z "$MODEL_API_KEY" ]; then
+    [ -s "$REDPILL_KEY_FILE" ] || die "missing MODEL_API_KEY and RedPill key file: $REDPILL_KEY_FILE"
+    MODEL_API_KEY="$(tr -d '\r\n' <"$REDPILL_KEY_FILE")"
+  fi
+  [ -n "$MODEL_API_KEY" ] || die "RedPill model API key is empty"
   : "${PITCHROTATOR_IMAGE:?set immutable PITCHROTATOR_IMAGE (repository@sha256:64hex)}"
   [[ "$PITCHROTATOR_IMAGE" =~ ^[a-z0-9.-]+([:/][a-z0-9._/-]+)+@sha256:[0-9a-f]{64}$ ]] \
     || die "PITCHROTATOR_IMAGE must be an immutable repository@sha256:64hex reference"
@@ -103,7 +111,7 @@ _box_run() {
     printf 'E_GAS_POLICY_ID=%q\n' "$GAS_POLICY_ID"
     printf 'E_INDEXER_REGISTRY_ADDR=%q\n' "$INDEXER_REGISTRY_ADDR"
     printf 'E_GATEWAY_DOMAIN=%q\n' "$GATEWAY_DOMAIN"
-    printf 'E_OPENROUTER_API_KEY=%q\n' "$OPENROUTER_API_KEY"
+    printf 'E_MODEL_API_KEY=%q\n' "$MODEL_API_KEY"
     printf 'E_DSTACK_DOCKER_USERNAME=%q\n' "${guser:-dmvt}"
     printf 'E_DSTACK_DOCKER_PASSWORD=%q\n' "$gtok"
     printf 'E_DSTACK_DOCKER_REGISTRY=%q\n' ghcr.io
@@ -116,7 +124,7 @@ preflight() {
   local hash
   hash=$(_box_run hash | grep -oE '^[0-9a-f]{64}$' | tail -1)
   [ -n "$hash" ] || die "box failed to hash resolved compose"
-  log "✔ preflight: source=$PITCHROTATOR_SOURCE_COMMIT tree=$PITCHROTATOR_SOURCE_TREE source_sha256=$PITCHROTATOR_SOURCE_SHA256 image=$PITCHROTATOR_IMAGE compose_hash=0x$hash"
+  log "✔ preflight: source=$PITCHROTATOR_SOURCE_COMMIT tree=$PITCHROTATOR_SOURCE_TREE source_sha256=$PITCHROTATOR_SOURCE_SHA256 overlay_sha256=$PITCHROTATOR_OVERLAY_SHA256 image=$PITCHROTATOR_IMAGE compose_hash=0x$hash"
 }
 
 deploy_cvm() {

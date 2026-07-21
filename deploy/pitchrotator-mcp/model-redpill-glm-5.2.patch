@@ -1,0 +1,20 @@
+diff --git a/mcp-server/src/model.ts b/mcp-server/src/model.ts
+--- a/mcp-server/src/model.ts
++++ b/mcp-server/src/model.ts
+@@ -9 +9 @@
+-// Without OPENROUTER_API_KEY set, returns a deterministic stub so the server is
++// Without MODEL_API_KEY set, returns a deterministic stub so the server is
+@@ -12 +12,3 @@
+-const ENDPOINT = "https://openrouter.ai/api/v1/chat/completions";
++const MODEL_BASE_URL = (process.env.MODEL_BASE_URL || "https://api.redpill.ai/v1")
++  .replace(/\/$/, "");
++const ENDPOINT = `${MODEL_BASE_URL}/chat/completions`;
+@@ -17 +19 @@
+-  const key = process.env.OPENROUTER_API_KEY;
++  const key = process.env.MODEL_API_KEY;
+@@ -19 +21 @@
+-    return STUB_MARKER + JSON.stringify({ note: "stub model output (no OPENROUTER_API_KEY)" });
++    return STUB_MARKER + JSON.stringify({ note: "stub model output (no MODEL_API_KEY)" });
+@@ -28 +30 @@
+-      model: process.env.PITCH_MODEL || "anthropic/claude-opus-4-8",
++      model: process.env.MODEL_NAME || "z-ai/glm-5.2",

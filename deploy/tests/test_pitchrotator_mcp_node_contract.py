@@ -10,12 +10,16 @@ DRIVER = ROOT / "deploy/pitchrotator-mcp-node.sh"
 BOX = ROOT / "deploy/pitchrotator-mcp-node-box.py"
 COMPOSE = ROOT / "deploy/compose/pitchrotator-mcp-node.yaml"
 WORKFLOW = ROOT / "deploy/workflows/pitchrotator-mcp-node.tsx"
+BUILD_SCRIPT = ROOT / "deploy/pitchrotator-mcp/build-image.sh"
+BUILD_DOCKERFILE = ROOT / "deploy/pitchrotator-mcp/Dockerfile"
+MODEL_OVERLAY = ROOT / "deploy/pitchrotator-mcp/model-redpill-glm-5.2.patch"
 UPSTREAM_COMMIT = "66b5495b0ea0695ef6d2a35969d444da4f680a52"
 UPSTREAM_TREE = "30ef21a38034bf1d1f7001445a6feea89a424cb3"
 SOURCE_ARCHIVE_SHA256 = (
     "57aa6a29108cdaa5a46cd6d12b962c7c01c8ca824882b77f16767ea395843e1d"
 )
 LOCKFILE_SHA256 = "3a3e75e10c0ebb9ed132cf93fd4641cc3c8d043c55e4a443ac42f32c25d73342"
+OVERLAY_SHA256 = "baa89e6b4c2eaf04c1fd81b7c4c0a026c68e1de8c7c5ec5cfa4275b733807559"
 
 
 class PitchRotatorMcpNodeContractTests(unittest.TestCase):
@@ -25,6 +29,9 @@ class PitchRotatorMcpNodeContractTests(unittest.TestCase):
         cls.box = BOX.read_text(encoding="utf-8")
         cls.compose = COMPOSE.read_text(encoding="utf-8")
         cls.workflow = WORKFLOW.read_text(encoding="utf-8")
+        cls.build_script = BUILD_SCRIPT.read_text(encoding="utf-8")
+        cls.build_dockerfile = BUILD_DOCKERFILE.read_text(encoding="utf-8")
+        cls.model_overlay = MODEL_OVERLAY.read_text(encoding="utf-8")
 
     def test_upstream_source_and_every_base_image_are_immutable(self) -> None:
         deployment = self.driver + self.box + self.compose
@@ -32,6 +39,7 @@ class PitchRotatorMcpNodeContractTests(unittest.TestCase):
         self.assertIn(UPSTREAM_TREE, deployment)
         self.assertIn(SOURCE_ARCHIVE_SHA256, deployment)
         self.assertIn(LOCKFILE_SHA256, deployment)
+        self.assertIn(OVERLAY_SHA256, deployment)
         self.assertIn(f"PITCHROTATOR_SOURCE_COMMIT={UPSTREAM_COMMIT}", self.compose)
         self.assertNotIn("${PITCHROTATOR_SOURCE_COMMIT}", self.compose)
         self.assertNotIn("${PUBLIC_URL}", self.compose)
@@ -92,16 +100,33 @@ class PitchRotatorMcpNodeContractTests(unittest.TestCase):
 
     def test_model_secret_is_sealed_and_not_exposed_as_a_cli_option(self) -> None:
         deployment = self.driver + self.box + self.compose
-        self.assertIn("OPENROUTER_API_KEY", self.compose)
+        self.assertIn("MODEL_API_KEY", self.compose)
+        self.assertIn("MODEL_BASE_URL=https://api.redpill.ai/v1", self.compose)
+        self.assertIn("MODEL_NAME=z-ai/glm-5.2", self.compose)
         self.assertRegex(
             self.driver,
-            r"printf\s+['\"]E_OPENROUTER_API_KEY=%q",
+            r"printf\s+['\"]E_MODEL_API_KEY=%q",
             "the model credential must enter the CVM through the sealed environment",
         )
-        self.assertIn('"OPENROUTER_API_KEY"', self.box)
+        self.assertIn('"MODEL_API_KEY"', self.box)
         self.assertNotRegex(deployment, r"(?m)^\s*set\s+-[^\n]*x")
         self.assertNotRegex(self.box, r"add_argument\([^\n]*OPENROUTER_API_KEY")
-        self.assertNotRegex(self.driver, r"--[a-z0-9-]*(?:key|token)[= ]\"?\$OPENROUTER")
+        self.assertNotRegex(self.driver, r"--[a-z0-9-]*(?:key|token)[= ]\"?\$MODEL_API_KEY")
+
+    def test_image_build_applies_measured_redpill_glm_overlay(self) -> None:
+        self.assertIn("https://api.redpill.ai/v1", self.model_overlay)
+        self.assertIn('process.env.MODEL_API_KEY', self.model_overlay)
+        self.assertIn('process.env.MODEL_NAME || "z-ai/glm-5.2"', self.model_overlay)
+        self.assertIn(OVERLAY_SHA256, self.build_script)
+        self.assertIn("sha256sum -c", self.build_script)
+        self.assertIn("patch -d", self.build_script)
+        self.assertRegex(
+            self.build_dockerfile,
+            r"(?m)^FROM node:[^\s]+@sha256:[0-9a-f]{64}",
+        )
+        self.assertIn("RUN npm ci", self.build_dockerfile)
+        self.assertIn("RUN npm run typecheck", self.build_dockerfile)
+        self.assertIn('io.attestmesh.pitchrotator.model="z-ai/glm-5.2"', self.build_dockerfile)
 
     def test_driver_exposes_repeatable_deploy_and_verification_verbs(self) -> None:
         for verb in (

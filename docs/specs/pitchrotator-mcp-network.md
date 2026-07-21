@@ -213,7 +213,9 @@ and emits only secret-free counters/hashes. Tests place canary secrets and ident
 in every field, including `rawSpan`, `currentPitch`, transcript, prior model output,
 and nested structures, and prove none bypasses policy.
 
-The model service hostname and model identity are measured plain configuration. The
+The pre-production deployment fixes the model service to RedPill at
+`https://api.redpill.ai/v1` and the model identity to `z-ai/glm-5.2`; both are
+measured plain configuration. The
 API key is sealed into the CVM and supplied by a runtime secret path/environment only;
 it is never an argv value. Egress is deny-by-default except DNS and the pinned model
 endpoint. Redirects to non-allowlisted hosts are rejected.

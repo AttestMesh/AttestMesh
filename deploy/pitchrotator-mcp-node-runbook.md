@@ -12,16 +12,20 @@ hardening blockers in issue 35 must be closed and independently reviewed first.
   SSH access to it, and a separate mesh-member SSH host for private probes.
 - The Base deployment credentials consumed by `deploy/env.sh`, Foundry, Python
   3, `jq`, `curl`, Bun, and the pinned Smithers dependencies under `deploy/`.
-- `SECRETS_FILE` (default
-  `~/.attestmesh/pitchrotator-mcp.env`) with mode `0600` and an
-  `OPENROUTER_API_KEY` entry. `PITCH_MODEL` is optional sealed configuration.
-  Never add either value to Smithers JSON, argv, source, or logs.
+- A RedPill API key in `~/.attestmesh/redpill-key` with mode `0600`, or a
+  `MODEL_API_KEY`/`REDPILL_API_KEY` entry in `SECRETS_FILE` (default
+  `~/.attestmesh/pitchrotator-mcp.env`). The measured runtime uses
+  `https://api.redpill.ai/v1` and `z-ai/glm-5.2`. Never add the key to Smithers
+  JSON, argv, source, or logs.
 - The PitchRotator source commit and source-archive SHA-256 in
   `deploy/pitchrotator-mcp-node.sh` must match the reviewed revision. Every
   deployed workload image must use an `@sha256:` reference. Supply the reviewed
   `PITCHROTATOR_IMAGE` digest when no immutable default has been published. Stop
   if either invariant fails; tag-only images and unverified source archives are
   not deployable.
+- Build the image with `deploy/pitchrotator-mcp/build-image.sh`. It verifies the
+  private source tree/archive/lockfile, applies the committed RedPill/GLM-5.2
+  overlay, pins the Node base digest, type-checks, and emits a local image tag.
 - Verify the checked commit tree, deterministic local `git archive`, and npm
   lockfile digests recorded by the driver. A GitHub API-generated tarball is not
   a durable release artifact and must not be substituted as the trust anchor.
