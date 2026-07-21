@@ -623,7 +623,7 @@ import hashlib, json, os, subprocess, sys, time
 
 tok = os.environ["TOK"]
 gw = os.environ["GW"].rstrip("/")
-image = os.environ["IMAGE"]
+image = "ghcr.io/attestmesh/synclave-workloads@sha256:eeeab97469edf54f2d5b9582a0a1c6b49866af931573324919a3dcc6b23a0b4e"
 request_suffix = f"{int(time.time())}-{os.getpid()}"
 idempotency_key = f"release-smoke-{request_suffix}"
 payload = {
