@@ -78,7 +78,7 @@ services:
         condition: service_completed_successfully
 
   storage-helper:
-    image: ghcr.io/dmvt/webhost-control-storage-helper@sha256:5f5c8d47042168d8e2677988b731d68abb3f84174c107b7a0bc4581489b55947
+    image: ghcr.io/dmvt/webhost-control-storage-helper@sha256:5cce44c3698b9b8b600f3b02c1a5d5d9e4b8f00b0ab9600e1f8eed8477afe242
     pull_policy: always
     restart: unless-stopped
     init: true
@@ -122,11 +122,11 @@ services:
       migration-backup:
         condition: service_completed_successfully
 
-  # Webhost v1.1.19 unifies the control API, admin UI, public directory, tenant
+  # Webhost v1.1.20 unifies the control API, admin UI, public directory, tenant
   # ingress, and runtime orchestration. These settings mirror its released
   # production Compose contract while retaining the live dstack volume names.
   frontproxy:
-    image: ghcr.io/dmvt/webhost-control-control-plane@sha256:9ed289613449c983ce72de6e7e90df4f8b2c4fa7ddb8051c273a2b7700ff7fc2
+    image: ghcr.io/dmvt/webhost-control-control-plane@sha256:76e0892ef515ff07b4aba68c38bee088ff49c7e06fea592150f66e24d8a11551
     pull_policy: always
     restart: unless-stopped
     init: true
@@ -139,8 +139,8 @@ services:
     logging: *production-logging
     environment:
       WEBHOST_ENV: production
-      WEBHOST_VERSION: v1.1.19
-      WEBHOST_BUILD_COMMIT: b80e56fe92a6f57a2b8bbe5a8a62670658f904b1
+      WEBHOST_VERSION: v1.1.20
+      WEBHOST_BUILD_COMMIT: 91f7f3f923e8e133e92b547ecf26fc3d4468e1cc
       WEBHOST_LOG_FORMAT: json
       WEBHOST_ADMIN_HOST: ${WEBHOST_ADMIN_HOST:-daemon.synclave.net}
       TEE_DAEMON_TOKEN: ${TEE_DAEMON_TOKEN:?set a 32-byte-or-longer control token}
@@ -290,7 +290,7 @@ services:
         condition: service_healthy
 
   tlsproxy:
-    image: ghcr.io/dmvt/webhost-control-tlsproxy@sha256:473d00673904f9ba9985ee4e428385858e9dc816633f54544507ad6e777c6929
+    image: ghcr.io/dmvt/webhost-control-tlsproxy@sha256:282a13855834058ec1d8c9aa18eef90d325cf8059420f85e26b46c644ec9cd73
     pull_policy: always
     restart: unless-stopped
     init: true
