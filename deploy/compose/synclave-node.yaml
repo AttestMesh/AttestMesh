@@ -205,7 +205,9 @@ services:
     #       landing hero poster + cloth drape (?hero= variants stay preview-gated).
     #       NOTE: fleet-control ≥ 11640ac requires SANDBOX_APPS_DOMAIN sealed (fail-closed
     #       sandbox ingress) — the first v49 roll crash-looped on exactly that.
-    image: ghcr.io/attestmesh/synclave-app:sha-7c16d68f6d64cb845a9ad629b0f261369d2c6772@sha256:3953ba54f65801a686a7c909b71704aa72521e8f529775eb941ac55f93678e18
+    # v50 = fleet-control main 366cea3 — Hermes provider onboarding seals third-party API keys
+    #       directly to the sandbox, plus local operator release verification after retiring CI.
+    image: ghcr.io/attestmesh/synclave-app:sha-366cea3b248729ac34b0883613d22a1964891ae7@sha256:31470f055f9af21d1e0ac845b1f7c1858267ca9143377871a97e407b5dd4b8b1
     environment:
       API_HOST: 0.0.0.0
       API_PORT: 80
