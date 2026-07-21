@@ -53,7 +53,7 @@ services:
   # through a networkless one-shot into a read-only worker volume, leaving the upstream BuildKit
   # image itself exactly at its official digest.
   sandbox-builder-tools:
-    image: ghcr.io/dmvt/confidential-sandboxes@sha256:83ccea6d327a61e273bce610f7a191b2faaae73cc00449704418045eb34b27cf
+    image: ghcr.io/dmvt/confidential-sandboxes@sha256:58994495e8b578e0c4501f7629931ec9b785aaa4d421fe3ceb6b66ca57f5121c
     restart: "no"
     network_mode: none
     read_only: true
@@ -133,7 +133,7 @@ services:
         condition: service_completed_successfully
 
   sandboxd:
-    image: ghcr.io/dmvt/confidential-sandboxes@sha256:83ccea6d327a61e273bce610f7a191b2faaae73cc00449704418045eb34b27cf
+    image: ghcr.io/dmvt/confidential-sandboxes@sha256:58994495e8b578e0c4501f7629931ec9b785aaa4d421fe3ceb6b66ca57f5121c
     # The dstack compose runner starts this service only after pre_launch_script has mounted and
     # verified the XFS quota filesystem. Dockerd must never restore it early against the underlying
     # directory during host boot; pre-launch recovery remains the sole restart authority.
@@ -237,7 +237,7 @@ services:
       SANDBOX_NETWORK_POOL: 10.192.0.0/10
       SANDBOX_NETWORK_PREFIXLEN: "29"
       SANDBOXD_REQUIRE_NETWORK_FIREWALL: "1"
-      SANDBOXD_FIREWALL_HELPER_IMAGE: ghcr.io/dmvt/confidential-sandboxes@sha256:83ccea6d327a61e273bce610f7a191b2faaae73cc00449704418045eb34b27cf
+      SANDBOXD_FIREWALL_HELPER_IMAGE: ghcr.io/dmvt/confidential-sandboxes@sha256:58994495e8b578e0c4501f7629931ec9b785aaa4d421fe3ceb6b66ca57f5121c
       SANDBOXD_FIREWALL_WATCHDOG_INTERVAL_SECONDS: "15"
       # Preview URLs (/app/{id}/…) are capability URLs reachable without the daemon bearer; /_api/*
       # stays bearer-gated.

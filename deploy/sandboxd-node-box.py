@@ -109,7 +109,7 @@ QUOTA_ZVOL_BYTES=$((251 * 1024 * 1024 * 1024))
 QUOTA_SOLD_MIB=237568
 QUOTA_FS_HEADROOM_MIB=18432
 QUOTA_POOL_HEADROOM_MIB=28672
-QUOTA_TOOLS_IMAGE="ghcr.io/dmvt/confidential-sandboxes@sha256:83ccea6d327a61e273bce610f7a191b2faaae73cc00449704418045eb34b27cf"
+QUOTA_TOOLS_IMAGE="ghcr.io/dmvt/confidential-sandboxes@sha256:58994495e8b578e0c4501f7629931ec9b785aaa4d421fe3ceb6b66ca57f5121c"
 SECRET_RUNTIME_ROOT="/run/sandboxd-secrets"
 MIN_HOST_VCPUS=12
 # The VMM resource readback must be exactly 24,576 MiB. Retain a conservative 22 GiB
