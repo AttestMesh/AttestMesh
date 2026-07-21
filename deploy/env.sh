@@ -37,9 +37,16 @@ export TX_RECEIPT_TIMEOUT_SECONDS="${TX_RECEIPT_TIMEOUT_SECONDS:-300}"
 export TX_RECEIPT_POLL_SECONDS="${TX_RECEIPT_POLL_SECONDS:-2}"
 export TX_CONFIRMATIONS="${TX_CONFIRMATIONS:-1}"
 export CVM_RPC_URL="${CVM_RPC_URL:-https://mainnet.base.org}"       # sealed into CVM sidecars; archive reads, rate-limited
-export BUNDLER_URL="${BUNDLER_URL:-$ALCHEMY_RPC_URL}"              # host-side AA bundler (unused by `update`; Alchemy dead)
-export CVM_BUNDLER_URL="${CVM_BUNDLER_URL:-https://base-rpc.publicnode.com}"  # sealed; interim — NEW-node registration needs a real bundler
-export GAS_POLICY_ID="$(_read "$TEESQL/alchemy-policy.id")"
+PIMLICO_KEY_FILE="${PIMLICO_KEY_FILE:-$HOME/.attestmesh/pimlico.key}"
+PIMLICO_POLICY_FILE="${PIMLICO_POLICY_FILE:-$HOME/.attestmesh/pimlico-policy.id}"
+[ -s "$PIMLICO_KEY_FILE" ] || { echo "ERROR: missing Pimlico key: $PIMLICO_KEY_FILE"; return 1 2>/dev/null || exit 1; }
+[ -s "$PIMLICO_POLICY_FILE" ] || { echo "ERROR: missing Pimlico policy: $PIMLICO_POLICY_FILE"; return 1 2>/dev/null || exit 1; }
+export PIMLICO_API_KEY="$(_read "$PIMLICO_KEY_FILE")"
+export PIMLICO_BUNDLER_URL="https://api.pimlico.io/v2/${CHAIN_ID}/rpc?apikey=${PIMLICO_API_KEY}"
+export PIMLICO_POLICY_ID="$(_read "$PIMLICO_POLICY_FILE")"
+export BUNDLER_URL="${BUNDLER_URL:-$PIMLICO_BUNDLER_URL}"
+export CVM_BUNDLER_URL="${CVM_BUNDLER_URL:-$BUNDLER_URL}"
+export GAS_POLICY_ID="${GAS_POLICY_ID:-$PIMLICO_POLICY_ID}"
 
 export PRIVATE_KEY="$(_read "$TEESQL/global-deployer.key")"
 export DEPLOYER_ADDR="$(_read "$TEESQL/global-deployer.address")"

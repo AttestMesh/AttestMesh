@@ -50,8 +50,12 @@ services:
             const body = await attest.json();
             if (!attest.ok || body.mode !== 'tdx' || body.trusted !== true || typeof body.quote !== 'string' || !body.quote.length) throw new Error('attestation');
             res.writeHead(200, {'content-type': 'application/json'}).end(JSON.stringify({ok: true, mode: 'tdx', trusted: true}));
-          } catch (_error) {
-            res.writeHead(503, {'content-type': 'application/json'}).end(JSON.stringify({ok: false}));
+          } catch (error) {
+            let mesh = null;
+            try {
+              mesh = await (await fetch('http://127.0.0.1:9090/healthz', {signal: AbortSignal.timeout(3000)})).json();
+            } catch (_meshError) {}
+            res.writeHead(503, {'content-type': 'application/json'}).end(JSON.stringify({ok: false, error: error.message, mesh}));
           }
         }).listen(9094, '0.0.0.0');
     read_only: true

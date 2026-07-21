@@ -80,9 +80,11 @@ _require_env() {
   indexer=$(jq -r .indexerRegistry "$RECEIPT" 2>/dev/null)
   INDEXER_REGISTRY_ADDR="${INDEXER_REGISTRY_ADDR:-$indexer}"
   [ -n "$INDEXER_REGISTRY_ADDR" ] && [ "$INDEXER_REGISTRY_ADDR" != null ] || die "missing INDEXER_REGISTRY_ADDR"
-  CVM_RUNTIME_RPC_URL="${CVM_RUNTIME_RPC_URL:-$(box_local_rpc_url "$BOX_HOST" pitchrotator)}"
-  [ -n "${BUNDLER_URL:-}" ] || die "missing BUNDLER_URL"
-  [ -n "${GAS_POLICY_ID:-}" ] || die "missing GAS_POLICY_ID"
+  CVM_RUNTIME_RPC_URL="${CVM_RUNTIME_RPC_URL:-${PITCHROTATOR_RPC_URL:-https://base-rpc.publicnode.com}}"
+  MESH_BUNDLER_URL="${CVM_BUNDLER_URL:-${BUNDLER_URL:-}}"
+  [[ "$MESH_BUNDLER_URL" == "https://api.pimlico.io/v2/${CHAIN_ID}/rpc?apikey="* ]] \
+    || die "PitchRotator requires the Base Pimlico bundler URL"
+  [[ "${GAS_POLICY_ID:-}" == sp_* ]] || die "PitchRotator requires a Pimlico sp_ sponsorship policy"
   ssh_box "sudo test -x '$BOX_PY' && sudo test -r '$BOX_DEPLOYER_KEY'" >/dev/null \
     || die "box prerequisites missing on $BOX_HOST"
 }
@@ -108,7 +110,7 @@ _box_run() {
   {
     printf 'E_CHAIN_ID=%q\n' "$CHAIN_ID"
     printf 'E_RPC_URL=%q\n' "$CVM_RUNTIME_RPC_URL"
-    printf 'E_BUNDLER_URL=%q\n' "$BUNDLER_URL"
+    printf 'E_BUNDLER_URL=%q\n' "$MESH_BUNDLER_URL"
     printf 'E_GAS_POLICY_ID=%q\n' "$GAS_POLICY_ID"
     printf 'E_INDEXER_REGISTRY_ADDR=%q\n' "$INDEXER_REGISTRY_ADDR"
     printf 'E_GATEWAY_DOMAIN=%q\n' "$GATEWAY_DOMAIN"

@@ -116,6 +116,12 @@ class PitchRotatorMcpNodeContractTests(unittest.TestCase):
         self.assertNotRegex(self.box, r"add_argument\([^\n]*OPENROUTER_API_KEY")
         self.assertNotRegex(self.driver, r"--[a-z0-9-]*(?:key|token)[= ]\"?\$MODEL_API_KEY")
 
+    def test_mesh_uses_pimlico_sponsorship(self) -> None:
+        self.assertIn("https://api.pimlico.io/v2/${CHAIN_ID}/rpc?apikey=", self.driver)
+        self.assertIn("PitchRotator requires a Pimlico sp_ sponsorship policy", self.driver)
+        self.assertIn("PITCHROTATOR_RPC_URL:-https://base-rpc.publicnode.com", self.driver)
+        self.assertRegex(self.driver, r"printf\s+['\"]E_BUNDLER_URL=%q")
+
     def test_image_build_applies_measured_redpill_glm_overlay(self) -> None:
         self.assertIn("https://api.redpill.ai/v1", self.model_overlay)
         self.assertIn('process.env.MODEL_API_KEY', self.model_overlay)
