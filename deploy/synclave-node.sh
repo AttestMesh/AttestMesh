@@ -46,8 +46,11 @@ CUSTOM_DOMAIN_CF_SECRETS_FILE="${CUSTOM_DOMAIN_CF_SECRETS_FILE:-$HOME/.attestmes
 # confidential-sandboxes (sandboxd) wiring for the "Provision sandbox" button. URL/image/plan are
 # non-secret config; the token is the sandboxd daemon secret (reused from its own secrets file).
 SANDBOX_DAEMON_URL="${SANDBOX_DAEMON_URL:-https://2105a8086e4700e611092aaa3efd37e1e302ffd6-8080.gateway.attestmesh.xyz}"
-SANDBOX_DEFAULT_IMAGE="${SANDBOX_DEFAULT_IMAGE:-ghcr.io/dmvt/cs-sandbox-base@sha256:8ccfb22336a73e28b7fd8bef024d355ec5673d70d09a6099ad5094836f65e9d3}"
+SANDBOX_DEFAULT_IMAGE="${SANDBOX_DEFAULT_IMAGE:-ghcr.io/attestmesh/synclave-workloads@sha256:eeeab97469edf54f2d5b9582a0a1c6b49866af931573324919a3dcc6b23a0b4e}"
 SANDBOX_DEFAULT_PLAN="${SANDBOX_DEFAULT_PLAN:-std-1-4-128}"
+# Required by fleet-control ≥ 11640ac (sandbox ingress fail-closed check): with production
+# sandboxd configured the API refuses to boot unless the sandbox apps DNS suffix is set.
+SANDBOX_APPS_DOMAIN="${SANDBOX_APPS_DOMAIN:-sandbox.synclave.net}"
 SANDBOX_DAEMON_TOKEN="${SANDBOX_DAEMON_TOKEN:-$(sed -nE 's/^SANDBOX_DAEMON_TOKEN=//p' "$HOME/.attestmesh/sandboxd.env" 2>/dev/null)}"
 
 # Non-secret config (overridable), sealed alongside the secrets for one measured surface.
@@ -142,6 +145,8 @@ _require_env() {
     [ -n "${!k:-}" ] || die "secret $k not set in $SECRETS_FILE"
   done
   [ -n "${SANDBOX_DAEMON_TOKEN:-}" ] || die "SANDBOX_DAEMON_TOKEN empty (expected in \$HOME/.attestmesh/sandboxd.env); required for the Provision button"
+  [[ "${SANDBOX_DEFAULT_IMAGE:-}" =~ ^ghcr\.io/attestmesh/synclave-workloads@sha256:[0-9a-f]{64}$ ]] \
+    || die "SANDBOX_DEFAULT_IMAGE must be an existing official digest in ghcr.io/attestmesh/synclave-workloads"
   # Synclave's DB defaults to the C3 pg-ha cluster. The compose exposes pg-ha via
   # sidecar-netns forwarders because the app container is not itself in the WG netns.
   DATABASE_URL="${DATABASE_URL:-postgresql://synclave:${POSTGRES_PASSWORD}@sidecar:15431/synclave}"
@@ -186,6 +191,7 @@ _box_run() {
     printf 'E_PUBLIC_BASE_URL=%q\n'          "$PUBLIC_BASE_URL"
     printf 'E_APP_DOMAIN=%q\n'               "$APP_DOMAIN"
     printf 'E_INDEXER_URL=%q\n'              "$INDEXER_URL"
+    printf 'E_PHALA_CLOUD_API_KEY=%q\n'      "${PHALA_CLOUD_API_KEY:-}"
     printf 'E_CLUSTER_NETWORKS=%q\n'         "${CLUSTER_NETWORKS:-}"
     printf 'E_CLUSTER_ORCHESTRATOR_URL=%q\n' "${CLUSTER_ORCHESTRATOR_URL:-}"
     printf 'E_CLUSTER_ORCHESTRATOR_TOKEN=%q\n' "${CLUSTER_ORCHESTRATOR_TOKEN:-}"
@@ -223,6 +229,7 @@ _box_run() {
     printf 'E_SANDBOX_DAEMON_TOKEN=%q\n'     "$SANDBOX_DAEMON_TOKEN"
     printf 'E_SANDBOX_DEFAULT_IMAGE=%q\n'    "$SANDBOX_DEFAULT_IMAGE"
     printf 'E_SANDBOX_DEFAULT_PLAN=%q\n'     "$SANDBOX_DEFAULT_PLAN"
+    printf 'E_SANDBOX_APPS_DOMAIN=%q\n'      "$SANDBOX_APPS_DOMAIN"
     printf 'E_DSTACK_DOCKER_USERNAME=%q\n'   "${guser:-dmvt}"
     printf 'E_DSTACK_DOCKER_PASSWORD=%q\n'   "$gtok"
     printf 'E_DSTACK_DOCKER_REGISTRY=%q\n'   "ghcr.io"

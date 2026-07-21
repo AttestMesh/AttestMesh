@@ -79,6 +79,9 @@ ENV_KEYS = [
     "PUBLIC_BASE_URL",
     "APP_DOMAIN",
     "INDEXER_URL",
+    # Phala Cloud host-observation key (lsdan account) — maps chain members to Phala CVMs by
+    # app_id in the network_members reconcile lane (value sealed, key measured)
+    "PHALA_CLOUD_API_KEY",
     "CLUSTER_NETWORKS",
     "CLUSTER_ORCHESTRATOR_URL",
     "CLUSTER_ORCHESTRATOR_TOKEN",
@@ -123,6 +126,9 @@ ENV_KEYS = [
     "SANDBOX_DAEMON_TOKEN",
     "SANDBOX_DEFAULT_IMAGE",
     "SANDBOX_DEFAULT_PLAN",
+    # required by fleet-control ≥ 11640ac: production sandboxd refuses to boot without the
+    # sandbox apps DNS suffix (ingress relay targets are fail-closed)
+    "SANDBOX_APPS_DOMAIN",
     # --- private-registry pull creds (ghcr.io/dmvt/* + attestmesh sidecar) ---
     "DSTACK_DOCKER_USERNAME",
     "DSTACK_DOCKER_PASSWORD",
