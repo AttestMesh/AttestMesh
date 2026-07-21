@@ -78,7 +78,7 @@ services:
         condition: service_completed_successfully
 
   storage-helper:
-    image: ghcr.io/dmvt/webhost-control-storage-helper@sha256:91ee79f2b553266336a393d6e7b484ed23d9735f4dc27eaff858658b5bc87cf0
+    image: ghcr.io/dmvt/webhost-control-storage-helper@sha256:52253688d06bda806770d28c45d958b995a2e8e84e8c0eddb528a4558dedae4d
     pull_policy: always
     restart: unless-stopped
     init: true
@@ -122,11 +122,11 @@ services:
       migration-backup:
         condition: service_completed_successfully
 
-  # Webhost v1.1.5 unifies the control API, admin UI, public directory, tenant
+  # Webhost v1.1.14 unifies the control API, admin UI, public directory, tenant
   # ingress, and runtime orchestration. These settings mirror its released
   # production Compose contract while retaining the live dstack volume names.
   frontproxy:
-    image: ghcr.io/dmvt/webhost-control-control-plane@sha256:9faee0607e7d40df9af9e8a2c6f754ff5e10ef36568ddb072542a9b7b70c437f
+    image: ghcr.io/dmvt/webhost-control-control-plane@sha256:872c1655637c0c9003f15374a24b4caa15b86f19837c6a7fc361bdd1d07b0f64
     pull_policy: always
     restart: unless-stopped
     init: true
@@ -139,8 +139,8 @@ services:
     logging: *production-logging
     environment:
       WEBHOST_ENV: production
-      WEBHOST_VERSION: v1.1.5
-      WEBHOST_BUILD_COMMIT: 11d25aea81233d9c62acfd1941ff0b2c0263b9ae
+      WEBHOST_VERSION: v1.1.14
+      WEBHOST_BUILD_COMMIT: ccf21646f0c606079ef926f2706353a7b7d46b33
       WEBHOST_LOG_FORMAT: json
       WEBHOST_ADMIN_HOST: ${WEBHOST_ADMIN_HOST:-daemon.synclave.net}
       TEE_DAEMON_TOKEN: ${TEE_DAEMON_TOKEN:?set a 32-byte-or-longer control token}
@@ -166,6 +166,8 @@ services:
       DAEMON_MAX_RETAINED_JOBS: ${DAEMON_MAX_RETAINED_JOBS:-1000}
       DAEMON_JOB_RETENTION_SECONDS: ${DAEMON_JOB_RETENTION_SECONDS:-86400}
       DAEMON_MAX_JOB_STATE_BYTES: ${DAEMON_MAX_JOB_STATE_BYTES:-16777216}
+      DAEMON_JOB_EVENT_MAX_COUNT: ${DAEMON_JOB_EVENT_MAX_COUNT:-4000}
+      DAEMON_JOB_EVENT_MAX_BYTES: ${DAEMON_JOB_EVENT_MAX_BYTES:-2097152}
       DAEMON_MAX_PROJECTS: ${DAEMON_MAX_PROJECTS:-1000}
       DAEMON_MAX_ACTIVE_PROJECTS: ${DAEMON_MAX_ACTIVE_PROJECTS:-100}
       DAEMON_MAX_ACTIVE_MEMORY_BYTES: ${DAEMON_MAX_ACTIVE_MEMORY_BYTES:-34359738368}
@@ -288,7 +290,7 @@ services:
         condition: service_healthy
 
   tlsproxy:
-    image: ghcr.io/dmvt/webhost-control-tlsproxy@sha256:06c17f112eebc792639c9990191b8d306c206ad4e9329732114c2c36a1966720
+    image: ghcr.io/dmvt/webhost-control-tlsproxy@sha256:2845fb5cb86e466718850cbe3b843daa01364316a24981e08070cabbf1b8ebd8
     pull_policy: always
     restart: unless-stopped
     init: true

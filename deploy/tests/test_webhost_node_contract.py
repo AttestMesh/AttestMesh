@@ -14,15 +14,15 @@ CANDIDATE = ROOT / "deploy/compose/webhost-node.yaml"
 ROLLBACK = ROOT / "deploy/compose/webhost-node-v1.1.3-rollback.yaml"
 CONTROL_IMAGE = (
     "ghcr.io/dmvt/webhost-control-control-plane@"
-    "sha256:9faee0607e7d40df9af9e8a2c6f754ff5e10ef36568ddb072542a9b7b70c437f"
+    "sha256:872c1655637c0c9003f15374a24b4caa15b86f19837c6a7fc361bdd1d07b0f64"
 )
 STORAGE_IMAGE = (
     "ghcr.io/dmvt/webhost-control-storage-helper@"
-    "sha256:91ee79f2b553266336a393d6e7b484ed23d9735f4dc27eaff858658b5bc87cf0"
+    "sha256:52253688d06bda806770d28c45d958b995a2e8e84e8c0eddb528a4558dedae4d"
 )
 TLS_IMAGE = (
     "ghcr.io/dmvt/webhost-control-tlsproxy@"
-    "sha256:06c17f112eebc792639c9990191b8d306c206ad4e9329732114c2c36a1966720"
+    "sha256:2845fb5cb86e466718850cbe3b843daa01364316a24981e08070cabbf1b8ebd8"
 )
 VOLUME_NAMES = {
     "daemon_data": "dstack_daemon_data",
@@ -100,13 +100,15 @@ class WebhostNodeContractTests(unittest.TestCase):
         self.assertNotIn("concierge", services)
         env = services["frontproxy"]["environment"]
         self.assertEqual(env["WEBHOST_ENV"], "production")
-        self.assertEqual(env["WEBHOST_VERSION"], "v1.1.5")
+        self.assertEqual(env["WEBHOST_VERSION"], "v1.1.14")
         self.assertEqual(
             env["WEBHOST_BUILD_COMMIT"],
-            "11d25aea81233d9c62acfd1941ff0b2c0263b9ae",
+            "ccf21646f0c606079ef926f2706353a7b7d46b33",
         )
         self.assertEqual(env["DAEMON_CONTAINER_RUNTIME"], "runsc")
         self.assertEqual(env["DAEMON_ENFORCE_EGRESS"], "1")
+        self.assertEqual(env["DAEMON_JOB_EVENT_MAX_COUNT"], "4000")
+        self.assertEqual(env["DAEMON_JOB_EVENT_MAX_BYTES"], "2097152")
         self.assertEqual(env["INGRESS_PORT"], "8088")
         self.assertEqual(services["frontproxy"]["cpus"], 1.0)
         self.assertFalse(
