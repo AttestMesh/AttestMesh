@@ -40,24 +40,23 @@ box_local_rpc_url() {
 }
 
 # Wait until the exact compose allowlist state is visible through the
-# box-local KMS RPC before stopping a healthy VM for an upgrade. The public
-# RPC can confirm the transaction several blocks before local Reth catches up.
-# The eth_call is bound to the same local block number used for the height
-# proof, and two consecutive reads are required.
+# box-local KMS RPC before stopping a healthy VM for an upgrade. The caller has
+# already confirmed the allowlist transaction through the public RPC; an exact
+# `true` result from the local RPC proves that its own chain view includes the
+# new hash even when its reported head trails the public RPC. The eth_call is
+# bound to the local head, and two consecutive reads are required.
 wait_box_local_allowlist_propagation() {
   local box_host="${1:?box host required}"
   local local_rpc="${2:?box-local RPC required}"
   local cluster="${3:?cluster required}"
   local compose_hash="${4:?compose hash required}"
-  local public_rpc="${5:?public RPC required}"
+  : "${5:?public RPC required}"
   local timeout_seconds="${6:-300}"
-  local required_block calldata deadline result local_block allowed consecutive=0
-  required_block=$(cast block-number --rpc-url "$public_rpc") \
-    || die "could not read post-allowlist public block"
+  local calldata deadline result local_block allowed consecutive=0
   calldata=$(cast calldata 'allowedComposeHashes(bytes32)' "0x${compose_hash#0x}") \
     || die "could not encode local allowlist proof call"
   deadline=$(( $(date +%s) + timeout_seconds ))
-  log "waiting for box-local KMS RPC to prove compose allowlist at block >=$required_block"
+  log "waiting for box-local KMS RPC to prove the exact compose allowlist"
   while [ "$(date +%s)" -lt "$deadline" ]; do
     result=$(
       {
@@ -99,7 +98,7 @@ SCRIPT
     ) || result=''
     local_block=$(printf '%s\n' "$result" | jq -r '.block // -1' 2>/dev/null || printf '%s' -1)
     allowed=$(printf '%s\n' "$result" | jq -r '.allowed // false' 2>/dev/null || printf '%s' false)
-    if [ "$allowed" = true ] && [ "$local_block" -ge "$required_block" ]; then
+    if [ "$allowed" = true ]; then
       consecutive=$((consecutive + 1))
       if [ "$consecutive" -ge 2 ]; then
         log "✔ box-local KMS RPC proves compose allowlist at block=$local_block"
