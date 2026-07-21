@@ -50,11 +50,10 @@ services:
       - sidecar-state:/source/sidecar-state:ro
       - migration_backup:/snapshot
 
-  # A deleted preflight canary left one legacy telemetry pathname with metadata
-  # that the current fail-closed retention scanner correctly rejects. Preserve
-  # its bytes under a non-active name before the unified writer starts; mv
-  # renames the directory entry and does not follow a symlink if the legacy
-  # pathname was replaced.
+  # Deleted test projects left legacy telemetry pathnames with metadata that the
+  # current fail-closed retention scanner correctly rejects. Preserve orphaned
+  # logs under non-active names before the unified writer starts; mv renames a
+  # directory entry and does not follow it if an old pathname is a symlink.
   telemetry-repair:
     image: busybox:1.36@sha256:73aaf090f3d85aa34ee199857f03fa3a95c8ede2ffd4cc2cdb5b94e566b11662
     pull_policy: always
@@ -67,16 +66,27 @@ services:
     entrypoint: ["/bin/sh", "-ec"]
     command:
       - |
-        source=/var/lib/tee-daemon/telemetry/waifus-preflight-canary.jsonl
-        quarantine="$${source}.quarantined-v1.1.23"
-        if [ -e "$${source}" ] || [ -L "$${source}" ]; then
+        telemetry=/var/lib/tee-daemon/telemetry
+        projects=/var/lib/tee-daemon/projects
+        changed=0
+        for source in "$${telemetry}"/*.jsonl "$${telemetry}"/*.jsonl.1; do
+          [ -e "$${source}" ] || [ -L "$${source}" ] || continue
+          filename=$${source##*/}
+          project=$${filename%.1}
+          project=$${project%.jsonl}
+          if [ -f "$${projects}/$${project}/project.json" ] && \
+             [ ! -L "$${projects}/$${project}/project.json" ]; then
+            continue
+          fi
+          quarantine="$${source}.quarantined-v1.1.23"
           if [ -e "$${quarantine}" ] || [ -L "$${quarantine}" ]; then
             echo "telemetry quarantine target already exists" >&2
             exit 1
           fi
           mv "$${source}" "$${quarantine}"
-          sync
-        fi
+          changed=1
+        done
+        [ "$${changed}" -eq 0 ] || sync
     volumes:
       - daemon_data:/var/lib/tee-daemon
     depends_on:
