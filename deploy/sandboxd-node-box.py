@@ -83,8 +83,17 @@ RUNSC_BIN="$INSTALL_DIR/runsc"
 
 DOCKER_DATASET="dstack/sandboxd-docker"
 DOCKER_DATA_ROOT="/var/lib/sandboxd-docker"
-DOCKER_DATA_LIMIT="28G"
-DOCKER_DATA_LIMIT_BYTES=$((28 * 1024 * 1024 * 1024))
+COMBINED_CACHE_LIMIT="28G"
+COMBINED_CACHE_LIMIT_BYTES=$((28 * 1024 * 1024 * 1024))
+DOCKER_DATA_LIMIT="22G"
+DOCKER_DATA_LIMIT_BYTES=$((22 * 1024 * 1024 * 1024))
+
+# BuildKit cache is a child of the combined 28 GiB Docker ceiling, with its own hard 6 GiB stop.
+# Sandbox image admission budgets the remaining 22 GiB; neither cache can starve the other silently.
+BUILDKIT_DATASET="$DOCKER_DATASET/buildkit"
+BUILDKIT_ROOT="/var/lib/sandboxd-buildkit"
+BUILDKIT_LIMIT="6G"
+BUILDKIT_LIMIT_BYTES=$((6 * 1024 * 1024 * 1024))
 
 STATE_DATASET="dstack/sandboxd-state"
 STATE_ROOT="/var/lib/sandboxd-state"
@@ -100,7 +109,8 @@ QUOTA_ZVOL_BYTES=$((251 * 1024 * 1024 * 1024))
 QUOTA_SOLD_MIB=237568
 QUOTA_FS_HEADROOM_MIB=18432
 QUOTA_POOL_HEADROOM_MIB=28672
-QUOTA_TOOLS_IMAGE="ghcr.io/dmvt/confidential-sandboxes@sha256:3bd7c80c2dda9f09866266deca9c763902361e750eddacca2d7217d667bcf00a"
+QUOTA_TOOLS_IMAGE="ghcr.io/dmvt/confidential-sandboxes@sha256:786720fcac62597c536ba30337954b472fb40c5844882c01089a61a232accce4"
+SECRET_RUNTIME_ROOT="/run/sandboxd-secrets"
 MIN_HOST_VCPUS=8
 # The VMM resource readback must still be exactly 16,384 MiB. Inside this TDX image that allocation
 # exposes about 15,034 MiB after confidential-guest firmware/kernel reservations, so retain a
@@ -114,12 +124,33 @@ mkdir -p "$DOCKER_CONFIG"
 chmod 0700 "$DOCKER_CONFIG"
 trap 'rm -rf "$DOCKER_CONFIG"' EXIT
 
-for tool in awk curl df docker find grep head jq mount rm sed zfs zpool; do
+for tool in awk chmod curl df docker find grep head jq mkdir mount rm sed stat zfs zpool; do
   command -v "$tool" >/dev/null 2>&1 || {
     echo "missing required sandboxd host tool: $tool" >&2
     exit 1
   }
 done
+
+# Decrypted per-sandbox launch material must be visible to both sandboxd and the host Docker daemon,
+# but must never survive a CVM reboot. `/run` is the host tmpfs; Compose bind-mounts this exact path
+# back into sandboxd so the path resolves identically when dockerd mounts it read-only into a tenant.
+[ "$(stat -f -c %T /run)" = "tmpfs" ] || {
+  echo "host /run is not tmpfs; refusing sealed-environment delivery" >&2
+  exit 1
+}
+run_mount_options=$(awk '$2 == "/run" && $3 == "tmpfs" { print $4; exit }' /proc/mounts)
+[ -n "$run_mount_options" ] || {
+  echo "cannot read host /run tmpfs mount options" >&2
+  exit 1
+}
+case ",$run_mount_options," in
+  *,noexec,*)
+    echo "host /run is noexec; refusing the measured tenant init mount" >&2
+    exit 1
+    ;;
+esac
+mkdir -p "$SECRET_RUNTIME_ROOT"
+chmod 0700 "$SECRET_RUNTIME_ROOT"
 
 # UpgradeApp does not resize an existing VM. Validate the resources visible inside the guest so an
 # update of an old 4-vCPU/8-GiB node cannot install admission budgets intended for the new profile.
@@ -230,8 +261,9 @@ done
 chmod 0700 "$STATE_ROOT"
 
 # Docker image layers, writable container metadata, named volumes, and container logs are outside a
-# tenant's /data quota. Put the entire Docker root on its own managed ZFS dataset with a real 28 GiB
-# ceiling before any app or quota-tools image is pulled. Never hide or migrate an existing root.
+# tenant's /data quota. The parent dataset has a 28 GiB descendant-inclusive quota; its own Docker
+# filesystem has a 22 GiB refquota and the BuildKit child below gets the remaining 6 GiB. Never hide
+# or migrate an existing root.
 current_docker_root=$(docker info --format '{{.DockerRootDir}}')
 if [ "$current_docker_root" != "$DOCKER_DATA_ROOT" ]; then
   existing_payload="$({ docker image ls -aq; docker container ls -aq; docker volume ls -q; } | sed '/^$/d' | head -n 1)"
@@ -247,7 +279,7 @@ if ! zfs list -H -o name "$DOCKER_DATASET" >/dev/null 2>&1; then
   fi
   zfs create \
     -o mountpoint="$DOCKER_DATA_ROOT" \
-    -o quota="$DOCKER_DATA_LIMIT" \
+    -o quota="$COMBINED_CACHE_LIMIT" \
     -o refquota="$DOCKER_DATA_LIMIT" \
     -o sandboxd:managed=1 \
     "$DOCKER_DATASET"
@@ -268,9 +300,9 @@ fi
   echo "Docker data-root dataset is not mounted: $DOCKER_DATASET" >&2
   exit 1
 }
-zfs set quota="$DOCKER_DATA_LIMIT" refquota="$DOCKER_DATA_LIMIT" "$DOCKER_DATASET"
-[ "$(zfs get -Hp -o value quota "$DOCKER_DATASET")" -eq "$DOCKER_DATA_LIMIT_BYTES" ] || {
-  echo "Docker dataset quota is not $DOCKER_DATA_LIMIT" >&2
+zfs set quota="$COMBINED_CACHE_LIMIT" refquota="$DOCKER_DATA_LIMIT" "$DOCKER_DATASET"
+[ "$(zfs get -Hp -o value quota "$DOCKER_DATASET")" -eq "$COMBINED_CACHE_LIMIT_BYTES" ] || {
+  echo "combined Docker/BuildKit dataset quota is not $COMBINED_CACHE_LIMIT" >&2
   exit 1
 }
 [ "$(zfs get -Hp -o value refquota "$DOCKER_DATASET")" -eq "$DOCKER_DATA_LIMIT_BYTES" ] || {
@@ -278,15 +310,53 @@ zfs set quota="$DOCKER_DATA_LIMIT" refquota="$DOCKER_DATA_LIMIT" "$DOCKER_DATASE
   exit 1
 }
 
-# Older sandboxd releases set `unless-stopped` on tenant and daemon containers. Neutralize and stop
-# both before restarting dockerd; otherwise sandboxd can bind the underlying quota-mount directory
-# before XFS is mounted, or untrusted code can start before the host firewall is restored. The new
-# compose also pins sandboxd to `restart: no`, so the dstack runner starts it only after pre-launch
-# has mounted XFS. The manager then resumes only durable rows recorded as running. Any failure aborts.
+if ! zfs list -H -o name "$BUILDKIT_DATASET" >/dev/null 2>&1; then
+  if [ -d "$BUILDKIT_ROOT" ] && [ -n "$(find "$BUILDKIT_ROOT" -mindepth 1 -maxdepth 1 -print -quit)" ]; then
+    echo "refusing to mount BuildKit dataset over nonempty $BUILDKIT_ROOT" >&2
+    exit 1
+  fi
+  zfs create \
+    -o mountpoint="$BUILDKIT_ROOT" \
+    -o quota="$BUILDKIT_LIMIT" \
+    -o refquota="$BUILDKIT_LIMIT" \
+    -o sandboxd:managed=1 \
+    "$BUILDKIT_DATASET"
+fi
+[ "$(zfs get -H -o value type "$BUILDKIT_DATASET")" = "filesystem" ] || {
+  echo "BuildKit dataset is not a filesystem: $BUILDKIT_DATASET" >&2
+  exit 1
+}
+[ "$(zfs get -H -o value sandboxd:managed "$BUILDKIT_DATASET")" = "1" ] || {
+  echo "refusing unmanaged BuildKit dataset $BUILDKIT_DATASET" >&2
+  exit 1
+}
+[ "$(zfs get -H -o value mountpoint "$BUILDKIT_DATASET")" = "$BUILDKIT_ROOT" ] || {
+  echo "unexpected BuildKit dataset mountpoint" >&2
+  exit 1
+}
+[ "$(zfs get -H -o value mounted "$BUILDKIT_DATASET")" = "yes" ] || {
+  echo "BuildKit dataset is not mounted: $BUILDKIT_DATASET" >&2
+  exit 1
+}
+zfs set quota="$BUILDKIT_LIMIT" refquota="$BUILDKIT_LIMIT" "$BUILDKIT_DATASET"
+for property in quota refquota; do
+  [ "$(zfs get -Hp -o value "$property" "$BUILDKIT_DATASET")" -eq "$BUILDKIT_LIMIT_BYTES" ] || {
+    echo "BuildKit dataset $property is not exactly $BUILDKIT_LIMIT" >&2
+    exit 1
+  }
+done
+chmod 0700 "$BUILDKIT_ROOT"
+
+# Older releases set `unless-stopped` on tenant, builder, and daemon containers. Neutralize and stop
+# all of them before restarting dockerd; otherwise sandboxd can bind the underlying quota-mount
+# directory before XFS is mounted, or untrusted code can start before the host firewall is restored.
+# The current compose pins sandboxd to `restart: no`, so the dstack runner starts it only after
+# pre-launch has mounted XFS. The manager then resumes only durable rows recorded as running.
 managed_ids=$(docker container ls -aq --filter label=cs.managed=1)
 daemon_ids=$(docker container ls -aq --filter label=com.docker.compose.service=sandboxd)
+builder_ids=$(docker container ls -aq --filter label=com.docker.compose.service=sandbox-builder)
 legacy_backup_ids=$(docker container ls -aq --filter label=com.docker.compose.service=sandboxd-backup)
-quiesce_ids="$managed_ids $daemon_ids $legacy_backup_ids"
+quiesce_ids="$managed_ids $daemon_ids $builder_ids $legacy_backup_ids"
 for container_id in $quiesce_ids; do
   docker update --restart=no "$container_id" >/dev/null
 done
@@ -400,15 +470,25 @@ docker run --rm --privileged --network host \
     while ipt -C DOCKER-USER -i "csb+" -j SANDBOXD-TENANT 2>/dev/null; do
       ipt -D DOCKER-USER -i "csb+" -j SANDBOXD-TENANT
     done
+    while ipt -C DOCKER-USER -i csbuild0 -j SANDBOXD-TENANT 2>/dev/null; do
+      ipt -D DOCKER-USER -i csbuild0 -j SANDBOXD-TENANT
+    done
+    ipt -I DOCKER-USER 1 -i csbuild0 -j SANDBOXD-TENANT
     ipt -I DOCKER-USER 1 -i "csb+" -j SANDBOXD-TENANT
     while ipt -C INPUT -i "csb+" -j REJECT 2>/dev/null; do
       ipt -D INPUT -i "csb+" -j REJECT
     done
+    while ipt -C INPUT -i csbuild0 -j REJECT 2>/dev/null; do
+      ipt -D INPUT -i csbuild0 -j REJECT
+    done
+    ipt -I INPUT 1 -i csbuild0 -j REJECT
     ipt -I INPUT 1 -i "csb+" -j REJECT
     first_forward="$(ipt -S FORWARD | sed -n "/^-A FORWARD /{p;q;}")"
     [ "$first_forward" = "-A FORWARD -j DOCKER-USER" ]
     ipt -C DOCKER-USER -i "csb+" -j SANDBOXD-TENANT
+    ipt -C DOCKER-USER -i csbuild0 -j SANDBOXD-TENANT
     ipt -C INPUT -i "csb+" -j REJECT
+    ipt -C INPUT -i csbuild0 -j REJECT
     ipt -C SANDBOXD-TENANT -d 10.192.0.0/10 -m physdev --physdev-is-bridged -j RETURN
     ipt -C SANDBOXD-TENANT -d 10.0.0.0/8 -j REJECT
     ipt -C SANDBOXD-TENANT -d 169.254.0.0/16 -j REJECT
@@ -631,7 +711,7 @@ def start_vm(vm_id: str) -> dict[str, object]:
 def main() -> None:
     mode = sys.argv[1] if len(sys.argv) > 1 else "hash"
 
-    # The measured compose admits up to 5 vCPU / 10 GiB / 232 GiB / 16,384 PIDs of tenant resources.
+    # The measured compose admits up to 4 vCPU / 10 GiB / 232 GiB / 16,384 PIDs of tenant resources.
     # Refuse an accidental undersized VM override; a larger explicit provisioning remains safe but
     # does not automatically raise admission ceilings.
     undersized = []
