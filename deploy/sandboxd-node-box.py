@@ -109,7 +109,7 @@ QUOTA_ZVOL_BYTES=$((251 * 1024 * 1024 * 1024))
 QUOTA_SOLD_MIB=237568
 QUOTA_FS_HEADROOM_MIB=18432
 QUOTA_POOL_HEADROOM_MIB=28672
-QUOTA_TOOLS_IMAGE="ghcr.io/dmvt/confidential-sandboxes@sha256:2381e07a706faf96c711941a637d2c935f61addedb6204f188af6b783113b2e4"
+QUOTA_TOOLS_IMAGE="ghcr.io/dmvt/confidential-sandboxes@sha256:7e7bfb22f401dbfaaf1fb68e5ac961f0c7ba80da630c737f22a76135c6279376"
 SECRET_RUNTIME_ROOT="/run/sandboxd-secrets"
 MIN_HOST_VCPUS=8
 # The VMM resource readback must still be exactly 16,384 MiB. Inside this TDX image that allocation

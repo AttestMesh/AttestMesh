@@ -15,7 +15,7 @@ class SandboxdDeployContract(unittest.TestCase):
     def test_release_pins_one_daemon_image_and_enables_bounded_exec(self) -> None:
         daemon_digest = (
             "ghcr.io/dmvt/confidential-sandboxes@sha256:"
-            "2381e07a706faf96c711941a637d2c935f61addedb6204f188af6b783113b2e4"
+            "7e7bfb22f401dbfaaf1fb68e5ac961f0c7ba80da630c737f22a76135c6279376"
         )
         self.assertEqual(COMPOSE.count(daemon_digest), 3)
         self.assertIn(f'QUOTA_TOOLS_IMAGE="{daemon_digest}"', PRELAUNCH)
