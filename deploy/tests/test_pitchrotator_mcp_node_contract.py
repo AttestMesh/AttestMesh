@@ -42,7 +42,7 @@ class PitchRotatorMcpNodeContractTests(unittest.TestCase):
         self.assertIn(OVERLAY_SHA256, deployment)
         self.assertIn(f"PITCHROTATOR_SOURCE_COMMIT={UPSTREAM_COMMIT}", self.compose)
         self.assertNotIn("${PITCHROTATOR_SOURCE_COMMIT}", self.compose)
-        self.assertNotIn("${PUBLIC_URL}", self.compose)
+        self.assertIn("PUBLIC_URL=https://${APP_ID}-8787.${GATEWAY_DOMAIN}", self.compose)
 
         images = re.findall(r"(?m)^\s*image:\s*([^\s#]+)", self.compose)
         self.assertTrue(images, "compose must declare its deterministic workload image")
@@ -88,16 +88,18 @@ class PitchRotatorMcpNodeContractTests(unittest.TestCase):
             r"(?m)^(?!\s*#).*\b(?:ALLOW_INSECURE_NO_TEE|DSTACK_SIMULATOR_ENDPOINT)\b",
         )
 
-    def test_workload_is_mesh_only_while_sidecar_transport_uses_gateway(self) -> None:
+    def test_workload_has_public_mcp_and_confidential_mesh_paths(self) -> None:
         deployment = self.driver + self.box
         self.assertRegex(self.box, r'BOX_GATEWAY_ENABLED",\s*"true"')
         self.assertRegex(self.box, r'BOX_PORTS",\s*"\[\]"')
         workload = self.compose.split("  pitchrotator-mcp:", 1)[1].split(
             "  app-egress-fw:", 1
         )[0]
-        self.assertNotRegex(workload, r"(?m)^\s*ports\s*:")
+        self.assertIn('- "8787:8787"', workload)
         self.assertIn('- "51900:51900"', self.compose)
         self.assertIn('bind="$${ip}"', self.compose)
+        self.assertIn("verify-public", self.driver)
+        self.assertRegex(self.driver, r"verify-mcp\)\s+verify_mcp;\s+verify_public_mcp")
 
     def test_model_secret_is_sealed_and_not_exposed_as_a_cli_option(self) -> None:
         deployment = self.driver + self.box + self.compose

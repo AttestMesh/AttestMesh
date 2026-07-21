@@ -35,8 +35,7 @@ services:
     expose:
       - "9090"
     ports:
-      # Public gateway transport for member-to-member WireGuard only. The MCP
-      # workload's 8787 port is never published through the gateway.
+      # Public gateway transport for member-to-member WireGuard.
       - "51900:51900"
     cap_add:
       - NET_ADMIN
@@ -48,7 +47,7 @@ services:
     restart: unless-stopped
     environment:
       - PORT=8787
-      - PUBLIC_URL=http://pitchrotator-mcp:8787
+      - PUBLIC_URL=https://${APP_ID}-8787.${GATEWAY_DOMAIN}
       - MODEL_API_KEY=${MODEL_API_KEY}
       - MODEL_BASE_URL=https://api.redpill.ai/v1
       - MODEL_NAME=z-ai/glm-5.2
@@ -60,8 +59,10 @@ services:
       - PITCHROTATOR_OVERLAY_SHA256=b13e1cb243f3978ccaee8a1eb1a82c987503066c550b1703ae4b65b37dd93b7a
     volumes:
       - /var/run/dstack.sock:/var/run/dstack.sock
-    expose:
-      - "8787"
+    ports:
+      # Public Streamable HTTP MCP endpoint. Founder isolation remains keyed by
+      # the caller-provided ?key= value; the raw key is never stored or logged.
+      - "8787:8787"
     healthcheck:
       test:
         - CMD
@@ -92,7 +93,7 @@ services:
     cap_add:
       - NET_ADMIN
 
-  # Bind only the attestmesh0 address. The workload has no public gateway port.
+  # Keep the same workload reachable inside the dedicated confidential mesh.
   mesh-proxy-mcp:
     image: alpine/socat:1.8.0.0@sha256:0a861c561b21bf3509a897a07f0daa2e2069cf8973ac55b00d6079c5207ba761
     restart: unless-stopped

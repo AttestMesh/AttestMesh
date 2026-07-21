@@ -75,7 +75,7 @@ _require_env() {
   : "${PITCHROTATOR_IMAGE:?set immutable PITCHROTATOR_IMAGE (repository@sha256:64hex)}"
   [[ "$PITCHROTATOR_IMAGE" =~ ^[a-z0-9.-]+([:/][a-z0-9._/-]+)+@sha256:[0-9a-f]{64}$ ]] \
     || die "PITCHROTATOR_IMAGE must be an immutable repository@sha256:64hex reference"
-  [ "$BOX_GATEWAY_ENABLED" = true ] || die "PitchRotator requires the gateway-TCP mesh transport; the workload port remains unpublished"
+  [ "$BOX_GATEWAY_ENABLED" = true ] || die "PitchRotator requires its public MCP gateway and gateway-TCP mesh transport"
   [ "$BOX_PORTS" = '[]' ] || die "PitchRotator v1 publishes no host ports; BOX_PORTS must remain []"
   indexer=$(jq -r .indexerRegistry "$RECEIPT" 2>/dev/null)
   INDEXER_REGISTRY_ADDR="${INDEXER_REGISTRY_ADDR:-$indexer}"
@@ -243,6 +243,23 @@ verify_mcp() {
   log "✔ MCP /health and self-reported TDX-mode /attestation smoke passed over mesh (not cryptographic quote verification)"
 }
 
+verify_public_mcp() {
+  _load; [ -n "${X:-}" ] || die "need deployed app id"
+  local base health attest unauth code body
+  base="https://$(tr A-F a-f <<<"${X#0x}")-8787.${GATEWAY_DOMAIN}"
+  health=$(curl -fsS --max-time 15 "$base/health") || die "public MCP health probe failed"
+  jq -e '.ok == true' <<<"$health" >/dev/null || die "invalid public /health response"
+  attest=$(curl -fsS --max-time 25 "$base/attestation?challenge=attestmesh-public-deploy-verification") \
+    || die "public attestation probe failed"
+  jq -e '.mode == "tdx" and .trusted == true and (.quote | type == "string" and length > 0)' <<<"$attest" >/dev/null \
+    || die "public endpoint did not return trusted TDX attestation"
+  unauth=$(curl -sS --max-time 15 -w $'\n%{http_code}' "$base/mcp") || die "public MCP route probe failed"
+  code="${unauth##*$'\n'}"; body="${unauth%$'\n'*}"
+  [ "$code" = 401 ] && jq -e '.error | contains("key")' <<<"$body" >/dev/null \
+    || die "public /mcp route did not enforce session-key presence"
+  log "✔ public MCP gateway health, TDX-mode attestation, and keyed /mcp route passed: $base/mcp"
+}
+
 update_member() {
   _load; _require_env
   [ -n "${X:-}" ] && [ -n "${VM_ID:-}" ] && [ -n "${CLUSTER:-}" ] || die "need deployed state"
@@ -268,8 +285,9 @@ case "$ACTION" in
   bind) bind_member ;;
   start) start_cvm ;;
   verify) verify ;;
-  verify-mcp) verify_mcp ;;
+  verify-mcp) verify_mcp; verify_public_mcp ;;
+  verify-public) verify_public_mcp ;;
   update) update_member ;;
-  all) preflight; deploy_cvm; deploy_cluster; patha_upgrade; prime_gate; bind_member; start_cvm; verify; verify_mcp ;;
-  *) die "usage: $0 <node> [preflight|deploy|cluster|patha|prime|bind|start|verify|verify-mcp|update|all]" ;;
+  all) preflight; deploy_cvm; deploy_cluster; patha_upgrade; prime_gate; bind_member; start_cvm; verify; verify_mcp; verify_public_mcp ;;
+  *) die "usage: $0 <node> [preflight|deploy|cluster|patha|prime|bind|start|verify|verify-mcp|verify-public|update|all]" ;;
 esac
