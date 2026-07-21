@@ -196,7 +196,7 @@ services:
     # v20 = CLUSTER_NETWORKS-only live mesh config + structured orchestrator errors;
     # v19 = Apps → Sandboxes rename (labels only, wire stays app).
     # Synclave main 164b8ff — verbatim deployment log streaming across UI, API, and CLI.
-    image: ghcr.io/attestmesh/synclave-app:sha-d1926ac4aa14ef4e388d1d02fbe226590d62c8e8@sha256:402a636a4e8bc1194e1dec5875fa0fcc230f454df7a063e71bf04e54dcd7ae6e
+    image: ghcr.io/attestmesh/synclave-app:sha-11640ac9643bba742fdbec6b6637204a375a4a6a@sha256:a4adc33cc1de74d0304c52340aaffa53950985da4da78d852bd67d80b381100f
     environment:
       API_HOST: 0.0.0.0
       API_PORT: 80
