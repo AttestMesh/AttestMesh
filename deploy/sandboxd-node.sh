@@ -25,7 +25,7 @@ APP_DOMAIN="${APP_DOMAIN:-sandbox.synclave.net}"
 # discarding pre-production tombstones/test history. Future stateful replacements need migration.
 ALLOW_EMPTY_STATE_RESET="${ALLOW_EMPTY_STATE_RESET:-0}"
 
-export BOX_VCPU="${BOX_VCPU:-8}" BOX_MEM="${BOX_MEM:-16384}" BOX_DISK="${BOX_DISK:-300}"
+export BOX_VCPU="${BOX_VCPU:-12}" BOX_MEM="${BOX_MEM:-24576}" BOX_DISK="${BOX_DISK:-450}"
 export BOX_PORTS="${BOX_PORTS:-[]}" BOX_GATEWAY_ENABLED="${BOX_GATEWAY_ENABLED:-true}" BOX_NET_MODE="${BOX_NET_MODE:-bridge}"
 
 STATE="$LOGDIR/sandboxd-node-${NODE}.state"
@@ -552,7 +552,7 @@ replace_cvm() {
       || die "replacement journal lacks the explicit empty-state reset approval"
     if [ "$REPLACEMENT_PHASE" = rolled-back ] && \
        { [ "${REPLACEMENT_H:-}" != "$nh" ] || [ -n "${REPLACEMENT_PREVIOUS_H:-}" ]; }; then
-      # The failed replacement is already the explicitly provisioned 8/16/300 VM. Reuse it by
+      # The failed replacement is already provisioned at the journaled target size. Reuse it by
       # installing the corrected compose while it remains stopped; never allocate a duplicate and
       # never start it alongside the healthy old VM. The two hashes make a crash during UpgradeApp
       # reconcilable from VMM readback.

@@ -14,9 +14,9 @@ import mcp_dstack as m  # noqa: E402
 
 NAME = os.environ.get("BOX_NAME", "sandboxd-node")
 COMPOSE_PATH = os.environ.get("BOX_COMPOSE", "/tmp/sandboxd-node.yaml")
-VCPU = int(os.environ.get("BOX_VCPU", "8"))
-MEM = int(os.environ.get("BOX_MEM", "16384"))
-DISK = int(os.environ.get("BOX_DISK", "300"))
+VCPU = int(os.environ.get("BOX_VCPU", "12"))
+MEM = int(os.environ.get("BOX_MEM", "24576"))
+DISK = int(os.environ.get("BOX_DISK", "450"))
 PORTS = json.loads(os.environ.get("BOX_PORTS", "[]"))
 NET_MODE = (os.environ.get("BOX_NET_MODE", "bridge").strip().lower() or "bridge")
 GATEWAY_ENABLED = os.environ.get("BOX_GATEWAY_ENABLED", "true").strip().lower() in {
@@ -109,13 +109,12 @@ QUOTA_ZVOL_BYTES=$((251 * 1024 * 1024 * 1024))
 QUOTA_SOLD_MIB=237568
 QUOTA_FS_HEADROOM_MIB=18432
 QUOTA_POOL_HEADROOM_MIB=28672
-QUOTA_TOOLS_IMAGE="ghcr.io/dmvt/confidential-sandboxes@sha256:786720fcac62597c536ba30337954b472fb40c5844882c01089a61a232accce4"
+QUOTA_TOOLS_IMAGE="ghcr.io/dmvt/confidential-sandboxes@sha256:83ccea6d327a61e273bce610f7a191b2faaae73cc00449704418045eb34b27cf"
 SECRET_RUNTIME_ROOT="/run/sandboxd-secrets"
-MIN_HOST_VCPUS=8
-# The VMM resource readback must still be exactly 16,384 MiB. Inside this TDX image that allocation
-# exposes about 15,034 MiB after confidential-guest firmware/kernel reservations, so retain a
-# conservative 14.5 GiB guest-visible floor while still rejecting every old 8 GiB node.
-MIN_HOST_MEMORY_MIB=14848
+MIN_HOST_VCPUS=12
+# The VMM resource readback must be exactly 24,576 MiB. Retain a conservative 22 GiB
+# guest-visible floor after confidential-guest firmware/kernel reservations.
+MIN_HOST_MEMORY_MIB=22528
 
 # Registry credentials are sealed into the CVM but need not persist on its host filesystem.
 DOCKER_CONFIG="/run/sandboxd-prelaunch-docker-auth"
@@ -153,7 +152,7 @@ mkdir -p "$SECRET_RUNTIME_ROOT"
 chmod 0700 "$SECRET_RUNTIME_ROOT"
 
 # UpgradeApp does not resize an existing VM. Validate the resources visible inside the guest so an
-# update of an old 4-vCPU/8-GiB node cannot install admission budgets intended for the new profile.
+# update of an older node cannot install admission budgets intended for the 12-vCPU/24-GiB profile.
 # dstack's minimal host image does not ship getconf. Count the online processors from procfs using
 # awk, which is already a required pre-launch tool, and still validate the result as an integer.
 actual_vcpus=$(awk -F: '/^processor[[:space:]]*:/ {count++} END {print count + 0}' /proc/cpuinfo)
@@ -711,16 +710,16 @@ def start_vm(vm_id: str) -> dict[str, object]:
 def main() -> None:
     mode = sys.argv[1] if len(sys.argv) > 1 else "hash"
 
-    # The measured compose admits up to 4 vCPU / 10 GiB / 232 GiB / 16,384 PIDs of tenant resources.
-    # Refuse an accidental undersized VM override; a larger explicit provisioning remains safe but
-    # does not automatically raise admission ceilings.
+    # The measured compose admits 90 vCPU of CFS quota ceilings from a 9-vCPU physical tenant pool,
+    # plus 18 GiB / 232 GiB / 16,384 PIDs of non-overcommitted tenant resources.
+    # Refuse an accidental undersized VM override.
     undersized = []
-    if VCPU < 8:
-        undersized.append(f"vcpu={VCPU} < 8")
-    if MEM < 16384:
-        undersized.append(f"memory={MEM} < 16384 MiB")
-    if DISK < 300:
-        undersized.append(f"disk={DISK} < 300 GiB")
+    if VCPU < 12:
+        undersized.append(f"vcpu={VCPU} < 12")
+    if MEM < 24576:
+        undersized.append(f"memory={MEM} < 24576 MiB")
+    if DISK < 450:
+        undersized.append(f"disk={DISK} < 450 GiB")
     if undersized:
         raise SystemExit("refusing undersized sandboxd VM: " + ", ".join(undersized))
 
