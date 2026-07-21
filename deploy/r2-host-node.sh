@@ -115,6 +115,13 @@ _load_r2_creds() {
   export R2_REGION="$(sed -nE 's/^region *= *"?([^"]+)"?.*/\1/p' "$R2_CREDS")"; : "${R2_REGION:=auto}"
   export R2_ACCESS_KEY_ID="$(sed -nE 's/^access_key_id *= *"?([^"]+)"?.*/\1/p' "$R2_CREDS")"
   export R2_SECRET_ACCESS_KEY="$(sed -nE 's/^secret_access_key *= *"?([^"]+)"?.*/\1/p' "$R2_CREDS")"
+  export BACKEND_PROVIDER="$(sed -nE 's/^provider *= *"?([^"]+)"?.*/\1/p' "$R2_CREDS")"; : "${BACKEND_PROVIDER:=Cloudflare}"
+  export BACKEND_ENDPOINT="${R2_ENDPOINT}"
+  export BACKEND_BUCKET="${R2_BUCKET}"
+  export BACKEND_REGION="${R2_REGION}"
+  export BACKEND_ACCESS_KEY_ID="${R2_ACCESS_KEY_ID}"
+  export BACKEND_SECRET_ACCESS_KEY="${R2_SECRET_ACCESS_KEY}"
+  export BACKEND_FORCE_PATH_STYLE="$(sed -nE 's/^force_path_style *= *"?([^"]+)"?.*/\1/p' "$R2_CREDS")"; : "${BACKEND_FORCE_PATH_STYLE:=true}"
   [ -n "$R2_ENDPOINT" ] && [ -n "$R2_BUCKET" ] && [ -n "$R2_ACCESS_KEY_ID" ] && [ -n "$R2_SECRET_ACCESS_KEY" ] \
     || die "R2 creds incomplete in $R2_CREDS"
 }
@@ -156,6 +163,13 @@ _box_run() {
     printf 'E_R2_REGION=%q\n' "${R2_REGION:-auto}"
     printf 'E_R2_ACCESS_KEY_ID=%q\n' "$R2_ACCESS_KEY_ID"
     printf 'E_R2_SECRET_ACCESS_KEY=%q\n' "$R2_SECRET_ACCESS_KEY"
+    printf 'E_BACKEND_PROVIDER=%q\n' "$BACKEND_PROVIDER"
+    printf 'E_BACKEND_ENDPOINT=%q\n' "$BACKEND_ENDPOINT"
+    printf 'E_BACKEND_BUCKET=%q\n' "$BACKEND_BUCKET"
+    printf 'E_BACKEND_REGION=%q\n' "$BACKEND_REGION"
+    printf 'E_BACKEND_ACCESS_KEY_ID=%q\n' "$BACKEND_ACCESS_KEY_ID"
+    printf 'E_BACKEND_SECRET_ACCESS_KEY=%q\n' "$BACKEND_SECRET_ACCESS_KEY"
+    printf 'E_BACKEND_FORCE_PATH_STYLE=%q\n' "$BACKEND_FORCE_PATH_STYLE"
     printf 'E_S3GW_ACCESS_KEY_ID=%q\n' "$S3GW_ACCESS_KEY_ID"
     printf 'E_S3GW_SECRET_ACCESS_KEY=%q\n' "$S3GW_SECRET_ACCESS_KEY"
     printf 'E_DSTACK_DOCKER_USERNAME=%q\n' "${guser:-dmvt}"
@@ -257,21 +271,25 @@ verify_health() {
   [ -n "${VM_ID:-}" ] || die "need VM_ID (run deploy first)"
   local i out
   for i in $(seq 1 40); do
-    out=$(ssh_box "sudo bash -s" <<SCRIPT 2>/dev/null
+    if out=$(ssh_box "sudo bash -s" <<SCRIPT 2>/dev/null
 set -u
 VMID="$VM_ID"
 $(_bridge_ip_snippet)
-curl -sS --max-time 5 "http://\$IP:9090/healthz" 2>/dev/null
+curl --fail --silent --show-error --max-time 5 "http://\$IP:9090/healthz" 2>/dev/null
 SCRIPT
-)
-    if echo "$out" | grep -q '"phase"'; then
-      log "✔ sidecar healthz: $out"
-      return 0
+); then
+      if printf '%s' "$out" | jq -e '
+        (.first_converged == true or .firstConverged == true)
+        and (.csk_acquired == true or .cskAcquired == true)
+      ' >/dev/null 2>&1; then
+        log "✔ sidecar healthz: $out"
+        return 0
+      fi
     fi
-    log "… sidecar not answering yet ($i/40): ${out:-<no response>}"
+    log "… sidecar not healthy yet ($i/40): ${out:-<no HTTP 200 response>}"
     sleep 15
   done
-  die "sidecar :9090 never answered at the bridge IP — check vm_logs $VM_ID"
+  die "sidecar :9090 never reached HTTP 200 with convergence+CSK gates — check vm_logs $VM_ID"
 }
 
 # Discover the r2-host node's mesh IP from the jump host: enumerate wg peer

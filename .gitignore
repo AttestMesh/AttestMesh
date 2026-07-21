@@ -28,6 +28,14 @@ dist/
 .env.local
 *.local
 
+# Private, non-open-source workload overlays and deployment records
+deploy/workflows/openkey*.tsx
+deploy/compose/openkey*.yaml
+deploy/openkey*.json
+deploy/openkey*.env
+deploy/logs/*openkey*
+contracts/script/clusters/openkey*.json
+
 # Logs
 *.log
 

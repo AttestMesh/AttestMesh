@@ -1,0 +1,124 @@
+# Single-CVM PostgreSQL + CSK-encrypted S3 gateway. PostgreSQL WAL-G backups
+# and the general S3 namespace use separate prefixes in the same R2 bucket.
+services:
+  sidecar:
+    image: ghcr.io/attestmesh/cluster-mesh-agent@sha256:edb20df54414c2c668cd557e2250b834590a3ef308c86965e4ef70f82ed5c36d
+    restart: unless-stopped
+    environment:
+      - CHAIN_ID=${CHAIN_ID}
+      - RPC_URL=${RPC_URL}
+      - BUNDLER_URL=${BUNDLER_URL}
+      - GAS_POLICY_ID=${GAS_POLICY_ID}
+      - INDEXER_REGISTRY_ADDR=${INDEXER_REGISTRY_ADDR}
+      - GATEWAY_DOMAIN=${GATEWAY_DOMAIN}
+      - DSTACK_SOCKET=/var/run/dstack.sock
+      - SIDECAR_STATE_DIR=/var/lib/attestmesh
+      - AGENT_GRPC_SOCKET=/var/run/attestmesh/agent.sock
+      - HEALTH_HTTP_ADDR=0.0.0.0:9090
+      - LOG_LEVEL=info,cluster_mesh_agent=debug
+    volumes:
+      - /var/run/dstack.sock:/var/run/dstack.sock
+      - sidecar-state:/var/lib/attestmesh
+      - agent-sock:/var/run/attestmesh
+    ports: ["9090:9090", "51900:51900"]
+    cap_add: [NET_ADMIN]
+    devices: [/dev/net/tun]
+
+  postgres-mesh-proxy:
+    image: alpine/socat:1.8.0.0
+    restart: unless-stopped
+    network_mode: service:sidecar
+    depends_on:
+      postgres: {condition: service_healthy}
+    entrypoint: [/bin/sh, -ec]
+    command:
+      - |
+        until ip="$$(ip -4 -o addr show dev attestmesh0 2>/dev/null | awk '{print $$4}' | cut -d/ -f1)" && [ -n "$$ip" ]; do sleep 1; done
+        exec socat TCP-LISTEN:5432,fork,reuseaddr,bind="$$ip" TCP:postgres:5432
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+
+  s3-mesh-proxy:
+    image: alpine/socat:1.8.0.0
+    restart: unless-stopped
+    network_mode: service:sidecar
+    depends_on: [s3gw]
+    entrypoint: [/bin/sh, -ec]
+    command:
+      - |
+        until ip="$$(ip -4 -o addr show dev attestmesh0 2>/dev/null | awk '{print $$4}' | cut -d/ -f1)" && [ -n "$$ip" ]; do sleep 1; done
+        exec socat TCP-LISTEN:19000,fork,reuseaddr,bind="$$ip" TCP:s3gw:19000
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+
+  postgres:
+    image: ghcr.io/attestmesh/postgres-walg@sha256:0edf068ddf5f89f73b41a00ffaf94679495c1d67a559f47f2e713036c6a681ad
+    restart: unless-stopped
+    env_file: [/tmp/attestmesh-workload.env]
+    environment:
+      - POSTGRES_USER=postgres
+      - POSTGRES_DB=postgres
+      - POSTGRES_INITDB_ARGS=--encoding=UTF8 --locale=C
+      - BACKUP_ENABLED=true
+      - BACKUP_PREFIX=shared-postgres/backups
+      - AGENT_GRPC_SOCKET=/var/run/attestmesh/agent.sock
+      - WALG_KEY_FILE=/run/walg/key
+      - WALG_STATUS_FILE=/walg-status/state
+    entrypoint: [/bin/bash, -c]
+    command:
+      - set -o pipefail; /usr/local/bin/docker-entrypoint-walg.sh postgres 2>&1 | tee -a /walg-status/postgres.log
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - agent-sock:/var/run/attestmesh
+      - walg-status:/walg-status
+    healthcheck:
+      test: [CMD-SHELL, "pg_isready -h 127.0.0.1 -U postgres -d postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 18
+
+  s3gw:
+    image: ghcr.io/attestmesh/r2host-s3gw@sha256:aff0dce82b46487930f19d4abbabdd5704159c83c5eea8db840b3005f9da85bc
+    restart: unless-stopped
+    depends_on: [sidecar]
+    env_file: [/tmp/attestmesh-workload.env]
+    environment:
+      - S3GW_LISTEN_PORT=19000
+      - S3GW_VFS_CACHE_MODE=writes
+      - S3GW_VFS_CACHE_MAX_SIZE=30G
+      - AGENT_GRPC_SOCKET=/var/run/attestmesh/agent.sock
+      - ROLL_ID=20260716T0125Z
+    volumes:
+      - agent-sock:/var/run/attestmesh
+      - s3gw-status:/s3gw-status
+      - vfs-cache:/vfs-cache
+    expose: ["19000"]
+
+  backup-status:
+    image: busybox:1.36
+    restart: unless-stopped
+    command: [httpd, -f, -p, "9180", -h, /status]
+    volumes:
+      - walg-status:/status:ro
+    ports: ["9180:9180"]
+
+  registration-calldata:
+    image: ghcr.io/attestmesh/attestmesh-indexer@sha256:14e9e3f6869ada585642c14e4e2e43bee197978ffc68d146dd6d3cddbc49d2bb
+    restart: "no"
+    entrypoint: [/usr/local/bin/attestmesh-registration-calldata]
+    environment:
+      - CLUSTER=${CLUSTER}
+      - DSTACK_SOCKET=/var/run/dstack.sock
+      - REGISTRATION_HELPER_ADDR=0.0.0.0:9092
+    ports: ["9092:9092"]
+    volumes: [/var/run/dstack.sock:/var/run/dstack.sock]
+
+volumes:
+  sidecar-state:
+  agent-sock:
+  pgdata:
+  walg-status:
+  s3gw-status:
+  vfs-cache:

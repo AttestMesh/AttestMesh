@@ -14,7 +14,7 @@
 
 services:
   sidecar:
-    image: ghcr.io/attestmesh/cluster-mesh-agent@sha256:b9e0ae107d9db015c22059c9fecdc28f2b35e09b257eabb4739bd4e46d96f641
+    image: ghcr.io/attestmesh/cluster-mesh-agent@sha256:8a5bfe0917bd23809f07660cf5dbf15ab593b547090c610746a417d541e86d2d
     restart: unless-stopped
     environment:
       # MEMBER_CONTRACT intentionally unset: the sidecar self-discovers the app_id.
@@ -74,7 +74,7 @@ services:
   # key material never touches disk. Boot phases + rclone NOTICE log land on the
   # s3gw-status volume (the TEE blocks container stdout).
   s3gw:
-    image: ghcr.io/attestmesh/r2host-s3gw@sha256:7fd59551fc5b181330c050bf0cd5de5f1bae725f8fb87bc437c173da77eaa3f3
+    image: ghcr.io/attestmesh/r2host-s3gw@sha256:aff0dce82b46487930f19d4abbabdd5704159c83c5eea8db840b3005f9da85bc
     restart: unless-stopped
     depends_on:
       - sidecar
@@ -84,6 +84,13 @@ services:
       - R2_REGION=${R2_REGION}
       - R2_ACCESS_KEY_ID=${R2_ACCESS_KEY_ID}
       - R2_SECRET_ACCESS_KEY=${R2_SECRET_ACCESS_KEY}
+      - BACKEND_PROVIDER=${BACKEND_PROVIDER}
+      - BACKEND_ENDPOINT=${BACKEND_ENDPOINT}
+      - BACKEND_BUCKET=${BACKEND_BUCKET}
+      - BACKEND_REGION=${BACKEND_REGION}
+      - BACKEND_ACCESS_KEY_ID=${BACKEND_ACCESS_KEY_ID}
+      - BACKEND_SECRET_ACCESS_KEY=${BACKEND_SECRET_ACCESS_KEY}
+      - BACKEND_FORCE_PATH_STYLE=${BACKEND_FORCE_PATH_STYLE}
       - S3GW_ACCESS_KEY_ID=${S3GW_ACCESS_KEY_ID}
       - S3GW_SECRET_ACCESS_KEY=${S3GW_SECRET_ACCESS_KEY}
       - S3GW_LISTEN_PORT=19000
@@ -107,7 +114,7 @@ services:
     depends_on:
       - s3gw
     environment:
-      - ALLOW_BASE_URL=${R2_ENDPOINT}
+      - ALLOW_BASE_URL=${BACKEND_ENDPOINT}
       - INTERNAL_HOSTS=
       - ALLOW_DNS=127.0.0.11
       - RERESOLVE_SECONDS=30
