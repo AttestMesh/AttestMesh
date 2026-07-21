@@ -82,6 +82,12 @@ against the CVM bridge address. Failure automatically applies the reviewed
 rollback Compose on the same VM. `migration-restore` validates the checksum and
 restores the snapshot before any legacy writer starts.
 
+Before the v1.1.23 writer starts, the measured `telemetry-repair` one-shot
+atomically renames the deleted `waifus-preflight-canary` telemetry log to a
+non-active quarantine name. This preserves the legacy bytes without following
+the pathname while allowing the fail-closed retention scanner to validate all
+active telemetry logs. The repair is idempotent after its first successful run.
+
 Manual rollback is intentionally destructive to post-migration writes and must
 therefore be used only for this release window:
 
