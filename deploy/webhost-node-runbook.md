@@ -83,13 +83,12 @@ rollback Compose on the same VM. `migration-restore` validates the checksum and
 restores the snapshot before any legacy writer starts.
 
 Before the v1.1.23 writer starts, the measured `telemetry-repair` one-shot
-atomically renames telemetry logs for deleted test projects to non-active
-quarantine names. It recognizes an active project only through a real,
-non-symlink `project.json`; the known deleted `waifus-preflight-canary` and
-corrupt `rtmrx-e2e` test reservations are always treated as orphaned. This
-preserves the legacy bytes without following the telemetry pathnames while
-allowing the fail-closed retention scanner to validate every active log. The
-repair is idempotent after a successful run.
+atomically renames legacy telemetry logs other than the sole active project,
+`beamr-economy`, to non-active quarantine names. It then atomically writes a
+durable completion marker, so subsequent restarts and future projects never
+repeat this migration. This preserves the legacy bytes without following the
+telemetry pathnames while allowing the fail-closed retention scanner to
+validate every active log.
 
 Manual rollback is intentionally destructive to post-migration writes and must
 therefore be used only for this release window:
