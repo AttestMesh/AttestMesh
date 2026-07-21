@@ -130,10 +130,11 @@ class WebhostNodeContractTests(unittest.TestCase):
         repair_command = "\n".join(repair["command"])
         self.assertIn('"$${telemetry}"/*.jsonl', repair_command)
         self.assertIn('"$${telemetry}"/*.jsonl.1', repair_command)
-        self.assertIn('"$${projects}/$${project}/project.json"', repair_command)
-        self.assertIn('[ ! -L "$${projects}/$${project}/project.json" ]', repair_command)
-        self.assertIn("waifus-preflight-canary|rtmrx-e2e", repair_command)
+        self.assertIn('[ "$${project}" != beamr-economy ] || continue', repair_command)
         self.assertIn(".quarantined-v1.1.23", repair_command)
+        self.assertIn(".orphan-quarantine-v1.1.23.complete", repair_command)
+        self.assertIn('[ ! -f "$${marker}" ] || exit 0', repair_command)
+        self.assertIn('[ -L "$${marker}" ]', repair_command)
         self.assertEqual(
             repair["depends_on"]["migration-backup"]["condition"],
             "service_completed_successfully",

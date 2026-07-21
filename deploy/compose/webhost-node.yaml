@@ -67,22 +67,19 @@ services:
     command:
       - |
         telemetry=/var/lib/tee-daemon/telemetry
-        projects=/var/lib/tee-daemon/projects
+        marker="$${telemetry}/.orphan-quarantine-v1.1.23.complete"
+        if [ -L "$${marker}" ]; then
+          echo "telemetry repair marker must not be a symlink" >&2
+          exit 1
+        fi
+        [ ! -f "$${marker}" ] || exit 0
         changed=0
         for source in "$${telemetry}"/*.jsonl "$${telemetry}"/*.jsonl.1; do
           [ -e "$${source}" ] || [ -L "$${source}" ] || continue
           filename=$${source##*/}
           project=$${filename%.1}
           project=$${project%.jsonl}
-          case "$${project}" in
-            waifus-preflight-canary|rtmrx-e2e) ;;
-            *)
-              if [ -f "$${projects}/$${project}/project.json" ] && \
-                 [ ! -L "$${projects}/$${project}/project.json" ]; then
-                continue
-              fi
-              ;;
-          esac
+          [ "$${project}" != beamr-economy ] || continue
           quarantine="$${source}.quarantined-v1.1.23"
           if [ -e "$${quarantine}" ] || [ -L "$${quarantine}" ]; then
             echo "telemetry quarantine target already exists" >&2
@@ -91,7 +88,11 @@ services:
           mv "$${source}" "$${quarantine}"
           changed=1
         done
-        [ "$${changed}" -eq 0 ] || sync
+        marker_tmp="$${marker}.tmp"
+        [ ! -e "$${marker_tmp}" ] && [ ! -L "$${marker_tmp}" ] || exit 1
+        printf 'active-project=beamr-economy\nquarantined=%s\n' "$${changed}" > "$${marker_tmp}"
+        mv "$${marker_tmp}" "$${marker}"
+        sync
     volumes:
       - daemon_data:/var/lib/tee-daemon
     depends_on:
