@@ -126,6 +126,7 @@ class PitchRotatorMcpNodeContractTests(unittest.TestCase):
         )
         self.assertIn("RUN npm ci", self.build_dockerfile)
         self.assertIn("RUN npm run typecheck", self.build_dockerfile)
+        self.assertIn("COPY --from=build", self.build_dockerfile)
         self.assertIn('io.attestmesh.pitchrotator.model="z-ai/glm-5.2"', self.build_dockerfile)
 
     def test_driver_exposes_repeatable_deploy_and_verification_verbs(self) -> None:

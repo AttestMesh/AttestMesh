@@ -22,10 +22,10 @@ LABEL org.opencontainers.image.source="https://github.com/AlbionaHoti/Pitch-Rota
 
 ENV NODE_ENV=production
 WORKDIR /app
-COPY package.json package-lock.json ./
+COPY --from=build /app/package.json /app/package-lock.json ./
 RUN npm ci --omit=dev && npm cache clean --force
-COPY tsconfig.json ./
-COPY src ./src
+COPY --from=build /app/tsconfig.json ./
+COPY --from=build /app/src ./src
 
 USER node
 EXPOSE 8787
