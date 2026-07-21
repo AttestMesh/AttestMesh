@@ -32,13 +32,13 @@ ROLLBACK_COMPOSE="${ROLLBACK_COMPOSE:-$ROOT/deploy/compose/webhost-node-v1.1.3-r
 GATEWAY_DOMAIN="${GATEWAY_DOMAIN:-gateway.attestmesh.xyz}"
 RECEIPT="$ROOT/contracts/script/deployments/${CHAIN_ID}.json"
 
-WEBHOST_RELEASE_VERSION="v1.1.20"
-WEBHOST_RELEASE_COMMIT="91f7f3f923e8e133e92b547ecf26fc3d4468e1cc"
+WEBHOST_RELEASE_VERSION="v1.1.21"
+WEBHOST_RELEASE_COMMIT="9def92a5c0a0c0d40cbf0eca95d6fdb0d8d3dac4"
 WEBHOST_RELEASE_IDENTITY="https://github.com/dmvt/webhost-control/.github/workflows/release.yml@refs/tags/${WEBHOST_RELEASE_VERSION}"
 WEBHOST_RELEASE_ISSUER="https://token.actions.githubusercontent.com"
-WEBHOST_CONTROL_IMAGE="ghcr.io/dmvt/webhost-control-control-plane@sha256:76e0892ef515ff07b4aba68c38bee088ff49c7e06fea592150f66e24d8a11551"
-WEBHOST_STORAGE_IMAGE="ghcr.io/dmvt/webhost-control-storage-helper@sha256:5cce44c3698b9b8b600f3b02c1a5d5d9e4b8f00b0ab9600e1f8eed8477afe242"
-WEBHOST_TLS_IMAGE="ghcr.io/dmvt/webhost-control-tlsproxy@sha256:282a13855834058ec1d8c9aa18eef90d325cf8059420f85e26b46c644ec9cd73"
+WEBHOST_CONTROL_IMAGE="ghcr.io/dmvt/webhost-control-control-plane@sha256:724450c1d2ea886f23385e5c595fd68e84afc9aa305f9dfa99c765cfd853516a"
+WEBHOST_STORAGE_IMAGE="ghcr.io/dmvt/webhost-control-storage-helper@sha256:f2fa0c1eec2518f5d9e7b125ac10e17810427e13a2f8d28caece9dc8cf889be8"
+WEBHOST_TLS_IMAGE="ghcr.io/dmvt/webhost-control-tlsproxy@sha256:b84a6e320a8055946a2d1b05019d75dbb6bdadb82cf66d18f8f7fa230b291e41"
 
 SECRETS_FILE="${SECRETS_FILE:-$HOME/.attestmesh/webhost.env}"
 SYNCLAVE_SECRETS="${SYNCLAVE_SECRETS:-$HOME/.attestmesh/synclave.env}"
