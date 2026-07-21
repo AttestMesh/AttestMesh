@@ -1,0 +1,65 @@
+# Confidential peer for the dedicated PitchRotator mesh. It carries no
+# application workload and exposes only the gateway-TCP mesh transport.
+services:
+  sidecar:
+    image: ghcr.io/attestmesh/cluster-mesh-agent@sha256:b9e0ae107d9db015c22059c9fecdc28f2b35e09b257eabb4739bd4e46d96f641
+    restart: unless-stopped
+    environment:
+      - CHAIN_ID=${CHAIN_ID}
+      - RPC_URL=${RPC_URL}
+      - BUNDLER_URL=${BUNDLER_URL}
+      - GAS_POLICY_ID=${GAS_POLICY_ID}
+      - INDEXER_REGISTRY_ADDR=${INDEXER_REGISTRY_ADDR}
+      - GATEWAY_DOMAIN=${GATEWAY_DOMAIN}
+      - DSTACK_SOCKET=/var/run/dstack.sock
+      - SIDECAR_STATE_DIR=/var/lib/attestmesh
+      - AGENT_GRPC_SOCKET=/var/run/attestmesh/agent.sock
+      - HEALTH_HTTP_ADDR=0.0.0.0:9090
+      - LOG_FORMAT=pretty
+      - LOG_LEVEL=info,cluster_mesh_agent=debug
+    volumes:
+      - /var/run/dstack.sock:/var/run/dstack.sock
+      - sidecar-state:/var/lib/attestmesh
+      - agent-sock:/var/run/attestmesh
+    expose:
+      - "9090"
+    ports:
+      - "51900:51900"
+      - "9094:9094"
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun
+
+  verifier:
+    image: ghcr.io/attestmesh/pitchrotator-mcp@sha256:936a2402a063708b3055954801e9a4c24bf91110daebbc7923c4214801ab5141
+    restart: unless-stopped
+    network_mode: service:sidecar
+    depends_on:
+      - sidecar
+    entrypoint: ["node", "-e"]
+    command:
+      - |
+        const http = require('node:http');
+        const target = 'http://10.35.220.107:8787';
+        http.createServer(async (_req, res) => {
+          try {
+            const health = await fetch(target + '/health', {signal: AbortSignal.timeout(5000)});
+            if (!health.ok || !(await health.json()).ok) throw new Error('health');
+            const attest = await fetch(target + '/attestation?challenge=attestmesh-deploy-verification', {signal: AbortSignal.timeout(10000)});
+            const body = await attest.json();
+            if (!attest.ok || body.mode !== 'tdx' || body.trusted !== true || typeof body.quote !== 'string' || !body.quote.length) throw new Error('attestation');
+            res.writeHead(200, {'content-type': 'application/json'}).end(JSON.stringify({ok: true, mode: 'tdx', trusted: true}));
+          } catch (_error) {
+            res.writeHead(503, {'content-type': 'application/json'}).end(JSON.stringify({ok: false}));
+          }
+        }).listen(9094, '0.0.0.0');
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+
+volumes:
+  sidecar-state:
+  agent-sock:

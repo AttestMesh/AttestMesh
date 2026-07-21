@@ -88,14 +88,15 @@ class PitchRotatorMcpNodeContractTests(unittest.TestCase):
             r"(?m)^(?!\s*#).*\b(?:ALLOW_INSECURE_NO_TEE|DSTACK_SIMULATOR_ENDPOINT)\b",
         )
 
-    def test_service_is_mesh_only_and_has_no_public_gateway_or_host_ports(self) -> None:
+    def test_workload_is_mesh_only_while_sidecar_transport_uses_gateway(self) -> None:
         deployment = self.driver + self.box
-        self.assertRegex(self.box, r'BOX_GATEWAY_ENABLED",\s*"false"')
+        self.assertRegex(self.box, r'BOX_GATEWAY_ENABLED",\s*"true"')
         self.assertRegex(self.box, r'BOX_PORTS",\s*"\[\]"')
         workload = self.compose.split("  pitchrotator-mcp:", 1)[1].split(
             "  app-egress-fw:", 1
         )[0]
         self.assertNotRegex(workload, r"(?m)^\s*ports\s*:")
+        self.assertIn('- "51900:51900"', self.compose)
         self.assertIn('bind="$${ip}"', self.compose)
 
     def test_model_secret_is_sealed_and_not_exposed_as_a_cli_option(self) -> None:

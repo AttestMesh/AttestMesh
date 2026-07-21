@@ -19,7 +19,7 @@ MEM = int(os.environ.get("BOX_MEM", "4096"))
 DISK = int(os.environ.get("BOX_DISK", "40"))
 PORTS = json.loads(os.environ.get("BOX_PORTS", "[]"))
 NET_MODE = os.environ.get("BOX_NET_MODE", "bridge").strip().lower() or "bridge"
-GATEWAY_ENABLED = os.environ.get("BOX_GATEWAY_ENABLED", "false").strip().lower() in {
+GATEWAY_ENABLED = os.environ.get("BOX_GATEWAY_ENABLED", "true").strip().lower() in {
     "1", "true", "yes", "on"
 }
 

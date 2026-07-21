@@ -18,12 +18,13 @@ BOX_KMS_ROOT_SIGNER="${BOX_KMS_ROOT_SIGNER:-0x7fa63d99495be2129cf28eee54e2ef2724
 COMPOSE="${COMPOSE:-$ROOT/deploy/compose/pitchrotator-mcp-node.yaml}"
 GATEWAY_DOMAIN="${GATEWAY_DOMAIN:-gateway.attestmesh.xyz}"
 MESH_SSH_HOST="${MESH_SSH_HOST:-attestmesh-mesh-node}"
+MESH_PROBE_URL="${MESH_PROBE_URL:-}"
 MESH_CIDR_IP="${MESH_CIDR_IP:-170065920}" # 10.35.0.0, dedicated v1 network
 MESH_CIDR_PREFIX="${MESH_CIDR_PREFIX:-16}"
 RECEIPT="$ROOT/contracts/script/deployments/${CHAIN_ID}.json"
 
 export BOX_VCPU="${BOX_VCPU:-2}" BOX_MEM="${BOX_MEM:-4096}" BOX_DISK="${BOX_DISK:-40}"
-export BOX_PORTS="${BOX_PORTS:-[]}" BOX_GATEWAY_ENABLED="${BOX_GATEWAY_ENABLED:-false}" BOX_NET_MODE="${BOX_NET_MODE:-bridge}"
+export BOX_PORTS="${BOX_PORTS:-[]}" BOX_GATEWAY_ENABLED="${BOX_GATEWAY_ENABLED:-true}" BOX_NET_MODE="${BOX_NET_MODE:-bridge}"
 
 SECRETS_FILE="${SECRETS_FILE:-$HOME/.attestmesh/pitchrotator-mcp.env}"
 REDPILL_KEY_FILE="${REDPILL_KEY_FILE:-$HOME/.attestmesh/pitchrotator-redpill.key}"
@@ -74,7 +75,7 @@ _require_env() {
   : "${PITCHROTATOR_IMAGE:?set immutable PITCHROTATOR_IMAGE (repository@sha256:64hex)}"
   [[ "$PITCHROTATOR_IMAGE" =~ ^[a-z0-9.-]+([:/][a-z0-9._/-]+)+@sha256:[0-9a-f]{64}$ ]] \
     || die "PITCHROTATOR_IMAGE must be an immutable repository@sha256:64hex reference"
-  [ "$BOX_GATEWAY_ENABLED" = false ] || die "PitchRotator v1 is mesh-only; BOX_GATEWAY_ENABLED must remain false"
+  [ "$BOX_GATEWAY_ENABLED" = true ] || die "PitchRotator requires the gateway-TCP mesh transport; the workload port remains unpublished"
   [ "$BOX_PORTS" = '[]' ] || die "PitchRotator v1 publishes no host ports; BOX_PORTS must remain []"
   indexer=$(jq -r .indexerRegistry "$RECEIPT" 2>/dev/null)
   INDEXER_REGISTRY_ADDR="${INDEXER_REGISTRY_ADDR:-$indexer}"
@@ -115,7 +116,7 @@ _box_run() {
     printf 'E_DSTACK_DOCKER_USERNAME=%q\n' "${guser:-dmvt}"
     printf 'E_DSTACK_DOCKER_PASSWORD=%q\n' "$gtok"
     printf 'E_DSTACK_DOCKER_REGISTRY=%q\n' ghcr.io
-  } | ssh_box "sudo BOX_NAME='$NODE' BOX_COMPOSE='/tmp/${NODE}.yaml' BOX_VCPU='$BOX_VCPU' BOX_MEM='$BOX_MEM' BOX_DISK='$BOX_DISK' BOX_PORTS='$BOX_PORTS' BOX_GATEWAY_ENABLED=false BOX_NET_MODE='$BOX_NET_MODE' bash -c 'set -a; . /dev/stdin; set +a; exec $BOX_PY /tmp/pitchrotator-mcp-node-box.py $mode $app_id $vm_id'"
+  } | ssh_box "sudo BOX_NAME='$NODE' BOX_COMPOSE='/tmp/${NODE}.yaml' BOX_VCPU='$BOX_VCPU' BOX_MEM='$BOX_MEM' BOX_DISK='$BOX_DISK' BOX_PORTS='$BOX_PORTS' BOX_GATEWAY_ENABLED=true BOX_NET_MODE='$BOX_NET_MODE' bash -c 'set -a; . /dev/stdin; set +a; exec $BOX_PY /tmp/pitchrotator-mcp-node-box.py $mode $app_id $vm_id'"
 }
 
 preflight() {
@@ -225,6 +226,13 @@ PY
 verify_mcp() {
   _load; [ -n "${MESH_IP:-}" ] || verify
   local health attest
+  if [ -n "$MESH_PROBE_URL" ]; then
+    health=$(curl -fsS --max-time 20 "$MESH_PROBE_URL") || die "confidential mesh peer verifier failed"
+    jq -e '.ok == true and .mode == "tdx" and .trusted == true' <<<"$health" >/dev/null \
+      || die "confidential mesh peer did not verify PitchRotator"
+    log "✔ confidential peer verified MCP /health and self-reported TDX-mode /attestation over the dedicated mesh"
+    return 0
+  fi
   health=$(ssh_mesh "curl -fsS --max-time 10 'http://$MESH_IP:8787/health'") || die "mesh-only health probe failed"
   jq -e '.ok == true' <<<"$health" >/dev/null || die "invalid /health response"
   attest=$(ssh_mesh "curl -fsS --max-time 20 'http://$MESH_IP:8787/attestation?challenge=attestmesh-deploy-verification'") || die "attestation probe failed"

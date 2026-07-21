@@ -32,8 +32,11 @@ services:
       - /var/run/dstack.sock:/var/run/dstack.sock
       - sidecar-state:/var/lib/attestmesh
       - agent-sock:/var/run/attestmesh
+    expose:
+      - "9090"
     ports:
-      - "9090:9090"
+      # Public gateway transport for member-to-member WireGuard only. The MCP
+      # workload's 8787 port is never published through the gateway.
       - "51900:51900"
     cap_add:
       - NET_ADMIN
@@ -89,7 +92,7 @@ services:
     cap_add:
       - NET_ADMIN
 
-  # Bind only the attestmesh0 address. The CVM has no gateway and no host port.
+  # Bind only the attestmesh0 address. The workload has no public gateway port.
   mesh-proxy-mcp:
     image: alpine/socat:1.8.0.0@sha256:0a861c561b21bf3509a897a07f0daa2e2069cf8973ac55b00d6079c5207ba761
     restart: unless-stopped
