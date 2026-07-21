@@ -132,6 +132,7 @@ class WebhostNodeContractTests(unittest.TestCase):
         self.assertIn('"$${telemetry}"/*.jsonl.1', repair_command)
         self.assertIn('"$${projects}/$${project}/project.json"', repair_command)
         self.assertIn('[ ! -L "$${projects}/$${project}/project.json" ]', repair_command)
+        self.assertIn("waifus-preflight-canary|rtmrx-e2e", repair_command)
         self.assertIn(".quarantined-v1.1.23", repair_command)
         self.assertEqual(
             repair["depends_on"]["migration-backup"]["condition"],
