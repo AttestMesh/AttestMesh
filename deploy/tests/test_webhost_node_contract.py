@@ -14,15 +14,15 @@ CANDIDATE = ROOT / "deploy/compose/webhost-node.yaml"
 ROLLBACK = ROOT / "deploy/compose/webhost-node-v1.1.3-rollback.yaml"
 CONTROL_IMAGE = (
     "ghcr.io/dmvt/webhost-control-control-plane@"
-    "sha256:872c1655637c0c9003f15374a24b4caa15b86f19837c6a7fc361bdd1d07b0f64"
+    "sha256:be4fbc00dd4075e96395a2354c14e20174d38bc007cd6dccdac30bc80602f5d5"
 )
 STORAGE_IMAGE = (
     "ghcr.io/dmvt/webhost-control-storage-helper@"
-    "sha256:52253688d06bda806770d28c45d958b995a2e8e84e8c0eddb528a4558dedae4d"
+    "sha256:c24fd69bc6dfae25c24a5f95f703321957db92bac23ef80bc8fb67e7ddae66ac"
 )
 TLS_IMAGE = (
     "ghcr.io/dmvt/webhost-control-tlsproxy@"
-    "sha256:2845fb5cb86e466718850cbe3b843daa01364316a24981e08070cabbf1b8ebd8"
+    "sha256:733e1ecc1ec436d3d3fc28482fff26e1141e167afd076dc72cb838457b8e9911"
 )
 VOLUME_NAMES = {
     "daemon_data": "dstack_daemon_data",
@@ -100,10 +100,10 @@ class WebhostNodeContractTests(unittest.TestCase):
         self.assertNotIn("concierge", services)
         env = services["frontproxy"]["environment"]
         self.assertEqual(env["WEBHOST_ENV"], "production")
-        self.assertEqual(env["WEBHOST_VERSION"], "v1.1.14")
+        self.assertEqual(env["WEBHOST_VERSION"], "v1.1.17")
         self.assertEqual(
             env["WEBHOST_BUILD_COMMIT"],
-            "ccf21646f0c606079ef926f2706353a7b7d46b33",
+            "cfb2401afe762210d3738cc472fda84b0a098ad7",
         )
         self.assertEqual(env["DAEMON_CONTAINER_RUNTIME"], "runsc")
         self.assertEqual(env["DAEMON_ENFORCE_EGRESS"], "1")
@@ -190,6 +190,16 @@ class WebhostNodeContractTests(unittest.TestCase):
         self.assertIn('tombstone_service" != sidecar', box)
         self.assertIn('docker rm "$tombstone_id"', box)
         self.assertNotIn('docker rm -f "$tombstone_id"', box)
+        self.assertIn(
+            'LEGACY_TELEMETRY_LOG="$DAEMON_VOLUME_ROOT/telemetry/'
+            'waifus-preflight-canary.jsonl"',
+            box,
+        )
+        self.assertIn('[ -L "$LEGACY_TELEMETRY_LOG" ]', box)
+        self.assertIn("stat -c '%h:%s' -- \"$LEGACY_TELEMETRY_LOG\"", box)
+        self.assertIn('chown --no-dereference 65532:65532 "$LEGACY_TELEMETRY_LOG"', box)
+        self.assertIn('chmod 0600 "$LEGACY_TELEMETRY_LOG"', box)
+        self.assertNotIn('find "$DAEMON_VOLUME_ROOT/telemetry"', box)
         self.assertIn("Webhost CVM bridge lease not ready", driver)
 
     def test_daemon_probe_uses_canonical_host_with_verified_tls(self) -> None:
