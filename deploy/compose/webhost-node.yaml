@@ -50,6 +50,39 @@ services:
       - sidecar-state:/source/sidecar-state:ro
       - migration_backup:/snapshot
 
+  # A deleted preflight canary left one legacy telemetry pathname with metadata
+  # that the current fail-closed retention scanner correctly rejects. Preserve
+  # its bytes under a non-active name before the unified writer starts; mv
+  # renames the directory entry and does not follow a symlink if the legacy
+  # pathname was replaced.
+  telemetry-repair:
+    image: busybox:1.36@sha256:73aaf090f3d85aa34ee199857f03fa3a95c8ede2ffd4cc2cdb5b94e566b11662
+    pull_policy: always
+    restart: "no"
+    read_only: true
+    network_mode: none
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: ["ALL"]
+    logging: *production-logging
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - |
+        source=/var/lib/tee-daemon/telemetry/waifus-preflight-canary.jsonl
+        quarantine="$${source}.quarantined-v1.1.23"
+        if [ -e "$${source}" ] || [ -L "$${source}" ]; then
+          if [ -e "$${quarantine}" ] || [ -L "$${quarantine}" ]; then
+            echo "telemetry quarantine target already exists" >&2
+            exit 1
+          fi
+          mv "$${source}" "$${quarantine}"
+          sync
+        fi
+    volumes:
+      - daemon_data:/var/lib/tee-daemon
+    depends_on:
+      migration-backup:
+        condition: service_completed_successfully
+
   sidecar:
     image: ghcr.io/attestmesh/cluster-mesh-agent@sha256:b9e0ae107d9db015c22059c9fecdc28f2b35e09b257eabb4739bd4e46d96f641
     restart: unless-stopped
@@ -255,6 +288,8 @@ services:
     stop_grace_period: 45s
     depends_on:
       migration-backup:
+        condition: service_completed_successfully
+      telemetry-repair:
         condition: service_completed_successfully
       storage-helper:
         condition: service_healthy

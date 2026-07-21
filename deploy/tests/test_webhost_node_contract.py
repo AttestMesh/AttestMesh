@@ -120,6 +120,26 @@ class WebhostNodeContractTests(unittest.TestCase):
             "service_completed_successfully",
         )
         self.assertEqual(
+            services["frontproxy"]["depends_on"]["telemetry-repair"]["condition"],
+            "service_completed_successfully",
+        )
+        repair = services["telemetry-repair"]
+        self.assertEqual(repair["network_mode"], "none")
+        self.assertTrue(repair["read_only"])
+        self.assertIn("ALL", repair["cap_drop"])
+        repair_command = "\n".join(repair["command"])
+        self.assertIn("waifus-preflight-canary.jsonl", repair_command)
+        self.assertIn(".quarantined-v1.1.23", repair_command)
+        self.assertEqual(
+            repair["depends_on"]["migration-backup"]["condition"],
+            "service_completed_successfully",
+        )
+        self.assertEqual(
+            [(volume["source"], volume["target"], volume.get("read_only", False))
+             for volume in repair["volumes"]],
+            [("daemon_data", "/var/lib/tee-daemon", False)],
+        )
+        self.assertEqual(
             services["frontproxy"]["depends_on"]["storage-helper"]["condition"],
             "service_healthy",
         )
