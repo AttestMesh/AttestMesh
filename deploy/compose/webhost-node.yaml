@@ -74,10 +74,15 @@ services:
           filename=$${source##*/}
           project=$${filename%.1}
           project=$${project%.jsonl}
-          if [ -f "$${projects}/$${project}/project.json" ] && \
-             [ ! -L "$${projects}/$${project}/project.json" ]; then
-            continue
-          fi
+          case "$${project}" in
+            waifus-preflight-canary|rtmrx-e2e) ;;
+            *)
+              if [ -f "$${projects}/$${project}/project.json" ] && \
+                 [ ! -L "$${projects}/$${project}/project.json" ]; then
+                continue
+              fi
+              ;;
+          esac
           quarantine="$${source}.quarantined-v1.1.23"
           if [ -e "$${quarantine}" ] || [ -L "$${quarantine}" ]; then
             echo "telemetry quarantine target already exists" >&2
