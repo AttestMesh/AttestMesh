@@ -22,6 +22,10 @@
 # No secrets are committed here; all ${VAR} values are sealed into the CVM by
 # deploy/synclave-node.sh (key NAMES are measured into the compose_hash, VALUES
 # are sealed to the app's X25519 key).
+# Keep the runner's established `dstack` project identity: persistent production
+# containers and their published sidecar ports are owned by that project.
+name: dstack
+
 x-logging: &production-logging
   driver: json-file
   options:
@@ -191,23 +195,10 @@ services:
     # v21 = user-visible orchestrator failure details in enclave deploys;
     # v20 = CLUSTER_NETWORKS-only live mesh config + structured orchestrator errors;
     # v19 = Apps → Sandboxes rename (labels only, wire stays app).
-    # v44 = fleet-control main 1cb4ebb — sandbox-first Stripe billing foundation;
-    #       production stays keyless/inert until separately approved credentials and switches arrive.
-    # v45 = fleet-control main 9791308 — production sandbox gallery, S/M/L catalog,
-    #       approved agent images, direct Hosted App uploads, and retired sandbox rollout gates.
-    # v46 = fleet-control main 37801f0 — production-safe sandbox catalog backfill; direct Hosted
-    #       App folder uploads remain available through the API and CLI.
-    # v47 = fleet-control main 206e348 — direct Hosted App uploads accept 128 MiB archives.
-    # v48 = fleet-control main f9b5b82 — align direct uploads to Cloudflare's 100 MB ceiling.
-    # v49 = fleet-control main 7c16d68 — live enclave membership: scheduled network_members
-    #       reconcile, host attribution (box VMM + Phala Cloud via PHALA_CLOUD_API_KEY, new
-    #       measured env key), removed-member admin surface, enclave deploys in the feed,
-    #       landing hero poster + cloth drape (?hero= variants stay preview-gated).
-    #       NOTE: fleet-control ≥ 11640ac requires SANDBOX_APPS_DOMAIN sealed (fail-closed
-    #       sandbox ingress) — the first v49 roll crash-looped on exactly that.
-    # v50 = fleet-control main 366cea3 — Hermes provider onboarding seals third-party API keys
-    #       directly to the sandbox, plus local operator release verification after retiring CI.
-    image: ghcr.io/attestmesh/synclave-app:sha-366cea3b248729ac34b0883613d22a1964891ae7@sha256:31470f055f9af21d1e0ac845b1f7c1858267ca9143377871a97e407b5dd4b8b1
+    # Synclave main 1aac2864 — Hosted Apps source-archive deploy fix (drop commit_sha from the
+    # multipart manifest; honest 413/size and packaging-error mapping) + console pill spacing.
+    # Digest from scripts/release/publish-production-image.sh, built 2026-07-22T17:46:30Z.
+    image: ghcr.io/attestmesh/synclave-app:sha-1aac28643bc7a76d55ce4739b4b40292b5a59545@sha256:3fd826d7d4bb2c1d987196082cfb91ae0bf224c4ec112429dd30d776862c7c13
     environment:
       API_HOST: 0.0.0.0
       API_PORT: 80
@@ -252,16 +243,17 @@ services:
       PUBLIC_BASE_URL: ${PUBLIC_BASE_URL}
       APP_DOMAIN: ${APP_DOMAIN}
       INDEXER_URL: ${INDEXER_URL}
-      PHALA_CLOUD_API_KEY: ${PHALA_CLOUD_API_KEY:-}
       CLUSTER_NETWORKS: ${CLUSTER_NETWORKS:-}
       CLUSTER_ORCHESTRATOR_URL: ${CLUSTER_ORCHESTRATOR_URL:-}
       CLUSTER_ORCHESTRATOR_TOKEN: ${CLUSTER_ORCHESTRATOR_TOKEN:-}
       CORS_ORIGIN: ${CORS_ORIGIN}
-      CLOUDFLARE_API_TOKEN: ${CLOUDFLARE_API_TOKEN}
-      # CF app-fronting: each tenant deploy creates a PROXIED <slug>.app DNS
-      # record in this zone pointing at the origin (the box haproxy).
-      CLOUDFLARE_ZONE_ID: ${CLOUDFLARE_ZONE_ID}
+      # Fleet is the sole public-hostname broker. Use the synclave.net-scoped token, then route
+      # exact *-app and *-sb records independently to their outbound Cloudflare Tunnels.
+      CLOUDFLARE_DNS_API_TOKEN: ${SYNCLAVE_CLOUDFLARE_API_TOKEN}
+      CLOUDFLARE_DNS_ZONE_ID: ${CLOUDFLARE_ZONE_ID}
       CLOUDFLARE_ORIGIN_IP: ${CLOUDFLARE_ORIGIN_IP}
+      CLOUDFLARE_APP_CNAME_TARGET: ${CLOUDFLARE_APP_CNAME_TARGET:-}
+      CLOUDFLARE_SANDBOX_CNAME_TARGET: ${CLOUDFLARE_SANDBOX_CNAME_TARGET:-}
       # Custom-domain control plane. These stay empty while rollout is dark;
       # readiness fails closed before any org can be enabled without the full set.
       CLOUDFLARE_SAAS_API_TOKEN: ${CLOUDFLARE_SAAS_API_TOKEN:-}
@@ -282,8 +274,6 @@ services:
     security_opt:
       - no-new-privileges:true
     mem_limit: 4g
-    # The live disk-preserving VM was originally created with one vCPU; UpgradeApp
-    # cannot resize it. Keep each container limit within that immutable VM ceiling.
     cpus: 1.0
     pids_limit: 1024
     logging: *production-logging
@@ -387,10 +377,8 @@ services:
       timeout: 5s
       retries: 8
       start_period: 45s
-    # service_started, deliberately NOT service_healthy: while the WG mesh warms up after a cold
-    # boot the app can exit-and-retry on DB unavailability; a healthy-gated chain then aborts
-    # compose permanently (proxies never start → lasting 525 even after the app self-heals,
-    # 2026-07-21 v49 boot). Proxies start unconditionally and 502 until the app is ready.
+    # Start the public proxy while the DB-backed app warms up. A health-gated dependency can abort
+    # this chain after a cold boot and leave TLS absent (Cloudflare 525) after app recovery.
     depends_on:
       app:
         condition: service_started

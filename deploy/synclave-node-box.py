@@ -79,9 +79,6 @@ ENV_KEYS = [
     "PUBLIC_BASE_URL",
     "APP_DOMAIN",
     "INDEXER_URL",
-    # Phala Cloud host-observation key (lsdan account) — maps chain members to Phala CVMs by
-    # app_id in the network_members reconcile lane (value sealed, key measured)
-    "PHALA_CLOUD_API_KEY",
     "CLUSTER_NETWORKS",
     "CLUSTER_ORCHESTRATOR_URL",
     "CLUSTER_ORCHESTRATOR_TOKEN",
@@ -105,10 +102,12 @@ ENV_KEYS = [
     "BILLING_CATALOG_RECONCILE_INTERVAL_SEC",
     "CLOUDFLARE_API_TOKEN",
     "SYNCLAVE_CLOUDFLARE_API_TOKEN",
-    # CF app-fronting: zone for the proxied <slug>.app records + the origin IP
-    # (box haproxy) they point at. Non-secret, still sealed (one measured surface).
+    # Fleet's central public-hostname broker. Exact app and sandbox records may target separate
+    # outbound tunnels; ORIGIN_IP is retained as an app-only migration fallback.
     "CLOUDFLARE_ZONE_ID",
     "CLOUDFLARE_ORIGIN_IP",
+    "CLOUDFLARE_APP_CNAME_TARGET",
+    "CLOUDFLARE_SANDBOX_CNAME_TARGET",
     # Custom-domain provider + routing projection. Optional while rollout is dark.
     "CLOUDFLARE_SAAS_API_TOKEN",
     "CLOUDFLARE_SAAS_ZONE_ID",
@@ -126,8 +125,6 @@ ENV_KEYS = [
     "SANDBOX_DAEMON_TOKEN",
     "SANDBOX_DEFAULT_IMAGE",
     "SANDBOX_DEFAULT_PLAN",
-    # required by fleet-control ≥ 11640ac: production sandboxd refuses to boot without the
-    # sandbox apps DNS suffix (ingress relay targets are fail-closed)
     "SANDBOX_APPS_DOMAIN",
     # --- private-registry pull creds (ghcr.io/dmvt/* + attestmesh sidecar) ---
     "DSTACK_DOCKER_USERNAME",
@@ -158,13 +155,51 @@ def app_compose_and_hash(env_keys: list[str]) -> tuple[str, str]:
         "no_instance_id": False,  # stable per-instance disk (app_id||instance_id)
         "secure_time": True,
     }
-    # Log in to the private registry inside the guest so ghcr.io/dmvt/* +
-    # ghcr.io/attestmesh/* images pull. Creds arrive sealed as DSTACK_DOCKER_*.
-    app_compose["pre_launch_script"] = (
-        'if [ -n "$DSTACK_DOCKER_PASSWORD" ]; then '
-        'echo "$DSTACK_DOCKER_PASSWORD" | docker login "${DSTACK_DOCKER_REGISTRY:-ghcr.io}" '
-        '-u "$DSTACK_DOCKER_USERNAME" --password-stdin; fi'
-    )
+    # Remove only the documented stopped Compose sidecar tombstone left by an
+    # interrupted recreate, then log in to the private registry. Never
+    # force-remove or broad-match live services.
+    app_compose["pre_launch_script"] = r"""set -euo pipefail
+tombstone_ids=()
+while read -r container_id container_name; do
+  case "$container_name" in
+    ????????????_dstack-sidecar-1)
+      prefix="${container_name%%_*}"
+      case "$prefix" in
+        *[!0-9a-f]*) ;;
+        *) tombstone_ids+=("$container_id") ;;
+      esac
+      ;;
+  esac
+done < <(docker ps -a --format '{{.ID}} {{.Names}}')
+if [ "${#tombstone_ids[@]}" -gt 1 ]; then
+  echo "multiple dstack sidecar tombstones found; refusing recovery" >&2
+  exit 1
+fi
+if [ "${#tombstone_ids[@]}" -eq 1 ]; then
+  tombstone_id="${tombstone_ids[0]}"
+  tombstone_name="$(docker inspect -f '{{.Name}}' "$tombstone_id")"
+  tombstone_name="${tombstone_name#/}"
+  tombstone_running="$(docker inspect -f '{{.State.Running}}' "$tombstone_id")"
+  tombstone_project="$(docker inspect -f '{{index .Config.Labels "com.docker.compose.project"}}' "$tombstone_id")"
+  tombstone_service="$(docker inspect -f '{{index .Config.Labels "com.docker.compose.service"}}' "$tombstone_id")"
+  case "$tombstone_name" in
+    ????????????_dstack-sidecar-1) ;;
+    *) echo "sidecar recovery target name changed; refusing" >&2; exit 1 ;;
+  esac
+  if [ "$tombstone_running" != false ] \
+    || [ "$tombstone_project" != dstack ] \
+    || [ "$tombstone_service" != sidecar ] \
+    || [ "$tombstone_name" = dstack-sidecar-1 ]; then
+    echo "sidecar recovery target is not a stopped Compose tombstone; refusing" >&2
+    exit 1
+  fi
+  echo "[prelaunch] removing stopped Compose tombstone $tombstone_name"
+  docker rm "$tombstone_id" >/dev/null
+fi
+
+if [ -n "${DSTACK_DOCKER_PASSWORD:-}" ]; then
+  echo "$DSTACK_DOCKER_PASSWORD" | docker login "${DSTACK_DOCKER_REGISTRY:-ghcr.io}" -u "$DSTACK_DOCKER_USERNAME" --password-stdin
+fi"""
     rendered = json.dumps(app_compose, indent=4, ensure_ascii=False)
     return rendered, hashlib.sha256(rendered.encode()).hexdigest()
 
