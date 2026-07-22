@@ -14,15 +14,15 @@ CANDIDATE = ROOT / "deploy/compose/webhost-node.yaml"
 ROLLBACK = ROOT / "deploy/compose/webhost-node-v1.1.3-rollback.yaml"
 CONTROL_IMAGE = (
     "ghcr.io/dmvt/webhost-control-control-plane@"
-    "sha256:1dc0aab9a3d152f1794d98fc7747ce748bfbe0d3b9458a2588fe825fe0e7f123"
+    "sha256:2c3fa7072686a116e2ec091581def40090cef3e5875d74aee2fe3d02cc0225ab"
 )
 STORAGE_IMAGE = (
     "ghcr.io/dmvt/webhost-control-storage-helper@"
-    "sha256:be3a2da81ef05e51a80063e6c73593a02602d057f6652d0f7f60a6f7645d2eb8"
+    "sha256:388ac40ef296525264f894fc16790a2960f8289eb68801413ef651a7cd4f6203"
 )
 TLS_IMAGE = (
     "ghcr.io/dmvt/webhost-control-tlsproxy@"
-    "sha256:3d2765c11662b0e7e8cc7ff24b14783ce65e328948b65c83bb92b1738b81b6b3"
+    "sha256:863a20e3f2fc84cbdbda141eeff5146384f6fbd801ceaf8b7fac386dc3060239"
 )
 VOLUME_NAMES = {
     "daemon_data": "dstack_daemon_data",
@@ -50,7 +50,7 @@ def compose_env() -> dict[str, str]:
             "GITHUB_SECRET": "test-secret",
             "NEXTAUTH_SECRET": "c" * 32,
             "NEXTAUTH_URL": "https://apps.synclave.net",
-            "APP_DOMAIN": "app.synclave.net",
+            "APP_DOMAIN": "synclave.net",
             "DIRECTORY_HOST": "apps.synclave.net",
             "CONSOLE_HOST": "apps.synclave.net",
             "WEBHOST_ADMIN_HOST": "daemon.synclave.net",
@@ -67,6 +67,7 @@ def compose_env() -> dict[str, str]:
             "RUNYARD_CALLBACK_URL": "https://synclave.net/api/runyard/privacy-audit-callback",
             "CLOUDFLARE_API_TOKEN": "test-cloudflare",
             "CLOUDFLARE_SYNCLAVE_API_TOKEN": "test-cloudflare-synclave",
+            "CLOUDFLARE_TUNNEL_TOKEN": "test-cloudflare-tunnel-token",
         }
     )
     return env
@@ -100,16 +101,17 @@ class WebhostNodeContractTests(unittest.TestCase):
         self.assertNotIn("concierge", services)
         env = services["frontproxy"]["environment"]
         self.assertEqual(env["WEBHOST_ENV"], "production")
-        self.assertEqual(env["WEBHOST_VERSION"], "v1.1.23")
+        self.assertEqual(env["WEBHOST_VERSION"], "v1.1.24")
         self.assertEqual(
             env["WEBHOST_BUILD_COMMIT"],
-            "dca0ea48015fee41e1c5e48bea81241e82911922",
+            "afdff6377796dd889d9ae42979b25c42b1270a44",
         )
         self.assertEqual(env["DAEMON_CONTAINER_RUNTIME"], "runsc")
         self.assertEqual(env["DAEMON_ENFORCE_EGRESS"], "1")
         self.assertEqual(env["DAEMON_JOB_EVENT_MAX_COUNT"], "4000")
         self.assertEqual(env["DAEMON_JOB_EVENT_MAX_BYTES"], "2097152")
         self.assertEqual(env["INGRESS_PORT"], "8088")
+        self.assertEqual(env["DAEMON_TRUSTED_PROXY_HOSTS"], "tlsproxy,cloudflared")
         self.assertEqual(services["frontproxy"]["cpus"], 1.0)
         self.assertFalse(
             any(key.startswith("RUNYARD_") for key in env),
@@ -152,10 +154,18 @@ class WebhostNodeContractTests(unittest.TestCase):
             services["tlsproxy"]["depends_on"]["frontproxy"]["condition"],
             "service_healthy",
         )
+        self.assertNotIn("ports", services["tlsproxy"])
         self.assertEqual(
-            {port["published"] for port in services["tlsproxy"]["ports"]},
-            {"80", "443"},
+            services["cloudflared"]["environment"]["TUNNEL_TOKEN"],
+            "test-cloudflare-tunnel-token",
         )
+        self.assertEqual(
+            services["cloudflared"]["depends_on"]["frontproxy"]["condition"],
+            "service_healthy",
+        )
+        self.assertIn("cloudflared", self.rollback["services"])
+        self.assertNotIn("ports", self.rollback["services"]["frontproxy"])
+        self.assertNotIn("ports", self.rollback["services"]["tlsproxy"])
 
     def test_durable_volume_names_and_backup_inventory_are_preserved(self) -> None:
         for logical, physical in VOLUME_NAMES.items():
@@ -198,10 +208,12 @@ class WebhostNodeContractTests(unittest.TestCase):
             "rollback_member()",
             'rollback_member\n  die "Webhost ${WEBHOST_RELEASE_VERSION} failed smoke',
             "BOX_FRESH_DISK is forbidden",
-            "cosign verify",
+            "_verify_local_release_image",
             "WEBHOST_RELEASE_COMMIT",
         ):
             self.assertIn(required, driver)
+        self.assertNotIn("certificate-oidc-issuer", driver)
+        self.assertNotIn("cosign verify", driver)
         self.assertGreaterEqual(
             driver.count("BOX_FRESH_DISK is forbidden"),
             2,
@@ -215,6 +227,7 @@ class WebhostNodeContractTests(unittest.TestCase):
         self.assertIn('tombstone_service" != sidecar', box)
         self.assertIn('docker rm "$tombstone_id"', box)
         self.assertNotIn('docker rm -f "$tombstone_id"', box)
+        self.assertIn("ready through Cloudflare Tunnel", driver)
         self.assertIn(
             'LEGACY_TELEMETRY_LOG="$DAEMON_VOLUME_ROOT/telemetry/'
             'waifus-preflight-canary.jsonl"',
@@ -225,9 +238,8 @@ class WebhostNodeContractTests(unittest.TestCase):
         self.assertIn('chown --no-dereference 65532:65532 "$LEGACY_TELEMETRY_LOG"', box)
         self.assertIn('chmod 0600 "$LEGACY_TELEMETRY_LOG"', box)
         self.assertNotIn('find "$DAEMON_VOLUME_ROOT/telemetry"', box)
-        self.assertIn("Webhost CVM bridge lease not ready", driver)
 
-    def test_daemon_probe_uses_canonical_host_with_verified_tls(self) -> None:
+    def test_daemon_probe_uses_canonical_host_through_cloudflare(self) -> None:
         driver = (ROOT / "deploy/webhost-node.sh").read_text(encoding="utf-8")
         self.assertIn(
             'local probe_host="${DAEMON_PROBE_HOST:-$WEBHOST_ADMIN_HOST}"',
@@ -235,8 +247,8 @@ class WebhostNodeContractTests(unittest.TestCase):
         )
         self.assertIn("--proto '=https'", driver)
         self.assertIn("--tlsv1.2", driver)
-        self.assertIn("--resolve '${probe_host}:443:${cvm_ip}'", driver)
-        self.assertIn("'https://${probe_host}/_api/projects'", driver)
+        self.assertIn('"https://${probe_host}/_api/projects"', driver)
+        self.assertNotIn("--resolve '${probe_host}:443:${cvm_ip}'", driver)
         self.assertNotIn("http://${cvm_ip}/_api/projects", driver)
 
     def test_snapshot_and_restore_commands_round_trip(self) -> None:

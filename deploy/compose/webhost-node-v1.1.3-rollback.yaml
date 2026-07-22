@@ -239,8 +239,8 @@ services:
       DAEMON_UPSTREAM: http://tee-daemon:8080
       CONCIERGE_UPSTREAM: http://concierge:8787
       FRONTPROXY_PORT: 8088
-    ports:
-      - "80:8088"
+    expose:
+      - "8088"
     depends_on:
       - concierge
       - tee-daemon
@@ -252,13 +252,35 @@ services:
       CLOUDFLARE_SYNCLAVE_API_TOKEN: ${CLOUDFLARE_SYNCLAVE_API_TOKEN}
       APP_DOMAIN: ${APP_DOMAIN}
       DIRECTORY_HOST: ${DIRECTORY_HOST}
-    ports:
-      - "443:443"
+    expose:
+      - "443"
     volumes:
       - caddy_data_v2:/data
       - caddy_config_v2:/config
     depends_on:
       - frontproxy
+
+  # Keep emergency rollback reachable through the same outbound-only tunnel;
+  # reverting must not re-expose the box or CVM origin address.
+  cloudflared:
+    image: cloudflare/cloudflared@sha256:4f6655284ab3d252b7f28fedb19fe6c8fc82ee5b1295c20ac74d475e5398a52d
+    restart: unless-stopped
+    init: true
+    read_only: true
+    environment:
+      TUNNEL_TOKEN: ${CLOUDFLARE_TUNNEL_TOKEN:?sealed Cloudflare Tunnel token required}
+    command:
+      - tunnel
+      - --no-autoupdate
+      - --metrics
+      - 0.0.0.0:2000
+      - --loglevel
+      - info
+      - run
+    depends_on:
+      - frontproxy
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
 
 volumes:
   sidecar-state:

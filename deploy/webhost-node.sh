@@ -32,21 +32,21 @@ ROLLBACK_COMPOSE="${ROLLBACK_COMPOSE:-$ROOT/deploy/compose/webhost-node-v1.1.3-r
 GATEWAY_DOMAIN="${GATEWAY_DOMAIN:-gateway.attestmesh.xyz}"
 RECEIPT="$ROOT/contracts/script/deployments/${CHAIN_ID}.json"
 
-WEBHOST_RELEASE_VERSION="v1.1.23"
-WEBHOST_RELEASE_COMMIT="dca0ea48015fee41e1c5e48bea81241e82911922"
-WEBHOST_RELEASE_IDENTITY="https://github.com/dmvt/webhost-control/.github/workflows/release.yml@refs/tags/${WEBHOST_RELEASE_VERSION}"
-WEBHOST_RELEASE_ISSUER="https://token.actions.githubusercontent.com"
-WEBHOST_CONTROL_IMAGE="ghcr.io/dmvt/webhost-control-control-plane@sha256:1dc0aab9a3d152f1794d98fc7747ce748bfbe0d3b9458a2588fe825fe0e7f123"
-WEBHOST_STORAGE_IMAGE="ghcr.io/dmvt/webhost-control-storage-helper@sha256:be3a2da81ef05e51a80063e6c73593a02602d057f6652d0f7f60a6f7645d2eb8"
-WEBHOST_TLS_IMAGE="ghcr.io/dmvt/webhost-control-tlsproxy@sha256:3d2765c11662b0e7e8cc7ff24b14783ce65e328948b65c83bb92b1738b81b6b3"
+WEBHOST_RELEASE_VERSION="v1.1.24"
+WEBHOST_RELEASE_COMMIT="afdff6377796dd889d9ae42979b25c42b1270a44"
+WEBHOST_CONTROL_IMAGE="ghcr.io/dmvt/webhost-control-control-plane@sha256:2c3fa7072686a116e2ec091581def40090cef3e5875d74aee2fe3d02cc0225ab"
+WEBHOST_STORAGE_IMAGE="ghcr.io/dmvt/webhost-control-storage-helper@sha256:388ac40ef296525264f894fc16790a2960f8289eb68801413ef651a7cd4f6203"
+WEBHOST_TLS_IMAGE="ghcr.io/dmvt/webhost-control-tlsproxy@sha256:863a20e3f2fc84cbdbda141eeff5146384f6fbd801ceaf8b7fac386dc3060239"
 
 SECRETS_FILE="${SECRETS_FILE:-$HOME/.attestmesh/webhost.env}"
 SYNCLAVE_SECRETS="${SYNCLAVE_SECRETS:-$HOME/.attestmesh/synclave.env}"
 REDPILL_KEY_FILE="${REDPILL_KEY_FILE:-$HOME/.attestmesh/redpill-key}"
 CLOUDFLARE_TOML="${CLOUDFLARE_TOML:-$HOME/.attestmesh/cloudflare-attestmesh-xyz.toml}"
 CLOUDFLARE_SYNCLAVE_TOML="${CLOUDFLARE_SYNCLAVE_TOML:-$HOME/.attestmesh/cloudflare-synclave-net.toml}"
+CLOUDFLARE_TUNNEL_TOKEN_FILE="${CLOUDFLARE_TUNNEL_TOKEN_FILE:-$HOME/.attestmesh/webhost-cloudflare-tunnel.token}"
 
-APP_DOMAIN="${APP_DOMAIN:-app.synclave.net}"
+APP_DOMAIN="${APP_DOMAIN:-synclave.net}"
+ROLLBACK_APP_DOMAIN="${ROLLBACK_APP_DOMAIN:-app.synclave.net}"
 DIRECTORY_HOST="${DIRECTORY_HOST:-apps.synclave.net}"
 WEBHOST_ADMIN_HOST="${WEBHOST_ADMIN_HOST:-daemon.synclave.net}"
 CONSOLE_HOST="${CONSOLE_HOST:-$DIRECTORY_HOST}"
@@ -135,8 +135,9 @@ EOF
   if [ -z "${CLOUDFLARE_SYNCLAVE_API_TOKEN:-}" ] && [ -f "$CLOUDFLARE_SYNCLAVE_TOML" ]; then
     CLOUDFLARE_SYNCLAVE_API_TOKEN="$(sed -nE 's/^api_token *= *"?([^" ]+)"?.*/\1/p' "$CLOUDFLARE_SYNCLAVE_TOML" | head -1)"
   fi
+  CLOUDFLARE_TUNNEL_TOKEN="${CLOUDFLARE_TUNNEL_TOKEN:-$(tr -d '\r\n' < "$CLOUDFLARE_TUNNEL_TOKEN_FILE" 2>/dev/null)}"
   local k
-  for k in TEE_DAEMON_TOKEN WEBHOST_MCP_TOKEN NEXTAUTH_SECRET GITHUB_ID GITHUB_SECRET CLOUDFLARE_API_TOKEN CLOUDFLARE_SYNCLAVE_API_TOKEN ACME_EMAIL REDPILL_API_KEY VENICE_API_KEY RUNYARD_CALLBACK_SECRET; do
+  for k in TEE_DAEMON_TOKEN WEBHOST_MCP_TOKEN NEXTAUTH_SECRET GITHUB_ID GITHUB_SECRET CLOUDFLARE_API_TOKEN CLOUDFLARE_SYNCLAVE_API_TOKEN CLOUDFLARE_TUNNEL_TOKEN ACME_EMAIL REDPILL_API_KEY VENICE_API_KEY RUNYARD_CALLBACK_SECRET; do
     [ -n "${!k:-}" ] || die "secret $k not set in $SECRETS_FILE"
   done
 }
@@ -197,6 +198,7 @@ _box_run() {
     printf 'E_RUNYARD_CALLBACK_URL=%q\n' "$RUNYARD_CALLBACK_URL"
     printf 'E_CLOUDFLARE_API_TOKEN=%q\n' "$CLOUDFLARE_API_TOKEN"
     printf 'E_CLOUDFLARE_SYNCLAVE_API_TOKEN=%q\n' "$CLOUDFLARE_SYNCLAVE_API_TOKEN"
+    printf 'E_CLOUDFLARE_TUNNEL_TOKEN=%q\n' "$CLOUDFLARE_TUNNEL_TOKEN"
     printf 'E_BACKUP_STORAGE=%q\n' "${BACKUP_STORAGE:-}"
     printf 'E_BACKUP_S3_ENDPOINT=%q\n' "${BACKUP_S3_ENDPOINT:-}"
     printf 'E_BACKUP_S3_BUCKET=%q\n' "${BACKUP_S3_BUCKET:-}"
@@ -340,30 +342,23 @@ verify_app() {
 
 verify_daemon() {
   _load
-  local probe_host="${DAEMON_PROBE_HOST:-$WEBHOST_ADMIN_HOST}" cvm_ip="${WEBHOST_CVM_IP:-}" i code
+  local probe_host="${DAEMON_PROBE_HOST:-$WEBHOST_ADMIN_HOST}" i code
   if ! [[ "$probe_host" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$ ]]; then
     die "invalid daemon probe host: $probe_host"
   fi
-  # The directory host intentionally routes every path to the public UI, so it
-  # cannot prove daemon reachability. Resolve the canonical daemon hostname to
-  # the running CVM's private bridge address so the probe verifies both the
-  # daemon route and its Synclave TLS certificate without traversing public DNS.
+  # Public workload ingress is Cloudflare Tunnel-only. Probing the public
+  # hostname verifies the tunnel, edge certificate, SNI routing, and daemon in
+  # one request without requiring a host-published CVM port.
   for i in $(seq 1 30); do
-    [ -n "$cvm_ip" ] || cvm_ip=$(_cvm_ip)
-    if [ -z "$cvm_ip" ]; then
-      log "… Webhost CVM bridge lease not ready ($i/30)"
-      sleep 10
-      continue
-    fi
-    code=$(ssh_box "curl --silent --show-error --proto '=https' --tlsv1.2 -o /dev/null -w '%{http_code}' --max-time 10 --resolve '${probe_host}:443:${cvm_ip}' 'https://${probe_host}/_api/projects'" 2>/dev/null || true)
+    code=$(curl --silent --show-error --proto '=https' --tlsv1.2 -o /dev/null -w '%{http_code}' --max-time 10 "https://${probe_host}/_api/projects" 2>/dev/null || true)
     if [ "$code" = 401 ] || [ "$code" = 200 ]; then
-      log "✔ tee-daemon reachable over verified TLS: ${probe_host} via ${cvm_ip} -> $code"
+      log "✔ tee-daemon reachable through Cloudflare Tunnel: ${probe_host} -> $code"
       return 0
     fi
     log "… tee-daemon not ready ($i/30, /_api/projects -> ${code:-000})"
     sleep 10
   done
-  die "tee-daemon did not respond via ${cvm_ip}/_api/projects"
+  die "tee-daemon did not respond through Cloudflare Tunnel at ${probe_host}/_api/projects"
 }
 
 _cvm_ip() {
@@ -406,6 +401,7 @@ _render_compose() {
     RUNYARD_CALLBACK_URL="$RUNYARD_CALLBACK_URL" \
     CLOUDFLARE_API_TOKEN="$CLOUDFLARE_API_TOKEN" \
     CLOUDFLARE_SYNCLAVE_API_TOKEN="$CLOUDFLARE_SYNCLAVE_API_TOKEN" \
+    CLOUDFLARE_TUNNEL_TOKEN="$CLOUDFLARE_TUNNEL_TOKEN" \
     BACKUP_STORAGE="${BACKUP_STORAGE:-}" \
     BACKUP_S3_ENDPOINT="${BACKUP_S3_ENDPOINT:-}" \
     BACKUP_S3_BUCKET="${BACKUP_S3_BUCKET:-}" \
@@ -418,14 +414,33 @@ _render_compose() {
     docker compose -f "$file" config --quiet
 }
 
+_verify_local_release_image() {
+  local image="${1:?image required}" labels
+  [[ "$image" =~ ^ghcr\.io/dmvt/webhost-control-[a-z-]+@sha256:[0-9a-f]{64}$ ]] \
+    || die "Webhost image must be an exact dmvt GHCR digest: $image"
+  docker pull --quiet --platform linux/amd64 "$image" >/dev/null \
+    || die "could not pull approved Webhost image: $image"
+  labels=$(docker image inspect --format '{{json .Config.Labels}}' "$image") \
+    || die "could not inspect approved Webhost image: $image"
+  jq -e \
+    --arg source "https://github.com/dmvt/webhost-control" \
+    --arg revision "$WEBHOST_RELEASE_COMMIT" \
+    --arg version "$WEBHOST_RELEASE_VERSION" \
+    '."org.opencontainers.image.source" == $source and
+     ."org.opencontainers.image.revision" == $revision and
+     ."org.opencontainers.image.version" == $version' \
+    <<<"$labels" >/dev/null \
+    || die "local release labels do not bind $image to the reviewed source, commit, and version"
+}
+
 preflight() {
   _load; _require_env
   [ -n "${X:-}" ] && [ -n "${VM_ID:-}" ] && [ -n "${CLUSTER:-}" ] || die "need X/VM_ID/CLUSTER in $STATE"
   [ -z "${BOX_FRESH_DISK:-}" ] || die "BOX_FRESH_DISK is forbidden for the state-preserving Webhost migration"
   [ -f "$COMPOSE" ] && [ ! -L "$COMPOSE" ] || die "candidate Compose must be a regular non-symlink file"
   [ -f "$ROLLBACK_COMPOSE" ] && [ ! -L "$ROLLBACK_COMPOSE" ] || die "rollback Compose must be a regular non-symlink file"
-  local command image first_name second_name candidate_hash rollback_hash saved_compose
-  for command in cast cosign docker jq scp ssh; do
+  local command image first_name second_name candidate_hash rollback_hash saved_compose saved_app_domain
+  for command in cast docker jq scp ssh; do
     command -v "$command" >/dev/null 2>&1 || die "required command unavailable: $command"
   done
   [[ "$ACME_EMAIL" =~ ^[^[:space:]@]+@[^[:space:]@]+\.[^[:space:]@]+$ ]] || die "ACME_EMAIL must be a valid email address"
@@ -447,19 +462,21 @@ preflight() {
   grep -Fq "WEBHOST_VERSION: $WEBHOST_RELEASE_VERSION" "$COMPOSE" || die "candidate Compose does not bind the release version"
   grep -Fq "WEBHOST_BUILD_COMMIT: $WEBHOST_RELEASE_COMMIT" "$COMPOSE" || die "candidate Compose does not bind the release commit"
   _render_compose "$COMPOSE" || die "candidate Compose failed semantic rendering"
+  saved_app_domain="$APP_DOMAIN"
+  APP_DOMAIN="$ROLLBACK_APP_DOMAIN"
   _render_compose "$ROLLBACK_COMPOSE" || die "rollback Compose failed semantic rendering"
+  APP_DOMAIN="$saved_app_domain"
   for image in "$WEBHOST_CONTROL_IMAGE" "$WEBHOST_STORAGE_IMAGE" "$WEBHOST_TLS_IMAGE"; do
-    cosign verify \
-      --certificate-identity "$WEBHOST_RELEASE_IDENTITY" \
-      --certificate-oidc-issuer "$WEBHOST_RELEASE_ISSUER" \
-      "$image" >/dev/null || die "Cosign verification failed for an approved Webhost image"
+    _verify_local_release_image "$image"
   done
   ssh_box true >/dev/null || die "production box is unreachable: $BOX_HOST"
   saved_compose="$COMPOSE"
   candidate_hash=$(_box_run hash | grep -oE '^[0-9a-f]{64}$' | tail -1)
   COMPOSE="$ROLLBACK_COMPOSE"
+  APP_DOMAIN="$ROLLBACK_APP_DOMAIN"
   rollback_hash=$(_box_run hash | grep -oE '^[0-9a-f]{64}$' | tail -1)
   COMPOSE="$saved_compose"
+  APP_DOMAIN="$saved_app_domain"
   [ -n "$candidate_hash" ] && [ -n "$rollback_hash" ] || die "could not compute candidate and rollback compose hashes"
   log "✔ Webhost ${WEBHOST_RELEASE_VERSION} preflight candidate=0x${candidate_hash} rollback=0x${rollback_hash} vm=${VM_ID}"
 }
@@ -497,21 +514,18 @@ _upgrade_compose() {
 }
 
 _candidate_smoke() {
-  local cvm_ip i ready substrate unauth wrong authorized
+  local i ready substrate unauth wrong authorized
   for i in $(seq 1 36); do
-    cvm_ip=$(_cvm_ip)
-    if [ -n "$cvm_ip" ]; then
-      ready=$(ssh_box "curl -sS --max-time 10 --resolve ${WEBHOST_ADMIN_HOST}:443:${cvm_ip} https://${WEBHOST_ADMIN_HOST}/readyz" 2>/dev/null || true)
-      substrate=$(ssh_box "curl -sS --max-time 10 --resolve ${DIRECTORY_HOST}:443:${cvm_ip} https://${DIRECTORY_HOST}/_api/substrate" 2>/dev/null || true)
-      unauth=$(ssh_box "curl -sS -o /dev/null -w '%{http_code}' --max-time 10 --resolve ${WEBHOST_ADMIN_HOST}:443:${cvm_ip} https://${WEBHOST_ADMIN_HOST}/_api/projects" 2>/dev/null || true)
-      wrong=$(ssh_box "curl -sS -o /dev/null -w '%{http_code}' --max-time 10 --resolve ${WEBHOST_ADMIN_HOST}:443:${cvm_ip} -H 'Authorization: Bearer deliberately-wrong-token' https://${WEBHOST_ADMIN_HOST}/_api/projects" 2>/dev/null || true)
-      authorized=$(printf '%s\n' "$TEE_DAEMON_TOKEN" | ssh_box "read -r token; curl -sS -o /dev/null -w '%{http_code}' --max-time 10 --resolve ${WEBHOST_ADMIN_HOST}:443:${cvm_ip} -H \"Authorization: Bearer \$token\" https://${WEBHOST_ADMIN_HOST}/_api/projects" 2>/dev/null || true)
-      if printf '%s' "$ready" | jq -e '.ready == true' >/dev/null 2>&1 \
-        && printf '%s' "$substrate" | jq -e --arg version "$WEBHOST_RELEASE_VERSION" --arg commit "$WEBHOST_RELEASE_COMMIT" '.version == $version and .buildCommit == $commit' >/dev/null 2>&1 \
-        && [ "$unauth" = 401 ] && [ "$wrong" = 403 ] && [ "$authorized" = 200 ]; then
-        log "✔ Webhost ${WEBHOST_RELEASE_VERSION} ready on ${cvm_ip}; auth boundaries and build commit verified"
-        return 0
-      fi
+    ready=$(curl -sS --max-time 10 "https://${WEBHOST_ADMIN_HOST}/readyz" 2>/dev/null || true)
+    substrate=$(curl -sS --max-time 10 "https://${DIRECTORY_HOST}/_api/substrate" 2>/dev/null || true)
+    unauth=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 10 "https://${WEBHOST_ADMIN_HOST}/_api/projects" 2>/dev/null || true)
+    wrong=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 10 -H 'Authorization: Bearer deliberately-wrong-token' "https://${WEBHOST_ADMIN_HOST}/_api/projects" 2>/dev/null || true)
+    authorized=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 10 -H "Authorization: Bearer ${TEE_DAEMON_TOKEN}" "https://${WEBHOST_ADMIN_HOST}/_api/projects" 2>/dev/null || true)
+    if printf '%s' "$ready" | jq -e '.ready == true' >/dev/null 2>&1 \
+      && printf '%s' "$substrate" | jq -e --arg version "$WEBHOST_RELEASE_VERSION" --arg commit "$WEBHOST_RELEASE_COMMIT" '.version == $version and .buildCommit == $commit' >/dev/null 2>&1 \
+      && [ "$unauth" = 401 ] && [ "$wrong" = 403 ] && [ "$authorized" = 200 ]; then
+      log "✔ Webhost ${WEBHOST_RELEASE_VERSION} ready through Cloudflare Tunnel; auth boundaries and build commit verified"
+      return 0
     fi
     log "… Webhost ${WEBHOST_RELEASE_VERSION} candidate not ready ($i/36)"
     sleep 10
@@ -527,6 +541,7 @@ verify_release() {
 rollback_member() {
   _load; _require_env
   [ -n "${X:-}" ] && [ -n "${VM_ID:-}" ] && [ -n "${CLUSTER:-}" ] || die "need X/VM_ID/CLUSTER in $STATE"
+  APP_DOMAIN="$ROLLBACK_APP_DOMAIN"
   _upgrade_compose "$ROLLBACK_COMPOSE" rollback || die "state-preserving Webhost rollback failed"
   verify_app
   verify_daemon

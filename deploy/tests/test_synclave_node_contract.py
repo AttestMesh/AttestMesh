@@ -37,11 +37,39 @@ class SynclaveNodeContractTests(unittest.TestCase):
 
         self.assertIn("SANDBOX_APPS_DOMAIN: ${SANDBOX_APPS_DOMAIN}", compose)
         self.assertIn(
-            'SANDBOX_APPS_DOMAIN="${SANDBOX_APPS_DOMAIN:-sandbox.synclave.net}"',
+            'SANDBOX_APPS_DOMAIN="${SANDBOX_APPS_DOMAIN:-synclave.net}"',
             driver,
         )
         self.assertIn("printf 'E_SANDBOX_APPS_DOMAIN=%q", driver)
         self.assertIn('"SANDBOX_APPS_DOMAIN"', box)
+
+    def test_fleet_brokers_exact_app_and_sandbox_dns_records(self) -> None:
+        compose = (ROOT / "deploy/compose/synclave-node.yaml").read_text(encoding="utf-8")
+        driver = (ROOT / "deploy/synclave-node.sh").read_text(encoding="utf-8")
+        box = (ROOT / "deploy/synclave-node-box.py").read_text(encoding="utf-8")
+
+        self.assertIn("APP_DOMAIN: ${APP_DOMAIN}", compose)
+        self.assertIn("CLOUDFLARE_DNS_API_TOKEN: ${SYNCLAVE_CLOUDFLARE_API_TOKEN}", compose)
+        self.assertIn("CLOUDFLARE_APP_CNAME_TARGET: ${CLOUDFLARE_APP_CNAME_TARGET:-}", compose)
+        self.assertIn("CLOUDFLARE_SANDBOX_CNAME_TARGET: ${CLOUDFLARE_SANDBOX_CNAME_TARGET:-}", compose)
+        self.assertIn('APP_DOMAIN="${APP_DOMAIN:-synclave.net}"', driver)
+        self.assertIn('"CLOUDFLARE_APP_CNAME_TARGET"', box)
+        self.assertIn('"CLOUDFLARE_SANDBOX_CNAME_TARGET"', box)
+
+    def test_production_roll_uses_locally_verified_release_identity(self) -> None:
+        compose = (ROOT / "deploy/compose/synclave-node.yaml").read_text(encoding="utf-8")
+        driver = (ROOT / "deploy/synclave-node.sh").read_text(encoding="utf-8")
+
+        image = (
+            "ghcr.io/attestmesh/synclave-app@sha256:"
+            "31e1340d627396091a3ad19e55c6e4dd6b4967de8592f240748c6c7b2bdbc02b"
+        )
+        self.assertIn(f"image: {image}", compose)
+        self.assertIn(f'SYNCLAVE_RELEASE_IMAGE="{image}"', driver)
+        self.assertIn("_verify_local_release_image", driver)
+        self.assertIn('org.opencontainers.image.revision', driver)
+        self.assertIn('org.opencontainers.image.version', driver)
+        self.assertNotIn("cosign verify", driver)
 
     def test_prelaunch_removes_only_the_stopped_compose_sidecar_tombstone(self) -> None:
         box = (ROOT / "deploy/synclave-node-box.py").read_text(encoding="utf-8")

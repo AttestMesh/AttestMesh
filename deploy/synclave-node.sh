@@ -48,20 +48,25 @@ CUSTOM_DOMAIN_CF_SECRETS_FILE="${CUSTOM_DOMAIN_CF_SECRETS_FILE:-$HOME/.attestmes
 SANDBOX_DAEMON_URL="${SANDBOX_DAEMON_URL:-https://2105a8086e4700e611092aaa3efd37e1e302ffd6-8080.gateway.attestmesh.xyz}"
 SANDBOX_DEFAULT_IMAGE="${SANDBOX_DEFAULT_IMAGE:-ghcr.io/attestmesh/synclave-workloads@sha256:eeeab97469edf54f2d5b9582a0a1c6b49866af931573324919a3dcc6b23a0b4e}"
 SANDBOX_DEFAULT_PLAN="${SANDBOX_DEFAULT_PLAN:-std-1-4-128}"
-SANDBOX_APPS_DOMAIN="${SANDBOX_APPS_DOMAIN:-sandbox.synclave.net}"
+SANDBOX_APPS_DOMAIN="${SANDBOX_APPS_DOMAIN:-synclave.net}"
 SANDBOX_DAEMON_TOKEN="${SANDBOX_DAEMON_TOKEN:-$(sed -nE 's/^SANDBOX_DAEMON_TOKEN=//p' "$HOME/.attestmesh/sandboxd.env" 2>/dev/null)}"
 
 # Non-secret config (overridable), sealed alongside the secrets for one measured surface.
 PUBLIC_BASE_URL="${PUBLIC_BASE_URL:-https://synclave.net}"
 CORS_ORIGIN="${CORS_ORIGIN:-https://synclave.net}"
 CONSOLE_HOST="${CONSOLE_HOST:-synclave.net}"
-APP_DOMAIN="${APP_DOMAIN:-app.synclave.net}"
+APP_DOMAIN="${APP_DOMAIN:-synclave.net}"
 INDEXER_URL="${INDEXER_URL:-http://10.0.100.1:8787}"
 GITHUB_OAUTH_CALLBACK_URL="${GITHUB_OAUTH_CALLBACK_URL:-https://synclave.net/api/v1/auth/github/callback}"
-# CF app-fronting (non-secret): the attestmesh.xyz zone + the origin the proxied
-# <slug>.app records point at (the box haproxy public IP).
-CLOUDFLARE_ZONE_ID="${CLOUDFLARE_ZONE_ID:-5b276342195bda12c978f20ed38a3757}"
+# Fleet owns exact public DNS for both workload classes in synclave.net. Each class can target a
+# different outbound Cloudflare Tunnel. The origin IP remains an app-only migration fallback.
+CLOUDFLARE_ZONE_ID="${CLOUDFLARE_ZONE_ID:-9c618e211544dcbd8b63dee67dcd2adb}"
 CLOUDFLARE_ORIGIN_IP="${CLOUDFLARE_ORIGIN_IP:-173.231.234.133}"
+CLOUDFLARE_APP_CNAME_TARGET="${CLOUDFLARE_APP_CNAME_TARGET:-9e9fed47-327a-4398-a43c-cfa51716b473.cfargotunnel.com}"
+CLOUDFLARE_SANDBOX_CNAME_TARGET="${CLOUDFLARE_SANDBOX_CNAME_TARGET:-b11c9505-f0be-4243-9d55-e09bfbc72050.cfargotunnel.com}"
+SYNCLAVE_RELEASE_COMMIT="343c412bfeef7e9343197efa34eb4e655ea63286"
+SYNCLAVE_RELEASE_VERSION="hostname-broker-343c412"
+SYNCLAVE_RELEASE_IMAGE="ghcr.io/attestmesh/synclave-app@sha256:31e1340d627396091a3ad19e55c6e4dd6b4967de8592f240748c6c7b2bdbc02b"
 CUSTOM_DOMAIN_KV_PROPAGATION_SEC="${CUSTOM_DOMAIN_KV_PROPAGATION_SEC:-60}"
 CLOUDFLARE_SAAS_ZONE_ID="${CLOUDFLARE_SAAS_ZONE_ID:-e58a44e83160efd73bc2a6be8c2bc309}"
 CUSTOM_DOMAIN_CNAME_ZONE="${CUSTOM_DOMAIN_CNAME_ZONE:-synclave.name}"
@@ -142,8 +147,9 @@ _require_env() {
     [ -n "${!k:-}" ] || die "secret $k not set in $SECRETS_FILE"
   done
   [ -n "${SANDBOX_DAEMON_TOKEN:-}" ] || die "SANDBOX_DAEMON_TOKEN empty (expected in \$HOME/.attestmesh/sandboxd.env); required for the Provision button"
-  [ "$SANDBOX_APPS_DOMAIN" = "sandbox.synclave.net" ] \
-    || die "SANDBOX_APPS_DOMAIN must be the dedicated sandbox.synclave.net zone"
+  [ "$APP_DOMAIN" = "synclave.net" ] || die "APP_DOMAIN must be Fleet's shared synclave.net zone"
+  [ "$SANDBOX_APPS_DOMAIN" = "$APP_DOMAIN" ] \
+    || die "SANDBOX_APPS_DOMAIN must equal APP_DOMAIN for the central hostname broker"
   [[ "${SANDBOX_DEFAULT_IMAGE:-}" =~ ^ghcr\.io/attestmesh/synclave-workloads@sha256:[0-9a-f]{64}$ ]] \
     || die "SANDBOX_DEFAULT_IMAGE must use the approved ghcr.io/attestmesh/synclave-workloads repository"
   # Synclave's DB defaults to the C3 pg-ha cluster. The compose exposes pg-ha via
@@ -212,6 +218,8 @@ _box_run() {
     printf 'E_SYNCLAVE_CLOUDFLARE_API_TOKEN=%q\n' "$SYNCLAVE_CLOUDFLARE_API_TOKEN"
     printf 'E_CLOUDFLARE_ZONE_ID=%q\n'       "$CLOUDFLARE_ZONE_ID"
     printf 'E_CLOUDFLARE_ORIGIN_IP=%q\n'     "$CLOUDFLARE_ORIGIN_IP"
+    printf 'E_CLOUDFLARE_APP_CNAME_TARGET=%q\n' "$CLOUDFLARE_APP_CNAME_TARGET"
+    printf 'E_CLOUDFLARE_SANDBOX_CNAME_TARGET=%q\n' "$CLOUDFLARE_SANDBOX_CNAME_TARGET"
     printf 'E_CLOUDFLARE_SAAS_API_TOKEN=%q\n' "${CLOUDFLARE_SAAS_API_TOKEN:-}"
     printf 'E_CLOUDFLARE_SAAS_ZONE_ID=%q\n'  "${CLOUDFLARE_SAAS_ZONE_ID:-}"
     printf 'E_CUSTOM_DOMAIN_CNAME_ZONE=%q\n' "${CUSTOM_DOMAIN_CNAME_ZONE:-}"
@@ -235,8 +243,28 @@ _box_run() {
     bash -c 'set -a; . /dev/stdin; set +a; exec $BOX_PY /tmp/synclave-node-box.py $mode $app_id $vm_id'"
 }
 
+_verify_local_release_image() {
+  local labels
+  grep -Fq "image: $SYNCLAVE_RELEASE_IMAGE" "$COMPOSE" \
+    || die "Synclave Compose does not bind the locally approved image digest"
+  docker pull --quiet --platform linux/amd64 "$SYNCLAVE_RELEASE_IMAGE" >/dev/null \
+    || die "could not pull the locally approved Synclave image"
+  labels=$(docker image inspect --format '{{json .Config.Labels}}' "$SYNCLAVE_RELEASE_IMAGE") \
+    || die "could not inspect the locally approved Synclave image"
+  jq -e \
+    --arg source "https://github.com/AttestMesh/synclave" \
+    --arg revision "$SYNCLAVE_RELEASE_COMMIT" \
+    --arg version "$SYNCLAVE_RELEASE_VERSION" \
+    '."org.opencontainers.image.source" == $source and
+     ."org.opencontainers.image.revision" == $revision and
+     ."org.opencontainers.image.version" == $version' \
+    <<<"$labels" >/dev/null \
+    || die "local release labels do not bind the Synclave image to the reviewed source, commit, and version"
+}
+
 deploy_cvm() {
   _load; _default_cluster_env; _require_env
+  _verify_local_release_image
   _save
   log "▶ box deploy_app synclave node=$NODE compose=$COMPOSE cluster=$CLUSTER"
   local out j
@@ -356,6 +384,7 @@ verify_daemon() {
 update_member() {
   _load; _default_cluster_env; _require_env
   [ -n "${X:-}" ] && [ -n "${VM_ID:-}" ] && [ -n "${CLUSTER:-}" ] || die "need X/VM_ID/CLUSTER in $STATE"
+  _verify_local_release_image
   local nh allowed out j mode
   nh=$(_box_run hash | grep -oE '^[0-9a-f]{64}$' | tail -1)
   [ -n "$nh" ] || die "could not compute new compose_hash"

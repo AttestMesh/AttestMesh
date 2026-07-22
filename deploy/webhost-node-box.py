@@ -46,9 +46,8 @@ PORTS = json.loads(os.environ.get("BOX_PORTS", "[]"))
 # backend + the dstack gateway reach tlsproxy:443 at the CVM's bridge IP. In bridge
 # mode KMS is the SLIRP alias 10.0.2.2 (RA-TLS cert SAN), reached via the host DNAT.
 NET_MODE = (os.environ.get("BOX_NET_MODE", "bridge").strip().lower() or "bridge")
-# Gateway ON: tenant apps at *.app.synclave.net route through the dstack gateway,
-# and the CVM is reachable at <app_id>-<port>s.gateway.attestmesh.xyz. Measured into
-# compose_hash (gateway_enabled).
+# Gateway stays enabled for authenticated control-plane access and recovery. Public tenant ingress
+# uses the outbound Cloudflare Tunnel measured into this compose instead of a host listener.
 GATEWAY_ENABLED = os.environ.get("BOX_GATEWAY_ENABLED", "true").strip().lower() in {
     "1",
     "true",
@@ -94,6 +93,7 @@ ENV_KEYS = [
     "RUNYARD_CALLBACK_URL",
     "CLOUDFLARE_API_TOKEN",
     "CLOUDFLARE_SYNCLAVE_API_TOKEN",
+    "CLOUDFLARE_TUNNEL_TOKEN",
     "BACKUP_STORAGE",
     "BACKUP_S3_ENDPOINT",
     "BACKUP_S3_BUCKET",
