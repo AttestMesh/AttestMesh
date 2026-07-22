@@ -210,3 +210,40 @@ send_with_nonce_retry() {
   nonce=$(cast nonce "$DEPLOYER_ADDR" --rpc-url "$RPC_URL") || return
   send_confirmed "${label}-retry" "$RPC_URL" "$PRIVATE_KEY" "$@" --nonce "$nonce"
 }
+
+# Refuse to roll when the files that shape a deployment drift from origin/main.
+#
+# The 2026-07-22 synclave outage came from rolling with a checkout parked on a stale feature
+# branch: its synclave-node.sh still carried the pre-broker hostname defaults (app./sandbox.
+# subdomains instead of the bare zone), so the sealed env tripped the app's
+# APP_DOMAIN === SANDBOX_APPS_DOMAIN check and every post-refactor image crash-looped on boot.
+# origin/main had been correct the whole time. The same drift had already bitten once that day
+# via the compose's renamed CLOUDFLARE_DNS_* keys. Treat it as a hard error, not a convention:
+# commit the change to main first, then roll from a checkout that matches it.
+#
+# ALLOW_ROLL_SOURCE_DRIFT=1 overrides (emergencies only; the drift is logged loudly).
+verify_roll_source_matches_main() {
+  local root="${1:?repo root required}"; shift
+  [ "$#" -gt 0 ] || die "verify_roll_source_matches_main: no paths given"
+  git -C "$root" rev-parse --git-dir >/dev/null 2>&1 \
+    || die "roll source is not a git checkout: $root"
+  git -C "$root" fetch --quiet origin main \
+    || die "could not fetch origin/main to verify the roll source"
+  local drifted="" p
+  for p in "$@"; do
+    git -C "$root" diff --quiet FETCH_HEAD -- "$p" 2>/dev/null \
+      || drifted="${drifted}  - ${p}"$'\n'
+  done
+  if [ -z "$drifted" ]; then
+    log "✔ roll source matches origin/main"
+    return 0
+  fi
+  if [ "${ALLOW_ROLL_SOURCE_DRIFT:-}" = "1" ]; then
+    log "⚠ roll source DIFFERS from origin/main — ALLOW_ROLL_SOURCE_DRIFT=1 override in effect:"
+    printf '%s' "$drifted" >&2
+    return 0
+  fi
+  die "roll source differs from origin/main — refusing to deploy stale deploy files:
+${drifted}  Commit and push the change to main, then roll from a checkout at origin/main.
+  (ALLOW_ROLL_SOURCE_DRIFT=1 overrides — emergencies only.)"
+}

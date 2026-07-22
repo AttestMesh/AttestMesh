@@ -416,6 +416,18 @@ update_member() {
   # so they can be individually gated; `update` performs the roll only.
 }
 
+# Stale deploy files are the #1 way to brick this roll (see lib.sh). Gate every mutating
+# action on the roll source matching origin/main; read-only verifies stay unguarded.
+case "$ACTION" in
+  deploy|prime|bind|update|setup|all)
+    verify_roll_source_matches_main "$ROOT" \
+      deploy/synclave-node.sh \
+      deploy/synclave-node-box.py \
+      deploy/lib.sh \
+      deploy/compose/synclave-node.yaml
+    ;;
+esac
+
 log "=== Synclave AttestMesh node: $NODE ==="
 case "$ACTION" in
   deploy) deploy_cvm ;;
