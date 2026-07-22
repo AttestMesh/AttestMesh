@@ -62,7 +62,7 @@ class SynclaveNodeContractTests(unittest.TestCase):
 
         image = (
             "ghcr.io/attestmesh/synclave-app@sha256:"
-            "31e1340d627396091a3ad19e55c6e4dd6b4967de8592f240748c6c7b2bdbc02b"
+            "c8148a5a622e3f2b62ea9ed309eb05a748f017c886aaa412a3139c286a7b8b52"
         )
         self.assertIn(f"image: {image}", compose)
         self.assertIn(f'SYNCLAVE_RELEASE_IMAGE="{image}"', driver)
@@ -70,6 +70,17 @@ class SynclaveNodeContractTests(unittest.TestCase):
         self.assertIn('org.opencontainers.image.revision', driver)
         self.assertIn('org.opencontainers.image.version', driver)
         self.assertNotIn("cosign verify", driver)
+
+    def test_public_tls_chain_starts_during_app_database_warmup(self) -> None:
+        compose = (ROOT / "deploy/compose/synclave-node.yaml").read_text(
+            encoding="utf-8"
+        )
+
+        frontproxy = compose.split("  frontproxy:\n", 1)[1].split("  tlsproxy:\n", 1)[0]
+        tlsproxy = compose.split("  tlsproxy:\n", 1)[1]
+        self.assertIn("app:\n        condition: service_started", frontproxy)
+        self.assertIn("frontproxy:\n        condition: service_started", tlsproxy)
+        self.assertIn("directory:\n        condition: service_started", tlsproxy)
 
     def test_prelaunch_removes_only_the_stopped_compose_sidecar_tombstone(self) -> None:
         box = (ROOT / "deploy/synclave-node-box.py").read_text(encoding="utf-8")
