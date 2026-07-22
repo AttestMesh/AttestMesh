@@ -1,6 +1,6 @@
-# Webhost v1.1.5 node migration
+# Webhost v1.1.24 node migration
 
-This runbook promotes the existing `open-webhost` CVM to Webhost `v1.1.5`
+This runbook promotes the existing `open-webhost` CVM to Webhost `v1.1.24`
 without creating a new VM or disk. The measured Compose project remains
 `dstack`, all six durable Docker volume names remain unchanged, and the public
 origins remain:
@@ -9,21 +9,20 @@ origins remain:
   readiness, and MCP;
 - `https://apps.synclave.net` — public application directory and substrate
   metadata;
-- `https://*.app.synclave.net` — tenant ingress.
+- `https://*-app.synclave.net` — Fleet-brokered tenant ingress.
 
 ## Release authority
 
-The reviewed node manifest binds these immutable, keyless-Cosign-verified
-multi-platform indexes from the successful private-repository release workflow
-for `dmvt/webhost-control` tag `v1.1.5`, source commit
-`11d25aea81233d9c62acfd1941ff0b2c0263b9ae`:
+The reviewed node manifest binds immutable, locally built and inspected image
+indexes for `dmvt/webhost-control` version `v1.1.24`, source commit
+`afdff6377796dd889d9ae42979b25c42b1270a44`:
 
-- control plane: `sha256:9faee0607e7d40df9af9e8a2c6f754ff5e10ef36568ddb072542a9b7b70c437f`;
-- storage helper: `sha256:91ee79f2b553266336a393d6e7b484ed23d9735f4dc27eaff858658b5bc87cf0`;
-- TLS proxy: `sha256:06c17f112eebc792639c9990191b8d306c206ad4e9329732114c2c36a1966720`.
+- control plane: `sha256:2c3fa7072686a116e2ec091581def40090cef3e5875d74aee2fe3d02cc0225ab`;
+- storage helper: `sha256:388ac40ef296525264f894fc16790a2960f8289eb68801413ef651a7cd4f6203`;
+- TLS proxy: `sha256:863a20e3f2fc84cbdbda141eeff5146384f6fbd801ceaf8b7fac386dc3060239`.
 
-`preflight` re-verifies all three signatures against the exact tagged
-`.github/workflows/release.yml` identity and GitHub OIDC issuer. Mutable tags
+`preflight` pulls each exact digest and verifies its OCI source, revision, and
+version labels against the release constants. GitHub Actions and mutable tags
 are not deployment authority.
 
 ## Sealed inputs
@@ -36,7 +35,7 @@ and callback secrets must be pairwise distinct. Secret values are sent only in
 memory to the box helper and sealed to the existing app ID.
 
 The legacy Runyard values remain in the sealed allowlist for the reviewed
-rollback topology, but the v1.1.5 control plane does not consume them. The
+rollback topology, but the v1.1.24 control plane does not consume them. The
 current Runyard member exposes only an internal HTTP hub while the production
 Webhost contract requires HTTPS, and the compatibility analyzer must not use
 Runyard. Enabling that optional integration later requires a separate reviewed
@@ -52,7 +51,7 @@ LOGDIR=/home/ubuntu/attestmesh/deploy/logs \
 ```
 
 The gate renders both candidate and rollback Compose models, verifies the
-release signatures and exact version/commit bindings, rejects fresh-disk mode,
+locally inspected OCI source/version/commit bindings, rejects fresh-disk mode,
 checks the production target and state, and computes both measured hashes on
 the box. It does not stop or update the VM.
 
@@ -60,7 +59,7 @@ the box. It does not stop or update the VM.
 
 The update uses dstack `UpgradeApp` on the same VM ID. The original v1.1.3
 migration attempt created the immutable local snapshot before any unified
-Webhost writer started. Before the v1.1.5 writer starts, the
+Webhost writer started. Before the v1.1.24 writer starts, the
 `migration-backup` one-shot service revalidates that snapshot and checksum in
 the persistent `dstack_webhost_v1_1_3_migration_backup` volume:
 
@@ -77,10 +76,12 @@ rollback boundary, not a replacement for off-VM disaster recovery.
 
 Every new writer depends on successful snapshot completion. Candidate
 readiness then proves the exact version/build commit, all dependency checks,
-valid TLS, unauthenticated `401`, wrong-token `403`, and authenticated `200`
-against the CVM bridge address. Failure automatically applies the reviewed
-rollback Compose on the same VM. `migration-restore` validates the checksum and
-restores the snapshot before any legacy writer starts.
+Cloudflare Tunnel routing and edge TLS, unauthenticated `401`, wrong-token
+`403`, and authenticated `200` through the public hostnames. Failure
+automatically applies the reviewed rollback Compose on the same VM.
+`migration-restore` validates the checksum and restores the snapshot before any
+legacy writer starts; that rollback also carries the outbound-only tunnel and
+does not republish ports on the box or CVM.
 
 Manual rollback is intentionally destructive to post-migration writes and must
 therefore be used only for this release window:

@@ -19,7 +19,7 @@ GATEWAY_DOMAIN="${GATEWAY_DOMAIN:-gateway.attestmesh.xyz}"
 WEBHOST_STATE="${WEBHOST_STATE:-$LOGDIR/webhost-node-open-webhost.state}"
 SECRETS_FILE="${SECRETS_FILE:-$HOME/.attestmesh/sandboxd.env}"
 CLOUDFLARE_SYNCLAVE_TOML="${CLOUDFLARE_SYNCLAVE_TOML:-$HOME/.attestmesh/cloudflare-synclave-net.toml}"
-APP_DOMAIN="${APP_DOMAIN:-sandbox.synclave.net}"
+APP_DOMAIN="${APP_DOMAIN:-synclave.net}"
 # A CreateVm replacement has a fresh encrypted data disk. This one-time switch is accepted only
 # after the old authenticated API proves it has no live sandboxes; it explicitly authorizes
 # discarding pre-production tombstones/test history. Future stateful replacements need migration.
@@ -83,6 +83,8 @@ EOF
   # shellcheck disable=SC1090
   source "$SECRETS_FILE"
   [ -n "${SANDBOX_DAEMON_TOKEN:-}" ] || die "SANDBOX_DAEMON_TOKEN missing in $SECRETS_FILE"
+  [ -n "${CLOUDFLARE_TUNNEL_TOKEN:-}" ] \
+    || die "CLOUDFLARE_TUNNEL_TOKEN missing in $SECRETS_FILE"
   # The pinned Caddy build uses CLOUDFLARE_API_TOKEN for DNS-01. Prefer the explicitly Synclave-
   # scoped value, then the protected operator token file. Feed the same zone-scoped credential to
   # both measured env names so this node never falls back to an unrelated Cloudflare zone token.
@@ -108,7 +110,7 @@ _require_env() {
   [ -n "${BUNDLER_URL:-}" ] || BUNDLER_URL="$RPC_URL"
   [ -n "$INDEXER_REGISTRY_ADDR" ] && [ "$INDEXER_REGISTRY_ADDR" != null ] || die "missing INDEXER_REGISTRY_ADDR"
   [ -s "$COMPOSE" ] || die "missing compose file: $COMPOSE"
-  [ "$APP_DOMAIN" = "sandbox.synclave.net" ] || die "APP_DOMAIN must be the dedicated sandbox.synclave.net zone"
+  [ "$APP_DOMAIN" = "synclave.net" ] || die "APP_DOMAIN must be Fleet's shared synclave.net public hostname zone"
   _ensure_secrets
 }
 
@@ -154,6 +156,7 @@ _box_run() {
     printf 'E_APP_DOMAIN=%q\n' "$APP_DOMAIN"
     printf 'E_CLOUDFLARE_API_TOKEN=%q\n' "$CLOUDFLARE_API_TOKEN"
     printf 'E_CLOUDFLARE_SYNCLAVE_API_TOKEN=%q\n' "$CLOUDFLARE_SYNCLAVE_API_TOKEN"
+    printf 'E_CLOUDFLARE_TUNNEL_TOKEN=%q\n' "$CLOUDFLARE_TUNNEL_TOKEN"
     printf 'E_DSTACK_DOCKER_USERNAME=%q\n' "${guser:-dmvt}"
     printf 'E_DSTACK_DOCKER_PASSWORD=%q\n' "$gtok"
     printf 'E_DSTACK_DOCKER_REGISTRY=%q\n' "ghcr.io"

@@ -195,8 +195,9 @@ services:
     # v21 = user-visible orchestrator failure details in enclave deploys;
     # v20 = CLUSTER_NETWORKS-only live mesh config + structured orchestrator errors;
     # v19 = Apps → Sandboxes rename (labels only, wire stays app).
-    # Synclave main 164b8ff — verbatim deployment log streaming across UI, API, and CLI.
-    image: ghcr.io/attestmesh/synclave-app:sha-09f3a1721f7c91a311235fd13fa42c1d7a690a08@sha256:c516a4fa6aa8ceb5d198032220d91f61d6b34bbbf9d7d04c371ebcc586d288b6
+    # Locally verified hostname-broker release; immutable digest and OCI source,
+    # revision, and version labels are checked before a production roll.
+    image: ghcr.io/attestmesh/synclave-app@sha256:31e1340d627396091a3ad19e55c6e4dd6b4967de8592f240748c6c7b2bdbc02b
     environment:
       API_HOST: 0.0.0.0
       API_PORT: 80
@@ -245,11 +246,13 @@ services:
       CLUSTER_ORCHESTRATOR_URL: ${CLUSTER_ORCHESTRATOR_URL:-}
       CLUSTER_ORCHESTRATOR_TOKEN: ${CLUSTER_ORCHESTRATOR_TOKEN:-}
       CORS_ORIGIN: ${CORS_ORIGIN}
-      CLOUDFLARE_API_TOKEN: ${CLOUDFLARE_API_TOKEN}
-      # CF app-fronting: each tenant deploy creates a PROXIED <slug>.app DNS
-      # record in this zone pointing at the origin (the box haproxy).
-      CLOUDFLARE_ZONE_ID: ${CLOUDFLARE_ZONE_ID}
+      # Fleet is the sole public-hostname broker. Use the synclave.net-scoped token, then route
+      # exact *-app and *-sb records independently to their outbound Cloudflare Tunnels.
+      CLOUDFLARE_DNS_API_TOKEN: ${SYNCLAVE_CLOUDFLARE_API_TOKEN}
+      CLOUDFLARE_DNS_ZONE_ID: ${CLOUDFLARE_ZONE_ID}
       CLOUDFLARE_ORIGIN_IP: ${CLOUDFLARE_ORIGIN_IP}
+      CLOUDFLARE_APP_CNAME_TARGET: ${CLOUDFLARE_APP_CNAME_TARGET:-}
+      CLOUDFLARE_SANDBOX_CNAME_TARGET: ${CLOUDFLARE_SANDBOX_CNAME_TARGET:-}
       # Custom-domain control plane. These stay empty while rollout is dark;
       # readiness fails closed before any org can be enabled without the full set.
       CLOUDFLARE_SAAS_API_TOKEN: ${CLOUDFLARE_SAAS_API_TOKEN:-}

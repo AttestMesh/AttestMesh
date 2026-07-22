@@ -102,10 +102,12 @@ ENV_KEYS = [
     "BILLING_CATALOG_RECONCILE_INTERVAL_SEC",
     "CLOUDFLARE_API_TOKEN",
     "SYNCLAVE_CLOUDFLARE_API_TOKEN",
-    # CF app-fronting: zone for the proxied <slug>.app records + the origin IP
-    # (box haproxy) they point at. Non-secret, still sealed (one measured surface).
+    # Fleet's central public-hostname broker. Exact app and sandbox records may target separate
+    # outbound tunnels; ORIGIN_IP is retained as an app-only migration fallback.
     "CLOUDFLARE_ZONE_ID",
     "CLOUDFLARE_ORIGIN_IP",
+    "CLOUDFLARE_APP_CNAME_TARGET",
+    "CLOUDFLARE_SANDBOX_CNAME_TARGET",
     # Custom-domain provider + routing projection. Optional while rollout is dark.
     "CLOUDFLARE_SAAS_API_TOKEN",
     "CLOUDFLARE_SAAS_ZONE_ID",

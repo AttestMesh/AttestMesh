@@ -15,22 +15,37 @@ class SandboxdDeployContract(unittest.TestCase):
     def test_release_pins_one_daemon_image_and_enables_bounded_exec(self) -> None:
         daemon_digest = (
             "ghcr.io/dmvt/confidential-sandboxes@sha256:"
-            "58994495e8b578e0c4501f7629931ec9b785aaa4d421fe3ceb6b66ca57f5121c"
+            "863059a8d4fb58cd1d7dbb4419a3d8365a28053b13f1bfed898752dcd57088e7"
         )
         self.assertEqual(COMPOSE.count(daemon_digest), 3)
         self.assertIn(f'QUOTA_TOOLS_IMAGE="{daemon_digest}"', PRELAUNCH)
         self.assertIn('SANDBOXD_ENABLE_EXEC: "1"', COMPOSE)
         self.assertNotIn('SANDBOXD_ENABLE_EXEC: "0"', COMPOSE)
 
-    def test_unique_host_tls_exposes_canonical_and_literal_mcp_ports(self) -> None:
-        self.assertIn('SANDBOXD_PUBLIC_HTTPS_PORTS: "443,8787"', COMPOSE)
-        self.assertIn('*.{$$SANDBOX_APPS_DOMAIN}:8787', COMPOSE)
-        self.assertIn('[.]{$$SANDBOX_APPS_DOMAIN}(?::8787)?$', COMPOSE)
-        self.assertIn('(?::8787)?$', COMPOSE)
+    def test_unique_host_tls_is_outbound_only_through_cloudflare(self) -> None:
+        self.assertIn('SANDBOXD_PUBLIC_HTTPS_PORTS: "443"', COMPOSE)
+        self.assertNotIn('*.{$$SANDBOX_APPS_DOMAIN}:8787', COMPOSE)
+        self.assertNotIn('(?::8787)?$', COMPOSE)
         self.assertNotIn(r'\.sandbox\.synclave\.net', COMPOSE)
-        self.assertIn('- "443:443"', COMPOSE)
-        self.assertIn('- "8787:8787"', COMPOSE)
+        self.assertIn(
+            r"header_regexp Host ^sbx-[0-9a-f]{52}-sb[.]{$$SANDBOX_APPS_DOMAIN}$",
+            COMPOSE,
+        )
+        self.assertNotIn('- "443:443"', COMPOSE)
+        self.assertNotIn('- "8787:8787"', COMPOSE)
         self.assertIn("reverse_proxy frontproxy:8088", COMPOSE)
+        self.assertIn("  cloudflared:", COMPOSE)
+        self.assertIn(
+            "cloudflare/cloudflared@sha256:4f6655284ab3d252b7f28fedb19fe6c8fc82ee5b1295c20ac74d475e5398a52d",
+            COMPOSE,
+        )
+        self.assertIn(
+            "TUNNEL_TOKEN: ${CLOUDFLARE_TUNNEL_TOKEN:?sealed Cloudflare Tunnel token required}",
+            COMPOSE,
+        )
+        self.assertIn("ipv4_address: 10.191.255.252", COMPOSE)
+        self.assertIn('"127.0.0.1:2000", "ready"', COMPOSE)
+        self.assertIn('"CLOUDFLARE_TUNNEL_TOKEN",', PRELAUNCH)
 
     def test_secret_runtime_is_shared_tmpfs_and_executable(self) -> None:
         self.assertIn("SANDBOXD_SECRET_RUNTIME_ROOT: /run/sandboxd-secrets", COMPOSE)
