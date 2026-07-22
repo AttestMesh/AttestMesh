@@ -195,9 +195,9 @@ services:
     # v21 = user-visible orchestrator failure details in enclave deploys;
     # v20 = CLUSTER_NETWORKS-only live mesh config + structured orchestrator errors;
     # v19 = Apps → Sandboxes rename (labels only, wire stays app).
-    # Locally verified hostname-broker release; immutable digest and OCI source,
-    # revision, and version labels are checked before a production roll.
-    image: ghcr.io/attestmesh/synclave-app@sha256:31e1340d627396091a3ad19e55c6e4dd6b4967de8592f240748c6c7b2bdbc02b
+    # Synclave main 5a2197b: hostname-broker fetch isolation plus complete deploy-log redaction.
+    # The immutable digest and OCI source, revision, and version labels are checked before a roll.
+    image: ghcr.io/attestmesh/synclave-app@sha256:c8148a5a622e3f2b62ea9ed309eb05a748f017c886aaa412a3139c286a7b8b52
     environment:
       API_HOST: 0.0.0.0
       API_PORT: 80
@@ -376,9 +376,11 @@ services:
       timeout: 5s
       retries: 8
       start_period: 45s
+    # Start the public proxy while the DB-backed app warms up. A health-gated dependency can abort
+    # this chain after a cold boot and leave TLS absent (Cloudflare 525) after app recovery.
     depends_on:
       app:
-        condition: service_healthy
+        condition: service_started
     restart: unless-stopped
 
   tlsproxy:
@@ -405,9 +407,9 @@ services:
       - caddy_config:/config
     depends_on:
       frontproxy:
-        condition: service_healthy
+        condition: service_started
       directory:
-        condition: service_healthy
+        condition: service_started
     restart: unless-stopped
     healthcheck:
       test:
