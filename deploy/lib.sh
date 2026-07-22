@@ -50,7 +50,7 @@ wait_box_local_allowlist_propagation() {
   local local_rpc="${2:?box-local RPC required}"
   local cluster="${3:?cluster required}"
   local compose_hash="${4:?compose hash required}"
-  : "${5:?public RPC required}"
+  local timeout_seconds="${6:-${ALLOWLIST_PROPAGATION_TIMEOUT_SECONDS:-300}}"
   local timeout_seconds="${6:-300}"
   local calldata deadline result local_block allowed consecutive=0
   calldata=$(cast calldata 'allowedComposeHashes(bytes32)' "0x${compose_hash#0x}") \
