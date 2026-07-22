@@ -247,3 +247,66 @@ verify_roll_source_matches_main() {
 ${drifted}  Commit and push the change to main, then roll from a checkout at origin/main.
   (ALLOW_ROLL_SOURCE_DRIFT=1 overrides — emergencies only.)"
 }
+
+# ── deploy lock with safe preemption ────────────────────────────────────────────
+# Two sessions rolling the same CVM concurrently is how 2026-07-22 produced
+# flip-flopping upgrades (one roll landed, another reverted it 11 minutes later).
+# Serialize rolls, and let a newer roll preempt an older one — but ONLY while the
+# older is still reversible (compose hash, on-chain allowlist, KMS polling). Those
+# stages have no durable effect: an extra allowlisted compose hash is inert.
+#
+# Once a roll reaches the VM-mutating section (StopVm/UpgradeApp/StartVm) it becomes
+# uninterruptible. Killing it there can leave the CVM stopped or half-upgraded, which
+# is strictly worse than waiting.
+ROLL_LOCK="${ROLL_LOCK:-}"
+
+roll_lock_release() {
+  [ -n "${ROLL_LOCK:-}" ] || return 0
+  rm -rf "$ROLL_LOCK" 2>/dev/null
+  ROLL_LOCK=""
+}
+
+roll_lock_enter_committed() {
+  [ -n "${ROLL_LOCK:-}" ] || return 0
+  printf 'committed' > "$ROLL_LOCK/phase" 2>/dev/null
+  # From here a preemption signal must not kill us mid-upgrade.
+  trap '' TERM INT
+  log "roll entered the non-cancellable phase — VM mutation in progress"
+}
+
+roll_lock_acquire() {
+  local name="${1:?lock name required}" timeout="${2:-180}"
+  local lock="${LOGDIR}/${name}.rolllock"
+  local deadline=$(( $(date +%s) + timeout ))
+  mkdir -p "$LOGDIR" 2>/dev/null
+  while :; do
+    if mkdir "$lock" 2>/dev/null; then
+      ROLL_LOCK="$lock"
+      printf '%s' "$$"      > "$lock/pid"
+      printf 'cancellable'  > "$lock/phase"
+      date -u +%Y%m%dT%H%M%SZ > "$lock/started" 2>/dev/null
+      trap 'roll_lock_release' EXIT
+      log "✔ acquired roll lock ($name)"
+      return 0
+    fi
+    local holder phase
+    holder=$(cat "$lock/pid" 2>/dev/null || true)
+    phase=$(cat "$lock/phase" 2>/dev/null || true)
+    if [ -z "$holder" ] || ! kill -0 "$holder" 2>/dev/null; then
+      log "clearing stale roll lock (holder ${holder:-unknown} is not running)"
+      rm -rf "$lock"
+      continue
+    fi
+    if [ "$phase" = "committed" ]; then
+      die "another roll (pid $holder) is mid VM-upgrade and cannot be preempted safely.
+  Wait for it to finish, then roll again."
+    fi
+    log "preempting older roll (pid $holder, phase ${phase:-unknown}) — it is still cancellable"
+    kill -TERM "$holder" 2>/dev/null
+    while [ -d "$lock" ] && kill -0 "$holder" 2>/dev/null; do
+      [ "$(date +%s)" -lt "$deadline" ] || die "timed out waiting for roll (pid $holder) to release the lock"
+      sleep 1
+    done
+    rm -rf "$lock" 2>/dev/null
+  done
+}

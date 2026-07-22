@@ -169,6 +169,7 @@ send_seq() {
 # BOX_* knobs ride the command line.
 _box_run() {
   local mode="$1" app_id="${2:-}" vm_id="${3:-}" guser gtok
+  roll_lock_enter_committed
   guser=$(grep -E '^\s*username\s*=' "$HOME/.teesql/ghcr-pull.toml" 2>/dev/null | head -1 | sed -E 's/.*=\s*//' | tr -d "\"' ")
   gtok=$(grep  -E '^\s*token\s*='    "$HOME/.teesql/ghcr-pull.toml" 2>/dev/null | head -1 | sed -E 's/.*=\s*//' | tr -d "\"' ")
   [ -n "$gtok" ] || die "no ghcr token in ~/.teesql/ghcr-pull.toml"
@@ -426,6 +427,12 @@ case "$ACTION" in
       deploy/lib.sh \
       deploy/compose/synclave-node.yaml
     ;;
+esac
+
+# Serialize rolls of this node. A newer roll preempts an older one while it is still
+# cancellable; once a roll is mutating the VM it finishes uninterrupted (see lib.sh).
+case "$ACTION" in
+  deploy|prime|bind|update|setup|all) roll_lock_acquire "$NODE" ;;
 esac
 
 log "=== Synclave AttestMesh node: $NODE ==="
