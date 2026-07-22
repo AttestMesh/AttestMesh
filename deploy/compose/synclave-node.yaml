@@ -197,7 +197,7 @@ services:
     # v19 = Apps → Sandboxes rename (labels only, wire stays app).
     # Synclave main 5a2197b: hostname-broker fetch isolation plus complete deploy-log redaction.
     # The immutable digest and OCI source, revision, and version labels are checked before a roll.
-    image: ghcr.io/attestmesh/synclave-app@sha256:f3d7d4888b11db59c2606e7ca4b849c0e26ef938e1ae9373726dcbd4044f43e2
+    image: ghcr.io/attestmesh/synclave-app@sha256:c8148a5a622e3f2b62ea9ed309eb05a748f017c886aaa412a3139c286a7b8b52
     environment:
       API_HOST: 0.0.0.0
       API_PORT: 80
