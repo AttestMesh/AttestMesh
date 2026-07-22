@@ -50,14 +50,14 @@ SANDBOX_DEFAULT_IMAGE="${SANDBOX_DEFAULT_IMAGE:-ghcr.io/attestmesh/synclave-work
 SANDBOX_DEFAULT_PLAN="${SANDBOX_DEFAULT_PLAN:-std-1-4-128}"
 # Required by fleet-control ≥ 11640ac (sandbox ingress fail-closed check): with production
 # sandboxd configured the API refuses to boot unless the sandbox apps DNS suffix is set.
-SANDBOX_APPS_DOMAIN="${SANDBOX_APPS_DOMAIN:-sandbox.synclave.net}"
+SANDBOX_APPS_DOMAIN="${SANDBOX_APPS_DOMAIN:-synclave.net}"
 SANDBOX_DAEMON_TOKEN="${SANDBOX_DAEMON_TOKEN:-$(sed -nE 's/^SANDBOX_DAEMON_TOKEN=//p' "$HOME/.attestmesh/sandboxd.env" 2>/dev/null)}"
 
 # Non-secret config (overridable), sealed alongside the secrets for one measured surface.
 PUBLIC_BASE_URL="${PUBLIC_BASE_URL:-https://synclave.net}"
 CORS_ORIGIN="${CORS_ORIGIN:-https://synclave.net}"
 CONSOLE_HOST="${CONSOLE_HOST:-synclave.net}"
-APP_DOMAIN="${APP_DOMAIN:-app.synclave.net}"
+APP_DOMAIN="${APP_DOMAIN:-synclave.net}"
 DAEMON_URL="${DAEMON_URL:-https://daemon.synclave.net}"
 INDEXER_URL="${INDEXER_URL:-http://10.0.100.1:8787}"
 GITHUB_OAUTH_CALLBACK_URL="${GITHUB_OAUTH_CALLBACK_URL:-https://synclave.net/api/v1/auth/github/callback}"
