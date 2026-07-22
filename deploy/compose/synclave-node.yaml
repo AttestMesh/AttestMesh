@@ -195,10 +195,10 @@ services:
     # v21 = user-visible orchestrator failure details in enclave deploys;
     # v20 = CLUSTER_NETWORKS-only live mesh config + structured orchestrator errors;
     # v19 = Apps → Sandboxes rename (labels only, wire stays app).
-    # Synclave main 1aac2864 — Hosted Apps source-archive deploy fix (drop commit_sha from the
-    # multipart manifest; honest 413/size and packaging-error mapping) + console pill spacing.
-    # Digest from scripts/release/publish-production-image.sh, built 2026-07-22T17:46:30Z.
-    image: ghcr.io/attestmesh/synclave-app:sha-1aac28643bc7a76d55ce4739b4b40292b5a59545@sha256:3fd826d7d4bb2c1d987196082cfb91ae0bf224c4ec112429dd30d776862c7c13
+    # Synclave main 95ba0ed — sandbox rows: inline overflow actions (web-only change on top
+    # of the 1aac2864 Hosted Apps source-archive contract fix).
+    # Digest from scripts/release/publish-production-image.sh, built 2026-07-22T18:00:42Z.
+    image: ghcr.io/attestmesh/synclave-app:sha-95ba0ed52d3a67a0b095ae40616112e76260a2a8@sha256:19ca069390459cad43f220bb68f708d52b3c7f09297452dbf7a5d10fb7e2ad49
     environment:
       API_HOST: 0.0.0.0
       API_PORT: 80
