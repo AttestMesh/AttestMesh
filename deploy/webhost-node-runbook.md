@@ -1,6 +1,6 @@
-# Webhost v1.1.24 node migration
+# Webhost v1.1.25 node migration
 
-This runbook promotes the existing `open-webhost` CVM to Webhost `v1.1.24`
+This runbook promotes the existing `open-webhost` CVM to Webhost `v1.1.25`
 without creating a new VM or disk. The measured Compose project remains
 `dstack`, all six durable Docker volume names remain unchanged, and the public
 origins remain:
@@ -13,17 +13,17 @@ origins remain:
 
 ## Release authority
 
-The reviewed node manifest binds immutable, locally built and inspected image
-indexes for `dmvt/webhost-control` version `v1.1.24`, source commit
-`afdff6377796dd889d9ae42979b25c42b1270a44`:
+The reviewed node manifest binds the immutable image indexes from the signed
+`dmvt/webhost-control` release record for version `v1.1.25`, source commit
+`f10b140005e9bb0a559bc56601099129b246dc90`:
 
-- control plane: `sha256:2c3fa7072686a116e2ec091581def40090cef3e5875d74aee2fe3d02cc0225ab`;
-- storage helper: `sha256:388ac40ef296525264f894fc16790a2960f8289eb68801413ef651a7cd4f6203`;
-- TLS proxy: `sha256:863a20e3f2fc84cbdbda141eeff5146384f6fbd801ceaf8b7fac386dc3060239`.
+- control plane: `sha256:822c07282c37506e7d88afa3fc4db51e6d153c6119d77352c561465bb842b04c`;
+- storage helper: `sha256:9726d0f4a431859fb16cd98466b698cd1b76bf7d0eb1e60465dace34e4bded48`;
+- TLS proxy: `sha256:cb384f78eac6c91868f2c5d0440b8c01b21b096b22cd430b5f397a4dbaf65d10`.
 
 `preflight` pulls each exact digest and verifies its OCI source, revision, and
-version labels against the release constants. GitHub Actions and mutable tags
-are not deployment authority.
+version labels against the release constants. The signed release record and
+these immutable digests are deployment authority; mutable tags are not.
 
 ## Sealed inputs
 
@@ -35,7 +35,7 @@ and callback secrets must be pairwise distinct. Secret values are sent only in
 memory to the box helper and sealed to the existing app ID.
 
 The legacy Runyard values remain in the sealed allowlist for the reviewed
-rollback topology, but the v1.1.24 control plane does not consume them. The
+rollback topology, but the v1.1.25 control plane does not consume them. The
 current Runyard member exposes only an internal HTTP hub while the production
 Webhost contract requires HTTPS, and the compatibility analyzer must not use
 Runyard. Enabling that optional integration later requires a separate reviewed
@@ -59,7 +59,7 @@ the box. It does not stop or update the VM.
 
 The update uses dstack `UpgradeApp` on the same VM ID. The original v1.1.3
 migration attempt created the immutable local snapshot before any unified
-Webhost writer started. Before the v1.1.24 writer starts, the
+Webhost writer started. Before the v1.1.25 writer starts, the
 `migration-backup` one-shot service revalidates that snapshot and checksum in
 the persistent `dstack_webhost_v1_1_3_migration_backup` volume:
 
@@ -83,7 +83,7 @@ automatically applies the reviewed rollback Compose on the same VM.
 legacy writer starts; that rollback also carries the outbound-only tunnel and
 does not republish ports on the box or CVM.
 
-Before the v1.1.24 writer starts, the measured `telemetry-repair` one-shot
+Before the v1.1.25 writer starts, the measured `telemetry-repair` one-shot
 atomically renames legacy telemetry logs other than the sole active project,
 `beamr-economy`, to non-active quarantine names. It then atomically writes a
 durable completion marker, so subsequent restarts and future projects never
