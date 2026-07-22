@@ -73,6 +73,9 @@ pub async fn serve(state: HttpState, addr: String) -> anyhow::Result<()> {
 async fn healthz(State(shared): State<Arc<Shared>>) -> (StatusCode, Json<serde_json::Value>) {
     let phase = shared.current_phase().await;
     let indexer = shared.get_indexer_status().await;
+    let mesh_error = shared.get_mesh_error().await;
+    let wg_public_key = safe_wg_output(&["show", "attestmesh0", "public-key"]).await;
+    let wg_latest_handshakes = safe_wg_output(&["show", "attestmesh0", "latest-handshakes"]).await;
     let first_converged = shared.gates.first_converged();
     let csk_acquired = shared.gates.csk_acquired();
     let healthy = first_converged && csk_acquired;
@@ -104,6 +107,9 @@ async fn healthz(State(shared): State<Arc<Shared>>) -> (StatusCode, Json<serde_j
         "indexer_connected": indexer.connected,
         "indexer_caught_up": indexer.caught_up,
         "indexer_cursor_block": indexer.cursor_block,
+        "mesh_error": mesh_error,
+        "wg_public_key": wg_public_key,
+        "wg_latest_handshakes": wg_latest_handshakes,
     });
     let code = if healthy {
         StatusCode::OK
@@ -111,6 +117,20 @@ async fn healthz(State(shared): State<Arc<Shared>>) -> (StatusCode, Json<serde_j
         StatusCode::SERVICE_UNAVAILABLE
     };
     (code, Json(body))
+}
+
+/// Only expose WireGuard public keys and handshake timestamps; never dump the
+/// interface because that output includes the private key.
+async fn safe_wg_output(args: &[&str]) -> Option<String> {
+    let output = tokio::process::Command::new("wg")
+        .args(args)
+        .output()
+        .await
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
 async fn metrics(State(shared): State<Arc<Shared>>) -> String {

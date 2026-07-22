@@ -392,7 +392,12 @@ async fn reconcile_loop(
 ) {
     loop {
         if let Err(e) = reconcile_once(&ctx, &gw_domain).await {
+            ctx.shared
+                .set_mesh_error(Some(format!("reconcile: {e:#}")))
+                .await;
             tracing::warn!(error = ?e, "peer reconcile pass failed; retrying");
+        } else {
+            ctx.shared.set_mesh_error(None).await;
         }
         // Indexer state events cut the latency; the interval reconciles current views.
         tokio::select! {

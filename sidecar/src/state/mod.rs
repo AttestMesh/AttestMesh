@@ -128,6 +128,8 @@ pub struct Shared {
     /// Indexer connectivity/progress is diagnostic only; Gates remains the complete
     /// health contract so an event-stream outage does not restart a healthy app.
     pub indexer_status: Mutex<IndexerStatus>,
+    /// Most recent mesh-control/reconcile failure, safe to expose on `/healthz`.
+    pub mesh_error: Mutex<Option<String>>,
 
     pub incoming_tx: broadcast::Sender<AppIncoming>,
     pub peer_event_tx: broadcast::Sender<AppPeerEvent>,
@@ -171,6 +173,7 @@ impl Shared {
             originator_member_id: Mutex::new(None),
             peer_change: Notify::new(),
             indexer_status: Mutex::new(IndexerStatus::default()),
+            mesh_error: Mutex::new(None),
             incoming_tx,
             peer_event_tx,
         })
@@ -228,6 +231,14 @@ impl Shared {
 
     pub async fn get_indexer_status(&self) -> IndexerStatus {
         *self.indexer_status.lock().await
+    }
+
+    pub async fn set_mesh_error(&self, error: Option<String>) {
+        *self.mesh_error.lock().await = error;
+    }
+
+    pub async fn get_mesh_error(&self) -> Option<String> {
+        self.mesh_error.lock().await.clone()
     }
 }
 
@@ -297,7 +308,7 @@ pub async fn run(config: Config) -> Result<()> {
     );
 
     let wg_ctl: Arc<dyn MeshControl> = Arc::new(wg::CommandWg);
-    wg_ctl
+    if let Err(error) = wg_ctl
         .create_interface(
             &keys.wg_secret.to_bytes(),
             shared.wg_listen_port,
@@ -305,7 +316,12 @@ pub async fn run(config: Config) -> Result<()> {
             shared.mesh_cidr_prefix,
         )
         .await
-        .ok();
+    {
+        shared
+            .set_mesh_error(Some(format!("create interface: {error:#}")))
+            .await;
+        tracing::error!(error = ?error, "wireguard interface setup failed");
+    }
 
     shared.set_phase(Phase::Registering).await;
 

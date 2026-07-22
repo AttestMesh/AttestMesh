@@ -50,6 +50,55 @@ services:
       - sidecar-state:/source/sidecar-state:ro
       - migration_backup:/snapshot
 
+  # Deleted test projects left legacy telemetry pathnames with metadata that the
+  # current fail-closed retention scanner correctly rejects. Preserve orphaned
+  # logs under non-active names before the unified writer starts; mv renames a
+  # directory entry and does not follow it if an old pathname is a symlink.
+  telemetry-repair:
+    image: busybox:1.36@sha256:73aaf090f3d85aa34ee199857f03fa3a95c8ede2ffd4cc2cdb5b94e566b11662
+    pull_policy: always
+    restart: "no"
+    read_only: true
+    network_mode: none
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: ["ALL"]
+    logging: *production-logging
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - |
+        telemetry=/var/lib/tee-daemon/telemetry
+        marker="$${telemetry}/.orphan-quarantine-v1.1.23.complete"
+        if [ -L "$${marker}" ]; then
+          echo "telemetry repair marker must not be a symlink" >&2
+          exit 1
+        fi
+        [ ! -f "$${marker}" ] || exit 0
+        changed=0
+        for source in "$${telemetry}"/*.jsonl "$${telemetry}"/*.jsonl.1; do
+          [ -e "$${source}" ] || [ -L "$${source}" ] || continue
+          filename=$${source##*/}
+          project=$${filename%.1}
+          project=$${project%.jsonl}
+          [ "$${project}" != beamr-economy ] || continue
+          quarantine="$${source}.quarantined-v1.1.23"
+          if [ -e "$${quarantine}" ] || [ -L "$${quarantine}" ]; then
+            echo "telemetry quarantine target already exists" >&2
+            exit 1
+          fi
+          mv "$${source}" "$${quarantine}"
+          changed=1
+        done
+        marker_tmp="$${marker}.tmp"
+        [ ! -e "$${marker_tmp}" ] && [ ! -L "$${marker_tmp}" ] || exit 1
+        printf 'active-project=beamr-economy\nquarantined=%s\n' "$${changed}" > "$${marker_tmp}"
+        mv "$${marker_tmp}" "$${marker}"
+        sync
+    volumes:
+      - daemon_data:/var/lib/tee-daemon
+    depends_on:
+      migration-backup:
+        condition: service_completed_successfully
+
   sidecar:
     image: ghcr.io/attestmesh/cluster-mesh-agent@sha256:b9e0ae107d9db015c22059c9fecdc28f2b35e09b257eabb4739bd4e46d96f641
     restart: unless-stopped
@@ -170,6 +219,8 @@ services:
       DAEMON_MAX_RETAINED_JOBS: ${DAEMON_MAX_RETAINED_JOBS:-1000}
       DAEMON_JOB_RETENTION_SECONDS: ${DAEMON_JOB_RETENTION_SECONDS:-86400}
       DAEMON_MAX_JOB_STATE_BYTES: ${DAEMON_MAX_JOB_STATE_BYTES:-16777216}
+      DAEMON_JOB_EVENT_MAX_COUNT: ${DAEMON_JOB_EVENT_MAX_COUNT:-4000}
+      DAEMON_JOB_EVENT_MAX_BYTES: ${DAEMON_JOB_EVENT_MAX_BYTES:-2097152}
       DAEMON_MAX_PROJECTS: ${DAEMON_MAX_PROJECTS:-1000}
       DAEMON_MAX_ACTIVE_PROJECTS: ${DAEMON_MAX_ACTIVE_PROJECTS:-100}
       DAEMON_MAX_ACTIVE_MEMORY_BYTES: ${DAEMON_MAX_ACTIVE_MEMORY_BYTES:-34359738368}
@@ -257,6 +308,8 @@ services:
     stop_grace_period: 45s
     depends_on:
       migration-backup:
+        condition: service_completed_successfully
+      telemetry-repair:
         condition: service_completed_successfully
       storage-helper:
         condition: service_healthy

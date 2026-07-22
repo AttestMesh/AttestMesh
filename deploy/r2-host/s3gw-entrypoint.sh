@@ -25,7 +25,17 @@ _st() { echo "$(date -u +%FT%TZ) s3gw: $*" >> "$STAT" 2>/dev/null || true; }
 # Observable failure, no crash-loop storm: report, linger, then let restart policy retry.
 _die() { _st "ERROR: $*"; sleep 30; exit 1; }
 
-for v in R2_ENDPOINT R2_BUCKET R2_ACCESS_KEY_ID R2_SECRET_ACCESS_KEY S3GW_ACCESS_KEY_ID S3GW_SECRET_ACCESS_KEY; do
+# BACKEND_* is the provider-neutral contract. The R2_* fallbacks preserve existing
+# sealed environments and credentials files.
+BACKEND_PROVIDER="${BACKEND_PROVIDER:-Cloudflare}"
+BACKEND_ENDPOINT="${BACKEND_ENDPOINT:-${R2_ENDPOINT:-}}"
+BACKEND_BUCKET="${BACKEND_BUCKET:-${R2_BUCKET:-}}"
+BACKEND_REGION="${BACKEND_REGION:-${R2_REGION:-auto}}"
+BACKEND_ACCESS_KEY_ID="${BACKEND_ACCESS_KEY_ID:-${R2_ACCESS_KEY_ID:-}}"
+BACKEND_SECRET_ACCESS_KEY="${BACKEND_SECRET_ACCESS_KEY:-${R2_SECRET_ACCESS_KEY:-}}"
+BACKEND_FORCE_PATH_STYLE="${BACKEND_FORCE_PATH_STYLE:-true}"
+
+for v in BACKEND_BUCKET BACKEND_ACCESS_KEY_ID BACKEND_SECRET_ACCESS_KEY S3GW_ACCESS_KEY_ID S3GW_SECRET_ACCESS_KEY; do
   eval "val=\${$v:-}"
   [ -n "$val" ] || _die "missing required env $v"
 done
@@ -69,17 +79,17 @@ unset csk keys
 [ -n "$pw_hex" ] && [ -n "$salt_hex" ] || _die "derived key material empty"
 
 # Remote config entirely via env vars — no rclone.conf on disk, ever.
-export RCLONE_CONFIG_R2_TYPE=s3
-export RCLONE_CONFIG_R2_PROVIDER=Cloudflare
-export RCLONE_CONFIG_R2_ACCESS_KEY_ID="$R2_ACCESS_KEY_ID"
-export RCLONE_CONFIG_R2_SECRET_ACCESS_KEY="$R2_SECRET_ACCESS_KEY"
-export RCLONE_CONFIG_R2_ENDPOINT="$R2_ENDPOINT"
-export RCLONE_CONFIG_R2_REGION="${R2_REGION:-auto}"
-export RCLONE_CONFIG_R2_FORCE_PATH_STYLE=true
-# Bucket pre-exists; a bucket-scoped R2 token cannot CreateBucket, so never try.
-export RCLONE_CONFIG_R2_NO_CHECK_BUCKET=true
+export RCLONE_CONFIG_BACKEND_TYPE=s3
+export RCLONE_CONFIG_BACKEND_PROVIDER="$BACKEND_PROVIDER"
+export RCLONE_CONFIG_BACKEND_ACCESS_KEY_ID="$BACKEND_ACCESS_KEY_ID"
+export RCLONE_CONFIG_BACKEND_SECRET_ACCESS_KEY="$BACKEND_SECRET_ACCESS_KEY"
+export RCLONE_CONFIG_BACKEND_ENDPOINT="$BACKEND_ENDPOINT"
+export RCLONE_CONFIG_BACKEND_REGION="$BACKEND_REGION"
+export RCLONE_CONFIG_BACKEND_FORCE_PATH_STYLE="$BACKEND_FORCE_PATH_STYLE"
+# The bucket is provisioned out of band for both R2 and S3-compatible stores.
+export RCLONE_CONFIG_BACKEND_NO_CHECK_BUCKET=true
 export RCLONE_CONFIG_CRYPT_TYPE=crypt
-export RCLONE_CONFIG_CRYPT_REMOTE="r2:${R2_BUCKET}"
+export RCLONE_CONFIG_CRYPT_REMOTE="backend:${BACKEND_BUCKET}"
 export RCLONE_CONFIG_CRYPT_FILENAME_ENCRYPTION=standard
 export RCLONE_CONFIG_CRYPT_PASSWORD="$(rclone obscure "$pw_hex")"
 export RCLONE_CONFIG_CRYPT_PASSWORD2="$(rclone obscure "$salt_hex")"
@@ -99,7 +109,7 @@ if [ -n "${S3GW_DEFAULT_BUCKET:-}" ]; then
     || _die "could not create encrypted S3 bucket ${S3GW_DEFAULT_BUCKET}"
 fi
 
-_st "ready: serving S3 on :${S3GW_LISTEN_PORT:-19000} -> crypt over r2:${R2_BUCKET}"
+_st "ready: serving S3 on :${S3GW_LISTEN_PORT:-19000} -> crypt over ${BACKEND_PROVIDER}:${BACKEND_BUCKET}"
 # 0.0.0.0 is safe: the port is never compose-published; the only route in is the
 # mesh-IP-bound socat proxy in the sidecar netns. NOTICE-level log to the status
 # volume for post-mortems (TEE blocks stdout).

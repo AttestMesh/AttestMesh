@@ -108,6 +108,8 @@ class WebhostNodeContractTests(unittest.TestCase):
         )
         self.assertEqual(env["DAEMON_CONTAINER_RUNTIME"], "runsc")
         self.assertEqual(env["DAEMON_ENFORCE_EGRESS"], "1")
+        self.assertEqual(env["DAEMON_JOB_EVENT_MAX_COUNT"], "4000")
+        self.assertEqual(env["DAEMON_JOB_EVENT_MAX_BYTES"], "2097152")
         self.assertEqual(env["INGRESS_PORT"], "8088")
         self.assertEqual(env["DAEMON_TRUSTED_PROXY_HOSTS"], "tlsproxy,cloudflared")
         self.assertEqual(services["frontproxy"]["cpus"], 1.0)
@@ -118,6 +120,31 @@ class WebhostNodeContractTests(unittest.TestCase):
         self.assertEqual(
             services["frontproxy"]["depends_on"]["migration-backup"]["condition"],
             "service_completed_successfully",
+        )
+        self.assertEqual(
+            services["frontproxy"]["depends_on"]["telemetry-repair"]["condition"],
+            "service_completed_successfully",
+        )
+        repair = services["telemetry-repair"]
+        self.assertEqual(repair["network_mode"], "none")
+        self.assertTrue(repair["read_only"])
+        self.assertIn("ALL", repair["cap_drop"])
+        repair_command = "\n".join(repair["command"])
+        self.assertIn('"$${telemetry}"/*.jsonl', repair_command)
+        self.assertIn('"$${telemetry}"/*.jsonl.1', repair_command)
+        self.assertIn('[ "$${project}" != beamr-economy ] || continue', repair_command)
+        self.assertIn(".quarantined-v1.1.23", repair_command)
+        self.assertIn(".orphan-quarantine-v1.1.23.complete", repair_command)
+        self.assertIn('[ ! -f "$${marker}" ] || exit 0', repair_command)
+        self.assertIn('[ -L "$${marker}" ]', repair_command)
+        self.assertEqual(
+            repair["depends_on"]["migration-backup"]["condition"],
+            "service_completed_successfully",
+        )
+        self.assertEqual(
+            [(volume["source"], volume["target"], volume.get("read_only", False))
+             for volume in repair["volumes"]],
+            [("daemon_data", "/var/lib/tee-daemon", False)],
         )
         self.assertEqual(
             services["frontproxy"]["depends_on"]["storage-helper"]["condition"],
@@ -201,6 +228,16 @@ class WebhostNodeContractTests(unittest.TestCase):
         self.assertIn('docker rm "$tombstone_id"', box)
         self.assertNotIn('docker rm -f "$tombstone_id"', box)
         self.assertIn("ready through Cloudflare Tunnel", driver)
+        self.assertIn(
+            'LEGACY_TELEMETRY_LOG="$DAEMON_VOLUME_ROOT/telemetry/'
+            'waifus-preflight-canary.jsonl"',
+            box,
+        )
+        self.assertIn('[ -L "$LEGACY_TELEMETRY_LOG" ]', box)
+        self.assertIn("stat -c '%h:%s' -- \"$LEGACY_TELEMETRY_LOG\"", box)
+        self.assertIn('chown --no-dereference 65532:65532 "$LEGACY_TELEMETRY_LOG"', box)
+        self.assertIn('chmod 0600 "$LEGACY_TELEMETRY_LOG"', box)
+        self.assertNotIn('find "$DAEMON_VOLUME_ROOT/telemetry"', box)
 
     def test_daemon_probe_uses_canonical_host_through_cloudflare(self) -> None:
         driver = (ROOT / "deploy/webhost-node.sh").read_text(encoding="utf-8")

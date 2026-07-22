@@ -10,6 +10,8 @@
     "up:postgres": "smithers-orchestrator up workflows/postgres-node.tsx",
     "graph:pg-ha-rotate": "bunx smithers-orchestrator graph workflows/pg-ha-rotate-provider.tsx",
     "up:pg-ha-rotate": "bunx smithers-orchestrator up workflows/pg-ha-rotate-provider.tsx",
+    "graph:r2-recovery": "smithers-orchestrator graph workflows/r2-host-recovery.tsx",
+    "up:r2-recovery": "smithers-orchestrator up workflows/r2-host-recovery.tsx",
     "security:staged": "./precommit-security.sh",
     "security:test": "python3 -m unittest tests/test_precommit_security.py",
     "security:install": "./install-precommit-security.sh"

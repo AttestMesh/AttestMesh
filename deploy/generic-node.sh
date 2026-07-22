@@ -332,6 +332,20 @@ update_member() {
   log "✔ generic node update complete mode=$mode vm=$VM_ID"
 }
 
+recreate_member() {
+  _load; _require_env
+  [ -n "${X:-}" ] && [ -n "${VM_ID:-}" ] || die "need X/VM_ID in $STATE"
+  log "▶ recreate generic node=$NODE with a fresh encrypted data disk"
+  local out j
+  out=$(_box_run recreate "$X" "$VM_ID") || die "fresh-disk recreate failed"
+  echo "$out"
+  j=$(echo "$out" | grep '"app_id"' | tail -1)
+  H=$(echo "$j" | jq -r .compose_hash)
+  VM_ID=$(echo "$j" | jq -r .vm_id)
+  STATE_PHASE="recreated"; _save
+  log "✔ recreated generic node vm=$VM_ID"
+}
+
 register_direct() {
   "$HERE/indexer-member-node.sh" "$NODE" register-member-direct
 }
@@ -346,7 +360,8 @@ case "$ACTION" in
   verify) verify ;;
   register-direct) register_direct ;;
   update) update_member ;;
+  recreate) recreate_member ;;
   cleanup|stop) cleanup ;;
   all) preflight; deploy_cvm; prime_gate; bind_member; start_cvm; register_direct; verify ;;
-  *) die "usage: generic-node.sh <node-name> [preflight|deploy|start|prime|bind|verify|register-direct|update|cleanup|stop|all]" ;;
+  *) die "usage: generic-node.sh <node-name> [preflight|deploy|start|prime|bind|verify|register-direct|update|recreate|cleanup|stop|all]" ;;
 esac

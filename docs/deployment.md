@@ -226,6 +226,7 @@ where it stopped.
 | `workflows/matrix-node.tsx` | `attestmesh-matrix-node` | `deploy -> cluster -> patha -> prime -> bind -> verify -> agent -> client -> isolation`, with an optional backup-status task when backups are enabled. |
 | `workflows/pg-ha.tsx` | `attestmesh-pg-ha` | New Safe-owned chain-only mesh: `deploy -> prime -> bind -> on-chain registration -> console runtime convergence -> fresh backup evidence -> isolation`; no Matrix, Tailscale, or SSH member dependency. Chain-agent E2E remains excluded until the Safe-specific sender is production-ready. |
 | `workflows/postgres-node.tsx` | `attestmesh-postgres-node` | `deploy -> prime -> bind -> verify -> meshEndpoint -> agent -> metrics -> isolation`. |
+| `workflows/r2-host-recovery.tsx` | `attestmesh-r2-host-recovery` | `capture -> proof -> allow-root -> simulate -> register -> clean-roll -> verify -> health -> [storage] -> isolation`. Recovery hard-stops unless the captured KMS signature recovers the explicitly expected root; registration is simulated before submission. `verifyStorage` is optional because a one-node mesh has no independent mesh client. |
 
 ### Compose payloads
 

@@ -83,6 +83,14 @@ automatically applies the reviewed rollback Compose on the same VM.
 legacy writer starts; that rollback also carries the outbound-only tunnel and
 does not republish ports on the box or CVM.
 
+Before the v1.1.24 writer starts, the measured `telemetry-repair` one-shot
+atomically renames legacy telemetry logs other than the sole active project,
+`beamr-economy`, to non-active quarantine names. It then atomically writes a
+durable completion marker, so subsequent restarts and future projects never
+repeat this migration. This preserves the legacy bytes without following the
+telemetry pathnames while allowing the fail-closed retention scanner to
+validate every active log.
+
 Manual rollback is intentionally destructive to post-migration writes and must
 therefore be used only for this release window:
 

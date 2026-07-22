@@ -268,6 +268,30 @@ if ! mountpoint -q "$STORAGE_ROOT"; then
 fi
 mount --make-rshared "$STORAGE_ROOT"
 
+# v1.1.14 correctly fails readiness when it encounters a telemetry file whose
+# metadata predates the private-file invariant. Repair only the one observed
+# preflight-canary log, only while application containers are stopped, and only
+# after proving it is a bounded regular single-link file. Its bytes are retained.
+LEGACY_TELEMETRY_LOG="$DAEMON_VOLUME_ROOT/telemetry/waifus-preflight-canary.jsonl"
+if [ -e "$LEGACY_TELEMETRY_LOG" ] || [ -L "$LEGACY_TELEMETRY_LOG" ]; then
+  if [ -L "$LEGACY_TELEMETRY_LOG" ] || [ ! -f "$LEGACY_TELEMETRY_LOG" ]; then
+    echo "[prelaunch] legacy telemetry repair target is not a regular file; refusing" >&2
+    exit 1
+  fi
+  TELEMETRY_META="$(stat -c '%h:%s' -- "$LEGACY_TELEMETRY_LOG")"
+  TELEMETRY_LINKS="${TELEMETRY_META%%:*}"
+  TELEMETRY_SIZE="${TELEMETRY_META#*:}"
+  if [ "$TELEMETRY_LINKS" != 1 ] \
+    || ! [ "$TELEMETRY_SIZE" -ge 0 ] 2>/dev/null \
+    || [ "$TELEMETRY_SIZE" -gt 67174400 ]; then
+    echo "[prelaunch] legacy telemetry repair target failed link/size bounds; refusing" >&2
+    exit 1
+  fi
+  chown --no-dereference 65532:65532 "$LEGACY_TELEMETRY_LOG"
+  chmod 0600 "$LEGACY_TELEMETRY_LOG"
+  echo "[prelaunch] repaired metadata for the bounded legacy telemetry canary log"
+fi
+
 if [ -n "${DSTACK_DOCKER_PASSWORD:-}" ]; then
   echo "$DSTACK_DOCKER_PASSWORD" | docker login "${DSTACK_DOCKER_REGISTRY:-ghcr.io}" -u "$DSTACK_DOCKER_USERNAME" --password-stdin
 fi'''
