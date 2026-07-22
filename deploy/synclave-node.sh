@@ -361,7 +361,7 @@ verify_app() {
       headers=$(curl --fail --silent --show-error --proto '=https' --tlsv1.2 --max-time 10 --dump-header - --output /dev/null "https://${host}/" 2>/dev/null || true)
     fi
     if printf '%s' "$api" | jq -e '.status == "ok" and .db != "down"' >/dev/null 2>&1 \
-       && printf '%s' "$root" | grep -qi '<title>Synclave</title>' \
+       && printf '%s' "$root" | grep -qi '<title>Synclave' \
        && printf '%s' "$headers" | grep -qi '^strict-transport-security:'; then
       log "✔ Synclave UI and DB-backed API are healthy over verified TLS"
       return 0

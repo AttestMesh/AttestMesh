@@ -82,6 +82,12 @@ class SynclaveNodeContractTests(unittest.TestCase):
         self.assertIn("frontproxy:\n        condition: service_started", tlsproxy)
         self.assertIn("directory:\n        condition: service_started", tlsproxy)
 
+    def test_public_verifier_accepts_the_branded_synclave_title(self) -> None:
+        driver = (ROOT / "deploy/synclave-node.sh").read_text(encoding="utf-8")
+
+        self.assertIn("grep -qi '<title>Synclave'", driver)
+        self.assertNotIn("grep -qi '<title>Synclave</title>'", driver)
+
     def test_prelaunch_removes_only_the_stopped_compose_sidecar_tombstone(self) -> None:
         box = (ROOT / "deploy/synclave-node-box.py").read_text(encoding="utf-8")
 
