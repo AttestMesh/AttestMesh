@@ -149,7 +149,7 @@ def app_compose_and_hash(env_keys: list[str]) -> tuple[str, str]:
         "gateway_enabled": GATEWAY_ENABLED,
         "local_key_provider_enabled": False,
         "key_provider_id": "",
-        "public_logs": False,
+        "public_logs": True,  # TEMPORARY: diagnosing app crash-loop (revert immediately after)
         "public_sysinfo": False,
         "allowed_envs": sorted(set(env_keys) | {"APP_ID"}),
         "no_instance_id": False,  # stable per-instance disk (app_id||instance_id)
